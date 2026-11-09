@@ -7,6 +7,7 @@ mod protocol;
 mod transfer;
 mod video;
 mod x11;
+mod window_semantics;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -136,6 +137,7 @@ struct Args {
 struct RemoteWindow {
     id: u32,
     icon: app_icon::WindowIcon,
+    state: window_semantics::State,
     window: Window,
     dirty: bool,
     announced: bool,
@@ -172,6 +174,7 @@ struct App {
     compositor: CompositorState,
     x11: x11::State,
     shell: XdgShellState,
+    _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState,
     _decorations: XdgDecorationState,
     _fractional_scale: FractionalScaleManagerState,
     _viewporter: ViewporterState,
@@ -252,7 +255,7 @@ impl App {
             }
             Some(id)
         });
-        let id = id.filter(|id| self.window(*id).is_some());
+        let id = id.map(|id| self.modal_target(id)).filter(|id| self.window(*id).is_some());
         let changed = self.focused_window != id;
         if changed {
             if let Some(root) = self.x11.grab.filter(|root| Some(*root) != id) {
@@ -350,7 +353,7 @@ impl App {
     }
 
     fn pointer_motion(&mut self, id: u32, x: f64, y: f64) {
-        if !x.is_finite() || !y.is_finite() {
+        if !self.input_allowed(id) || !x.is_finite() || !y.is_finite() {
             return;
         }
         let Some(window) = self.window(self.root_id(id)) else {
@@ -446,6 +449,9 @@ impl App {
     }
 
     fn begin_file_drop(&mut self, id: u32, x: f64, y: f64, uris: Vec<u8>) {
+        if !self.input_allowed(id) {
+            return;
+        }
         self.release_input();
         self.focus(Some(id));
         self.pointer_motion(id, x, y);
@@ -567,6 +573,7 @@ impl App {
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0);
         match value["type"].as_str().unwrap_or("") {
+            "window_state" => self.native_window_state(id, &value),
             "frame_ack" => {
                 if let Some(peer) = &self.peer {
                     peer.acknowledge(id, value["sequence"].as_u64().unwrap_or(0));
@@ -610,7 +617,7 @@ impl App {
                 );
                 p.frame(self);
             }
-            "button" => {
+            "button" if self.input_allowed(id) => {
                 if value["x"].is_number() && value["y"].is_number() {
                     self.pointer_message(id, &value);
                 }
@@ -651,7 +658,7 @@ impl App {
                 );
                 pointer.frame(self);
             }
-            "key" if self.focused_window == Some(self.root_id(id)) => {
+            "key" if self.input_allowed(id) && self.focused_window == Some(self.root_id(id)) => {
                 let key = value["key"].as_u64().unwrap_or(u64::MAX);
                 if key > 767 {
                     return;
@@ -683,7 +690,7 @@ impl App {
                     );
                 }
             }
-            "scroll" if self.window(self.root_id(id)).is_some() => {
+            "scroll" if self.input_allowed(id) && self.window(self.root_id(id)).is_some() => {
                 let x = value["x"].as_f64().unwrap_or(0.0).clamp(-1000.0, 1000.0);
                 let y = value["y"].as_f64().unwrap_or(0.0).clamp(-1000.0, 1000.0);
                 let p = self.seat.get_pointer().unwrap();
@@ -696,7 +703,7 @@ impl App {
                 p.frame(self);
             }
             "viewport" => self.update_viewport(id, &value),
-            "resize" if self.window(id).is_some() => {
+            "resize" if self.windows.iter().any(|w| w.id == id && w.mapped) => {
                 let started = Instant::now();
                 self.update_viewport(id, &value);
                 self.set_scale(
@@ -705,8 +712,14 @@ impl App {
                     monitor_mode(&value, self.output.current_mode().unwrap().refresh),
                 );
                 if let Some(window) = self.window(id) {
-                    let width = value["width"].as_i64().unwrap_or(960).clamp(64, 3840) as i32;
-                    let height = value["height"].as_i64().unwrap_or(640).clamp(64, 2160) as i32;
+                    let (width, height) = if self.semantics_enabled() {
+                        self.native_resize(id, &value).unwrap()
+                    } else {
+                        (
+                            value["width"].as_i64().unwrap_or(960).clamp(64, 3840) as i32,
+                            value["height"].as_i64().unwrap_or(640).clamp(64, 2160) as i32,
+                        )
+                    };
                     if let Some(peer) = &self.peer {
                         let scale = dpi_scale(&value);
                         peer.begin_resize(
@@ -729,7 +742,7 @@ impl App {
                     top.with_pending_state(|s| {
                         s.size = Some((width, height).into());
                         if let Some(maximized) = value["maximized"].as_bool() {
-                            if maximized {
+                            if maximized && !s.states.contains(xdg_toplevel::State::Fullscreen) {
                                 s.states.set(xdg_toplevel::State::Maximized);
                             } else {
                                 s.states.unset(xdg_toplevel::State::Maximized);
@@ -911,8 +924,22 @@ impl App {
             .map(|w| w.id)
             .collect();
         for id in dead {
+            if let Some(top) = self.window(id).and_then(|w| w.toplevel().cloned()) {
+                self.reparent_children(top.wl_surface(), top.parent());
+            }
             if self.focused_window == Some(id) {
-                self.focus(None);
+                let parent = self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == id)
+                    .and_then(|w| w.last_info["parent"].as_u64())
+                    .and_then(|p| u32::try_from(p).ok())
+                    .filter(|parent| {
+                        self.windows
+                            .iter()
+                            .any(|w| w.id == *parent && w.window.alive())
+                    });
+                self.focus(parent);
             }
             if let Some(remote) = self.windows.iter().find(|w| w.id == id) {
                 self.dh.remove_global::<App>(remote.output_global.clone());
@@ -925,6 +952,7 @@ impl App {
             }
             self.control(json!({"type":"window_closed", "id":id}));
         }
+        let semantics = self.semantics_enabled();
         let parent_ids: Vec<_> = self
             .windows
             .iter()
@@ -962,7 +990,7 @@ impl App {
             {
                 continue;
             }
-            let info = if let Some(x) = remote.window.x11_surface() {
+            let mut info = if let Some(x) = remote.window.x11_surface() {
                 x11::info(
                     x,
                     remote.id,
@@ -992,6 +1020,24 @@ impl App {
                     "decoration":if native_decoration {"server"}else{"client"}})
                 })
             };
+            if semantics {
+                remote.state.input = window_semantics::input_region(&surface,bbox);
+                if let Some(top)=remote.window.toplevel() {
+                    let (min,max)=window_semantics::limits(top.wl_surface());
+                    info["min_size"]=json!(min);info["max_size"]=json!(max);
+                    info["modal"]=with_states(top.wl_surface(),|s|json!(s.data_map.get::<XdgToplevelSurfaceData>().unwrap().lock().unwrap().modal));
+                } else if let Some(x)=remote.window.x11_surface() {
+                    info["min_size"]=json!(x.min_size().map(|s|[s.w,s.h]).unwrap_or([0,0]));
+                    info["max_size"]=json!(x.max_size().map(|s|[s.w,s.h]).unwrap_or([0,0]));
+                    info["modal"]=json!(x.is_popup());
+                }
+                info["fullscreen"]=json!(remote.state.fullscreen);
+                info["fullscreen_epoch"]=json!(remote.state.fullscreen_epoch);
+                info["mapping_epoch"]=json!(remote.state.mapping_epoch);
+                info["input_region"]=remote.state.input.clone();
+            }
+            remote.icon.observe(info["app_id"].as_str().unwrap_or_default());
+            info["icon_revision"]=json!(remote.icon.revision);
             if let Some(peer) = &self.peer {
                 if !remote.announced || remote.last_info != info {
                     peer.control(info.clone());
@@ -1023,7 +1069,7 @@ impl App {
                             peer.window_icon(remote.id, remote.icon.message(remote.id));
                     }
                 }
-                if remote.dirty {
+                if remote.dirty && (!semantics || remote.state.visible) {
                     remote.frame_sequence += 1;
                     let mut frame = capture_surface(
                         &mut self.renderer,
@@ -1045,8 +1091,18 @@ impl App {
             remote.window.send_frame(
                 &remote.output,
                 self.start.elapsed(),
-                Some(Duration::ZERO),
-                |_, _| Some(remote.output.clone()),
+                Some(if semantics && !remote.state.visible {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::ZERO
+                }),
+                |_, _| {
+                    if semantics && !remote.state.visible {
+                        None
+                    } else {
+                        Some(remote.output.clone())
+                    }
+                },
             );
         }
         self.refresh_x11_grab();
@@ -1060,14 +1116,18 @@ impl App {
             }
             let location = popup_location(&root.window, &popup.surface) + bbox.loc
                 - root.window.geometry().loc;
-            let info = json!({"type":"popup","id":popup.id,"root":popup.root,"parent":popup.parent,
+            let mut info = json!({"type":"popup","id":popup.id,"root":popup.root,"parent":popup.parent,
                 "x":location.x,"y":location.y,"width":bbox.size.w,"height":bbox.size.h,"scale":root.scale});
+            if semantics {
+                info["input_region"] =
+                    window_semantics::input_region(popup.surface.wl_surface(), bbox);
+            }
             if let Some(peer) = &self.peer {
                 if popup.last_info != info {
                     peer.control(info.clone());
                     popup.last_info = info;
                 }
-                if popup.dirty {
+                if popup.dirty && (!semantics || root.state.visible) {
                     popup.sequence += 1;
                     let frame = capture_surface(
                         &mut self.renderer,
@@ -1193,7 +1253,7 @@ impl App {
             .find(|w| w.window.toplevel() == Some(surface))
         {
             self.control(
-                json!({"type":"window_action","id":window.id,"action":action,"edge":edge}),
+                json!({"type":"window_action","id":window.id,"action":action,"edge":edge,"fullscreen_epoch":window.state.fullscreen_epoch}),
             );
         }
     }
@@ -1249,6 +1309,7 @@ impl CompositorHandler for App {
             }
         }
         self.popups.commit(surface);
+        let semantics = self.semantics_enabled();
         if let Some(PopupKind::Xdg(p)) = self.popups.find_popup(surface) {
             if !p.is_initial_configure_sent() {
                 let _ = p.send_configure();
@@ -1268,6 +1329,7 @@ impl CompositorHandler for App {
         }
         let root = self.root_for(surface);
         let mut newly_mapped_focus = None;
+        let mut unmapped = None;
         for remote in &mut self.windows {
             if remote.window.wl_surface().as_deref() != Some(&root) {
                 continue;
@@ -1279,8 +1341,40 @@ impl CompositorHandler for App {
                 newly_mapped_focus = Some(remote.id);
             }
             tracing::debug!(id=remote.id, mapped, bbox=?remote.window.bbox(), "surface commit");
+            if mapped != remote.mapped {
+                remote.state.mapping_epoch += 1;
+                if !mapped {
+                    remote.state.fullscreen(false);
+                    remote.target = None;
+                    remote.target_size = (0, 0);
+                    unmapped = Some(remote.id);
+                }
+                if mapped {
+                    remote.state.visible = true;
+                    let top = remote.window.toplevel().unwrap();
+                    top.with_pending_state(|s| {
+                        s.states.unset(xdg_toplevel::State::Suspended);
+                    });
+                    top.send_pending_configure();
+                }
+                if semantics && remote.announced {
+                    self.peer.as_ref().unwrap().control(json!({"type":"window_visibility","id":remote.id,"mapped":mapped,"mapping_epoch":remote.state.mapping_epoch,"fullscreen":remote.state.fullscreen,"fullscreen_epoch":remote.state.fullscreen_epoch}));
+                }
+            }
             remote.mapped = mapped;
+            if unmapped != Some(remote.id)
+                && !remote
+                    .window
+                    .toplevel()
+                    .unwrap()
+                    .is_initial_configure_sent()
+            {
+                remote.window.toplevel().unwrap().send_configure();
+            }
             set_surface_scale(surface, &remote.output, remote.scale);
+        }
+        if let Some(id) = unmapped {
+            self.unmap_toplevel(id);
         }
         if let Some(id) = newly_mapped_focus {
             self.focus(Some(id));
@@ -1350,6 +1444,7 @@ impl XdgShellHandler for App {
         self.windows.push(RemoteWindow {
             id,
             icon: app_icon::WindowIcon::default(),
+            state: window_semantics::State::default(),
             window: Window::new_wayland_window(surface),
             dirty: true,
             announced: false,
@@ -1427,6 +1522,29 @@ impl XdgShellHandler for App {
         }
     }
 
+    fn parent_changed(&mut self, surface: ToplevelSurface) {
+        if surface.parent().is_some_and(|parent| {
+            !self.windows.iter().any(|w| {
+                w.mapped && w.window.alive() && w.window.wl_surface().as_deref() == Some(&parent)
+            })
+        }) {
+            with_states(surface.wl_surface(), |s| {
+                s.data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .parent = None
+            });
+        }
+        if let Some(focused) = self.focused_window {
+            let target = self.modal_target(focused);
+            if target != focused {
+                self.focus(Some(target));
+            }
+        }
+    }
+
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
         if self.has_pointer_grab(&surface, &seat, serial) {
             self.window_action(&surface, "move", None);
@@ -1443,15 +1561,27 @@ impl XdgShellHandler for App {
             self.window_action(&surface, "resize", Some(edge as u32));
         }
     }
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        App::fullscreen_request(self, &surface, true);
+    }
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        App::fullscreen_request(self, &surface, false);
+    }
     fn minimize_request(&mut self, surface: ToplevelSurface) {
         self.window_action(&surface, "minimize", None);
     }
     fn maximize_request(&mut self, surface: ToplevelSurface) {
+        self.clear_fullscreen_request(&surface);
         surface.with_pending_state(|s| s.states.set(xdg_toplevel::State::Maximized));
         surface.send_pending_configure();
         self.window_action(&surface, "maximize", None);
     }
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        self.clear_fullscreen_request(&surface);
         surface.with_pending_state(|s| s.states.unset(xdg_toplevel::State::Maximized));
         surface.send_pending_configure();
         self.window_action(&surface, "restore", None);
@@ -1707,7 +1837,13 @@ fn main() -> Result<()> {
     let x11 = x11::start(&dh, xloop.handle(), args.xwayland)?;
     let (events, tx) = network::listen(&args.listen, auth)?;
     let compositor = CompositorState::new_v6::<App>(&dh);
-    let shell = XdgShellState::new::<App>(&dh);
+    let shell = XdgShellState::new_with_capabilities::<App>(
+        &dh,
+        [
+            xdg_toplevel::WmCapabilities::Maximize,
+            xdg_toplevel::WmCapabilities::Minimize,
+        ],
+    );
     let decorations = XdgDecorationState::new::<App>(&dh);
     let shm = ShmState::new::<App>(&dh, vec![]);
     let mut seats = SeatState::new();
@@ -1759,6 +1895,7 @@ fn main() -> Result<()> {
         cursor: cursor::Cursor::default(),
         _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<App>(&dh),
         icons: app_icon::Icons::new(tx.clone()),
+        _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<App>(&dh),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1847,6 +1984,7 @@ fn main() -> Result<()> {
                     app.release_input();
                     app.peer = Some(peer);
                     app.cursor.dirty = true;
+                    app.configure_capabilities();
                     for p in &mut app.remote_popups {
                         p.last_info = Value::Null;
                         p.dirty = true;
@@ -1857,6 +1995,12 @@ fn main() -> Result<()> {
                         }
                     }
                     for w in &mut app.windows {
+                        w.state.visible = true;
+                        w.state.minimized = false;
+                        w.window.toplevel().unwrap().with_pending_state(|s| {
+                            s.states.unset(xdg_toplevel::State::Suspended);
+                        });
+                        w.window.toplevel().unwrap().send_pending_configure();
                         w.announced = false;
                         w.icon.sent = false;
                         w.dirty = true;
@@ -1891,6 +2035,7 @@ fn main() -> Result<()> {
                     app.focus(None);
                     app.transfers.cancel();
                     app.peer = None;
+                    app.configure_capabilities();
                 }
                 Event::Clipboard {
                     generation,

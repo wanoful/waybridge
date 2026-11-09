@@ -19,6 +19,7 @@
 #include "image_decoder.h"
 #include "native_cursor.h"
 #include "native_icon.h"
+#include "window_semantics.h"
 #include "third_party/json.hpp"
 #include <algorithm>
 #include <atomic>
@@ -116,6 +117,7 @@ struct RemoteWindow {
   NativeIcon icon;
   std::string appId;
   uint64_t iconRevision = 0;
+  NativeWindowState state;
   uint32_t id;
   HWND hwnd = nullptr;
   int width = 960, height = 640;
@@ -141,6 +143,8 @@ std::map<uint32_t, std::unique_ptr<RemoteWindow>> windows;
 uint32_t grabbedRoot = 0;
 bool iconsNegotiated = false;
 std::unique_ptr<ImageDecoder> iconDecoder;
+bool semanticsNegotiated = false;
+void reconcileWindows();
 
 DWORD windowStyle(bool clientDecorated) {
   // Client-decorated applications already supply their own title bar and controls.
@@ -149,6 +153,10 @@ DWORD windowStyle(bool clientDecorated) {
 }
 
 void setDecoration(RemoteWindow *w, bool clientDecorated) {
+  if (w->state.fullscreen) {
+    w->clientDecorated = clientDecorated;
+    return;
+  }
   if (w->clientDecorated == clientDecorated)
     return;
   RECT client;
@@ -1013,11 +1021,12 @@ void setPopupGrab(uint32_t root, bool active) {
 }
 
 void sendResize(RemoteWindow *w) {
-  if (w->popup || IsIconic(w->hwnd))
+  if (w->popup || IsIconic(w->hwnd) ||
+      (semanticsNegotiated && (!w->state.metadataReady || w->state.applying)))
     return;
   RECT rect;
   GetClientRect(w->hwnd, &rect);
-  bool maximized = IsZoomed(w->hwnd) != FALSE;
+  bool maximized = !w->state.fullscreen && IsZoomed(w->hwnd) != FALSE;
   MONITORINFO monitor{};
   monitor.cbSize = sizeof(monitor);
   GetMonitorInfoW(MonitorFromWindow(w->hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
@@ -1027,8 +1036,11 @@ void sendResize(RemoteWindow *w) {
   ClientToScreen(w->hwnd, &origin);
   int workX = MulDiv(monitor.rcWork.left - origin.x, 96, w->dpi),
       workY = MulDiv(monitor.rcWork.top - origin.y, 96, w->dpi);
-  bool resized = w->lastResizeWidth != rect.right || w->lastResizeHeight != rect.bottom ||
-                 w->lastMaximized != maximized || w->lastDpi != w->dpi;
+  bool resized =
+      w->lastResizeWidth != rect.right || w->lastResizeHeight != rect.bottom ||
+      w->lastMaximized != maximized || w->lastDpi != w->dpi ||
+      (semanticsNegotiated && (w->state.lastFullscreen != w->state.fullscreen ||
+                               w->state.lastFullscreenEpoch != w->state.fullscreenEpoch));
   if (rect.right <= 0 || rect.bottom <= 0 ||
       (!resized && w->lastWorkWidth == workWidth && w->lastWorkHeight == workHeight &&
        w->lastWorkX == workX && w->lastWorkY == workY))
@@ -1038,6 +1050,8 @@ void sendResize(RemoteWindow *w) {
   w->lastResizeWidth = rect.right;
   w->lastResizeHeight = rect.bottom;
   w->lastMaximized = maximized;
+  w->state.lastFullscreen = w->state.fullscreen;
+  w->state.lastFullscreenEpoch = w->state.fullscreenEpoch;
   w->lastDpi = w->dpi;
   w->lastWorkWidth = workWidth;
   w->lastWorkHeight = workHeight;
@@ -1054,7 +1068,9 @@ void sendResize(RemoteWindow *w) {
             {"work_height", workHeight},
             {"work_x", workX},
             {"work_y", workY},
-            {"maximized", maximized}});
+            {"maximized", maximized},
+            {"fullscreen", w->state.fullscreen},
+            {"fullscreen_epoch", w->state.fullscreenEpoch}});
 }
 void acknowledge(RemoteWindow *w) {
   if (w->frame && w->frame->sequence > w->lastAck) {
@@ -1074,6 +1090,80 @@ void refreshCursor() {
       break;
     }
   }
+}
+void sendWindowState(RemoteWindow *w) {
+  if (!semanticsNegotiated || w->popup || !w->shown || w->state.applying)
+    return;
+  bool minimized = IsIconic(w->hwnd) != FALSE;
+  bool visible = IsWindowVisible(w->hwnd) && !minimized && w->state.mapped;
+  if (w->state.stateSent && w->state.lastVisible == visible && w->state.lastMinimized == minimized)
+    return;
+  w->state.stateSent = true;
+  w->state.lastVisible = visible;
+  w->state.lastMinimized = minimized;
+  sendJson({{"type", "window_state"},
+            {"id", w->id},
+            {"visible", visible},
+            {"minimized", minimized},
+            {"mapping_epoch", w->state.mappingEpoch}});
+}
+void setFullscreen(RemoteWindow *w, bool fullscreen) {
+  w->state.setFullscreen(w->hwnd, fullscreen, w->clientDecorated);
+  sendResize(w);
+  sendWindowState(w);
+}
+void reconcileWindows() {
+  std::set<uint32_t> blocked;
+  HWND foreground = GetForegroundWindow(), modalFocus = nullptr;
+  for (auto &[id, w] : windows) {
+    if (w->popup)
+      continue;
+    uint32_t owner = w->parent;
+    std::set<uint32_t> seen{id};
+    for (uint32_t current = owner; current;) {
+      if (!seen.insert(current).second) {
+        owner = 0;
+        break;
+      }
+      auto found = windows.find(current);
+      if (found == windows.end() || found->second->popup) {
+        if (current == owner)
+          owner = 0;
+        break;
+      }
+      current = found->second->parent;
+    }
+    HWND hwnd = owner && windows.count(owner) ? windows.at(owner)->hwnd : nullptr;
+    if (GetWindow(w->hwnd, GW_OWNER) != hwnd)
+      SetWindowLongPtrW(w->hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(hwnd));
+    auto style = GetWindowLongPtrW(w->hwnd, GWL_EXSTYLE);
+    auto updated = hwnd ? style & ~WS_EX_APPWINDOW : style | WS_EX_APPWINDOW;
+    if (style != updated) {
+      SetWindowLongPtrW(w->hwnd, GWL_EXSTYLE, updated);
+      SetWindowPos(w->hwnd, nullptr, 0, 0, 0, 0,
+                   SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+    }
+    if (owner && w->state.modal && w->state.mapped && w->shown) {
+      blocked.insert(owner);
+      if (hwnd == foreground)
+        modalFocus = w->hwnd;
+    }
+  }
+  for (auto &[id, w] : windows)
+    if (!w->popup && IsWindowEnabled(w->hwnd) == (blocked.count(id) != 0))
+      EnableWindow(w->hwnd, !blocked.count(id));
+  if (modalFocus && IsWindowEnabled(modalFocus))
+    SetForegroundWindow(modalFocus);
+}
+bool acceptsInput(RemoteWindow *w, LPARAM lp) {
+  POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+  ScreenToClient(w->hwnd, &point);
+  RECT r = imageRect(w);
+  if (r.right <= r.left || r.bottom <= r.top)
+    return true;
+  double x = double(point.x - r.left) * w->width / (r.right - r.left),
+         y = double(point.y - r.top) * w->height / (r.bottom - r.top);
+  return w->state.accepts(x, y, w->originX, w->originY, w->width, w->height);
 }
 
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
@@ -1103,8 +1193,27 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       sendJson({{"type", "popup_cancel"}, {"id", w->id}});
     }
     break;
+  case WM_WINDOWPOSCHANGING:
+    if (semanticsNegotiated && !w->popup)
+      w->state.clamp(hwnd, w->dpi, w->clientDecorated, reinterpret_cast<WINDOWPOS *>(lp));
+    break;
+  case WM_SHOWWINDOW:
+    sendWindowState(w);
+    break;
+  case WM_SYSCOMMAND:
+    if (semanticsNegotiated && w->state.fullscreen &&
+        ((wp & 0xfff0) == SC_RESTORE || (wp & 0xfff0) == SC_MAXIMIZE)) {
+      setFullscreen(w, false);
+      ShowWindow(hwnd, (wp & 0xfff0) == SC_MAXIMIZE ? SW_MAXIMIZE : SW_RESTORE);
+      sendResize(w);
+      return 0;
+    }
+    break;
   case WM_WINDOWPOSCHANGED:
     if (!w->popup) {
+      // WM_SHOWWINDOW arrives before WS_VISIBLE changes. Observe the final
+      // flags here as well, including hide/show without a size change.
+      sendWindowState(w);
       for (auto &[id, popup] : windows)
         if (popup->popup && popup->root == w->id)
           positionPopup(popup.get());
@@ -1114,50 +1223,54 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         sendResize(w);
     }
     break;
-  case WM_GETMINMAXINFO:
-    if (w->clientDecorated) {
+  case WM_GETMINMAXINFO: {
+    DefWindowProcW(hwnd, message, wp, lp);
+    auto limits = reinterpret_cast<MINMAXINFO *>(lp);
+    if (w->clientDecorated || w->state.fullscreen) {
       MONITORINFO info{};
       info.cbSize = sizeof(info);
       if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info)) {
-        auto limits = reinterpret_cast<MINMAXINFO *>(lp);
-        limits->ptMaxPosition = {info.rcWork.left - info.rcMonitor.left,
-                                 info.rcWork.top - info.rcMonitor.top};
-        limits->ptMaxSize = {info.rcWork.right - info.rcWork.left,
-                             info.rcWork.bottom - info.rcWork.top};
+        RECT area = w->state.fullscreen ? info.rcMonitor : info.rcWork;
+        limits->ptMaxPosition = {area.left - info.rcMonitor.left, area.top - info.rcMonitor.top};
+        limits->ptMaxSize = {area.right - area.left, area.bottom - area.top};
         limits->ptMinTrackSize = {64, 64};
-        return 0;
       }
     }
-    break;
+    if (semanticsNegotiated)
+      w->state.minMax(hwnd, w->dpi, w->clientDecorated, limits);
+    return 0;
+  }
   case WM_NCCALCSIZE:
-    if (w->popup || w->clientDecorated)
+    if (w->popup || w->clientDecorated || w->state.fullscreen)
       return 0;
     break;
   case WM_NCHITTEST:
-    if (w->popup)
-      return HTCLIENT;
-    if (w->clientDecorated) {
-      if (IsZoomed(hwnd))
-        return HTCLIENT;
-      RECT r;
-      GetWindowRect(hwnd, &r);
-      int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-      int edge =
-          std::max(MulDiv(5, w->dpi, 96), GetSystemMetricsForDpi(SM_CXSIZEFRAME, w->dpi) +
-                                              GetSystemMetricsForDpi(SM_CXPADDEDBORDER, w->dpi));
-      bool left = x < r.left + edge, right = x >= r.right - edge, top = y < r.top + edge,
-           bottom = y >= r.bottom - edge;
-      if (top)
-        return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
-      if (bottom)
-        return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
-      if (left)
-        return HTLEFT;
-      if (right)
-        return HTRIGHT;
-      return HTCLIENT;
+    if (!w->popup && !w->clientDecorated && !w->state.fullscreen) {
+      auto native = DefWindowProcW(hwnd, message, wp, lp);
+      if (native != HTCLIENT)
+        return native;
     }
-    break;
+    if (!w->popup && w->clientDecorated && !w->state.fullscreen) {
+      if (!IsZoomed(hwnd)) {
+        RECT r;
+        GetWindowRect(hwnd, &r);
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        int edge =
+            std::max(MulDiv(5, w->dpi, 96), GetSystemMetricsForDpi(SM_CXSIZEFRAME, w->dpi) +
+                                                GetSystemMetricsForDpi(SM_CXPADDEDBORDER, w->dpi));
+        bool left = x < r.left + edge, right = x >= r.right - edge, top = y < r.top + edge,
+             bottom = y >= r.bottom - edge;
+        if (top)
+          return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
+        if (bottom)
+          return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
+        if (left)
+          return HTLEFT;
+        if (right)
+          return HTRIGHT;
+      }
+    }
+    return semanticsNegotiated && !acceptsInput(w, lp) ? HTTRANSPARENT : HTCLIENT;
   case WM_ENTERSIZEMOVE:
     w->sizing = true;
     sendJson({{"type", "cancel_input"}, {"id", w->id}});
@@ -1227,12 +1340,22 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     w->dpi = effectiveDpi(hwnd);
     w->icon.apply(hwnd, w->dpi);
     auto r = reinterpret_cast<const RECT *>(lp);
+    RECT fullscreenRect{};
+    if (w->state.fullscreen) {
+      MONITORINFO monitor{};
+      monitor.cbSize = sizeof(monitor);
+      if (GetMonitorInfoW(MonitorFromRect(r, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        fullscreenRect = monitor.rcMonitor;
+        r = &fullscreenRect;
+      }
+    }
     SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                  SWP_NOZORDER | SWP_NOACTIVATE);
     sendResize(w);
     return 0;
   }
   case WM_SIZE:
+    sendWindowState(w);
     if (w->presentation)
       w->presentation->layout(imageRect(w));
     if (!w->popup && wp != SIZE_MINIMIZED) {
@@ -1345,8 +1468,21 @@ void destroyRemote(uint32_t id) {
     return;
   if (grabbedRoot == id)
     setPopupGrab(id, false);
+  HWND oldOwner = GetWindow(found->second->hwnd, GW_OWNER);
+  bool restoreFocus = GetForegroundWindow() == found->second->hwnd;
+  // Owned HWNDs otherwise die with their owner even if their Wayland toplevel survives.
+  for (auto &[child, w] : windows)
+    if (!w->popup && w->parent == id) {
+      w->parent = 0;
+      SetWindowLongPtrW(w->hwnd, GWLP_HWNDPARENT, 0);
+    }
+  found->second->state.modal = false;
+  reconcileWindows();
   DestroyWindow(found->second->hwnd);
   windows.erase(found);
+  reconcileWindows();
+  if (restoreFocus && oldOwner && IsWindow(oldOwner) && IsWindowEnabled(oldOwner))
+    SetForegroundWindow(oldOwner);
 }
 
 void dispatchNetwork() {
@@ -1369,6 +1505,7 @@ void dispatchNetwork() {
         PostQuitMessage(1);
         return;
       }
+      semanticsNegotiated = m.value("window_semantics_v1", false);
       cursorNegotiated = m.value("cursor_v1", false);
       iconsNegotiated = m.value("window_icon_v1", false);
       if (m.value("split_media", false))
@@ -1387,6 +1524,28 @@ void dispatchNetwork() {
         if (!w->icon.update(png, *iconDecoder)) continue;
       }
       w->icon.apply(w->hwnd, w->dpi);
+    } else if (type == "window_visibility" && semanticsNegotiated) {
+      auto found = windows.find(m.value("id", 0u));
+      if (found == windows.end() || found->second->popup)
+        continue;
+      auto *w = found->second.get();
+      auto epoch = m.value("mapping_epoch", uint64_t(0));
+      if (epoch < w->state.mappingEpoch)
+        continue;
+      w->state.mappingEpoch = epoch;
+      w->state.mapped = m.value("mapped", true);
+      w->state.stateSent = false;
+      if (!w->state.mapped) {
+        ShowWindow(w->hwnd, SW_HIDE);
+        auto fullscreenEpoch = m.value("fullscreen_epoch", w->state.fullscreenEpoch);
+        if (fullscreenEpoch >= w->state.fullscreenEpoch) {
+          w->state.fullscreenEpoch = fullscreenEpoch;
+          setFullscreen(w, m.value("fullscreen", false));
+        }
+      } else if (w->shown)
+        ShowWindow(w->hwnd, SW_SHOWNOACTIVATE);
+      reconcileWindows();
+      sendWindowState(w);
     } else if (type == "pong") {
       clientStats.record("control_rtt", double(GetTickCount64() - m.at("nonce").get<uint64_t>()));
     } else if (type == "window") {
@@ -1451,7 +1610,8 @@ void dispatchNetwork() {
         if (FAILED(registration))
           std::cerr << "OLE drop registration failed\n";
         DragAcceptFiles(hwnd, TRUE);
-        sendResize(windows.at(id).get());
+        if (!semanticsNegotiated)
+          sendResize(windows.at(id).get());
       } else {
         setDecoration(windows.at(id).get(), m.value("decoration", "server") == "client");
         SetWindowTextW(windows.at(id)->hwnd, wide(m.value("title", "Linux application")).c_str());
@@ -1464,11 +1624,33 @@ void dispatchNetwork() {
         iconWindow->icon.clear();
       }
       iconWindow->icon.apply(iconWindow->hwnd, iconWindow->dpi);
+      auto *updated = windows.at(id).get();
       auto parent = m.find("parent");
-      if (parent != m.end() && parent->is_number_unsigned() &&
-          windows.count(parent->get<uint32_t>()))
-        SetWindowLongPtrW(windows.at(id)->hwnd, GWLP_HWNDPARENT,
-                          reinterpret_cast<LONG_PTR>(windows.at(parent->get<uint32_t>())->hwnd));
+      updated->parent =
+          parent != m.end() && parent->is_number_unsigned() ? parent->get<uint32_t>() : 0;
+      if (semanticsNegotiated) {
+        updated->state.constraints(m);
+        updated->state.input(m.value("input_region", Json()));
+        updated->state.mappingEpoch = m.value("mapping_epoch", uint64_t(1));
+        updated->state.metadataReady = true;
+        auto epoch = m.value("fullscreen_epoch", uint64_t(0));
+        if (epoch >= updated->state.fullscreenEpoch) {
+          updated->state.fullscreenEpoch = epoch;
+          setFullscreen(updated, m.value("fullscreen", false));
+        }
+        WINDOWPOS position{};
+        position.flags = SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER;
+        RECT rect;
+        GetWindowRect(updated->hwnd, &rect);
+        position.cx = rect.right - rect.left;
+        position.cy = rect.bottom - rect.top;
+        auto old = position;
+        updated->state.clamp(updated->hwnd, updated->dpi, updated->clientDecorated, &position);
+        if (position.cx != old.cx || position.cy != old.cy)
+          SetWindowPos(updated->hwnd, nullptr, 0, 0, position.cx, position.cy, position.flags);
+      }
+      reconcileWindows();
+      sendResize(updated);
     } else if (type == "popup") {
       uint32_t id = m.at("id").get<uint32_t>(), root = m.at("root").get<uint32_t>(),
                parent = m.at("parent").get<uint32_t>();
@@ -1508,6 +1690,8 @@ void dispatchNetwork() {
       w->width = m.at("width");
       w->height = m.at("height");
       positionPopup(w);
+      if (semanticsNegotiated)
+        w->state.input(m.value("input_region", Json()));
     } else if (type == "popup_grab") {
       setPopupGrab(m.at("root").get<uint32_t>(), m.at("active").get<bool>());
     } else if (type == "window_action") {
@@ -1515,7 +1699,17 @@ void dispatchNetwork() {
       if (found == windows.end())
         continue;
       HWND hwnd = found->second->hwnd;
+      auto *native = found->second.get();
+      if (semanticsNegotiated && m.contains("fullscreen_epoch"))
+        native->state.fullscreenEpoch = m.at("fullscreen_epoch").get<uint64_t>();
       auto action = m.value("action", "");
+      if (semanticsNegotiated && (action == "fullscreen" || action == "unfullscreen")) {
+        setFullscreen(native, action == "fullscreen");
+        continue;
+      }
+      if (semanticsNegotiated && native->state.fullscreen &&
+          (action == "maximize" || action == "restore"))
+        setFullscreen(native, false);
       if (action == "move") {
         ReleaseCapture();
         PostMessageW(hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
@@ -1582,6 +1776,12 @@ void dispatchNetwork() {
     w->originX = frame->originX;
     w->originY = frame->originY;
     clientStats.record("ui_queue", millis(Clock::now() - frame->decoded));
+    if (semanticsNegotiated &&
+        (!w->state.mapped || (w->shown && (!IsWindowVisible(w->hwnd) || IsIconic(w->hwnd))))) {
+      w->frame = frame;
+      acknowledge(w);
+      continue; // retain/decode in order, return hidden-frame credit
+    }
     auto presentStart = Clock::now();
     if (frame->video.texture) {
       if (!w->presentation ||
@@ -1614,7 +1814,10 @@ void dispatchNetwork() {
       InvalidateRect(w->hwnd, nullptr, FALSE);
     if (!w->shown) {
       w->shown = true;
-      ShowWindow(w->hwnd, w->popup ? SW_SHOWNOACTIVATE : SW_SHOW);
+      if (w->state.mapped)
+        ShowWindow(w->hwnd, w->popup ? SW_SHOWNOACTIVATE : SW_SHOW);
+      reconcileWindows();
+      sendWindowState(w);
       if (!w->popup && grabbedRoot == w->id)
         SetCapture(w->hwnd);
     }
@@ -1744,6 +1947,7 @@ int wmain(int argc, wchar_t **argv) {
             {"frame_ack", true},
             {"cursor_v1", true},
             {"window_icon_v1", true},
+            {"window_semantics_v1", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},

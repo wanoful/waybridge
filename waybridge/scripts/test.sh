@@ -11,6 +11,7 @@ if command -v rsvg-convert >/dev/null; then
   python tests/app_icon_smoke.py
 fi
 python tests/decorations_smoke.py
+python tests/window_semantics_smoke.py
 
 python tests/qt_smoke.py
 if command -v dolphin >/dev/null; then

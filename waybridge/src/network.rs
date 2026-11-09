@@ -80,6 +80,7 @@ pub struct Peer {
     acknowledgements: bool,
     cursor_v1: bool,
     window_icon_v1: bool,
+    window_semantics_v1: bool,
     media_attached: AtomicBool,
 }
 
@@ -120,6 +121,9 @@ impl Peer {
         true
     }
 
+    pub fn semantics_enabled(&self) -> bool {
+        self.window_semantics_v1
+    }
     pub fn begin_resize(&self, id: u32, width: u32, height: u32, started: Instant) {
         self.queue.lock().unwrap().resizes.insert(
             id,
@@ -373,6 +377,7 @@ pub fn listen(
                     acknowledgements: hello["frame_ack"].as_bool().unwrap_or(false),
                     cursor_v1: hello["cursor_v1"].as_bool().unwrap_or(false),
                     window_icon_v1: hello["window_icon_v1"].as_bool().unwrap_or(false),
+                    window_semantics_v1: hello["window_semantics_v1"].as_bool().unwrap_or(false),
                 });
                 let mut key = [0; 32];
                 if std::fs::File::open("/dev/urandom")
@@ -399,7 +404,7 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "codecs":["png_rgba","h264_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha","cursor_v1","window_icon_v1"], "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "codecs":["png_rgba","h264_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha","cursor_v1","window_icon_v1","window_semantics_v1"], "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);
