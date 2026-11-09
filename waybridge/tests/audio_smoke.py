@@ -20,6 +20,13 @@ def packet(sock):
     return body[0],json.loads(body[1:]) if body[0]==0 else body[1:]
 def send(sock,**value):
     body=b'\0'+json.dumps(value).encode();sock.sendall(struct.pack('>I',len(body))+body)
+def control_message(sock,message_type):
+    deadline=time.monotonic()+2
+    while time.monotonic()<deadline:
+        kind,value=packet(sock)
+        assert kind==0,'control socket must carry JSON'
+        if value.get('type')==message_type:return value
+    raise AssertionError('missing control message: '+message_type)
 def tone(sink,env):
     pcm=b''.join(struct.pack('<hh',int(12000*math.sin(2*math.pi*1000*i/48000)),int(6000*math.sin(2*math.pi*500*i/48000))) for i in range(24000))
     process=subprocess.Popen(['pacat','--playback','--raw','--format=s16le','--rate=48000','--channels=2','--device='+sink],env=env,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
@@ -73,7 +80,7 @@ def main():
             send(audio,type='audio_ack',sequence=last+9999)
             assert not select.select([audio],[],[],.05)[0],'future ACK must not grant credits'
             started=time.monotonic();send(control,type='ping',nonce=123)
-            assert packet(control)[1]==dict(type='pong',nonce=123)
+            assert control_message(control,'pong')==dict(type='pong',nonce=123)
             assert time.monotonic()-started<.5
             send(audio,type='audio_ack',sequence=last);frame()
             decoy_name='waybridge-audio-decoy-'+str(host.pid)
@@ -87,7 +94,7 @@ def main():
             for process,worker,result in players:
                 worker.join(timeout=12);assert not worker.is_alive() and result and result[0][0]==0,result
             audio.close();audio=None
-            send(control,type='ping',nonce=456);assert packet(control)[1]['nonce']==456
+            send(control,type='ping',nonce=456);assert control_message(control,'pong')['nonce']==456
             control.close();control=None
             time.sleep(.1)
             # Legacy clients do not negotiate an audio socket.
