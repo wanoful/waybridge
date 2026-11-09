@@ -20,6 +20,9 @@ python tests/qt_smoke.py
 python tests/ime_smoke.py
 if command -v dolphin >/dev/null; then
   python tests/dolphin_smoke.py
+  if command -v Xwayland >/dev/null && command -v parec >/dev/null && pactl info >/dev/null 2>&1; then
+    python tests/launch_smoke.py
+  fi
 fi
 
 if command -v ghostty >/dev/null; then

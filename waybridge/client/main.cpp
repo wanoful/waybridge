@@ -1215,9 +1215,15 @@ void pointer(RemoteWindow *w, LPARAM param) {
             {"origin_x", w->originX},
             {"origin_y", w->originY}});
 }
-uint32_t linuxKey(LPARAM param) {
+uint32_t linuxKey(LPARAM param, UINT virtualKey = 0) {
   uint32_t code = (param >> 16) & 0xff;
-  if (!(param & (1LL << 24)))
+  bool extended = (param & (1LL << 24)) != 0;
+  if (!code && virtualKey && virtualKey != VK_PROCESSKEY && virtualKey != VK_PACKET) {
+    UINT scan = MapVirtualKeyExW(virtualKey, MAPVK_VK_TO_VSC_EX, GetKeyboardLayout(0));
+    code = scan & 0xff;
+    extended |= (scan & 0xff00) == 0xe000;
+  }
+  if (!extended)
     return code;
   switch (code) {
   case 0x1c:
@@ -1548,6 +1554,15 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   }
   if (!w)
     return DefWindowProcW(hwnd, message, wp, lp);
+  if (GetEnvironmentVariableW(L"WAYBRIDGE_IME_TRACE", nullptr, 0) &&
+      (message == WM_KEYDOWN || message == WM_KEYUP || message == WM_CHAR ||
+       message == WM_IME_STARTCOMPOSITION || message == WM_IME_ENDCOMPOSITION ||
+       message == WM_IME_COMPOSITION))
+    std::cerr << "IME event window=" << w->id << " message=" << message
+              << " key=" << ((message == WM_KEYDOWN || message == WM_KEYUP ||
+                                (message == WM_CHAR && wp < 32)) ? wp : 0)
+              << " flags=" << lp << " composing=" << w->ime.composing
+              << " enabled=" << w->ime.enabled << " generation=" << w->ime.generation << '\n';
   switch (message) {
   case WM_INPUT: {
     LONG dx = 0, dy = 0;
@@ -1771,21 +1786,35 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         std::optional<std::wstring> result, preedit;
         LONG cursor = 0;
         if (lp & GCS_RESULTSTR) { result = NativeIme::string(context, GCS_RESULTSTR); preedit = L""; }
-        if (lp & GCS_COMPSTR) {
+        if (lp & (GCS_COMPSTR | GCS_CURSORPOS)) {
           preedit = NativeIme::string(context, GCS_COMPSTR);
           cursor = ImmGetCompositionStringW(context, GCS_CURSORPOS, nullptr, 0);
           if (cursor < 0 && preedit) cursor = LONG(preedit->size());
         }
-        if (!lp) preedit = L"";
+        constexpr LPARAM compositionFlags = GCS_COMPSTR | GCS_COMPATTR | GCS_COMPCLAUSE |
+            GCS_COMPREADSTR | GCS_COMPREADATTR | GCS_COMPREADCLAUSE | GCS_CURSORPOS |
+            GCS_DELTASTART | GCS_RESULTSTR | GCS_RESULTCLAUSE | GCS_RESULTREADSTR |
+            GCS_RESULTREADCLAUSE;
+        if (!(lp & compositionFlags)) preedit = L"";
         ImmReleaseContext(hwnd, context);
         sendIme(w, result, preedit, cursor);
+        // A result, an empty preedit, or cancellation can complete composition
+        // before (or without) WM_IME_ENDCOMPOSITION. Do not keep swallowing
+        // Enter/Backspace until an unrelated focus change resets this flag.
+        if (preedit) {
+          bool wasComposing = w->ime.composing;
+          if (!wasComposing && !preedit->empty())
+            w->ime.compositionGeneration = w->ime.generation;
+          w->ime.composing = !preedit->empty();
+          if (wasComposing && !w->ime.composing) synchronizeImeModifiers(w);
+        }
       }
       return 0;
     }
     return DefWindowProcW(hwnd, message, wp, lp);
   case WM_IME_ENDCOMPOSITION: {
     bool current = w->ime.composing && w->ime.compositionGeneration == w->ime.generation;
-    sendIme(w, {}, std::wstring());
+    if (current) sendIme(w, {}, std::wstring());
     w->ime.composing = false;
     if (current) synchronizeImeModifiers(w);
     return 0;
@@ -1794,9 +1823,28 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0; // Result strings are committed exactly once through WM_IME_COMPOSITION.
   case WM_CHAR:
     if (FileDrag::ownsInput()) return 0;
-    if (w->ime.enabled && !w->ime.composing && wp >= 32 && wp != 127) {
-      if (w->ime.rawCharacterKeys.count(linuxKey(lp))) return 0;
-      if (auto text = w->ime.character(wchar_t(wp))) sendIme(w, text, std::wstring());
+    if (w->ime.enabled && !w->ime.composing) {
+      UINT virtualKey = wp == L'\b' ? VK_BACK : wp == L'\r' ? VK_RETURN : wp == L'\t' ? VK_TAB : 0;
+      if (!virtualKey && wp >= 32 && wp != 127) {
+        SHORT mapped = VkKeyScanExW(wchar_t(wp), GetKeyboardLayout(0));
+        if (mapped != -1) virtualKey = UINT(mapped) & 0xff;
+      }
+      uint32_t key = linuxKey(lp, virtualKey);
+      if (key && w->ime.rawCharacterKeys.count(key)) return 0;
+      if (wp == L'\b' || wp == L'\r' || wp == L'\t') {
+        // Ctrl+H/I/M also translate to these characters. Their shortcut was
+        // already forwarded, even when WM_CHAR carries no physical scan code.
+        if (w->ime.shortcut(virtualKey, lp)) return 0;
+        // An IME may translate VK_PROCESSKEY into a control WM_CHAR. Send
+        // balanced raw events only if the physical key route did not send it.
+        if (key) {
+          synchronizeImeModifiers(w);
+          sendJson({{"type", "key"}, {"id", w->id}, {"key", key}, {"down", true}});
+          sendJson({{"type", "key"}, {"id", w->id}, {"key", key}, {"down", false}});
+        }
+      } else if (wp >= 32 && wp != 127) {
+        if (auto text = w->ime.character(wchar_t(wp))) sendIme(w, text, std::wstring());
+      }
     }
     return 0;
   case WM_DISPLAYCHANGE:
@@ -1956,7 +2004,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (FileDrag::ownsInput()) return 0;
-    if (auto key = linuxKey(lp)) {
+    if (auto key = linuxKey(lp, UINT(wp))) {
       bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
       if (down) {
         w->ime.rawCharacterKeys.erase(key);

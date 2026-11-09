@@ -12,7 +12,7 @@
 // One normalized 128px master, two owned icons per remote toplevel.
 class NativeIcon {
   std::vector<uint8_t> pixels;
-  HICON large = nullptr, small = nullptr;
+  HICON large = nullptr, smallIcon = nullptr;
   bool ownLarge = false, ownSmall = false;
   UINT lastDpi = 0;
 
@@ -64,9 +64,9 @@ class NativeIcon {
   void release() {
     if (ownLarge && large)
       DestroyIcon(large);
-    if (ownSmall && small && small != large)
-      DestroyIcon(small);
-    large = small = nullptr;
+    if (ownSmall && smallIcon && smallIcon != large)
+      DestroyIcon(smallIcon);
+    large = smallIcon = nullptr;
     ownLarge = ownSmall = false;
   }
 
@@ -139,7 +139,7 @@ public:
                    reinterpret_cast<void *>(SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0)));
     release();
     large = nextLarge;
-    small = nextSmall;
+    smallIcon = nextSmall;
     ownLarge = nextOwnLarge;
     ownSmall = nextOwnSmall;
     lastDpi = dpi;

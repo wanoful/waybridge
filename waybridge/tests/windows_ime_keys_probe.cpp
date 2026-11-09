@@ -135,6 +135,29 @@ int wmain(int argc, wchar_t **argv) {
     Sleep(200);
   } else if (action == L"late-copy-character") {
     SendMessageW(hwnd, WM_CHAR, L'c', LPARAM(1 | (MapVirtualKeyW('C', MAPVK_VK_TO_VSC) << 16)));
+  } else if (action == L"zero-scan-shortcuts") {
+    key(VK_CONTROL, true);
+    for (auto vk : {'H', 'I', 'M'}) {
+      SendMessageW(hwnd, WM_KEYDOWN, vk, 1);
+      SendMessageW(hwnd, WM_CHAR, vk == 'H' ? L'\b' : vk == 'I' ? L'\t' : L'\r', 1);
+      SendMessageW(hwnd, WM_KEYUP, vk, 1 | (1LL << 30) | (1LL << 31));
+    }
+    key(VK_CONTROL, false);
+  } else if (action == L"zero-scan-controls" || action == L"ime-control-characters") {
+    for (auto vk : {VK_BACK, VK_RETURN}) {
+      LPARAM scan = action == L"zero-scan-controls" ? 0 : (LPARAM(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16);
+      SendMessageW(hwnd, WM_KEYDOWN, action == L"zero-scan-controls" ? vk : VK_PROCESSKEY, scan | 1);
+      SendMessageW(hwnd, WM_CHAR, vk == VK_BACK ? L'\b' : L'\r', scan | 1);
+      SendMessageW(hwnd, WM_KEYUP, vk, scan | 1 | (1LL << 30) | (1LL << 31));
+    }
+  } else if (action == L"empty-composition" || action == L"empty-preedit" || action == L"result-only") {
+    SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, 0, 0);
+    // Reproduce completion/cancellation without a subsequent END notification.
+    SendMessageW(hwnd, WM_IME_COMPOSITION, 0,
+                 action == L"empty-preedit" ? GCS_COMPSTR :
+                 action == L"result-only" ? GCS_RESULTSTR : 0);
+    key(VK_BACK, true); key(VK_BACK, false);
+    key(VK_RETURN, true); key(VK_RETURN, false);
   } else if (action == L"generation-start") {
     key(VK_CONTROL, true);
     SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, 0, 0);

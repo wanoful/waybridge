@@ -47,13 +47,21 @@ ssh -N -L 49090:127.0.0.1:49090 wano@<Linux-IP>
 
 TCP 协议自身不加密，默认使用本地监听和 SSH 隧道；可选 UDP 媒体另有 AES-GCM 认证加密。认证握手和版本检查在任何窗口数据发送前完成；一次只允许一个查看端连接。
 
-应用可在服务端运行期间继续加入：
+在 Waybridge 打开的终端内启动应用会继承正确的环境。从另一个 SSH 终端加入正在运行的会话，请使用：
 
 ```bash
-WAYLAND_DISPLAY=waybridge-0 weston-terminal
+./target/release/waybridge --launch -- dolphin --new-window
+./target/release/waybridge --launch -- hmcl-bin
+./target/release/waybridge --launch -- vlc
+./target/release/waybridge --launch -- mpv "/path/to/video.mkv"
+# Chrome 的独立 profile 避免把窗口交给宿主桌面已有的 Chrome 进程：
+./target/release/waybridge --launch -- google-chrome-stable \
+  --user-data-dir="$HOME/.local/share/waybridge-chrome"
 ```
 
-Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通过已有 D-Bus 服务打开到原桌面，需要使用应用的新实例参数，或用 `dbus-run-session -- <应用>` 启动独立实例。已有 KWin 窗口不会迁移到这个会话。
+自定义 socket 的会话同时指定 `--socket <名称>`。`--launch` 读取服务端写入的 0600 权限会话描述文件，自动带上私有 DISPLAY、Wayland、D-Bus 和音频环境，并清除宿主 fcitx/ibus 覆盖；不会修改宿主环境。过期描述会被拒绝，服务端正常退出时移除。不要仅设置 `WAYLAND_DISPLAY` 后直接在外部 SSH 启动应用，这会绕过会话的输入法、音频和 D-Bus 设置。已有 KWin 窗口不会迁移到这个会话。
+
+正常启动 `./target/release/waybridge -- ghostty` 会自动启用已安装的 Xwayland，以及可用的私有音频 sink。`--no-xwayland` / `--no-audio` 可分别关闭；`--xwayland` / `--audio` 则要求该功能初始化成功，失败时直接报错。可选功能不可用时默认保留原生 Wayland 窗口。
 
 可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc|hevc-nvenc|av1-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
 
@@ -77,13 +85,13 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 
 快捷键不会再额外提交其翻译字符，例如 Ctrl+Space 不会额外插入空格。组合输入结束或取消后，仍按住的 Ctrl/Shift 等修饰键会恢复同步，已经松开的键保持松开；AltGr 继续用于本地键盘布局的文本输入。
 
-已验证真实 Qt 和 Ghostty/GTK 在 175% 下的中文、emoji、预编辑/取消及焦点保护，也验证了 Wine 中原生 Win32 Unicode 输入到 Qt 的完整链路。**微软拼音实际候选面板、选词和快捷键切换还需在 WoA 实机验收**；Wine Unicode 注入不代表真实微软 IME 引擎测试。
+已验证真实 Qt 和 Ghostty/GTK 在 175% 下的中文、emoji、预编辑/取消及焦点保护。2026-11-10 的 WoA 实机测试已覆盖微软拼音原生候选框、`ni` 选词提交“你”、不切焦点立即退格和回车；Ghostty 的 Linux 真终端回归也检查提交后立即收到退格/回车。其他输入法、GTK 实机候选行为及更多切换场景仍需扩展验收；Wine Unicode 注入与实机测试分别记录。
 
-仅支持实现 `text-input-v3` 的 Wayland 应用；X11/XIM、文档重转换和周边文本查询暂未支持。应用周边文本不传到 Windows。如果程序被宿主环境强制使用 fcitx/ibus 模块，可在启动该远端实例时清除 `GTK_IM_MODULE` / `QT_IM_MODULE`，让它选择 Wayland 文本输入后端。
+仅支持实现 `text-input-v3` 的 Wayland 应用；X11/XIM、文档重转换和周边文本查询暂未支持。应用周边文本不传到 Windows。启动命令和 `--launch` 自动清除宿主 `GTK_IM_MODULE` / `QT_IM_MODULE` 等覆盖，Qt/GTK 优先选择原生 Wayland，避免将远端输入交给宿主的 fcitx。
 
 ## 会话音频（可选）
 
-使用 `--audio` 启动，例如 `./target/release/waybridge --audio -- ghostty`。Linux 需安装 `pactl` 和 `parec`（PulseAudio 客户端工具，亦可连接 PipeWire-Pulse）。服务端创建私有 sink，启动的应用通过 `PULSE_SINK` 加入；不修改系统默认输出。日志中的 `sink=waybridge-<pid>` 可用于之后加入的应用：`PULSE_SINK=waybridge-<pid> WAYLAND_DISPLAY=waybridge-0 <应用>`。直接使用 ALSA 或绕过 PulseAudio 的应用需要自行选择该输出。
+Linux 安装 `pactl` 和 `parec` 并有可用 PulseAudio/PipeWire-Pulse 时，音频默认自动启用。服务端创建私有 sink，通过 `PULSE_SINK` 路由 PulseAudio 应用，并通过 `PIPEWIRE_NODE`/流属性路由 mpv 等原生 PipeWire 应用；不修改系统默认输出。后续应用使用 `--launch` 自动加入同一 sink，无需手工抄 PID。原生 PipeWire 流禁止在目标消失时回退到宿主输出；直接使用硬件 ALSA 的应用仍需选择兼容后端。
 
 新版 Windows 客户端自动协商独立音频 TCP 连接，仍经过原来的 SSH 端口，使用 WASAPI 播放到默认输出设备。出现 `WASAPI 48 kHz stereo audio playback active` 表示音频设备已启动；设置 `WAYBRIDGE_NO_AUDIO=1` 可关闭客户端音频，`WAYBRIDGE_AUDIO_DEVICE` 可指定 WASAPI endpoint ID。无声卡或音频连接失败不影响画面。
 
@@ -91,7 +99,7 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 
 ## 可选 X11 应用
 
-运行时需安装 `Xwayland`。例如在独立端口和 socket 测试：
+安装 `Xwayland` 后默认自动启用。Java/JavaFX、默认 X11 后端的 Chrome 等应用可直接从会话终端或 `--launch` 启动。例如在独立端口和 socket 强制要求 X11：
 
 ```bash
 ./target/release/waybridge --xwayland \

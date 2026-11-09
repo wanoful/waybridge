@@ -1,4 +1,22 @@
-# Validation — 2026-11-09
+# Validation — 2026-11-10
+
+## Application fixes after physical WoA testing
+
+The previous ordinary startup inherited the host's `QT_IM_MODULE=fcitx`/`GTK_IM_MODULE=fcitx`, omitted Xwayland/audio unless explicit flags were supplied, and routed only PulseAudio applications with `PULSE_SINK`. This prevented Dolphin's native text-input bridge, legacy GUI startup and mpv's default native PipeWire output. Startup now detects available Xwayland/private audio, isolates the application D-Bus session, removes host IM overrides and routes both PulseAudio and native PipeWire. `--launch -- <application>` restores that same environment for another SSH shell using a 0600 descriptor with process-identity checks and owned cleanup.
+
+Executed Linux checks:
+
+- `scripts/test.sh`: formatting, strict Clippy, 17 Rust tests and the full protocol/Qt/Dolphin/Ghostty/files/desktop suite passed, including the new inherited-fcitx environment regression.
+- `launch_smoke.py`: real Dolphin enables text-input-v3, commits a Chinese directory path and immediately handles raw Backspace/Return. An external `--launch` process receives the identical display, D-Bus, IM and audio environment; stale descriptors cannot launch a command.
+- `launch_smoke.py --apps`: installed Google Chrome, HMCL (Java/JavaFX) and VLC each create and paint remote windows. Chrome uses an isolated `--user-data-dir` and local test page; this does not promise reuse of the host browser's active profile. All test state is private, and the preexisting host Dolphin daemon/VLC process were retained.
+- `launch_smoke.py --audio`: actual mpv chooses native PipeWire without an AO override, its paused stream targets the private sink with fallback forbidden, and streamed PCM reaches peak 12000. `audio_smoke.py` and `session_integration_smoke.py` pass isolation, authentication, flow control, shutdown and multi-backend checks. The host default output remains unchanged.
+- A stronger `ghostty_smoke.py --ime` exposed a second input bug even when raw keys reached GTK: redundant non-null empty preedit updates left Ghostty composing and swallowed Backspace/Return. Active cancellations now use null preedit/cursor -1; redundant clears are skipped. The old Release fails the exact PTY test, while the fix receives committed Chinese followed immediately by DEL/CR with no refocus. Logs: `/tmp/waybridge-ghostty-key-{before,after}.log`.
+
+Windows native MSVC ARM64 testing in the collaborating Windows session verified the real Microsoft Pinyin candidate UI, `ni` + Space committing “你”, immediate Backspace and raw Return without changing focus. It also found and fixed composition-end messages that do not arrive, zero-scan key events, translated control characters and Ctrl+H/I/M duplication. The full Wine IME/OLE regression, including the new cases, passes (`/tmp/waybridge-ime-keys-final.log`). `native_icon.h` no longer uses the RPC-macro-colliding member name `small`, and the native ARM64 build/shader checks pass.
+
+The same Windows session confirmed actual mpv default PipeWire → private sink → PCM → native WoA WASAPI → default physical output. A quiet 997 Hz fixture produced loopback magnitude 0.01343 at 997 Hz and 0.0000565 at adjacent 2003 Hz; only frequency magnitudes were measured, no recording was saved. This is an audio/IME subset of physical validation, not certification of every integrated feature or the Linux cross-compiled artifact. The completed 49120 test service was stopped after the Windows operator finished; no user service or application was restarted.
+
+Linux Release and cross-compiled Windows ARM64 builds passed (`/tmp/waybridge-fixes-{release,arm64}-final.log`); Linux application logs are under `build/tests/launch-*.log`. The earlier integration checkpoints remain below for traceability.
 
 The source integrates all 14 feature implementations. Results below distinguish the feature/media checkpoints, the desktop+media combined session, the final files-inclusive rerun, and earlier physical-device work. Building an ARM64 executable or running a PE under Wine is not physical WoA validation.
 
@@ -68,7 +86,7 @@ This physical evidence applies to that earlier H.264/PNG/resize baseline. It doe
 ## Remaining device and compatibility validation
 
 - Real Windows/WoA HEVC/AV1 and Main10 MFT availability, correct GPU planes/textures, DirectComposition FP16 HDR presentation, active HDR↔SDR transitions, per-pixel alpha and multi-monitor DPI. The production HDR shader/WIC numerical checks under private software D3D11 verify arithmetic only; WARP is not advertised as HDR hardware.
-- Microsoft Pinyin candidate positioning, selection, composition/cancel and Win+Space/shortcut switching in Qt/GTK on the physical device. XIM and surrounding-text reconversion are not implemented.
+- Further Microsoft Pinyin candidate positioning, cancellation and Win+Space/shortcut switching across Qt/GTK on the physical device, beyond the basic Qt candidate/commit/Backspace/Return test above. XIM and surrounding-text reconversion are not implemented.
 - Windows Explorer/desktop and third-party OLE targets; Outlook/archive/cloud providers, real COM cancellation and provider hangs. No FUSE, IStorage, unknown-size HGLOBAL, move semantics or general third-party compatibility claim. An unresponsive provider that ignores OS cancellation may require source-process recovery.
 - Cross-process transparent click-through and KDE blur are not implemented. Relative-only/unlocked motion, confined-pointer and popup locks remain unsupported. X11 lacks PRIMARY, XDND, XIM, full EWMH and automatic crash restart.
 - General multi-GPU/driver/application coverage, congestion adaptation, endpoint roaming, Opus, microphone, strict A/V synchronization and device hot-switching remain outside this implementation. CUDA retains GPU copies/synchronous waits and independent alpha readback; it is not an entirely zero-copy pipeline.

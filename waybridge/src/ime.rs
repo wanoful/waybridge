@@ -28,6 +28,7 @@ struct Input {
     rectangle: [i32; 4],
     purpose: u32,
     pending: Pending,
+    has_preedit: bool,
 }
 #[derive(Default)]
 pub struct Ime {
@@ -48,6 +49,12 @@ impl Ime {
             .iter()
             .find(|i| i.enabled && i.object.id().same_client_as(&focus.id()))
     }
+    fn active_mut(&mut self) -> Option<&mut Input> {
+        let focus = self.focus.as_ref().filter(|f| f.is_alive())?;
+        self.inputs
+            .iter_mut()
+            .find(|i| i.enabled && i.object.id().same_client_as(&focus.id()))
+    }
     pub fn focus(&mut self, surface: Option<WlSurface>) -> bool {
         if self.focus == surface {
             return false;
@@ -57,6 +64,7 @@ impl Ime {
                 if i.object.id().same_client_as(&old.id()) {
                     i.object.leave(old);
                     i.enabled = false;
+                    i.has_preedit = false;
                     i.pending = Pending::default();
                 }
             }
@@ -122,11 +130,14 @@ impl App {
         {
             return;
         }
-        let Some(input) = self.ime.active() else {
+        let Some(input) = self.ime.active_mut() else {
             return;
         };
         let commit = message.get("commit").and_then(Value::as_str);
-        let preedit = message.get("preedit").and_then(Value::as_str);
+        let preedit = message
+            .get("preedit")
+            .and_then(Value::as_str)
+            .or(commit.map(|_| ""));
         if commit.is_some_and(|s| s.len() > 60 * 1024)
             || preedit.is_some_and(|s| s.len() > 60 * 1024)
         {
@@ -139,15 +150,27 @@ impl App {
                 return;
             }
         }
+        let mut changed = false;
         if let Some(text) = commit {
             input.object.commit_string(Some(text.to_string()));
+            changed = true;
         }
         if let Some(text) = preedit {
-            input
-                .object
-                .preedit_string(Some(text.to_string()), begin as i32, end as i32);
+            if !text.is_empty() {
+                input
+                    .object
+                    .preedit_string(Some(text.to_string()), begin as i32, end as i32);
+                input.has_preedit = true;
+                changed = true;
+            } else if input.has_preedit {
+                // GTK/Ghostty can start a new empty composition for repeated
+                // non-null empty preedits. End only the composition we own.
+                input.object.preedit_string(None, -1, -1);
+                input.has_preedit = false;
+                changed = true;
+            }
         }
-        if commit.is_some() || preedit.is_some() {
+        if changed {
             input.object.done(input.serial);
         }
     }
@@ -194,6 +217,7 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for App {
                 rectangle: [0, 0, 1, 20],
                 purpose: 0,
                 pending: Pending::default(),
+                has_preedit: false,
             });
         }
     }
@@ -255,6 +279,7 @@ impl Dispatch<ZwpTextInputV3, ()> for App {
                 let pending = std::mem::take(&mut input.pending);
                 if let Some(enable) = pending.enable {
                     input.enabled = enable;
+                    input.has_preedit = false;
                     input.rectangle = [0, 0, 1, 20];
                     input.purpose = 0;
                     app.ime.generation = app.ime.generation.wrapping_add(1);

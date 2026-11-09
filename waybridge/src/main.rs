@@ -7,6 +7,7 @@ mod cursor;
 mod drag;
 mod file_tree;
 mod ime;
+mod launch;
 mod metrics;
 mod network;
 mod protocol;
@@ -124,9 +125,12 @@ struct Args {
     /// Experimental explicitly tagged Windows-scRGB surfaces (not general ICC HDR).
     #[arg(long,default_value="off",value_parser=["off","experimental-scrgb"])]
     hdr: String,
-    /// Capture only this session's private PulseAudio/PipeWire-Pulse sink.
+    /// Require private session audio (otherwise enabled automatically when available).
     #[arg(long)]
     audio: bool,
+    /// Disable private session audio.
+    #[arg(long, conflicts_with = "audio")]
+    no_audio: bool,
     /// Use an SSH tunnel to this loopback listener for the initial prototype.
     #[arg(long, default_value = "127.0.0.1:49090")]
     listen: String,
@@ -138,9 +142,15 @@ struct Args {
     /// UDP pacing ceiling, including parity shards (not adaptive congestion control).
     #[arg(long, default_value_t=200, value_parser=clap::value_parser!(u32).range(1..=1000))]
     udp_mbps: u32,
-    /// Launch a private rootless Xwayland server for legacy X11 applications.
+    /// Require Xwayland (otherwise enabled automatically when installed).
     #[arg(long)]
     xwayland: bool,
+    /// Disable X11 application compatibility.
+    #[arg(long, conflicts_with = "xwayland")]
+    no_xwayland: bool,
+    /// Launch an application inside the running --socket session, including its audio and D-Bus.
+    #[arg(long)]
+    launch: bool,
     /// Authentication token file; created with mode 0600 if absent.
     #[arg(long)]
     token_file: Option<PathBuf>,
@@ -2524,6 +2534,9 @@ fn token(path: &PathBuf) -> Result<String> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.launch {
+        return launch::attach(&args.socket, &args.command);
+    }
     if args.check_hdr {
         let (mut renderer, node) = make_renderer(args.render_node.as_ref())?;
         let mut report = color::preflight(&mut renderer);
@@ -2584,12 +2597,20 @@ fn main() -> Result<()> {
     };
     let mut display = Display::<App>::new()?;
     let dh = display.handle();
-    let socket = ListeningSocket::bind(&args.socket)
-        .context("binding private Wayland socket (already running?)")?;
     let mut xloop = smithay::reexports::calloop::EventLoop::<App>::try_new()?;
-    let x11 = x11::start(&dh, xloop.handle(), args.xwayland)?;
-    let audio = if args.audio {
-        Some(audio::Session::new()?)
+    let xwayland_enabled = args.xwayland || (!args.no_xwayland && launch::available("Xwayland"));
+    let x11 = x11::start(&dh, xloop.handle(), xwayland_enabled)?;
+    let audio = if !args.no_audio
+        && (args.audio || (launch::available("pactl") && launch::available("parec")))
+    {
+        match audio::Session::new() {
+            Ok(audio) => Some(audio),
+            Err(error) if !args.audio => {
+                tracing::warn!(%error, "automatic session audio unavailable; continuing without audio");
+                None
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         None
     };
@@ -2609,6 +2630,10 @@ fn main() -> Result<()> {
             udp,
         },
     )?;
+    // Publishing the Wayland socket is also the readiness signal used by local
+    // launchers. Do it after optional backends and the viewer listener exist.
+    let socket = ListeningSocket::bind(&args.socket)
+        .context("binding private Wayland socket (already running?)")?;
     let compositor = CompositorState::new_v6::<App>(&dh);
     let shell = XdgShellState::new_with_capabilities::<App>(
         &dh,
@@ -2741,7 +2766,7 @@ fn main() -> Result<()> {
     )?;
     app.drag_sink = Some(drag::Sink::new(sink_client)?);
     let mut children: Vec<Child> = Vec::new();
-    if args.xwayland {
+    if xwayland_enabled {
         let deadline = Instant::now() + Duration::from_secs(15);
         while app.x11.display.is_none() && !app.x11.failed && Instant::now() < deadline {
             display.dispatch_clients(&mut app)?;
@@ -2749,22 +2774,20 @@ fn main() -> Result<()> {
             xloop.dispatch(Some(Duration::from_millis(1)), &mut app)?;
         }
         if app.x11.display.is_none() {
-            bail!("private Xwayland startup failed; see Xwayland logs");
+            if args.xwayland {
+                bail!("private Xwayland startup failed; see Xwayland logs");
+            }
+            tracing::warn!(
+                "automatic Xwayland unavailable; continuing with native Wayland applications"
+            );
         }
     }
+    let application_session =
+        launch::Session::new(&args.socket, app.x11.display, app.audio.as_ref())?;
     if let Some(program) = args.command.first() {
         let mut command = Command::new(program);
-        command
-            .args(&args.command[1..])
-            .env("WAYLAND_DISPLAY", &args.socket);
-        if let Some(number) = app.x11.display {
-            command.env("DISPLAY", format!(":{number}"));
-        } else {
-            command.env_remove("DISPLAY");
-        }
-        if let Some(audio) = &app.audio {
-            command.env("PULSE_SINK", audio.sink());
-        }
+        command.args(&args.command[1..]);
+        application_session.configure(&mut command, app.audio.as_ref());
         children.push(
             command
                 .spawn()

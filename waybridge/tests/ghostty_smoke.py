@@ -8,10 +8,12 @@ def main():
     ime='--ime' in sys.argv
     with tempfile.TemporaryDirectory(prefix='waybridge-ghostty-') as runtime,open(ROOT/'build/tests/ghostty-host.log','w') as log,open(ROOT/'build/tests/ghostty-app.log','w') as app_log:
         env={**os.environ,'XDG_RUNTIME_DIR':runtime,'WAYLAND_DISPLAY':'ghostty-0','GDK_BACKEND':'wayland','XDG_CONFIG_HOME':str(Path(runtime)/'config'),'XDG_CACHE_HOME':str(Path(runtime)/'cache'),'XDG_DATA_HOME':str(Path(runtime)/'data')}
-        if ime:env.pop('GTK_IM_MODULE',None)
+        if ime:
+            env.pop('GTK_IM_MODULE',None)
+            env['WAYLAND_DEBUG']='1'
         with socket.socket() as free:free.bind(('127.0.0.1',0));port=free.getsockname()[1]
         token='ghostty-test-'+40*'8';token_path=Path(runtime)/'token';token_path.write_text(token);token_path.chmod(0o600)
-        host=subprocess.Popen([str(ROOT/'target/debug/waybridge'),'--listen',f'127.0.0.1:{port}','--socket','ghostty-0','--token-file',str(token_path),'--codec','png'],env=env,stdout=log,stderr=log)
+        host=subprocess.Popen([os.environ.get('WAYBRIDGE_BINARY',str(ROOT/'target/debug/waybridge')),'--listen',f'127.0.0.1:{port}','--socket','ghostty-0','--token-file',str(token_path),'--codec','png'],env=env,stdout=log,stderr=log)
         app=None
         try:
             end=time.monotonic()+10
@@ -52,7 +54,13 @@ def main():
                 end=time.monotonic()+10
                 while time.monotonic()<end and received.read_bytes()!='你好🙂中文'.encode():time.sleep(.02)
                 assert received.read_bytes()=='你好🙂中文'.encode(),received.read_bytes()
-                print('PASS: actual Ghostty GTK text-input-v3 at 175%, caret state, Chinese/emoji reach PTY exactly once, preedit/cancel never reach PTY')
+                for code in (14,28):
+                    for down in (True,False):viewer.send(type='key',id=id,key=code,down=down)
+                expected='你好🙂中文'.encode()+b'\x7f\r'
+                end=time.monotonic()+5
+                while time.monotonic()<end and received.read_bytes()!=expected:time.sleep(.02)
+                assert received.read_bytes()==expected,received.read_bytes()
+                print('PASS: actual Ghostty GTK text-input-v3 at 175%, Chinese/emoji commit once, preedit/cancel never reach PTY; Backspace and Return arrive immediately after commit without refocusing')
                 return
             viewer.send(type='pointer',id=id,x=geometry[0]-25,y=geometry[1]-25)
             viewer.send(type='button',id=id,button=273,down=True)

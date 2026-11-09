@@ -139,6 +139,13 @@ def main():
                 assert not keys(unicode) and text(unicode) == "你🙂", unicode
                 typed = run("type")
                 assert not keys(typed) and text(typed) == "a", typed
+                for action in ("empty-composition", "empty-preedit", "result-only", "zero-scan-controls", "ime-control-characters"):
+                    completed = run(action)
+                    assert keys(completed) == [(14, True), (14, False), (28, True), (28, False)], completed
+                    assert not text(completed), completed
+                shortcuts = run("zero-scan-shortcuts")
+                assert keys(shortcuts) == [(29, True), (35, True), (35, False), (23, True), (23, False), (50, True), (50, False), (29, False)], shortcuts
+                assert not text(shortcuts), shortcuts
                 started = run("generation-start")
                 assert keys(started) == [(29, True), (29, False)], started
                 start = len(snapshot())

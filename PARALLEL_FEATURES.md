@@ -36,12 +36,12 @@
 ./scripts/build-windows-arm64.sh
 ```
 
-产物为 `target/release/waybridge`、`build/windows/waybridge-client.exe` 和 `build/windows-arm64/waybridge-client.exe`。请同时更新两端，WoA 使用 ARM64 版本。默认 PNG/H.264、普通窗口与数据交换按能力自动协商；以下功能需显式启用。
+产物为 `target/release/waybridge`、`build/windows/waybridge-client.exe` 和 `build/windows-arm64/waybridge-client.exe`。请同时更新两端，WoA 使用 ARM64 版本。默认 PNG/H.264、普通窗口与数据交换按能力自动协商；音频和 Xwayland 默认自动检测，其余扩展按下表启用。
 
 | 功能 | 服务端开关 | Windows 端 |
 |---|---|---|
-| 音频 | `--audio` | 自动协商；`WAYBRIDGE_NO_AUDIO=1` 可禁用 |
-| X11 | `--xwayland` | 无新增客户端依赖 |
+| 音频 | 默认自动；`--audio` 要求成功，`--no-audio` 关闭 | 自动协商；`WAYBRIDGE_NO_AUDIO=1` 可禁用 |
+| X11 | 已安装时自动；`--xwayland` 要求成功，`--no-xwayland` 关闭 | 无新增客户端依赖 |
 | CUDA 颜色输入 | `--gpu-input cuda` | 保留原 GPU 解码能力探测 |
 | HEVC / AV1 | `--codec hevc-nvenc` / `--codec av1-nvenc` | `--check-codecs` 查询实际支持 |
 | UDP | `--udp-listen <地址>:49091` | 设置可直达的 `WAYBRIDGE_UDP_HOST`；SSH 仍承载 TCP |

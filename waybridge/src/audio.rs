@@ -158,6 +158,17 @@ impl Session {
     pub fn sink(&self) -> &str {
         &self.sink.name
     }
+    pub fn configure_command(&self, command: &mut Command) {
+        let inherited = std::env::var("PIPEWIRE_PROPS").unwrap_or_default();
+        let body = inherited.trim();
+        let body = body
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(body);
+        command.env("PULSE_SINK", self.sink())
+            .env("PIPEWIRE_NODE", self.sink())
+            .env("PIPEWIRE_PROPS", format!("{{ {body} target.object=\"{}\" node.dont-fallback=true node.dont-reconnect=true }}", self.sink()));
+    }
     pub fn set_peer(&self, peer: Option<&Arc<Peer>>) {
         *self.peer.lock().unwrap() = peer.map_or_else(Weak::new, Arc::downgrade);
     }
