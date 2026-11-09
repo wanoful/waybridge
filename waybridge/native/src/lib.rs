@@ -6,6 +6,14 @@ use std::{
 };
 
 unsafe extern "C" {
+    fn wb_hdr_probe_10bit(
+        kind: c_int,
+        depth: *mut c_int,
+        distinct: *mut c_int,
+        peak: *mut c_int,
+        error: *mut c_char,
+        size: usize,
+    ) -> c_int;
     fn wb_encoder_new_codec(
         kind: c_int,
         width: c_int,
@@ -222,5 +230,31 @@ impl Drop for Encoder {
         unsafe {
             wb_encoder_free(self.handle.as_ptr());
         }
+    }
+}
+
+/// A diagnostic only: confirms actual P010 values survive a Main10 encode/decode.
+/// It does not imply the compositor or Windows presentation path is HDR-ready.
+pub fn probe_10bit(codec: Codec) -> Result<(u32, u32, u32), String> {
+    let mut depth = 0;
+    let mut distinct = 0;
+    let mut peak = 0;
+    let mut error = [0 as c_char; 512];
+    let status = unsafe {
+        wb_hdr_probe_10bit(
+            codec as c_int,
+            &mut depth,
+            &mut distinct,
+            &mut peak,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if status < 0 {
+        Err(unsafe { CStr::from_ptr(error.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
+    } else {
+        Ok((depth as u32, distinct as u32, peak as u32))
     }
 }

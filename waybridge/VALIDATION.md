@@ -1,5 +1,13 @@
 # Validation — 2026-11-09
 
+HDR checkpoint — precision and display preflight, still partial:
+
+- `tests/hdr_preflight.py` confirms 1024 distinct RGB10 values and 1024 distinct FP16 values through actual Smithay import/render and public GL capture. FP16 green=2.0 survives (above SDR white). Smithay 0.7 `map_texture` hardcodes four bytes per pixel, so FP16 must use the public GL callback/CUDA resource path; reading its normal mapping would silently expose only half the FP16 bytes.
+- Real P010 → HEVC Main10 → decode retains 10-bit format and 870 distinct luma values; AV1 Main10 retains 877. AV1 QP0 lossless is not supported by this host; QP1 verifies actual ten-bit data. Metadata alone is not used as evidence of HDR or ten-bit fidelity.
+- Linux `--check-hdr` runs before session setup and creates no token, Wayland socket or viewer listener. Windows `--check-hdr` uses DXGI Output6 active color-space/bit-depth reports and a detached FP16 composition swapchain with readback of >1.0 values plus scRGB color-space support. It never changes host HDR/display settings. DXGI active SDR does not establish that a display lacks supported-but-disabled HDR.
+- x64/ARM64 builds pass. The actual x64 PE in a private Wine/Xvfb desktop reports SDR/partial when hardware presentation is unavailable, and existing HEVC/AV1 negotiation/PNG fallback tests still pass. Real Windows HDR display behavior remains untested.
+- This checkpoint is not HDR streaming completion: normal capture/decoder/presentation remain RGBA8/NV12/BGRA8, and hello explicitly advertises only BT.709 SDR. The next experimental subset requires explicit Windows-scRGB surface descriptions, FP16 color-aware composition, Main10/P010 transport and scRGB FP16 Windows presentation with monitor-aware fallback.
+
 Opt-in CUDA GL color input — RTX 5070 Ti:
 
 - The native fixture uses a private device EGL/GLES context on NVIDIA, an actual RGBA8 renderbuffer, CUDA GL registration and FFmpeg CUDA AVFrames. `tests/gpu_native_smoke.c` checks every RGBA pixel of a 641×481 nonuniform premultiplied fixture under both vertical orientations, including exact GPU unpremultiply and alpha 0/128/255. Opaque input returns no full alpha plane. Actual CUDA AVFrames encode H.264/HEVC/AV1 IDR/P chains and all four frames decode with FFmpeg.

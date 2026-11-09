@@ -17,6 +17,7 @@
 #include "h264_decoder.h"
 #include "h264_decoder_cache.h"
 #include "image_decoder.h"
+#include "hdr_capabilities.h"
 #include "third_party/json.hpp"
 #include <algorithm>
 #include <atomic>
@@ -1604,6 +1605,10 @@ BOOL WINAPI consoleControl(DWORD) {
 }
 
 int wmain(int argc, wchar_t **argv) {
+  if (argc == 2 && std::wstring(argv[1]) == L"--check-hdr") {
+    std::cout << HdrCapabilities::inspect().dump() << '\n';
+    return 0;
+  }
   if (argc == 2 && std::wstring(argv[1]) == L"--check-codecs") {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     auto &mf = MediaFoundation::get();
@@ -1709,6 +1714,8 @@ int wmain(int argc, wchar_t **argv) {
             {"version", 3},
             {"split_media", true},
             {"frame_ack", true},
+            {"hdr", false},
+            {"color_spaces", Json::array({"bt709_sdr"})},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},

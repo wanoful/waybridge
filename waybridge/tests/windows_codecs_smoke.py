@@ -13,6 +13,7 @@ from hardware_smoke import Viewer, ROOT
 
 
 def main():
+    (ROOT/"build/tests").mkdir(parents=True,exist_ok=True)
     subprocess.run(['x86_64-w64-mingw32-g++', '-municode', '-static', '-O2', 'tests/windows_probe.cpp', '-o', 'build/tests/windows-codec-probe.exe', '-lgdi32', '-lshell32', '-lole32', '-luuid'], cwd=ROOT, check=True)
     processes = []
     prefix = ROOT/'build/wine-codecs'; prefix.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -39,7 +40,10 @@ def main():
         try:
             subprocess.run(['wineboot', '-u'], env=env, stdout=log, stderr=log, timeout=60, check=True)
             result = subprocess.run(['wine', str(ROOT/'build/windows/waybridge-client.exe'), '--check-codecs'], env=env, text=True, capture_output=True, timeout=20, check=True)
-            assert 'HEVC capability=unavailable' in result.stdout and 'AV1 capability=unavailable' in result.stdout, result.stdout
+            hdr = subprocess.run(['wine', str(ROOT/'build/windows/waybridge-client.exe'), '--check-hdr'], env=env, text=True, capture_output=True, timeout=20, check=True)
+            report = json.loads(hdr.stdout)
+            assert report['streaming_hdr'] is False and report['current_decoder_format'] == 'NV12' and report['current_swapchain_format'] == 'BGRA8', report
+            assert 'HEVC capability=unavailable'  in result.stdout and 'AV1 capability=unavailable' in result.stdout, result.stdout
             for kind, capability, name in ((4, 'hevc_alpha', 'HEVC'), (5, 'av1_alpha', 'AV1')):
                 with socket.socket() as listener:
                     listener.bind(('127.0.0.1', 0)); listener.listen(); listener.settimeout(15)

@@ -1,4 +1,5 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
+mod color;
 mod metrics;
 mod network;
 mod protocol;
@@ -96,6 +97,9 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
+    /// Inspect real render/codec precision without opening a viewer listener or changing a display.
+    #[arg(long)]
+    check_hdr: bool,
     /// Use an SSH tunnel to this loopback listener for the initial prototype.
     #[arg(long, default_value = "127.0.0.1:49090")]
     listen: String,
@@ -1603,13 +1607,20 @@ fn token(path: &PathBuf) -> Result<String> {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+    if args.check_hdr {
+        let (mut renderer, node) = make_renderer(args.render_node.as_ref())?;
+        let mut report = color::preflight(&mut renderer);
+        report["render_node"] = json!(node);
+        println!("{}", report);
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "waybridge=info".into()),
         )
         .init();
-    let args = Args::parse();
     metrics::init(args.stats);
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .context("XDG_RUNTIME_DIR must name a private runtime directory")?;

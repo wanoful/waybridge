@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=nvenc.c");
+    println!("cargo:rerun-if-changed=hdr_probe.c");
     println!("cargo:rerun-if-changed=gpu_interop.c");
     println!("cargo:rerun-if-changed=gpu_interop.h");
     println!("cargo:rerun-if-changed=gpu_kernel_ptx.h");
@@ -26,6 +27,7 @@ fn main() {
     build
         .file("gpu_interop.c")
         .file("nvenc.c")
+        .file("hdr_probe.c")
         .warnings(true)
         .compile("waybridge_nvenc");
 }

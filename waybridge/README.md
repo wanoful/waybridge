@@ -54,6 +54,12 @@ kernel 源码，可用 `bash scripts/build-gpu-kernel.sh` 重新生成；预生�
 降到 1.67/2.40 ms；1440p 从约 10.80/15.35 ms 降到 2.40/3.37 ms。这些是本机
 合成测试的阶段耗时，不是物理输入到屏幕延迟，也不代表其他设备性能。
 
+HDR 当前处于实验开发的 **partial** 状态。`waybridge --check-hdr` 在私有离屏 EGL
+上下文测量 RGB10/FP16 像素精度和真实 Main10 编解码，不打开查看端监听；Windows
+`waybridge-client.exe --check-hdr` 只读查询活动显示器的 HDR 模式，并验证离屏
+FP16/scRGB composition swapchain 能力，不更改显示设置。硬件就绪不代表当前应用
+流已经 HDR：默认链路仍明确协商 8-bit BT.709 SDR。
+
 ## 直接运行
 
 本机已构建 Linux 服务端和 x64、ARM64 Windows 客户端：
