@@ -1,0 +1,7 @@
+/sunshine/
+/moonlight/
+/waybridge/target/
+/waybridge/build/
+/waybridge/.runtime/
+*.log
+__pycache__/

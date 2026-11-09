@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p build/tests
+wayland-scanner client-header /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml build/tests/xdg-shell-client-protocol.h
+wayland-scanner private-code /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml build/tests/xdg-shell-protocol.c
+wayland-scanner client-header /usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml build/tests/xdg-decoration-client-protocol.h
+wayland-scanner private-code /usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml build/tests/xdg-decoration-protocol.c
+cc -std=c11 -Wall -Wextra -Werror -Ibuild/tests tests/test_app.c build/tests/xdg-shell-protocol.c build/tests/xdg-decoration-protocol.c -o build/tests/test-app $(pkg-config --cflags --libs wayland-client)

@@ -1,0 +1,9 @@
+[package]
+name = "waybridge-codec"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
