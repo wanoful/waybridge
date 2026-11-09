@@ -1,5 +1,12 @@
 # Validation — 2026-11-09
 
+Locked relative-pointer v1 (isolated worktree implementation):
+
+- `tests/relative_smoke.py` runs real Wayland `relative-pointer` and `pointer-constraints` resources against the real EGL compositor on an ephemeral port/private runtime. It passes old-viewer capability gating, two-phase native acknowledgement, wrong target/generation and invalid delta rejection, exact relative/unaccelerated values, absence of absolute motion while locked, focus/native release with held keys/buttons, resource recreation, committed activation-region exclusion, oneshot lifecycle, acknowledgement expiry, unmap/remap, reconnect, invalid-JSON disconnect and surface destruction. Confined-pointer requests remain inactive.
+- `tests/windows_relative_smoke.py` runs the actual x64 PE client in its own Wine prefix and Xvfb desktop. It passes native acknowledgement, hidden cursor and one-pixel native clipping, synthetic `SendInput` → `WM_INPUT` → real Wayland relative-motion delivery without duplicate absolute motion, Ctrl+Alt+Shift+F12 emergency release, focus loss, Windows close, application-side surface destruction and network disconnect. Prior desktop clipping/visibility is restored in each case. Wine's synthetic mouse counts are not a physical-device accuracy measurement.
+- Linux formatting, strict Clippy, four unit tests, protocol/input/clipboard/file smoke and actual Qt 175%/125% input/menu/modal smoke pass. The actual x64 PE's Qt overflow/nested-popup and owned-dialog Wine regression passes. x64 GNU MinGW and ARM64 LLVM-MinGW client builds pass.
+- First version activates only locked-pointer constraints for a focused toplevel target; popup locks, confined-pointer activation, optional cursor-position hints and relative-only input outside a lock are not implemented. Hardware mouse/game compatibility, multi-monitor clipping and actual Windows ARM64 execution of this extension remain unverified. Existing media ACK/credit semantics are unchanged.
+
 Maximize/restore resize checks:
 
 - The actual native FFmpeg/NVENC adapter measured roughly 101 ms to create a session and 70 ms to destroy one when alternating 960×640 / 2240×1400. Keeping both sizes and forcing independent SPS/PPS+IDR on reuse reduced warm first-frame encoding to about 3.1 ms. These adapter timings exclude capture, alpha and network processing.

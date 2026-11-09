@@ -4,6 +4,51 @@ All packets begin with a big-endian u32 length counting the kind byte and body. 
 
 First client message: `{"type":"hello","version":3,"token":"...","dpi":168,"work_width":3840,"work_height":2080}`. The server verifies authentication and exclusive viewer ownership before announcing protocol version, codec, and capabilities. This transport is meant to run through an SSH tunnel. The server advertises `codec:"mixed"`, supported `codecs` and a random per-session `media_key`. Both ends must use v3. Clients advertise `codecs:["png_rgba","h264_alpha"]` when hardware decoding is available, otherwise PNG only. DPI defaults to 96; work dimensions are physical monitor work-area pixels.
 
+## Locked relative pointer (optional v3 extension)
+
+The server advertises `features:[...,"relative_pointer_locked","locked_pointer"]`.
+The viewer opts in with `hello.pointer_lock:true`. Viewers omitting it keep ordinary
+absolute input and never receive lock requests. No media or frame-credit fields change.
+
+The compositor exposes `zwp_relative_pointer_manager_v1` and
+`zwp_pointer_constraints_v1`. **Only locked-pointer constraints are activated in this
+version**; confined-pointer requests remain inactive. Relative motion is currently
+provided while locked; an application requesting only relative-pointer without a lock
+continues to receive ordinary absolute input. Popup locks and cursor-position hints
+are not implemented.
+
+When a lock's target is mapped, has keyboard focus in its root toplevel, contains the
+pointer in its input/constraint region, and no popup grab is active, the server sends
+`{"type":"pointer_lock","id":1,"generation":7,"active":true}`. `id` is the root
+window; generation is a nonzero server-process-lifetime u64 and changes for every
+request, including reconnect/recreation. The viewer must verify native focus and
+establish Raw Input, a hidden cursor and native clipping before replying
+`{"type":"pointer_lock_ack","id":1,"generation":7,"active":true}`. Only then does
+the compositor send Wayland `locked`. A native failure replies `active:false`.
+A request expires after two seconds without a valid acknowledgement. Absolute
+positions are held at the anchor during pending/active lock.
+
+While active the viewer sends
+`{"type":"relative_pointer","id":1,"generation":7,"dx":12,"dy":-3}`.
+Both deltas must be finite JSON numbers, with absolute value at most 1,000,000 per
+packet. Wrong targets/generations and malformed deltas are ignored; invalid JSON
+closes the transport as before. Windows passes raw relative mouse counts without
+Windows pointer acceleration as both Wayland accelerated and unaccelerated deltas;
+the server supplies a monotonic microsecond timestamp. Absolute-device Raw Input is
+not converted into relative motion.
+
+Server `pointer_lock` with `active:false` releases that exact target/generation.
+The viewer may independently send `pointer_lock_ack` with `active:false` after first
+restoring native cursor state. Focus loss, close/destruction, move/resize, popup grab,
+constraint removal, unmapping, region exclusion, disconnect and
+**Ctrl+Alt+Shift+F12** end a lock. Native cleanup precedes notification/network waits.
+The viewer restores its prior clip, visibility count and cursor, and restores the old
+cursor position only while its window remains foreground. Held mouse buttons are
+released before removing an implicit Wayland grab. An emergency/native rejection
+blocks the same persistent constraint until a real pointer leave/reentry, a focus
+change, or a newly created constraint; it cannot immediately trap the cursor again.
+Oneshot constraints require a newly created object after deactivation.
+
 ## Media connection
 
 A viewer requesting `split_media:true` opens a second TCP connection to the same address and port. Authenticate it with `{"type":"hello","version":3,"token":"...","channel":"media","media_key":"..."}`. Only the current viewer's random key is accepted, and only one media socket attaches. The server replies `media_ready`, then sends frame kinds 1/2 over this socket. Input, window control, clipboard and file messages stay on the control socket. Socket failure closes the session; reconnect restores live windows. Existing SSH forwarding carries both connections. Test/simple viewers may omit `split_media` to multiplex on one socket.

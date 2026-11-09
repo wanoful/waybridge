@@ -17,6 +17,7 @@
 #include "h264_decoder.h"
 #include "h264_decoder_cache.h"
 #include "image_decoder.h"
+#include "relative_input.h"
 #include "third_party/json.hpp"
 #include <algorithm>
 #include <atomic>
@@ -131,6 +132,7 @@ struct RemoteWindow {
 };
 std::map<uint32_t, std::unique_ptr<RemoteWindow>> windows;
 uint32_t grabbedRoot = 0;
+RelativeInput relativeInput;
 
 DWORD windowStyle(bool clientDecorated) {
   // Client-decorated applications already supply their own title bar and controls.
@@ -917,7 +919,19 @@ RECT imageRect(RemoteWindow *w) {
   return {(r.right - width) / 2, (r.bottom - height) / 2, (r.right + width) / 2,
           (r.bottom + height) / 2};
 }
+void releasePointer(bool notify = true) {
+  if (!relativeInput.active())
+    return;
+  auto id = relativeInput.id();
+  auto generation = relativeInput.generation();
+  relativeInput.release();
+  if (notify)
+    sendJson({{"type", "pointer_lock_ack"}, {"id", id},
+              {"generation", generation}, {"active", false}});
+}
 void pointer(RemoteWindow *w, LPARAM param) {
+  if (relativeInput.active())
+    return;
   RECT r = imageRect(w);
   if (r.right <= r.left || r.bottom <= r.top)
     return;
@@ -1060,6 +1074,28 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   if (!w)
     return DefWindowProcW(hwnd, message, wp, lp);
   switch (message) {
+  case WM_INPUT: {
+    LONG dx = 0, dy = 0;
+    if (relativeInput.active(hwnd) && relativeInput.motion(reinterpret_cast<HRAWINPUT>(lp), dx, dy))
+      sendJson({{"type", "relative_pointer"}, {"id", relativeInput.id()},
+                {"generation", relativeInput.generation()}, {"dx", dx}, {"dy", dy}});
+    // Foreground Raw Input requires DefWindowProc to release system resources.
+    return DefWindowProcW(hwnd, message, wp, lp);
+  }
+  case WM_SETCURSOR:
+    if (relativeInput.active(hwnd)) {
+      SetCursor(nullptr);
+      return TRUE;
+    }
+    break;
+  case WM_ACTIVATE:
+    if (LOWORD(wp) == WA_INACTIVE && relativeInput.active(hwnd))
+      releasePointer();
+    break;
+  case WM_CANCELMODE:
+    if (relativeInput.active(hwnd))
+      releasePointer();
+    break;
   case WM_MOUSEACTIVATE:
     if (w->popup)
       return MA_NOACTIVATE;
@@ -1071,6 +1107,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     break;
   case WM_WINDOWPOSCHANGED:
+    if (relativeInput.active(hwnd))
+      releasePointer();
     if (!w->popup) {
       for (auto &[id, popup] : windows)
         if (popup->popup && popup->root == w->id)
@@ -1126,6 +1164,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     break;
   case WM_ENTERSIZEMOVE:
+    if (relativeInput.active(hwnd))
+      releasePointer();
     w->sizing = true;
     sendJson({{"type", "cancel_input"}, {"id", w->id}});
     return 0;
@@ -1135,6 +1175,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_DESTROY:
+    if (relativeInput.active(hwnd))
+      releasePointer();
     RevokeDragDrop(hwnd);
     return 0;
   case WM_PAINT: {
@@ -1178,6 +1220,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", true}});
     return 0;
   case WM_KILLFOCUS:
+    if (relativeInput.active(hwnd))
+      releasePointer();
     if (w->popup)
       return 0;
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", false}});
@@ -1199,6 +1243,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   }
   case WM_SIZE:
+    if (relativeInput.active(hwnd))
+      releasePointer();
     if (w->presentation)
       w->presentation->layout(imageRect(w));
     if (!w->popup && wp != SIZE_MINIMIZED) {
@@ -1215,6 +1261,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_MOUSEMOVE:
+    if (relativeInput.active(hwnd))
+      return 0;
     pointer(w, lp);
     if (!w->tracking) {
       TRACKMOUSEEVENT e{sizeof(e), TME_LEAVE, hwnd, 0};
@@ -1223,6 +1271,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     return 0;
   case WM_MOUSELEAVE:
+    if (relativeInput.active(hwnd))
+      return 0;
     w->tracking = false;
     sendJson({{"type", "leave"}, {"id", w->id}});
     return 0;
@@ -1264,9 +1314,9 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     if (down) {
       if (!w->popup)
         SetFocus(hwnd);
-      if (!grabbedRoot)
+      if (!grabbedRoot && !relativeInput.active())
         SetCapture(hwnd);
-    } else if (!grabbedRoot)
+    } else if (!grabbedRoot && !relativeInput.active())
       ReleaseCapture();
     pointer(w, lp);
     sendJson({{"type", "button"}, {"id", w->id}, {"button", button}, {"down", down}});
@@ -1285,6 +1335,12 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_KEYUP:
   case WM_SYSKEYDOWN:
   case WM_SYSKEYUP:
+    if (relativeInput.active(hwnd) && wp == VK_F12 &&
+        (GetKeyState(VK_CONTROL) & 0x8000) && (GetKeyState(VK_MENU) & 0x8000) &&
+        (GetKeyState(VK_SHIFT) & 0x8000)) {
+      releasePointer();
+      return 0;
+    }
     if (auto key = linuxKey(lp))
       sendJson({{"type", "key"},
                 {"id", w->id},
@@ -1292,6 +1348,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
                 {"down", message == WM_KEYDOWN || message == WM_SYSKEYDOWN}});
     return 0;
   case WM_CLOSE:
+    if (relativeInput.active(hwnd))
+      releasePointer();
     sendJson({{"type", "close"}, {"id", w->id}});
     return 0;
   }
@@ -1448,7 +1506,26 @@ void dispatchNetwork() {
       w->width = m.at("width");
       w->height = m.at("height");
       positionPopup(w);
+    } else if (type == "pointer_lock") {
+      uint32_t id = m.at("id").get<uint32_t>();
+      uint64_t generation = m.at("generation").get<uint64_t>();
+      if (relativeInput.stale(generation))
+        continue;
+      if (!m.at("active").get<bool>()) {
+        if (relativeInput.id() == id && relativeInput.generation() == generation)
+          releasePointer(false);
+      } else {
+        auto found = windows.find(id);
+        bool locked = found != windows.end() && !found->second->popup && !grabbedRoot &&
+                      relativeInput.lock(found->second->hwnd, id, generation);
+        std::cout << "Pointer lock " << (locked ? "active" : "unavailable")
+                  << " for window " << id << " generation " << generation << '\n';
+        sendJson({{"type", "pointer_lock_ack"}, {"id", id},
+                  {"generation", generation}, {"active", locked}});
+      }
     } else if (type == "popup_grab") {
+      if (m.at("active").get<bool>())
+        releasePointer();
       setPopupGrab(m.at("root").get<uint32_t>(), m.at("active").get<bool>());
     } else if (type == "window_action") {
       auto found = windows.find(m.at("id").get<uint32_t>());
@@ -1575,11 +1652,13 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_CLOSE) {
+      releasePointer(false);
       PostQuitMessage(0);
       return 0;
     }
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
+    releasePointer(false);
     PostQuitMessage(1);
     return 0;
   }
@@ -1680,6 +1759,7 @@ int wmain(int argc, wchar_t **argv) {
             {"version", 3},
             {"split_media", true},
             {"frame_ack", true},
+            {"pointer_lock", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},
@@ -1692,6 +1772,7 @@ int wmain(int argc, wchar_t **argv) {
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
+  releasePointer(false);
   running = false;
   inboxWake.notify_all();
   frameWake.notify_all();

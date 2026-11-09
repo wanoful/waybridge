@@ -137,6 +137,25 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 
 开发诊断环境变量：`WAYBRIDGE_DPI=168` 强制 175%，`WAYBRIDGE_GDI=1` 强制备用绘制，`WAYBRIDGE_PNG=1` 禁用查看端 H.264 协商。正常使用跟随 Windows 的实际 DPI。清除环境变量恢复自动选择。
 
+## 相对鼠标与锁指针首版
+
+新版两端支持 Wayland `relative-pointer` 与 `pointer-constraints` 的 locked-pointer
+路径。应用请求锁定后，仅在对应顶层窗口聚焦、指针命中目标、Windows 成功建立
+Raw Input 与本地隐藏/约束时才通知应用锁定。移动不再受屏幕边缘限制。
+**Ctrl+Alt+Shift+F12** 可紧急释放；失焦、关闭、断线和应用撤销约束也会恢复光标。
+紧急释放后需指针离开再进入、切换焦点或应用新建约束才能重新锁定。
+
+首版不激活 confined-pointer，不支持弹出窗口锁定、光标位置提示或仅请求
+relative-pointer 的无锁相对输入。老查看端继续使用普通绝对输入。实际 Windows
+鼠标/游戏兼容性和 ARM64 运行仍需实机验证；隔离 Wine 的合成 Raw Input 验证
+不代表硬件验证。协议见 [锁指针扩展](PROTOCOL.md#locked-relative-pointer-optional-v3-extension)。
+
+```bash
+python tests/relative_smoke.py
+# 可选：完整 Windows .exe 在私有 Wine/Xvfb 桌面运行
+python tests/windows_relative_smoke.py
+```
+
 ## 当前边界与后续工作
 
 - 改进 GPU 直接送入编码器与异步回读，减少 CPU 往返；增加 UDP/FEC 和拥塞控制。
@@ -144,7 +163,7 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 - 每个视频顶层窗口使用一个 NVENC 会话；会话数量受硬件/驱动限制，不能分配时回退 PNG。视频支持范围为 48×48 至 4096×2304，其他尺寸走 PNG。
 - 完善模态协议、窗口状态和光标/输入区域映射。
 - 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。
-- 接入 Xwayland，完善输入法、相对鼠标、指针形状和显式同步。
+- 接入 Xwayland，完善输入法、相对鼠标的无锁/约束区域路径、指针形状和显式同步。
 - 实现 Linux → Windows 原生拖出、目录和按需文件访问。
 - 完善音频、断点续传、文件传输进度/取消、端到端加密及会话管理。
 
