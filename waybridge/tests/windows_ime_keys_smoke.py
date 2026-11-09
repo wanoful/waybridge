@@ -9,8 +9,10 @@ import json
 import os
 from pathlib import Path
 import socket
+import select as select_io
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -82,6 +84,15 @@ def main():
             def snapshot():
                 with lock: return list(messages)
 
+            def relative_state(locked):
+                output = monitor("state")
+                fields = output.split()
+                x, y, right, bottom, shown = map(int, fields[1:5] + fields[6:7])
+                if locked:
+                    assert (right - x, bottom - y, shown) == (1, 1, 0), (output, snapshot())
+                else:
+                    assert (x, y, right, bottom, shown) == (0, 0, 1280, 1024, 1), (output, snapshot())
+
             send(type="hello", version=3, codec="mixed", split_media=False)
             send(type="window", id=1, width=320, height=200, title="IME key routing probe")
             image = io.BytesIO(); Image.new("RGBA", (320, 200), (255, 0, 0, 255)).save(image, format="PNG")
@@ -105,46 +116,95 @@ def main():
             def text(result):
                 return "".join(m.get("commit", "") for m in result if m["type"] == "ime")
 
-            space = run("shortcut")
-            assert keys(space) == [(29, True), (57, True), (57, False), (29, False)], space
-            assert not text(space), space
-            late = run("late-character")
-            assert keys(late) == keys(space) and not text(late), late
-            select = run("select")
-            assert keys(select) == [(29, True), (30, True), (30, False), (29, False)] and not text(select), select
-            alt = run("right-alt-shortcut")
-            assert keys(alt) == [(29, True), (100, True), (16, True), (16, False), (100, False), (29, False)] and not text(alt), alt
-            for action, modifier, key in (("composition", 29, 46), ("cancel", 29, 46), ("shift", 42, 105)):
-                result = run(action)
-                assert keys(result) == [(modifier, True), (modifier, False), (modifier, True), (key, True), (key, False), (modifier, False)], result
-                assert not text(result), result
-            released = run("released")
-            assert keys(released) == [(29, True), (29, False)] and text(released) == "c", released
-            unicode = run("unicode")
-            assert not keys(unicode) and text(unicode) == "你🙂", unicode
-            typed = run("type")
-            assert not keys(typed) and text(typed) == "a", typed
-            started = run("generation-start")
-            assert keys(started) == [(29, True), (29, False)], started
-            start = len(snapshot())
-            send(type="ime_state", enabled=True, id=1, generation=43, rectangle=[30, 10, 1, 20], purpose=0)
-            wait_for(lambda: native("ready-new", check=False).returncode == 0)
-            native("old-end")
-            time.sleep(.15)
-            changed = snapshot()[start:]
-            assert not keys(changed), changed
-            copied = run("copy-release")
-            assert keys(copied) == [(29, True), (46, True), (46, False), (29, False)], copied
-            for drag, action in enumerate(("ole-start", "ole-composition"), 1):
+            if "--ole" in sys.argv:
+                send(type="ime_state", enabled=True, id=1, generation=43, rectangle=[30, 10, 1, 20], purpose=0)
+                wait_for(lambda: native("ready-new", check=False).returncode == 0)
+            else:
+                space = run("shortcut")
+                assert keys(space) == [(29, True), (57, True), (57, False), (29, False)], space
+                assert not text(space), space
+                late = run("late-character")
+                assert keys(late) == keys(space) and not text(late), late
+                select = run("select")
+                assert keys(select) == [(29, True), (30, True), (30, False), (29, False)] and not text(select), select
+                alt = run("right-alt-shortcut")
+                assert keys(alt) == [(29, True), (100, True), (16, True), (16, False), (100, False), (29, False)] and not text(alt), alt
+                for action, modifier, key in (("composition", 29, 46), ("cancel", 29, 46), ("shift", 42, 105)):
+                    result = run(action)
+                    assert keys(result) == [(modifier, True), (modifier, False), (modifier, True), (key, True), (key, False), (modifier, False)], result
+                    assert not text(result), result
+                released = run("released")
+                assert keys(released) == [(29, True), (29, False)] and text(released) == "c", released
+                unicode = run("unicode")
+                assert not keys(unicode) and text(unicode) == "你🙂", unicode
+                typed = run("type")
+                assert not keys(typed) and text(typed) == "a", typed
+                started = run("generation-start")
+                assert keys(started) == [(29, True), (29, False)], started
+                start = len(snapshot())
+                send(type="ime_state", enabled=True, id=1, generation=43, rectangle=[30, 10, 1, 20], purpose=0)
+                wait_for(lambda: native("ready-new", check=False).returncode == 0)
+                native("old-end")
+                time.sleep(.15)
+                changed = snapshot()[start:]
+                assert not keys(changed), changed
+                copied = run("copy-release")
+                assert keys(copied) == [(29, True), (46, True), (46, False), (29, False)], copied
+            observer = subprocess.Popen(["wine", str(probe), "relative-monitor"], env=env,
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                                        text=True, bufsize=1)
+            processes.append(observer)
+            assert observer.stdout.readline().strip() == "READY"
+
+            def monitor(command):
+                observer.stdin.write(command + "\n"); observer.stdin.flush()
+                assert select_io.select([observer.stdout], [], [], 5)[0], "relative state monitor timed out"
+                return observer.stdout.readline().strip()
+
+            for drag, action in enumerate(("ole-start", "ole-composition", "ole-start"), 1):
+                lock_test = drag == 3
                 start = len(snapshot())
                 driver = subprocess.Popen(["wine", str(probe), action], env=env, stdout=log, stderr=log)
                 processes.append(driver)
                 wait_for(lambda: any(m["type"] == "button" and m.get("down") for m in snapshot()[start:]))
+                assert driver.wait(timeout=5) == 0
+                if lock_test:
+                    # Place the local cover at the future clipped point before
+                    # locking; creating a window can itself change Wine focus.
+                    assert monitor("cover") == "COVER"
+                    assert monitor("focus") == "FOCUS"
+                    generation = 100 + drag * 2
+                    send(type="pointer_lock", id=1, generation=generation, active=True)
+                    wait_for(lambda: any(m["type"] == "pointer_lock_ack" and
+                                         m.get("generation") == generation and m.get("active")
+                                         for m in snapshot()[start:]))
+                    relative_state(True)
                 send(type="drag_offer", drag=drag, id=1, files=[dict(id=0, name="copy.txt", size=0)])
                 wait_for(lambda: any(m["type"] == "drag_claim" and m.get("drag") == drag for m in snapshot()[start:]))
+                # DoDragDrop must receive an unclipped, visible pointer even
+                # when the previous remote interaction owned a native lock.
                 send(type="drag_ready", drag=drag)
-                assert driver.wait(timeout=5) == 0
+                if lock_test:
+                    wait_for(lambda: any(m["type"] == "pointer_lock_ack" and
+                                         m.get("generation") == generation and not m.get("active")
+                                         for m in snapshot()[start:]))
                 wait_for(lambda: native("ole-suspended", check=False).returncode == 0)
+                assert not any(m["type"] == "drag_result" for m in snapshot()[start:]), snapshot()[start:]
+                if lock_test:
+                    relative_state(False)
+                    # DoDragDrop pumps the UI inbox. Restore focus without
+                    # launching a new process, then verify a late lock is denied.
+                    assert monitor("focus") == "FOCUS"
+                    late_generation = generation + 1
+                    send(type="pointer_lock", id=1, generation=late_generation, active=True)
+                    wait_for(lambda: any(m["type"] == "pointer_lock_ack" and
+                                         m.get("generation") == late_generation
+                                         for m in snapshot()[start:]))
+                    assert not any(m["type"] == "pointer_lock_ack" and
+                                   m.get("generation") == late_generation and m.get("active")
+                                   for m in snapshot()[start:]), snapshot()[start:]
+                    relative_state(False)
+                    assert monitor("uncover") == "UNCOVER"
                 native("ole-end")
                 wait_for(lambda: any(m["type"] == "drag_result" and m.get("drag") == drag for m in snapshot()[start:]))
                 handoff = snapshot()[start:]
@@ -158,12 +218,17 @@ def main():
                 assert not keys(restored) and text(restored) == "c", restored
                 normal = run("select")
                 assert keys(normal) == [(29, True), (30, True), (30, False), (29, False)] and not text(normal), normal
+            assert monitor("quit") == "BYE"
+            assert observer.wait(timeout=5) == 0
             start = len(snapshot())
             lost = run("focus-lost-end")
             assert keys(lost) == [(29, True), (29, False)], lost
             assert any(m["type"] == "focus" and not m["focused"] for m in snapshot()[start:])
             assert client.poll() is None
-            print("PASS: actual SendInput Ctrl+Space/Ctrl+A route once; held Ctrl/Shift restored after controlled composition end/cancel; OLE handoff cancels preedit/releases raw keys, ignores stale END and restores fresh text/shortcuts; generation cancellation restores no stale keys; Unicode/emoji and English commit once (Wine; no Microsoft IME engine)")
+            if "--ole" in sys.argv:
+                print("PASS: actual PE native relative lock releases before OLE; late locks rejected during drag; unclipped visible cursor, cancelled preedit/released raw keys and fresh text/shortcuts after handoff (Wine)")
+            else:
+                print("PASS: actual SendInput Ctrl+Space/Ctrl+A route once; held Ctrl/Shift restored after controlled composition end/cancel; OLE handoff releases native relative lock/clip/cursor, cancels preedit/releases raw keys, ignores stale END and restores fresh text/shortcuts; generation cancellation restores no stale keys; Unicode/emoji and English commit once (Wine; no Microsoft IME engine)")
         except BaseException:
             print(Path(log.name).read_text())
             raise

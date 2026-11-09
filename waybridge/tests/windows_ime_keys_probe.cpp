@@ -3,6 +3,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <imm.h>
+#include <algorithm>
 #include <iostream>
 #include <string>
 
@@ -21,15 +22,92 @@ int wmain(int argc, wchar_t **argv) {
   if (argc != 2) return 1;
   HWND hwnd = FindWindowW(L"WaybridgeRemote", L"IME key routing probe");
   if (!hwnd) return 2;
+  std::wstring action = argv[1];
   SetForegroundWindow(hwnd);
   Sleep(200);
-  std::wstring action = argv[1];
   if (action == L"ready" || action == L"ready-new") {
     GUITHREADINFO info{};
     info.cbSize = sizeof(info);
     return GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, nullptr), &info) &&
                    info.hwndFocus == hwnd && info.hwndCaret == hwnd &&
                    info.rcCaret.left == (action == L"ready" ? 10 : 30) ? 0 : 4;
+  }
+  if (action == L"relative-monitor") {
+    // Keep one probe alive before locking: launching/focusing another process
+    // while locked can itself release the lock and invalidate the observation.
+    HWND cover = nullptr;
+    MSG message{};
+    PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
+    HANDLE reader = CreateThread(nullptr, 0, [](LPVOID data) -> DWORD {
+      auto target = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(data));
+      std::string command;
+      while (std::getline(std::cin, command)) {
+        auto copy = new std::string(command);
+        if (!PostThreadMessageW(target, WM_APP + 42, 0, reinterpret_cast<LPARAM>(copy))) {
+          delete copy;
+          return 1;
+        }
+        if (command == "quit") break;
+      }
+      return 0;
+    }, reinterpret_cast<LPVOID>(static_cast<ULONG_PTR>(GetCurrentThreadId())), 0, nullptr);
+    if (!reader) return 7;
+    std::cout << "READY" << std::endl;
+    while (GetMessageW(&message, nullptr, 0, 0)) {
+      if (message.message != WM_APP + 42) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+        continue;
+      }
+      auto copy = reinterpret_cast<std::string *>(message.lParam);
+      std::string command = *copy;
+      delete copy;
+      if (command == "focus") {
+        SetForegroundWindow(hwnd);
+        Sleep(100);
+        GUITHREADINFO info{};
+        info.cbSize = sizeof(info);
+        if (!GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, nullptr), &info) ||
+            info.hwndFocus != hwnd) return 12;
+        std::cout << "FOCUS" << std::endl;
+      } else if (command == "state") {
+        RECT clip{};
+        CURSORINFO cursor{};
+        cursor.cbSize = sizeof(cursor);
+        if (!GetClipCursor(&clip) || !GetCursorInfo(&cursor)) return 9;
+        std::cout << "CLIP " << clip.left << ' ' << clip.top << ' ' << clip.right << ' '
+                  << clip.bottom << " SHOWING " << ((cursor.flags & CURSOR_SHOWING) ? 1 : 0) << std::endl;
+      } else if (command == "cover") {
+        // A local no-activate cover permits an outbound claim while preserving
+        // the remote source's focus and its already active native pointer lock.
+        POINT point{};
+        GetCursorPos(&point);
+        RECT area{};
+        GetClientRect(hwnd, &area);
+        POINT first{area.left, area.top}, last{area.right, area.bottom};
+        ClientToScreen(hwnd, &first); ClientToScreen(hwnd, &last);
+        point.x = std::clamp(point.x, first.x, last.x - 1);
+        point.y = std::clamp(point.y, first.y, last.y - 1);
+        cover = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOPMOST, L"STATIC",
+                                L"Relative OLE handoff cover", WS_POPUP | WS_VISIBLE,
+                                point.x - 10, point.y - 10, 21, 21, nullptr, nullptr,
+                                GetModuleHandleW(nullptr), nullptr);
+        if (!cover) return 10;
+        std::cout << "COVER" << std::endl;
+      } else if (command == "uncover") {
+        if (cover) DestroyWindow(cover);
+        cover = nullptr;
+        std::cout << "UNCOVER" << std::endl;
+      } else if (command == "quit") {
+        if (cover) DestroyWindow(cover);
+        WaitForSingleObject(reader, 1000);
+        CloseHandle(reader);
+        std::cout << "BYE" << std::endl;
+        return 0;
+      } else return 11;
+    }
+    CloseHandle(reader);
+    return 0;
   }
   if (action == L"ole-start" || action == L"ole-composition") {
     key(VK_CONTROL, true);

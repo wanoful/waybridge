@@ -2239,6 +2239,7 @@ void dispatchNetwork() {
       } else {
         auto found = windows.find(id);
         bool locked = found != windows.end() && !found->second->popup && !grabbedRoot &&
+                      !FileDrag::ownsInput() &&
                       relativeInput.lock(found->second->hwnd, id, generation);
         if (!locked) refreshCursor();
         std::cout << "Pointer lock " << (locked ? "active" : "unavailable")
