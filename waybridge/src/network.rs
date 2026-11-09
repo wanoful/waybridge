@@ -29,6 +29,8 @@ type QueuedFrame = (u8, Vec<u8>, Option<Instant>);
 
 #[derive(Default)]
 struct Queue {
+    audio: VecDeque<Vec<u8>>,
+    audio_unacked: BTreeSet<u64>,
     controls: VecDeque<Vec<u8>>,
     frames: BTreeMap<u32, VecDeque<QueuedFrame>>,
     png_only: BTreeSet<u32>,
@@ -69,6 +71,8 @@ impl Queue {
 }
 
 pub struct Peer {
+    audio_enabled: bool,
+    audio_attached: AtomicBool,
     queue: Mutex<Queue>,
     wake: Condvar,
     split_media: bool,
@@ -78,6 +82,41 @@ pub struct Peer {
 }
 
 impl Peer {
+    pub fn audio_frame(&self, frame: Vec<u8>) {
+        if !self.audio_enabled || !self.audio_attached.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut q = self.queue.lock().unwrap();
+        if q.closed {
+            return;
+        }
+        while q.audio.len() >= 4 {
+            q.audio.pop_front();
+        }
+        q.audio.push_back(frame);
+        self.wake.notify_all();
+    }
+    fn write_audio(&self, mut socket: TcpStream, alive: &AtomicBool) -> io::Result<()> {
+        loop {
+            let frame = {
+                let mut q = self.queue.lock().unwrap();
+                while (q.audio.is_empty() || q.audio_unacked.len() >= 4)
+                    && !q.closed
+                    && alive.load(Ordering::Relaxed)
+                {
+                    q = self.wake.wait(q).unwrap();
+                }
+                if q.closed || !alive.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let frame = q.audio.pop_front().unwrap();
+                q.audio_unacked
+                    .insert(u64::from_be_bytes(frame[12..20].try_into().unwrap()));
+                frame
+            };
+            protocol::write_packet(&mut socket, 3, &frame)?;
+        }
+    }
     pub fn begin_resize(&self, id: u32, width: u32, height: u32, started: Instant) {
         self.queue.lock().unwrap().resizes.insert(
             id,
@@ -306,6 +345,7 @@ pub fn listen(
     address: &str,
     token: String,
     hdr_enabled: bool,
+    audio: bool,
 ) -> anyhow::Result<(Receiver<Event>, SyncSender<Event>)> {
     let listener = TcpListener::bind(address)?;
     tracing::info!(address = %listener.local_addr()?, "viewer listener ready");
@@ -335,6 +375,74 @@ pub fn listen(
                 {
                     return;
                 }
+                if hello["channel"] == "audio" {
+                    let peer = session.lock().unwrap().as_ref().and_then(|(key, peer)| {
+                        (hello["media_key"].as_str() == Some(key))
+                            .then(|| peer.upgrade())
+                            .flatten()
+                    });
+                    let Some(peer) = peer else { return };
+                    if !peer.audio_enabled || peer.audio_attached.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(mut ack_socket) = socket.try_clone() else {
+                        peer.audio_attached.store(false, Ordering::SeqCst);
+                        return;
+                    };
+                    let shutdown = socket.try_clone().ok();
+                    let alive = Arc::new(AtomicBool::new(true));
+                    let reader_alive = alive.clone();
+                    let reader_peer = peer.clone();
+                    let reader = thread::spawn(move || {
+                        use std::io::Read;
+                        let mut header = [0; 4];
+                        while ack_socket.read_exact(&mut header).is_ok() {
+                            let size = u32::from_be_bytes(header) as usize;
+                            if !(2..=512).contains(&size) {
+                                break;
+                            }
+                            let mut body = vec![0; size];
+                            if ack_socket.read_exact(&mut body).is_err()
+                                || body[0] != protocol::JSON
+                            {
+                                break;
+                            }
+                            let Ok(value) = serde_json::from_slice::<Value>(&body[1..]) else {
+                                break;
+                            };
+                            if value["type"] != "audio_ack" {
+                                break;
+                            }
+                            let Some(sequence) = value["sequence"].as_u64() else {
+                                break;
+                            };
+                            let mut q = reader_peer.queue.lock().unwrap();
+                            if q.audio_unacked.contains(&sequence) {
+                                q.audio_unacked.retain(|s| *s > sequence);
+                                reader_peer.wake.notify_all();
+                            }
+                        }
+                        // Change the wait predicate under its mutex to prevent a lost EOF wake.
+                        let _queue = reader_peer.queue.lock().unwrap();
+                        reader_alive.store(false, Ordering::Relaxed);
+                        reader_peer.wake.notify_all();
+                    });
+                    let _ = protocol::write_packet(
+                        &mut socket,
+                        protocol::JSON,
+                        b"{\"type\":\"audio_ready\"}",
+                    );
+                    let _ = peer.write_audio(socket, &alive);
+                    if let Some(socket) = shutdown {
+                        let _ = socket.shutdown(std::net::Shutdown::Both);
+                    }
+                    let _ = reader.join();
+                    let mut q = peer.queue.lock().unwrap();
+                    q.audio.clear();
+                    q.audio_unacked.clear();
+                    peer.audio_attached.store(false, Ordering::SeqCst);
+                    return;
+                }
                 if hello["channel"] == "media" {
                     let peer = session.lock().unwrap().as_ref().and_then(|(key, peer)| {
                         (hello["media_key"].as_str() == Some(key))
@@ -358,6 +466,8 @@ pub fn listen(
                     return;
                 }
                 let peer = Arc::new(Peer {
+                    audio_enabled: audio && hello["audio_pcm"].as_bool().unwrap_or(false),
+                    audio_attached: AtomicBool::new(false),
                     queue: Mutex::new(Queue::default()),
                     wake: Condvar::new(),
                     split_media: hello["split_media"].as_bool().unwrap_or(false),
@@ -403,7 +513,7 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "hdr":hdr_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

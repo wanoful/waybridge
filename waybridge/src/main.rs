@@ -1,4 +1,5 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
+mod audio;
 mod color;
 mod color_management;
 mod metrics;
@@ -104,6 +105,9 @@ struct Args {
     /// Experimental explicitly tagged Windows-scRGB surfaces (not general ICC HDR).
     #[arg(long,default_value="off",value_parser=["off","experimental-scrgb"])]
     hdr: String,
+    /// Capture only this session's private PulseAudio/PipeWire-Pulse sink.
+    #[arg(long)]
+    audio: bool,
     /// Use an SSH tunnel to this loopback listener for the initial prototype.
     #[arg(long, default_value = "127.0.0.1:49090")]
     listen: String,
@@ -176,6 +180,7 @@ struct App {
     _color_manager: Option<GlobalId>,
     gpu_device: Option<Rc<waybridge_codec::GpuDevice>>,
     video_codec: Option<waybridge_codec::Codec>,
+    audio: Option<audio::Session>,
     dh: DisplayHandle,
     compositor: CompositorState,
     shell: XdgShellState,
@@ -1775,12 +1780,18 @@ fn main() -> Result<()> {
     let dh = display.handle();
     let socket = ListeningSocket::bind(&args.socket)
         .context("binding private Wayland socket (already running?)")?;
+    let audio = if args.audio {
+        Some(audio::Session::new()?)
+    } else {
+        None
+    };
     let (events, tx) = network::listen(
         &args.listen,
         auth,
         color_programs.is_some()
             && gpu_device.is_some()
             && video_codec.is_some_and(|c| c.hdr_variant().is_some()),
+        audio.is_some(),
     )?;
     let compositor = CompositorState::new_v6::<App>(&dh);
     let shell = XdgShellState::new::<App>(&dh);
@@ -1845,6 +1856,7 @@ fn main() -> Result<()> {
         color_programs,
         gpu_device,
         video_codec,
+        audio,
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1885,11 +1897,16 @@ fn main() -> Result<()> {
     };
     let mut children: Vec<Child> = Vec::new();
     if let Some(program) = args.command.first() {
+        let mut command = Command::new(program);
+        command
+            .args(&args.command[1..])
+            .env("WAYLAND_DISPLAY", &args.socket)
+            .env_remove("DISPLAY");
+        if let Some(audio) = &app.audio {
+            command.env("PULSE_SINK", audio.sink());
+        }
         children.push(
-            Command::new(program)
-                .args(&args.command[1..])
-                .env("WAYLAND_DISPLAY", &args.socket)
-                .env_remove("DISPLAY")
+            command
                 .spawn()
                 .with_context(|| format!("launching {program}"))?,
         );
@@ -1897,7 +1914,7 @@ fn main() -> Result<()> {
     tracing::info!(socket = %args.socket, token_file = %token_path.display(), "ready; launch apps with WAYLAND_DISPLAY set to this socket");
     let interval = Duration::from_secs_f64(1.0 / args.fps as f64);
     let mut next_frame = Instant::now();
-    loop {
+    while !audio::stopping() {
         while let Some(stream) = socket.accept()? {
             app.dh
                 .insert_client(stream, Arc::new(ClientState::default()))?;
@@ -1910,6 +1927,9 @@ fn main() -> Result<()> {
             let Ok(event) = events.try_recv() else { break };
             match event {
                 Event::Connected(peer) => {
+                    if let Some(audio) = &app.audio {
+                        audio.set_peer(Some(&peer));
+                    }
                     app.release_input();
                     app.peer = Some(peer);
                     for p in &mut app.remote_popups {
@@ -1937,6 +1957,9 @@ fn main() -> Result<()> {
                 Event::Message(value) => app.message(value),
                 Event::Disconnected => {
                     app.release_gpu_sources();
+                    if let Some(audio) = &app.audio {
+                        audio.set_peer(None);
+                    }
                     app.release_input();
                     app.encoder.reset();
                     app.focus(None);
@@ -1977,6 +2000,7 @@ fn main() -> Result<()> {
         children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
         std::thread::sleep(Duration::from_millis(2));
     }
+    Ok(())
 }
 
 fn dpi_scale(value: &Value) -> f64 {

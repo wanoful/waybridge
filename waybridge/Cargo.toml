@@ -8,6 +8,7 @@ description = "A headless Wayland compositor with native remote application wind
 [dependencies]
 waybridge-codec = { path = "native" }
 anyhow = "1"
+libc = "0.2"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -1101,6 +1101,7 @@ dependencies = [
  "base64",
  "clap",
  "image",
+ "libc",
  "percent-encoding",
  "serde",
  "serde_json",
