@@ -72,6 +72,9 @@ impl Codec {
         Self::HevcHdr,
         Self::Av1Hdr,
     ];
+    pub fn from_kind(kind: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|codec| *codec as u8 == kind)
+    }
     pub fn hdr(self) -> bool {
         matches!(self, Self::HevcHdr | Self::Av1Hdr)
     }
@@ -278,5 +281,20 @@ pub fn probe_10bit(codec: Codec) -> Result<(u32, u32, u32), String> {
             .into_owned())
     } else {
         Ok((depth as u32, distinct as u32, peak as u32))
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::Codec;
+
+    #[test]
+    fn video_kinds_round_trip_without_claiming_other_channels() {
+        for codec in Codec::ALL {
+            assert_eq!(Codec::from_kind(codec as u8), Some(codec));
+        }
+        for kind in [0, 1, 3, 6, 9, 255] {
+            assert_eq!(Codec::from_kind(kind), None);
+        }
     }
 }
