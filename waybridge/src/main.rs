@@ -1,5 +1,6 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
 mod drag;
+mod file_tree;
 mod metrics;
 mod network;
 mod protocol;
@@ -668,6 +669,30 @@ impl App {
         self.drop_accepted = false;
     }
 
+    fn publish_uploaded_files(&mut self, value: &Value, uris: Vec<u8>) {
+        let id = value["id"]
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .unwrap_or(0);
+        if value["drop"].as_bool() == Some(true) {
+            let (x, y) = self.message_position(id, value);
+            self.begin_file_drop(id, x, y, uris);
+        } else {
+            let contents = BTreeMap::from([("text/uri-list".to_string(), uris)]);
+            self.clipboard_generation += 1;
+            if let Some(peer) = &self.peer {
+                peer.begin_file_export(self.clipboard_generation);
+            }
+            self.clipboard = contents.clone();
+            set_data_device_selection(
+                &self.dh,
+                &self.seat,
+                vec!["text/uri-list".into()],
+                Arc::new(contents),
+            );
+        }
+    }
+
     fn message(&mut self, value: Value) {
         let id = value["id"]
             .as_u64()
@@ -897,6 +922,9 @@ impl App {
                     }
                 }
                 self.clipboard_generation += 1; // discard reads from a superseded Linux selection
+                if let Some(peer) = &self.peer {
+                    peer.begin_file_export(self.clipboard_generation);
+                }
                 self.clipboard = contents.clone();
                 let seat = self.seat.clone();
                 set_data_device_selection(
@@ -910,6 +938,89 @@ impl App {
                 for window in &mut self.windows {
                     window.announced = false;
                     window.dirty = true;
+                }
+            }
+            "file_tree_epoch" if self.peer.as_ref().is_some_and(|p| p.file_tree()) => {
+                if let (Some(peer), Some(epoch)) = (&self.peer, value["epoch"].as_u64()) {
+                    if epoch > peer.file_epoch() {
+                        peer.set_file_epoch(epoch);
+                        self.clipboard_generation += 1;
+                        peer.begin_file_export(self.clipboard_generation);
+                    }
+                }
+            }
+            "tree_upload_begin" | "tree_upload_chunk" | "tree_upload_end"
+            | "tree_upload_commit" | "tree_upload_cancel" => {
+                let batch = value["batch"].as_u64().unwrap_or(0);
+                // Once a batch has failed/finished, queued chunks are stale.
+                // Report the first failure without flooding the control queue.
+                if !matches!(
+                    value["type"].as_str(),
+                    Some("tree_upload_begin" | "tree_upload_cancel")
+                ) && !self.transfers.has_tree(batch)
+                {
+                    return;
+                }
+                let result = (|| -> Result<()> {
+                    if !self.peer.as_ref().is_some_and(|p| p.file_tree()) {
+                        bail!("file_tree capability required");
+                    }
+                    match value["type"].as_str().unwrap() {
+                        "tree_upload_begin" => {
+                            let metadata = value["entries"]
+                                .as_array()
+                                .context("missing tree entries")?;
+                            if metadata.is_empty() || metadata.len() > file_tree::MAX_ENTRIES {
+                                bail!("invalid tree entry count");
+                            }
+                            let entries: Vec<file_tree::Entry> =
+                                serde::Deserialize::deserialize(&value["entries"])?;
+                            let epoch =
+                                if value["drop"].as_bool() == Some(true) {
+                                    None
+                                } else {
+                                    Some(value["epoch"].as_u64().unwrap_or_else(|| {
+                                        self.peer.as_ref().unwrap().file_epoch()
+                                    }))
+                                };
+                            if epoch.is_some_and(|epoch| {
+                                epoch != self.peer.as_ref().unwrap().file_epoch()
+                            }) {
+                                bail!("clipboard upload superseded");
+                            }
+                            self.transfers.begin_tree(batch, entries, epoch)?;
+                            self.control(
+                                json!({"type":"tree_upload_ready","batch":batch,"stage":"begin"}),
+                            );
+                        }
+                        "tree_upload_chunk" => self.transfers.tree_chunk(
+                            batch,
+                            usize::try_from(value["file"].as_u64().context("missing file")?)?,
+                            value["data"].as_str().context("missing chunk")?,
+                        )?,
+                        "tree_upload_end" => self.transfers.tree_end(
+                            batch,
+                            usize::try_from(value["file"].as_u64().context("missing file")?)?,
+                        )?,
+                        "tree_upload_commit" => {
+                            let uris = self.transfers.finish_tree(
+                                batch,
+                                self.peer.as_ref().unwrap().file_epoch(),
+                                value["drop"].as_bool() == Some(true),
+                            )?;
+                            self.publish_uploaded_files(&value, uris);
+                            self.control(
+                                json!({"type":"tree_upload_ready","batch":batch,"stage":"commit"}),
+                            );
+                        }
+                        "tree_upload_cancel" => self.transfers.cancel_tree(batch),
+                        _ => {}
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    self.transfers.cancel_tree(batch);
+                    self.control(json!({"type":"tree_upload_error","batch":batch,"message":error.to_string()}));
                 }
             }
             "upload_begin" | "upload_chunk" | "upload_end" | "upload_commit" => {
@@ -929,21 +1040,7 @@ impl App {
                         "upload_commit" => {
                             let ids: Vec<u64> = serde_json::from_value(value["transfers"].clone())?;
                             let uris = self.transfers.finish(&ids)?;
-                            if value["drop"].as_bool() == Some(true) {
-                                let (x, y) = self.message_position(id, &value);
-                                self.begin_file_drop(id, x, y, uris);
-                                self.control(json!({"type":"upload_ready","files":ids.len()}));
-                                return Ok(());
-                            }
-                            let contents = BTreeMap::from([("text/uri-list".to_string(), uris)]);
-                            self.clipboard_generation += 1;
-                            self.clipboard = contents.clone();
-                            set_data_device_selection(
-                                &self.dh,
-                                &self.seat,
-                                vec!["text/uri-list".into()],
-                                Arc::new(contents),
-                            );
+                            self.publish_uploaded_files(&value, uris);
                             self.control(json!({"type":"upload_ready","files":ids.len()}));
                         }
                         _ => {}
@@ -1560,8 +1657,11 @@ impl SelectionHandler for App {
         }
         self.clipboard_generation += 1;
         let generation = self.clipboard_generation;
+        if let Some(peer) = &self.peer {
+            peer.begin_file_export(generation);
+        }
         self.clipboard.clear();
-        self.control(json!({"type":"clipboard", "items":{}}));
+        self.control(json!({"type":"clipboard", "items":{}, "generation":generation}));
         let Some(source) = source else { return };
         let types = source.mime_types();
         for mime in [
@@ -1911,7 +2011,7 @@ fn main() -> Result<()> {
                         .map(|(mime, data)| (mime.clone(), B64.encode(data)))
                         .collect();
                     if !items.is_empty() {
-                        app.control(json!({"type":"clipboard", "items":items}));
+                        app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                     }
                 }
                 Event::Message(value) => app.message(value),
@@ -1920,9 +2020,10 @@ fn main() -> Result<()> {
                         match result {
                             Ok(files) => {
                                 let manifest = files.manifest.clone();
+                                let tree = files.tree;
                                 let window = drag.window;
                                 drag.files = Some(files);
-                                app.control(json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"action":"copy"}));
+                                app.control(json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"tree":tree,"action":"copy"}));
                             }
                             Err(error) => {
                                 tracing::debug!(%error, "outbound drag not supported");
@@ -1957,7 +2058,7 @@ fn main() -> Result<()> {
                         .iter()
                         .map(|(mime, data)| (mime.clone(), B64.encode(data)))
                         .collect();
-                    app.control(json!({"type":"clipboard", "items":items}));
+                    app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                 }
                 Event::Clipboard { .. } => {}
             }

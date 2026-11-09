@@ -11,6 +11,7 @@ constexpr size_t Chunk = 65536;
 struct File {
   std::wstring name;
   uint64_t size;
+  bool directory = false;
 };
 struct Response {
   bool ready = false, failed = false;
@@ -332,6 +333,8 @@ public:
     if (format->cfFormat == contents) {
       if (format->lindex < 0 || size_t(format->lindex) >= transfer->files.size())
         return DV_E_LINDEX;
+      if (transfer->files[size_t(format->lindex)].directory)
+        return DV_E_FORMATETC;
       return format->tymed & TYMED_ISTREAM ? S_OK : DV_E_TYMED;
     }
     if (format->cfFormat != descriptor && format->cfFormat != preferred)
@@ -370,7 +373,7 @@ public:
         auto &d = group->fgd[i];
         const auto &file = transfer->files[i];
         d.dwFlags = FD_UNICODE | FD_FILESIZE | FD_ATTRIBUTES | FD_PROGRESSUI;
-        d.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        d.dwFileAttributes = file.directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
         d.nFileSizeHigh = static_cast<DWORD>(file.size >> 32);
         d.nFileSizeLow = static_cast<DWORD>(file.size);
         memcpy(d.cFileName, file.name.c_str(), (file.name.size() + 1) * sizeof(wchar_t));
@@ -584,43 +587,38 @@ inline bool control(const Json &message, HWND controllerWindow, HWND sourceWindo
       }
     }
     if (!sourceWindow || !message.at("files").is_array() || message["files"].empty() ||
-        message["files"].size() > 128) {
+        message["files"].size() > (message.value("tree", false) ? FileTree::MaxEntries : 128)) {
       state->finish(false);
       return true;
     }
-    for (const auto &entry : message["files"]) {
-      auto name = wide(entry.at("name").get<std::string>());
-      auto size = entry.at("size").get<uint64_t>();
-      if (entry.at("id").get<size_t>() != state->files.size() || name.empty() ||
-          name.size() > 240 || name == L"." || name == L".." ||
-          name.find_first_of(L"<>:\"/\\|?*") != std::wstring::npos || name.back() == L'.' ||
-          name.back() == L' ' ||
-          std::any_of(name.begin(), name.end(), [](wchar_t c) { return c < 32; }) ||
-          size > 1024ULL * 1024 * 1024) {
+    if (message.value("tree", false)) {
+      try {
+        FileTree::require(FileTree::supported, "file_tree capability required");
+        auto entries = FileTree::parse(message["files"]);
+        for (const auto &entry : entries)
+          state->files.push_back({FileTree::nativePath(entry.name), entry.size, entry.directory});
+      } catch (const std::exception &error) {
+        std::cerr << "Native tree drag: " << error.what() << '\n';
         state->finish(false);
         return true;
       }
-      std::wstring stem = name.substr(0, name.find(L'.'));
-      while (!stem.empty() && stem.back() == L' ')
-        stem.pop_back();
-      std::transform(stem.begin(), stem.end(), stem.begin(),
-                     [](wchar_t c) { return c >= L'a' && c <= L'z' ? c - L'a' + L'A' : c; });
-      bool device = stem == L"CON" || stem == L"PRN" || stem == L"AUX" || stem == L"NUL" ||
-                    stem == L"CONIN$" || stem == L"CONOUT$";
-      if (stem.size() == 4 && (stem.substr(0, 3) == L"COM" || stem.substr(0, 3) == L"LPT"))
-        device = device || (stem[3] >= L'1' && stem[3] <= L'9') || stem[3] == L'\u00b9' ||
-                 stem[3] == L'\u00b2' || stem[3] == L'\u00b3';
-      if (device) {
-        state->finish(false);
-        return true;
-      }
-      for (const auto &other : state->files) {
-        if (CompareStringOrdinal(name.c_str(), -1, other.name.c_str(), -1, TRUE) == CSTR_EQUAL) {
+    } else {
+      for (const auto &entry : message["files"]) {
+        auto name = wide(entry.at("name").get<std::string>());
+        auto size = entry.at("size").get<uint64_t>();
+        if (entry.at("id").get<size_t>() != state->files.size() || !FileTree::validName(name) ||
+            size > FileTree::MaxFile) {
           state->finish(false);
           return true;
         }
+        for (const auto &other : state->files) {
+          if (CompareStringOrdinal(name.c_str(), -1, other.name.c_str(), -1, TRUE) == CSTR_EQUAL) {
+            state->finish(false);
+            return true;
+          }
+        }
+        state->files.push_back({std::move(name), size});
       }
-      state->files.push_back({std::move(name), size});
     }
     {
       std::lock_guard<std::mutex> lock(activeMutex);

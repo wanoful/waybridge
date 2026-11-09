@@ -5,14 +5,18 @@ from pathlib import Path
 import socket
 import subprocess
 import tempfile
+import sys
+from urllib.parse import unquote, urlparse
+from tree_smoke import fixture, snapshot, entries
 from drag_out_smoke import wait_for
 from smoke import ROOT
 
 
 def main():
+    tree = "--tree" in sys.argv
     subprocess.run(["bash", "tests/build-fixture.sh"], cwd=ROOT, check=True)
-    for name in ("windows_probe", "windows_drag_out_probe"):
-        subprocess.run(["x86_64-w64-mingw32-g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-municode", "-static", "-O2", f"tests/{name}.cpp", "-o", f"build/tests/{name}.exe", "-lgdi32", "-lshell32", "-lole32", "-luuid"], cwd=ROOT, check=True)
+    for name in ("windows_probe", "windows_drag_out_probe", "windows_tree_probe"):
+        subprocess.run(["x86_64-w64-mingw32-g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-municode", "-static", "-O2", f"tests/{name}.cpp", "-o", f"build/tests/{name}.exe", "-lgdi32", "-lshell32", "-lole32", "-luuid", "-lcrypt32"], cwd=ROOT, check=True)
     prefix = ROOT / "build/wine-drag-out"
     prefix.mkdir(parents=True, mode=0o700, exist_ok=True)
     processes = []
@@ -29,9 +33,18 @@ def main():
         sources = [root / "图片 data.bin", root / "empty.txt"]
         sources[0].write_bytes(payload)
         sources[1].write_bytes(b"")
+        if tree:
+            tree_source = root / "目录树"
+            fixture(tree_source)
+            sources = [tree_source]
+            expected = snapshot(tree_source)
+            descriptor_count = len(entries(tree_source))
         uris = root / "uris"
         uris.write_text("".join(p.as_uri() + "\r\n" for p in sources))
         env = {**os.environ, "XDG_RUNTIME_DIR": directory, "WAYLAND_DISPLAY": "drag-native-0", "WAYBRIDGE_TEST_DRAG_URIS": str(uris)}
+        if tree:
+            env["WAYBRIDGE_TEST_DROP"] = str(root / "drop.txt")
+            env["WAYBRIDGE_TEST_DRAG_ENABLED"] = str(root / "enable-drag")
         with socket.socket() as free:
             free.bind(("127.0.0.1", 0))
             port = free.getsockname()[1]
@@ -42,6 +55,9 @@ def main():
             return subprocess.run(["wine", str(ROOT / "build/tests/windows_probe.exe"), *args], env=wine, capture_output=True, text=True, check=check, timeout=20)
         try:
             subprocess.run(["wineboot", "-u"], env=wine, stdout=log, stderr=log, timeout=60, check=True)
+            if tree:
+                checks = subprocess.run(["wine", str(ROOT / "build/tests/windows_tree_probe.exe")], env=wine, capture_output=True, text=True, timeout=15, check=True)
+                assert "PASS: Win32 tree" in checks.stdout, checks.stdout
             host = subprocess.Popen([str(ROOT / "target/debug/waybridge"), "--socket", "drag-native-0", "--listen", f"127.0.0.1:{port}", "--token-file", str(token), "--codec", "png"], env=env, stdout=log, stderr=log)
             processes.append(host)
             wait_for(lambda: (root / "drag-native-0").exists())
@@ -50,6 +66,25 @@ def main():
             client = subprocess.Popen(["wine", str(ROOT / "build/windows/waybridge-client.exe"), "127.0.0.1", str(port), token.read_text()], env=wine, stdout=log, stderr=log)
             processes.append(client)
             wait_for(lambda: probe("inspect", check=False).returncode == 0, 20)
+            if tree:
+                win_source = "Z:" + str(tree_source).replace("/", "\\")
+                probe("copyfile", win_source)
+                def linux_tree():
+                    result = subprocess.run(["wl-paste", "--no-newline", "--type", "text/uri-list"], env=env, capture_output=True, timeout=3)
+                    return Path(unquote(urlparse(result.stdout.decode().strip()).path)) if result.returncode == 0 else None
+                uploaded = wait_for(lambda: (lambda p: p if p and p.name == tree_source.name and p.exists() else None)(linux_tree()))
+                assert snapshot(uploaded) == expected
+                probe("drop", win_source)
+                wait_for(lambda: (root / "drop.txt").exists() and (root / "drop.txt").stat().st_size)
+                dropped = Path(unquote(urlparse((root / "drop.txt").read_text().strip()).path))
+                assert snapshot(dropped) == expected
+                copier = subprocess.Popen(["wl-copy", "--foreground", "--type", "text/uri-list"], env=env, stdin=subprocess.PIPE, stdout=log, stderr=log)
+                processes.append(copier)
+                copier.stdin.write((tree_source.as_uri() + "\r\n").encode()); copier.stdin.close()
+                path = wait_for(lambda: (lambda r: r.stdout.strip() if r.returncode == 0 and "Waybridge-tree-" in r.stdout else None)(probe("files", check=False)))
+                staged = Path(subprocess.check_output(["winepath", "-u", path], env=wine, text=True).strip())
+                assert snapshot(staged) == expected
+                (root / "enable-drag").touch()
             probe("clipboard", "drag clipboard sentinel")
             finished = cancelled = 0
             for mode in ("sync", "async", "cancel", "reject", "early"):
@@ -59,9 +94,13 @@ def main():
                 assert result.returncode == 0, (mode, result.stdout, result.stderr)
                 if mode in ("sync", "async"):
                     finished += 1
-                    assert (output / sources[0].name).read_bytes() == payload
-                    assert (output / sources[1].name).read_bytes() == b""
-                    assert "EXTRACTED 2" in result.stdout, result.stdout
+                    if tree:
+                        assert snapshot(output / tree_source.name) == expected
+                        assert f"EXTRACTED {descriptor_count}" in result.stdout, result.stdout
+                    else:
+                        assert (output / sources[0].name).read_bytes() == payload
+                        assert (output / sources[1].name).read_bytes() == b""
+                        assert "EXTRACTED 2" in result.stdout, result.stdout
                     if mode == "async":
                         assert "ASYNC_STARTED" in result.stdout
                 else:
@@ -70,7 +109,10 @@ def main():
                 wait_for(lambda: Path(app_log.name).read_text().count("SOURCE_FINISHED") == finished and Path(app_log.name).read_text().count("SOURCE_CANCELLED") == cancelled)
                 assert client.poll() is None and host.poll() is None and app.poll() is None
             assert "drag clipboard sentinel" in probe("clipboard").stdout
-            assert sources[0].read_bytes() == payload and sources[1].exists()
+            if tree:
+                assert snapshot(tree_source) == expected and snapshot(uploaded) == expected and snapshot(dropped) == expected and snapshot(staged) == expected
+            else:
+                assert sources[0].read_bytes() == payload and sources[1].exists()
             # Disconnect while OLE owns capture and the real mouse is still down.
             output = root / "disconnect"
             output.mkdir()
@@ -82,6 +124,8 @@ def main():
                 host.wait(timeout=5)
                 client.wait(timeout=2)
                 assert drop.wait(timeout=8) == 0
+            if tree:
+                print("PASS: native directory clipboard in both directions and Windows OLE folder drop in/out; relative virtual directory descriptors, empty/Unicode/zero/same-basename entries, sync/async extraction; completed trees retained")
             print("PASS: actual Windows PE OLE drag source -> native virtual-file target; Unicode/multiple/empty files; IStream Stat/Seek/Clone/EOF; async extraction; Esc/rejection/early-release/disconnect; clipboard and source files preserved (Wine/Xvfb)")
         except BaseException:
             print(Path(log.name).read_text())

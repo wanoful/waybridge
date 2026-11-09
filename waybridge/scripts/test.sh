@@ -7,6 +7,7 @@ cargo test --workspace --locked
 cargo build --locked
 python tests/smoke.py
 python tests/drag_out_smoke.py
+python tests/tree_smoke.py
 python tests/decorations_smoke.py
 
 python tests/qt_smoke.py

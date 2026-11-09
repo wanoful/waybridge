@@ -268,7 +268,8 @@ static void button(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32
   (void)s;
   (void)t;
   printf("BUTTON %u %u\n", b, state);
-  if (getenv("WAYBRIDGE_TEST_DRAG_URIS") && !drag_source && pointer_window &&
+  const char *drag_enabled = getenv("WAYBRIDGE_TEST_DRAG_ENABLED");
+  if (getenv("WAYBRIDGE_TEST_DRAG_URIS") && (!drag_enabled || access(drag_enabled, F_OK) == 0) && !drag_source && pointer_window &&
       b == 272 && state == WL_POINTER_BUTTON_STATE_PRESSED) {
     drag_source = wl_data_device_manager_create_data_source(data_manager);
     wl_data_source_add_listener(drag_source, &source_listener, NULL);

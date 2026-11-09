@@ -26,12 +26,23 @@ static void extract(IDataObject *data) {
   STGMEDIUM descriptors{};
   check(data->GetData(&format, &descriptors));
   auto group = static_cast<FILEGROUPDESCRIPTORW *>(GlobalLock(descriptors.hGlobal));
-  if (!group || !group->cItems || group->cItems > 128)
+  if (!group || !group->cItems || group->cItems > 512)
     throw E_FAIL;
   std::vector<FILEDESCRIPTORW> files(group->fgd, group->fgd + group->cItems);
   GlobalUnlock(descriptors.hGlobal);
   ReleaseStgMedium(&descriptors);
   for (size_t i = 0; i < files.size(); ++i) {
+    auto destination = outputDirectory + L"\\" + files[i].cFileName;
+    if (files[i].dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      if (!CreateDirectoryW(destination.c_str(), nullptr))
+        throw E_FAIL;
+      FORMATETC directoryContents{
+          static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILECONTENTS)), nullptr,
+          DVASPECT_CONTENT, static_cast<LONG>(i), TYMED_ISTREAM};
+      if (SUCCEEDED(data->QueryGetData(&directoryContents)))
+        throw E_FAIL;
+      continue;
+    }
     format.cfFormat = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_FILECONTENTS));
     format.lindex = static_cast<LONG>(i);
     format.tymed = TYMED_ISTREAM;

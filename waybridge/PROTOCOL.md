@@ -118,3 +118,90 @@ Opened source descriptors live until completion/cancellation. Streams support
 Read/Seek/Stat/Clone and bounded memory, with no full-file staging or destination
 temporary files. The target owns files it creates. No move/delete acknowledgement
 is accepted, and clipboard contents are unaffected.
+
+### Directory trees (`file_tree`)
+
+Both sides opt in through viewer hello `file_tree:true` and server feature
+`file_tree`. Flat `upload_*`/`files_*` messages remain supported; a peer without
+this capability receives regular files only, with the original 128-file limit.
+No additional binary packet kinds are used.
+
+A tree manifest is a parent-before-child array of
+`{id,name,kind,size}`. IDs are consecutive from zero, `kind` is `"file"` or
+`"directory"`, and directory size is zero. `name` is a **relative** `/`-separated
+path including the selected top-level basename. Explicit directory entries
+preserve empty directories; repeated basenames under different parents are valid.
+Only the top-level entries become clipboard/drop URIs or CF_HDROP paths.
+
+Limits apply to the entire batch: 128 roots, 512 entries, 16 path components,
+1 GiB per file, 8 GiB total file bytes, 240 UTF-16 code units per relative path,
+and 240 UTF-8 bytes/UTF-16 code units per component. Empty components, `.`, `..`,
+absolute/drive/UNC paths, backslashes, controls, ADS/colon syntax, Windows reserved
+names, trailing dots/spaces, duplicate IDs/paths and case-insensitive collisions
+are rejected before destination creation. Parents must already be declared
+directories with exactly matching spelling. There is no implicit rename or
+overwrite. Win32 staging additionally requires the complete temporary path to fit
+MAX_PATH; longer paths fail with an error rather than truncation.
+
+Symlinks, NTFS reparse points (including junctions/cloud placeholders), and special
+files fail the entire batch. Linux inspects through O_PATH and walks relative to
+pinned directory fds, without following links or opening a device/FIFO for I/O.
+Windows opens/inspects reparse points and denies source replacement while handles
+are held. File contents/names are copied; permissions, executable bits, timestamps
+and hard-link identity are not preserved. Detected source changes fail the copy.
+
+Linux clipboard → Windows:
+
+1. `tree_begin {batch,epoch,entries}` after validating/opening the complete source
+   manifest. `batch` is the Linux clipboard generation.
+2. `tree_chunk {batch,file,data}` for file entries, at most 65536 decoded bytes.
+   Directories and zero-byte files require no chunks.
+3. `tree_done {batch}`, or `tree_error {batch,message}`. Only exact-length,
+   complete trees are published from a fresh private staging directory. A newer
+   batch, local selection, failure or disconnect removes unfinished staging.
+
+Windows → Linux (clipboard and incoming OLE drop):
+
+1. `tree_upload_begin {batch,epoch,drop,entries}`; `drop` defaults to false.
+   The server validates the manifest and creates a fresh private tree, then
+   acknowledges `tree_upload_ready {batch,stage:"begin"}`.
+2. `tree_upload_chunk {batch,file,data}` (64 KiB decoded maximum), followed by
+   `tree_upload_end {batch,file}` for **every file**, including zero-byte files.
+3. `tree_upload_commit {batch,drop,...}` must match the begin purpose. With
+   `drop:true`, target `id`, `x`, `y`, `origin_x`, `origin_y` have the existing
+   upload-drop meanings. The server offers top-level destination-local URIs only
+   after every file is finalized, then acknowledges stage `"commit"`.
+4. `tree_upload_cancel {batch}` or `tree_upload_error {batch,message}` retires
+   unfinished uploads. Already committed files are retained. Queued chunks for
+   retired batches are ignored, avoiding repeated error/control-queue floods.
+
+There are at most two active server upload trees. The Windows client uses one
+upload worker and at most two pending requests, reports a full queue, cancels
+superseded clipboard requests, and preserves explicit queued drop requests. Begin
+and commit acknowledgements have 10-second deadlines. Disconnect releases jobs,
+source handles and unfinished destination trees.
+
+`file_tree_epoch {epoch}` advances a viewer-local counter when its local clipboard
+changes (excluding its own remote publications). It cancels pending Linux export
+reads/workers. File download begins carry the captured epoch; clipboard upload
+begin/commit must match the current epoch. Drop uploads are independent of
+clipboard epochs. A stale epoch cannot overwrite a newer local selection.
+Linux clipboard messages additionally carry `generation`; receivers ignore older
+formats and give a completed file batch precedence over text formats from that
+same generation. Duplicate/stale file begins are ignored.
+
+For native Linux → Windows drag, `drag_offer` adds `tree:true` and its `files`
+array uses this manifest. FILEDESCRIPTORW names use Windows relative separators;
+directory descriptors set FILE_ATTRIBUTE_DIRECTORY. FILECONTENTS/lindex and
+`drag_read` refer to the original manifest indices, including directory slots,
+but only file slots provide streams. The existing real-button handoff, COPY-only
+and asynchronous completion rules apply. Native targets own and clean up any
+destination files they create; Waybridge only removes its own private staging.
+
+Completed clipboard/drop trees remain at
+`$XDG_RUNTIME_DIR/waybridge-inbox/tree-<batch>/` or `%TEMP%\Waybridge-tree-*` so
+applications can read them later. They may be manually removed once consumers no
+longer need them. Copy/cancellation never deletes source files. Virtual directory
+descriptors and all four directions are tested with real Wayland and native OLE
+probes under Wine/Xvfb; Windows Explorer/third-party compatibility still needs
+Windows 10/11 device validation.

@@ -106,6 +106,7 @@ struct IncomingFile {
 std::map<uint32_t, IncomingFile> incomingFiles;
 uint64_t incomingBatch = 0;
 DWORD incomingClipboardSequence = 0;
+std::wstring incomingDirectory;
 
 struct RemoteWindow {
   uint32_t id;
@@ -225,6 +226,9 @@ void sendJson(const Json &value) {
     shutdown(connection, SD_BOTH);
   }
 }
+HGLOBAL globalBytes(const void *data, size_t size);
+void cancelIncomingFiles();
+#include "file_tree.h"
 #include "file_drag.h"
 
 bool readAll(SOCKET socket, void *bytes, size_t n) {
@@ -260,7 +264,7 @@ void receiveLoop(SOCKET socket) {
       Json incoming;
       if (control) {
         incoming = Json::parse(packet.begin() + 1, packet.end());
-        if (FileDrag::receive(incoming)) continue;
+        if (FileTree::uploadResponse(incoming) || FileDrag::receive(incoming)) continue;
       }
       {
         std::unique_lock<std::mutex> guard(inboxMutex);
@@ -300,6 +304,7 @@ void receiveLoop(SOCKET socket) {
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
   }
+  FileTree::cancelUploads();
   FileDrag::disconnect();
   PostMessageW(controller, WM_CLOSE, 0, 0);
 }
@@ -591,7 +596,18 @@ HGLOBAL globalBytes(const void *data, size_t size) {
   return mem;
 }
 
-void uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
+bool uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
+  if (paths.empty() || paths.size() > FileTree::MaxRoots) return false;
+  for (const auto &path : paths) {
+    WIN32_FILE_ATTRIBUTE_DATA metadata{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &metadata) || (metadata.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+      std::cerr << "File source is unavailable or is a reparse point\n"; return false;
+    }
+    if ((metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !FileTree::supported) {
+      std::cerr << "The server does not support file_tree; directories were not transferred\n"; return false;
+    }
+  }
+  if (FileTree::supported) return FileTree::upload(std::move(paths), std::move(drop));
   fileWorkers.emplace_back([paths = std::move(paths), drop = std::move(drop)] {
     Json transfers = Json::array();
     for (const auto &path : paths) {
@@ -636,6 +652,7 @@ void uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
       sendJson(commit);
     }
   });
+  return true;
 }
 
 RECT imageRect(RemoteWindow *w);
@@ -686,7 +703,10 @@ public:
     auto drop = static_cast<HDROP>(storage.hGlobal);
     std::vector<std::wstring> paths;
     UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
-    for (UINT i = 0; i < std::min(count, 128u); ++i) {
+    if (!count || count > FileTree::MaxRoots) {
+      ReleaseStgMedium(&storage); std::cerr << "Too many file roots; transfer rejected\n"; return S_OK;
+    }
+    for (UINT i = 0; i < count; ++i) {
       UINT n = DragQueryFileW(drop, i, nullptr, 0);
       std::wstring path(n + 1, L'\0');
       DragQueryFileW(drop, i, path.data(), n + 1);
@@ -698,26 +718,37 @@ public:
     ScreenToClient(window->hwnd, &position);
     RECT r = imageRect(window);
     if (!paths.empty() && r.right > r.left && r.bottom > r.top) {
-      uploadFiles(std::move(paths),
+      bool scheduled = uploadFiles(std::move(paths),
                   {{"drop", true},
                    {"id", window->id},
                    {"origin_x", window->originX},
                    {"origin_y", window->originY},
                    {"x", double(position.x - r.left) * window->width / (r.right - r.left)},
                    {"y", double(position.y - r.top) * window->height / (r.bottom - r.top)}});
-      *effect = DROPEFFECT_COPY;
+      *effect = scheduled ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     }
     return S_OK;
   }
 };
 
+void cancelIncomingFiles() {
+  for (auto &[id, file] : incomingFiles) if (file.handle != INVALID_HANDLE_VALUE) CloseHandle(file.handle);
+  incomingFiles.clear();
+  if (!incomingDirectory.empty()) FileTree::removeTree(incomingDirectory);
+  incomingDirectory.clear();
+  incomingBatch = 0;
+  incomingClipboardSequence = 0;
+}
+
 void receiveFiles(const Json &message) {
   const std::string type = message.at("type");
   if (type == "files_begin") {
-    for (auto &[id, file] : incomingFiles)
-      if (file.handle != INVALID_HANDLE_VALUE)
-        CloseHandle(file.handle);
-    incomingFiles.clear();
+    uint64_t batch = message.at("batch").get<uint64_t>();
+    if ((message.contains("epoch") && message["epoch"].get<uint64_t>() != FileTree::epoch) ||
+        batch <= FileTree::latestIncoming || batch < FileTree::serverGeneration || batch <= FileTree::blockedGeneration) return;
+    FileTree::latestIncoming = batch;
+    FileTree::cancelIncoming();
+    cancelIncomingFiles();
     incomingBatch = message.at("batch").get<uint64_t>();
     incomingClipboardSequence = GetClipboardSequenceNumber();
     wchar_t temp[MAX_PATH];
@@ -727,12 +758,12 @@ void receiveFiles(const Json &message) {
                              std::to_wstring(GetTickCount64());
     if (!CreateDirectoryW(directory.c_str(), nullptr))
       throw std::runtime_error("Cannot create incoming file directory");
-    if (message.at("files").size() > 128)
+    incomingDirectory = directory;
+    if (message.at("files").empty() || message.at("files").size() > 128)
       throw std::runtime_error("Too many incoming files");
     for (const auto &metadata : message.at("files")) {
       std::wstring name = wide(metadata.at("name").get<std::string>());
-      if (name.empty() || name == L"." || name == L".." ||
-          name.find_first_of(L"/\\:\0") != std::wstring::npos)
+      if (!FileTree::validName(name))
         throw std::runtime_error("Invalid incoming filename");
       IncomingFile file;
       file.path = directory + L"\\" + name;
@@ -769,6 +800,7 @@ void receiveFiles(const Json &message) {
       paths.push_back(L'\0');
       // A newer local clipboard must win over a file download that finishes
       // late.
+      bool published = false;
       if (GetClipboardSequenceNumber() == incomingClipboardSequence && OpenClipboard(controller)) {
         EmptyClipboard();
         std::vector<uint8_t> data(sizeof(DROPFILES) + paths.size() * sizeof(wchar_t));
@@ -780,18 +812,15 @@ void receiveFiles(const Json &message) {
         if (auto mem = globalBytes(data.data(), data.size())) {
           if (!SetClipboardData(CF_HDROP, mem))
             GlobalFree(mem);
+          else published = true;
         }
         CloseClipboard();
         ownClipboardSequence = GetClipboardSequenceNumber();
       }
-      incomingFiles.clear();
+      if (published) { FileTree::publishedGeneration = incomingBatch; incomingFiles.clear(); incomingDirectory.clear(); incomingBatch = 0; }
+      else cancelIncomingFiles();
     } else if (type == "files_error") {
-      for (auto &[id, file] : incomingFiles) {
-        if (file.handle != INVALID_HANDLE_VALUE)
-          CloseHandle(file.handle);
-        DeleteFileW(file.path.c_str());
-      }
-      incomingFiles.clear();
+      cancelIncomingFiles();
       std::cerr << message.value("message", "File transfer failed") << '\n';
     }
   }
@@ -857,7 +886,10 @@ void publishClipboard() {
   std::vector<std::wstring> files;
   if (auto drop = static_cast<HDROP>(GetClipboardData(CF_HDROP))) {
     UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
-    for (UINT i = 0; i < std::min(count, 128u); ++i) {
+    if (!count || count > FileTree::MaxRoots) {
+      CloseClipboard(); std::cerr << "Too many file roots; clipboard transfer rejected\n"; return;
+    }
+    for (UINT i = 0; i < count; ++i) {
       UINT n = DragQueryFileW(drop, i, nullptr, 0);
       std::wstring name(n + 1, L'\0');
       DragQueryFileW(drop, i, name.data(), n + 1);
@@ -1243,7 +1275,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     DragQueryPoint(drop, &position);
     std::vector<std::wstring> paths;
     UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
-    for (UINT i = 0; i < std::min(count, 128u); ++i) {
+    if (!count || count > FileTree::MaxRoots) {
+      DragFinish(drop); std::cerr << "Too many file roots; transfer rejected\n"; return 0;
+    }
+    for (UINT i = 0; i < count; ++i) {
       UINT n = DragQueryFileW(drop, i, nullptr, 0);
       std::wstring path(n + 1, L'\0');
       DragQueryFileW(drop, i, path.data(), n + 1);
@@ -1345,7 +1380,7 @@ void dispatchNetwork() {
       auto found = windows.find(m.value("id", uint32_t(0)));
       if (found != windows.end()) sourceWindow = found->second->hwnd;
     }
-    if (FileDrag::control(m, controller, sourceWindow)) continue;
+    if (FileTree::receive(m) || FileDrag::control(m, controller, sourceWindow)) continue;
     if (type == "hello") {
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
       if (m.value("version", 0) != 3 || m.value("codec", "") != "mixed") {
@@ -1353,6 +1388,8 @@ void dispatchNetwork() {
         PostQuitMessage(1);
         return;
       }
+      if (m.contains("features") && m["features"].is_array())
+        FileTree::supported = std::find(m["features"].begin(), m["features"].end(), "file_tree") != m["features"].end();
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
@@ -1521,8 +1558,14 @@ void dispatchNetwork() {
     } else if (type == "window_closed") {
       uint32_t id = m.at("id").get<uint32_t>();
       destroyRemote(id);
-    } else if (type == "clipboard")
-      setClipboard(m.at("items"));
+    } else if (type == "clipboard") {
+      auto generation = m.value("generation", uint64_t(0));
+      if (FileTree::serverClipboard(generation)) {
+        setClipboard(m.at("items"));
+        FileTree::clipboardApplied(generation, ownClipboardSequence);
+        if (incomingBatch == generation && !incomingFiles.empty()) incomingClipboardSequence = ownClipboardSequence;
+      }
+    }
     else if (type == "files_begin" || type == "file_chunk" || type == "files_done" ||
              type == "files_error")
       receiveFiles(m);
@@ -1590,8 +1633,11 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_CLIPBOARDUPDATE) {
-      if (GetClipboardSequenceNumber() != ownClipboardSequence)
+      if (GetClipboardSequenceNumber() != ownClipboardSequence) {
+        FileTree::localClipboardChanged();
+        cancelIncomingFiles();
         publishClipboard();
+      }
       return 0;
     }
     if (message == WM_TIMER) {
@@ -1706,6 +1752,7 @@ int wmain(int argc, wchar_t **argv) {
             {"split_media", true},
             {"frame_ack", true},
             {"file_drop_out", true},
+            {"file_tree", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},
@@ -1719,6 +1766,8 @@ int wmain(int argc, wchar_t **argv) {
     DispatchMessageW(&msg);
   }
   running = false;
+  FileTree::cancelUploads();
+  FileTree::cancelIncoming();
   FileDrag::disconnect();
   inboxWake.notify_all();
   frameWake.notify_all();
@@ -1734,9 +1783,7 @@ int wmain(int argc, wchar_t **argv) {
     worker.join();
   }
   closesocket(connection);
-  for (auto &[id, file] : incomingFiles)
-    if (file.handle != INVALID_HANDLE_VALUE)
-      CloseHandle(file.handle);
+  cancelIncomingFiles();
   for (auto &[id, w] : windows)
     DestroyWindow(w->hwnd);
   windows.clear();

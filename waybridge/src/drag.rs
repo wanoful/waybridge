@@ -9,12 +9,8 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 use std::{
-    fs::{File, Metadata, OpenOptions},
     io::Read,
-    os::unix::{
-        fs::{FileExt, MetadataExt, OpenOptionsExt},
-        net::UnixStream,
-    },
+    os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{sync_channel, SyncSender},
@@ -47,6 +43,7 @@ pub struct ReadRequest {
 }
 pub struct Export {
     pub manifest: Vec<Value>,
+    pub tree: bool,
     requests: SyncSender<ReadRequest>,
     cancelled: Arc<AtomicBool>,
 }
@@ -60,30 +57,9 @@ impl Drop for Export {
         self.cancelled.store(true, Ordering::Relaxed);
     }
 }
-fn unchanged(a: &Metadata, b: &Metadata) -> bool {
-    a.len() == b.len()
-        && a.mtime() == b.mtime()
-        && a.mtime_nsec() == b.mtime_nsec()
-        && a.ctime() == b.ctime()
-        && a.ctime_nsec() == b.ctime_nsec()
-}
+#[cfg(test)]
 pub fn windows_name(name: &str) -> bool {
-    let stem = name
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(' ')
-        .to_ascii_uppercase();
-    transfer::safe_name(name)
-        && name.encode_utf16().count() <= 240
-        && !name.ends_with(['.', ' '])
-        && !name.contains(['<', '>', '"', '|', '?', '*'])
-        && !["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str())
-        && !["COM", "LPT"].iter().any(|prefix| {
-            stem.strip_prefix(prefix).is_some_and(|s| {
-                ["1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"].contains(&s)
-            })
-        })
+    crate::file_tree::valid_name(name)
 }
 
 /// One bounded worker owns the opened source files and serves random range reads.
@@ -105,7 +81,7 @@ pub fn prepare(
     }
     std::thread::spawn(move || {
         let _worker = Worker;
-        let mut open = || -> Result<Vec<(String, File, Metadata)>> {
+        let mut open = || -> Result<crate::file_tree::Source> {
             input.set_read_timeout(Some(Duration::from_millis(100)))?;
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             let mut bytes = Vec::new();
@@ -138,37 +114,15 @@ pub fn prepare(
                 bail!("file URI list too large");
             }
             let text = std::str::from_utf8(&bytes)?;
-            let mut files = Vec::new();
-            for line in text
+            let paths = text
                 .lines()
                 .filter(|s| !s.is_empty() && !s.starts_with('#'))
-            {
-                if files.len() >= 128 {
-                    bail!("too many files");
-                }
-                let path =
-                    transfer::uri_path(line).context("only local UTF-8 file URIs are supported")?;
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .context("invalid filename")?;
-                if !windows_name(name) {
-                    bail!("filename is not supported on Windows");
-                }
-                let file = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-                    .open(&path)?;
-                let metadata = file.metadata()?;
-                if !metadata.is_file() || metadata.len() > 1024 * 1024 * 1024 {
-                    bail!("only regular files up to 1 GiB are supported");
-                }
-                files.push((name.to_string(), file, metadata));
-            }
-            if files.is_empty() {
-                bail!("no files");
-            }
-            Ok(files)
+                .take(129)
+                .map(|line| {
+                    transfer::uri_path(line).context("only local UTF-8 file URIs are supported")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            crate::file_tree::Source::open(paths, peer.file_tree())
         };
         let files = match open() {
             Ok(files) => files,
@@ -181,12 +135,18 @@ pub fn prepare(
             }
         };
         let (requests, receive) = sync_channel::<ReadRequest>(8);
+        let tree = files.is_tree();
         let export = Export {
-            manifest: files
-                .iter()
-                .enumerate()
-                .map(|(i, (name, _, m))| json!({"id":i,"name":name,"size":m.len()}))
-                .collect(),
+            manifest: if tree {
+                files
+                    .entries
+                    .iter()
+                    .map(|e| serde_json::to_value(e).unwrap())
+                    .collect()
+            } else {
+                files.legacy_metadata()
+            },
+            tree,
             requests,
             cancelled: cancelled.clone(),
         };
@@ -205,31 +165,7 @@ pub fn prepare(
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(_) => break,
             };
-            let run = || -> Result<Vec<u8>> {
-                if request.length == 0 || request.length > MAX_READ {
-                    bail!("invalid read length");
-                }
-                let (_, file, original) = files.get(request.file).context("unknown file")?;
-                if request.offset > original.len() || !unchanged(original, &file.metadata()?) {
-                    bail!("source file changed");
-                }
-                let length = request
-                    .length
-                    .min((original.len() - request.offset) as usize);
-                let mut bytes = vec![0; length];
-                let mut offset = 0;
-                while offset < length {
-                    let n = file.read_at(&mut bytes[offset..], request.offset + offset as u64)?;
-                    if n == 0 {
-                        bail!("source file truncated");
-                    }
-                    offset += n;
-                }
-                if !unchanged(original, &file.metadata()?) {
-                    bail!("source file changed");
-                }
-                Ok(bytes)
-            };
+            let run = || files.read(request.file, request.offset, request.length);
             let response = match run() {
                 Ok(bytes) => {
                     json!({"type":"drag_data","drag":id,"request":request.request,"data":B64.encode(bytes)})

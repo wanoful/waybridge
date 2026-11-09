@@ -64,11 +64,12 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 ## 使用数据交换
 
 - 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
-- Windows 资源管理器中复制文件，传输完成后可在支持文件粘贴的 Linux 应用里粘贴；Linux 应用提供 `text/uri-list` 时，文件下载后可粘贴到 Windows 资源管理器。
-- 从 Windows 资源管理器拖文件到远端窗口，先上传文件，再由合成器向目标应用协商 Copy 拖放。当前不会在上传期间显示远端拖动预览。
-- Linux 应用提供标准文件拖放时，可按住左键拖出远端窗口，到支持 Windows 虚拟文件的原生目标释放。文件内容按目标读取请求传输，无需先下载完整文件；支持异步提取、取消以及断线清理，始终使用 Copy，保留 Linux 源文件并保持剪贴板内容。仅接受 CF_HDROP 的目标暂不支持这一拖出路径。
-- 单次最多 128 个普通文件，单文件最多 1 GiB。暂不支持目录、剪切/移动。拖出首版不支持符号链接、非本地 URI、Windows 不兼容文件名及同批大小写冲突名称；要求应用使用 Wayland data-device v3 并支持 Copy，同时只处理一个出站操作，空闲超过 120 秒取消。
-- Linux 收到的文件保留在 `$XDG_RUNTIME_DIR/waybridge-inbox/<transfer-id>/`；Windows 文件保留在 `%TEMP%\Waybridge-*`。不在粘贴后立即删除，因为应用可能延迟读取。临时文件可在不再需要后手动清理。
+- Windows 资源管理器中复制文件或目录，传输完成后可在支持文件粘贴的 Linux 应用里粘贴；Linux 应用提供 `text/uri-list` 时，目录树下载后可粘贴到 Windows 资源管理器。两端会协商 `file_tree` 能力，保留层级、空目录、零字节文件和名称；旧端仍只支持普通文件。
+- 从 Windows 资源管理器拖文件或目录到远端窗口，先上传完整数据，再由合成器向目标应用协商 Copy 拖放。当前不会在上传期间显示远端拖动预览。
+- Linux 应用提供标准文件/目录拖放时，可按住左键拖出远端窗口，到支持 Windows 虚拟文件的原生目标释放。文件内容按目标读取请求传输，无需先下载完整文件；支持异步提取、取消以及断线清理，始终使用 Copy，保留 Linux 源文件并保持剪贴板内容。仅接受 CF_HDROP 的目标暂不支持这一拖出路径。
+- 目录批次最多 128 个顶层项、512 个条目、16 层路径、总文件内容 8 GiB，单文件最多 1 GiB；相对路径最多 240 个 UTF-16 单元，单个名称最多 240 UTF-8 字节/UTF-16 单元。Windows 临时目录加完整相对路径还必须小于 MAX_PATH，超限会报错。仅 Copy，不保留权限、时间戳和硬链接关系。
+- 符号链接、NTFS reparse point（含 junction/云占位文件）、特殊文件、非本地 URI、Windows 保留名/ADS/尾点空格及同一父目录下的大小写冲突会拒绝整批，绝不静默覆盖或改名。Linux 拖出要求应用使用 Wayland data-device v3 并支持 Copy；一次一个出站操作，空闲超过 120 秒取消。
+- 未完成的私有目标树会在取消、错误、替换剪贴板或断线时清理。通过新协议完成的文件/目录批次保留在 Linux `$XDG_RUNTIME_DIR/waybridge-inbox/tree-<batch>/` 或 Windows `%TEMP%\Waybridge-tree-*`；旧普通文件路径分别为 `<transfer-id>/` 和 `%TEMP%\Waybridge-*`。应用可能延迟读取，成功后不立即删除；确认无消费者后可手动清理。原生拖出目标自己创建的文件由目标管理，Waybridge 不删除用户目标目录或源文件。
 
 应用对粘贴和拖入的数据类型有自己的限制；私有应用格式不做跨平台转换。
 
@@ -101,8 +102,12 @@ python tests/windows_smoke.py --terminal
 python tests/windows_smoke.py --qt
 # Linux → Windows 原生虚拟文件拖出：真实 Wayland + 私有接收端
 python tests/drag_out_smoke.py
+# 真实目录清单、双向字节、空目录、拖入/拖出及恶意路径/取消清理
+python tests/tree_smoke.py
 # 原生 OLE 同步/异步提取、Seek/Clone、取消与断线（独立 Wine/Xvfb）
 python tests/windows_drag_out_smoke.py
+# 原生目录剪贴板/拖放四方向和 Win32 路径/半成品清理探针
+python tests/windows_drag_out_smoke.py --tree
 # 可选：需要 NVIDIA/NVENC；真实硬件编码、P 帧、alpha、奇数尺寸及回退
 python tests/hardware_smoke.py
 # 可选：真实 NVENC 尺寸切换、缓存淘汰、IDR/P 引用与回环耗时
@@ -151,7 +156,7 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 - 完善模态协议、窗口状态和光标/输入区域映射。
 - 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。
 - 接入 Xwayland，完善输入法、相对鼠标、指针形状和显式同步。
-- 扩展目录传输、Windows → Linux 虚拟文件导入及通用按需文件访问；在 Windows 10/11 实机验收 Explorer 与第三方应用的出站虚拟文件兼容性。
+- 扩展 Windows → Linux 虚拟文件导入及通用按需文件访问；在 Windows 10/11 实机验收 Explorer 与第三方应用的普通/目录虚拟文件兼容性。
 - 完善音频、断点续传、文件传输进度/取消、端到端加密及会话管理。
 
 普通 `wl_shm` 客户端和 DMA-BUF 导入已接通；各类 GPU 应用、驱动及大型应用组合仍需逐一验证。此版本不保证 “All 应用” 的兼容性。
