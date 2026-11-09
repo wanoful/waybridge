@@ -16,9 +16,10 @@ Linux 应用在 Windows 上显示为独立原生窗口的开发原型。服务�
 - 双向文件复制粘贴，64 KiB 分块传输。
 - 可协商的目录树复制和拖放，保留层级/空目录，严格校验路径和资源上限，清理未完成目标。
 - Windows 文件拖入远端窗口，在 Wayland 侧完成文件拖放。
+- Windows 无文件路径的 FILEDESCRIPTOR/FILECONTENTS 虚拟源可复制或拖入 Linux，独立 COM worker 流式接收，完成后发布本地文件。
 - Linux 文件拖出至支持 Windows 虚拟文件的原生目标，按需读取内容，保留源文件；已通过独立 Wine/Xvfb 的同步、异步、取消与断线测试，实机兼容性待验收。
 - 会话断线保留应用，重连恢复窗口，断线释放按键。
 
-这是开发原型，已在 Snapdragon 8cx Gen 3 / Adreno 690 实机验证原生 ARM64 硬解和尺寸切换；仍缺少 AV1、音频、X11 接入、完整输入法及 Windows 虚拟文件导入。目录传输和 Linux → Windows 虚拟拖出已通过独立 Wine/Xvfb 探针验证，Explorer/第三方目标实机兼容性和输入到显示的端到端延迟仍需验证。
+这是开发原型，已在 Snapdragon 8cx Gen 3 / Adreno 690 实机验证原生 ARM64 硬解和尺寸切换；仍缺少 AV1、音频、X11 接入、完整输入法及通用按需文件系统。目录传输和双向虚拟文件已通过独立 Wine/Xvfb 探针验证，Explorer/Outlook/第三方应用实机兼容性和输入到显示的端到端延迟仍需验证。
 
 详见 [运行说明与当前边界](waybridge/README.md)、[协议](waybridge/PROTOCOL.md)。

@@ -80,6 +80,20 @@ struct Transfer {
     return S_OK;
   }
 };
+inline IDataObject *ownObject = nullptr; // UI thread, valid only inside DoDragDrop
+inline bool isOwn(IDataObject *object) {
+  if (!ownObject || !object)
+    return false;
+  IUnknown *a = nullptr, *b = nullptr;
+  object->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&a));
+  ownObject->QueryInterface(IID_IUnknown, reinterpret_cast<void **>(&b));
+  bool same = a && a == b;
+  if (a)
+    a->Release();
+  if (b)
+    b->Release();
+  return same;
+}
 inline std::mutex activeMutex;
 inline std::shared_ptr<Transfer> active;
 inline std::shared_ptr<Transfer> current() {
@@ -557,7 +571,9 @@ inline void start(HWND controllerWindow) {
   }
   ReleaseCapture();
   DWORD effect = 0;
+  ownObject = data;
   HRESULT result = DoDragDrop(data, source, DROPEFFECT_COPY, &effect);
+  ownObject = nullptr;
   source->Release();
   bool finish, success;
   {

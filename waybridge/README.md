@@ -66,6 +66,7 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 - 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
 - Windows 资源管理器中复制文件或目录，传输完成后可在支持文件粘贴的 Linux 应用里粘贴；Linux 应用提供 `text/uri-list` 时，目录树下载后可粘贴到 Windows 资源管理器。两端会协商 `file_tree` 能力，保留层级、空目录、零字节文件和名称；旧端仍只支持普通文件。
 - 从 Windows 资源管理器拖文件或目录到远端窗口，先上传完整数据，再由合成器向目标应用协商 Copy 拖放。当前不会在上传期间显示远端拖动预览。
+- Windows 应用仅提供 `FILEDESCRIPTORW/A` + `FILECONTENTS`、没有 `CF_HDROP` 路径时，也可复制或拖入远端窗口。独立 COM worker 按文件获取并以 64 KiB 分块读取流；支持 Clone/Seek、顺序流、未知大小流的 Stat，以及最多 12 MiB 的已知大小 HGLOBAL。异步源在 Linux 提交后收到完成通知，同步拖入等完整接收后返回，等待期间 Esc 可取消。Linux 应用读取的是完成后保留的本地文件，尚未提供 FUSE 按需文件系统；IStorage 和未知大小 HGLOBAL 暂不支持。
 - Linux 应用提供标准文件/目录拖放时，可按住左键拖出远端窗口，到支持 Windows 虚拟文件的原生目标释放。文件内容按目标读取请求传输，无需先下载完整文件；支持异步提取、取消以及断线清理，始终使用 Copy，保留 Linux 源文件并保持剪贴板内容。仅接受 CF_HDROP 的目标暂不支持这一拖出路径。
 - 目录批次最多 128 个顶层项、512 个条目、16 层路径、总文件内容 8 GiB，单文件最多 1 GiB；相对路径最多 240 个 UTF-16 单元，单个名称最多 240 UTF-8 字节/UTF-16 单元。Windows 临时目录加完整相对路径还必须小于 MAX_PATH，超限会报错。仅 Copy，不保留权限、时间戳和硬链接关系。
 - 符号链接、NTFS reparse point（含 junction/云占位文件）、特殊文件、非本地 URI、Windows 保留名/ADS/尾点空格及同一父目录下的大小写冲突会拒绝整批，绝不静默覆盖或改名。Linux 拖出要求应用使用 Wayland data-device v3 并支持 Copy；一次一个出站操作，空闲超过 120 秒取消。
@@ -108,6 +109,8 @@ python tests/tree_smoke.py
 python tests/windows_drag_out_smoke.py
 # 原生目录剪贴板/拖放四方向和 Win32 路径/半成品清理探针
 python tests/windows_drag_out_smoke.py --tree
+# 无 CF_HDROP 的跨进程 STA 虚拟源，流/内存、同步/异步和失败清理
+python tests/windows_virtual_smoke.py
 # 可选：需要 NVIDIA/NVENC；真实硬件编码、P 帧、alpha、奇数尺寸及回退
 python tests/hardware_smoke.py
 # 可选：真实 NVENC 尺寸切换、缓存淘汰、IDR/P 引用与回环耗时
@@ -128,6 +131,7 @@ python tests/ghostty_smoke.py
 2. 滚动终端、连续输入，检查两端实际启用的编码日志。对比 `--codec png` 与 `--codec auto`，使用相同窗口尺寸和内容。
 3. 自动测试构建后，可用 `WAYLAND_DISPLAY=waybridge-0 ./build/tests/qt-app` 打开验证应用。`Ctrl+O` 打开靠近右下角的越界/嵌套菜单；透明窗口左侧不透明红色、中间半透明绿色、右侧透出 Windows 背景。
 4. 在远端文件管理器中选择多个普通文件（包含 Unicode 名称、空文件和较大文件），拖到 Windows Explorer/桌面并松开；核对名称、大小和哈希、确认 Linux 源文件和剪贴板仍保留。分别检查 Esc、拒绝目标、传输中断线、按住 Ctrl 拖动后继续输入。出站拖出目前通过的是独立原生 OLE 测试目标的 Wine 验证，Windows 10/11 Explorer 与第三方目标仍需实机完成这一项验收。
+5. 从压缩包、邮件附件等真实虚拟文件源复制和拖入 Linux 应用，核对 Unicode 名称、零字节、目录与哈希；验证同步/异步源、源程序退出、剪贴板替换、Esc、断线及接收中关闭目标。Wine 的独立 STA 探针覆盖该协议路径，但不能替代 Outlook、压缩软件和实际 Windows COM 取消调用的兼容性验证。
 
 诊断延迟时，在 Linux 启动：
 
@@ -156,7 +160,7 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 - 完善模态协议、窗口状态和光标/输入区域映射。
 - 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。
 - 接入 Xwayland，完善输入法、相对鼠标、指针形状和显式同步。
-- 扩展 Windows → Linux 虚拟文件导入及通用按需文件访问；在 Windows 10/11 实机验收 Explorer 与第三方应用的普通/目录虚拟文件兼容性。
+- 扩展通用按需文件访问、IStorage 和更多虚拟源；在 Windows 10/11 实机验收 Explorer、Outlook 与压缩软件的普通/目录虚拟文件兼容性。源 COM 调用有 30 秒无进展取消，Wine 的取消 API 缺失时在有限调用返回后停止；永不返回且不响应系统取消的源仍需结束源进程。
 - 完善音频、断点续传、文件传输进度/取消、端到端加密及会话管理。
 
 普通 `wl_shm` 客户端和 DMA-BUF 导入已接通；各类 GPU 应用、驱动及大型应用组合仍需逐一验证。此版本不保证 “All 应用” 的兼容性。

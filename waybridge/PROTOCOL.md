@@ -126,6 +126,37 @@ Both sides opt in through viewer hello `file_tree:true` and server feature
 this capability receives regular files only, with the original 128-file limit.
 No additional binary packet kinds are used.
 
+The Windows frontend also imports true virtual sources with no CF_HDROP using
+FILEGROUPDESCRIPTORW/A plus per-descriptor FILECONTENTS. This uses the same
+`tree_upload_*` protocol; the wire manifest never contains source-local paths.
+Original descriptor indices are preserved when requesting contents, while missing
+parent directories are synthesized before strict manifest validation. Directory
+descriptors require no content medium.
+
+An apartment-marshaled IDataObject feeds the single MTA upload worker. File
+contents are acquired one file at a time and read in 64 KiB chunks; a returned
+IStream is cloned and rewound when supported, with sequential non-seekable streams
+accepted from their initial position. Missing FD_FILESIZE requires IStream::Stat;
+known-size HGLOBAL contents are supported up to 12 MiB. IStorage and unknown-size
+HGLOBAL contents are rejected. E_PENDING is retried within a 30-second progress
+deadline. Streams, storage media and source references are released on failure,
+source loss, clipboard epoch change, target loss or disconnect. Windows additionally
+requests COM call cancellation; Wine lacks this API and cancels after a finite
+provider call returns. A provider that never returns or ignores OS cancellation
+still requires source-process recovery; untrusted providers are not isolated in
+a broker process.
+
+For async-enabled IDataObjectAsyncCapability sources, StartOperation precedes
+worker access and EndOperation runs on the source-facing STA only after Linux
+commit acknowledgement or failure. Other OLE drops keep Drop open with COM-aware
+message dispatch until the full tree succeeds/fails, returning COPY/NONE
+accordingly; Escape cancels this synchronous wait. Async COPY acceptance means
+the import was scheduled, with final success reported by EndOperation. Linux
+publishes only complete destination-local paths; there is no lazy FUSE filesystem
+or remote IStream backing Linux application reads. Successful imports retain the
+same private inbox lifetime as filesystem tree imports, and never delete source
+items. Windows/Outlook/archive-provider compatibility requires real-Windows tests.
+
 A tree manifest is a parent-before-child array of
 `{id,name,kind,size}`. IDs are consecutive from zero, `kind` is `"file"` or
 `"directory"`, and directory size is zero. `name` is a **relative** `/`-separated

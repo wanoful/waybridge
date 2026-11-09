@@ -1003,6 +1003,11 @@ impl App {
                             usize::try_from(value["file"].as_u64().context("missing file")?)?,
                         )?,
                         "tree_upload_commit" => {
+                            if value["drop"].as_bool() == Some(true)
+                                && !self.windows.iter().any(|w| w.id == id && w.mapped)
+                            {
+                                bail!("drop target is gone");
+                            }
                             let uris = self.transfers.finish_tree(
                                 batch,
                                 self.peer.as_ref().unwrap().file_epoch(),

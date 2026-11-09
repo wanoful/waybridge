@@ -92,11 +92,14 @@ inline std::wstring nativePath(std::wstring path) {
 }
 inline Json metadata(const std::vector<Entry> &entries) {
   Json result = Json::array();
-  for (const auto &e : entries)
+  for (const auto &e : entries) {
+    auto name = utf8(e.name);
+    require(wide(name) == e.name, "Invalid Unicode tree path");
     result.push_back({{"id", e.id},
-                      {"name", utf8(e.name)},
+                      {"name", std::move(name)},
                       {"kind", e.directory ? "directory" : "file"},
                       {"size", e.size}});
+  }
   return result;
 }
 struct Handle {
@@ -183,11 +186,37 @@ struct Source {
   }
 };
 
+// Importers provide a bounded sequential reader. The same worker/protocol owns
+// filesystem handles and IDataObject streams, with publication only on commit.
+struct Input {
+  std::vector<Entry> entries;
+  virtual ~Input() = default;
+  virtual void begin(size_t id) = 0;
+  virtual size_t read(uint8_t *bytes, size_t length) = 0;
+  virtual void end() = 0;
+};
+struct FileInput final : Input {
+  Source source;
+  size_t current = 0;
+  explicit FileInput(const std::vector<std::wstring> &paths) : source(paths) {
+    entries = source.entries;
+  }
+  void begin(size_t id) override { current = id; }
+  size_t read(uint8_t *bytes, size_t length) override {
+    DWORD n = 0;
+    require(ReadFile(source.handles[current].value, bytes, static_cast<DWORD>(length), &n, nullptr),
+            "Cannot read file source");
+    return n;
+  }
+  void end() override {}
+};
 struct Upload {
   std::mutex mutex;
   std::condition_variable wake;
   bool failed = false, clipboard = false;
   unsigned stage = 0;
+  DWORD comThread = 0;
+  uint64_t external = 0;
 };
 inline std::mutex uploadsMutex;
 inline std::map<uint64_t, std::shared_ptr<Upload>> uploads;
@@ -195,6 +224,10 @@ struct UploadRequest {
   std::vector<std::wstring> paths;
   Json drop;
   uint64_t selectionEpoch;
+  std::function<std::unique_ptr<Input>()> open;
+  std::function<void(bool)> complete;
+  std::function<bool()> current;
+  uint64_t external = 0;
 };
 inline std::mutex requestsMutex;
 inline std::condition_variable requestsWake;
@@ -224,7 +257,16 @@ inline bool uploadResponse(const Json &message) {
     std::cerr << "Tree upload: " << message.value("message", "failed") << '\n';
   return true;
 }
+inline void cancelComCall(DWORD thread) {
+  // Wine currently exports an aborting stub for CoCancelCall. Let its finite
+  // RPC reads finish and cancel at the next chunk boundary; Windows uses the
+  // real API to interrupt an outstanding call as well.
+  static bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+  if (!wine)
+    CoCancelCall(thread, 0);
+}
 inline void cancelClipboardUploads() {
+  std::vector<DWORD> calls;
   {
     std::lock_guard<std::mutex> lock(uploadsMutex);
     for (auto &[id, job] : uploads)
@@ -232,75 +274,131 @@ inline void cancelClipboardUploads() {
         std::lock_guard<std::mutex> guard(job->mutex);
         job->failed = true;
         job->wake.notify_all();
+        if (job->comThread)
+          calls.push_back(job->comThread);
       }
   }
-  std::lock_guard<std::mutex> lock(requestsMutex);
-  requests.erase(
-      std::remove_if(requests.begin(), requests.end(),
-                     [](const UploadRequest &r) { return !r.drop.value("drop", false); }),
-      requests.end());
+  for (auto thread : calls)
+    cancelComCall(thread);
+  std::deque<UploadRequest> cancelled;
+  {
+    std::lock_guard<std::mutex> lock(requestsMutex);
+    for (auto it = requests.begin(); it != requests.end();) {
+      if (!it->drop.value("drop", false)) {
+        cancelled.push_back(std::move(*it));
+        it = requests.erase(it);
+      } else
+        ++it;
+    }
+  }
+  for (auto &request : cancelled)
+    if (request.complete)
+      request.complete(false);
 }
 inline void cancelUploads() {
   uploadStopping = true;
+  std::vector<DWORD> calls;
   {
     std::lock_guard<std::mutex> lock(uploadsMutex);
     for (auto &[id, job] : uploads) {
       std::lock_guard<std::mutex> guard(job->mutex);
       job->failed = true;
       job->wake.notify_all();
+      if (job->comThread)
+        calls.push_back(job->comThread);
     }
   }
+  for (auto thread : calls)
+    cancelComCall(thread);
+  std::deque<UploadRequest> cancelled;
   {
     std::lock_guard<std::mutex> lock(requestsMutex);
-    requests.clear();
+    cancelled.swap(requests);
   }
+  for (auto &request : cancelled)
+    if (request.complete)
+      request.complete(false);
   requestsWake.notify_all();
+}
+inline void cancelRequest(uint64_t external) {
+  if (!external)
+    return;
+  std::vector<DWORD> calls;
+  {
+    std::lock_guard<std::mutex> lock(uploadsMutex);
+    for (auto &[id, job] : uploads)
+      if (job->external == external) {
+        std::lock_guard<std::mutex> guard(job->mutex);
+        job->failed = true;
+        job->wake.notify_all();
+        if (job->comThread)
+          calls.push_back(job->comThread);
+      }
+  }
+  std::deque<UploadRequest> cancelled;
+  {
+    std::lock_guard<std::mutex> lock(requestsMutex);
+    for (auto it = requests.begin(); it != requests.end();) {
+      if (it->external == external) {
+        cancelled.push_back(std::move(*it));
+        it = requests.erase(it);
+      } else
+        ++it;
+    }
+  }
+  for (auto thread : calls)
+    cancelComCall(thread);
+  for (auto &request : cancelled)
+    if (request.complete)
+      request.complete(false);
 }
 inline void performUpload(UploadRequest request) {
   uint64_t batch = ++nextUpload;
   auto job = std::make_shared<Upload>();
   job->clipboard = !request.drop.value("drop", false);
+  job->external = request.external;
   auto valid = [&] {
-    return running && !uploadStopping &&
+    return running && !uploadStopping && (!request.current || request.current()) &&
            (!job->clipboard || request.selectionEpoch == epoch.load());
   };
-  bool began = false;
+  bool began = false, success = false;
   auto wait = [&](unsigned stage) {
     std::unique_lock<std::mutex> lock(job->mutex);
     require(job->wake.wait_for(lock, std::chrono::seconds(10),
-                               [&] { return job->failed || job->stage >= stage || !running; }) &&
+                               [&] { return job->failed || job->stage >= stage || !valid(); }) &&
                 !job->failed && valid(),
             "Tree upload failed or timed out");
   };
   try {
     require(valid(), "Tree upload superseded");
-    Source source(request.paths);
-    require(valid(), "Tree upload superseded");
+    job->comThread = request.open ? GetCurrentThreadId() : 0;
     {
       std::lock_guard<std::mutex> lock(uploadsMutex);
       uploads.emplace(batch, job);
     }
+    auto source = request.open ? request.open() : std::make_unique<FileInput>(request.paths);
+    parse(metadata(source->entries));
+    require(valid(), "Tree upload superseded");
     sendJson({{"type", "tree_upload_begin"},
               {"batch", batch},
               {"drop", !job->clipboard},
               {"epoch", request.selectionEpoch},
-              {"entries", metadata(source.entries)}});
+              {"entries", metadata(source->entries)}});
     began = true;
     wait(1);
     std::vector<uint8_t> bytes(65536);
-    for (const auto &entry : source.entries) {
+    for (const auto &entry : source->entries) {
       if (entry.directory)
         continue;
+      source->begin(entry.id);
       uint64_t total = 0;
       for (;;) {
         {
           std::lock_guard<std::mutex> lock(job->mutex);
           require(!job->failed && valid(), "Tree upload cancelled");
         }
-        DWORD n = 0;
-        require(ReadFile(source.handles[entry.id].value, bytes.data(),
-                         static_cast<DWORD>(bytes.size()), &n, nullptr),
-                "Cannot read tree source");
+        size_t n = source->read(bytes.data(), bytes.size());
+        require(n <= bytes.size(), "Invalid source read length");
         if (!n)
           break;
         total += n;
@@ -311,6 +409,7 @@ inline void performUpload(UploadRequest request) {
                   {"data", base64(bytes.data(), n)}});
       }
       require(total == entry.size, "Source size changed");
+      source->end();
       sendJson({{"type", "tree_upload_end"}, {"batch", batch}, {"file", entry.id}});
     }
     require(valid(), "Tree upload superseded");
@@ -319,6 +418,7 @@ inline void performUpload(UploadRequest request) {
     commit["batch"] = batch;
     sendJson(commit);
     wait(2);
+    success = true;
   } catch (const std::exception &e) {
     std::cerr << "Tree upload: " << e.what() << '\n';
     if (began && running && !uploadStopping)
@@ -328,33 +428,43 @@ inline void performUpload(UploadRequest request) {
     std::lock_guard<std::mutex> lock(uploadsMutex);
     uploads.erase(batch);
   }
+  if (request.complete)
+    request.complete(success);
 }
-inline bool upload(std::vector<std::wstring> paths, Json drop) {
+inline bool enqueue(UploadRequest request) {
   std::lock_guard<std::mutex> lock(requestsMutex);
   if (uploadStopping || requests.size() >= 2) {
     std::cerr << "File upload queue is full; retry the transfer\n";
     return false;
   }
-  requests.push_back({std::move(paths), std::move(drop), epoch.load()});
+  requests.push_back(std::move(request));
   if (!uploadWorkerStarted) {
     uploadWorkerStarted = true;
     fileWorkers.emplace_back([] {
+      HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      CoEnableCallCancellation(nullptr);
       for (;;) {
         UploadRequest request;
         {
           std::unique_lock<std::mutex> lock(requestsMutex);
           requestsWake.wait(lock, [] { return uploadStopping || !running || !requests.empty(); });
           if (uploadStopping || !running)
-            return;
+            break;
           request = std::move(requests.front());
           requests.pop_front();
         }
         performUpload(std::move(request));
       }
+      CoDisableCallCancellation(nullptr);
+      if (SUCCEEDED(initialized))
+        CoUninitialize();
     });
   }
   requestsWake.notify_one();
   return true;
+}
+inline bool upload(std::vector<std::wstring> paths, Json drop) {
+  return enqueue({std::move(paths), std::move(drop), epoch.load(), {}, {}, {}, 0});
 }
 
 inline void removeTree(const std::wstring &path) {

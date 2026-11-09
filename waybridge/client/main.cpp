@@ -230,6 +230,7 @@ HGLOBAL globalBytes(const void *data, size_t size);
 void cancelIncomingFiles();
 #include "file_tree.h"
 #include "file_drag.h"
+#include "virtual_files.h"
 
 bool readAll(SOCKET socket, void *bytes, size_t n) {
   auto p = static_cast<char *>(bytes);
@@ -682,12 +683,13 @@ public:
   }
   HRESULT STDMETHODCALLTYPE DragEnter(IDataObject *data, DWORD, POINTL, DWORD *effect) override {
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    accepted = SUCCEEDED(data->QueryGetData(&format));
+    accepted = (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
+               (SUCCEEDED(data->QueryGetData(&format)) || VirtualFiles::supports(data));
     *effect = accepted ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD *effect) override {
-    *effect = accepted ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    *effect = accepted && (*effect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragLeave() override {
@@ -695,11 +697,29 @@ public:
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE Drop(IDataObject *data, DWORD, POINTL point, DWORD *effect) override {
+    bool copyAllowed = (*effect & DROPEFFECT_COPY) != 0;
     *effect = DROPEFFECT_NONE;
+    if (!copyAllowed || FileDrag::isOwn(data))
+      return S_OK;
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     STGMEDIUM storage{};
-    if (FAILED(data->GetData(&format, &storage)))
+    if (FAILED(data->GetData(&format, &storage))) {
+      POINT position{point.x, point.y};
+      ScreenToClient(window->hwnd, &position);
+      RECT r = imageRect(window);
+      if (r.right <= r.left || r.bottom <= r.top)
+        return S_OK;
+      Json drop{{"drop", true},
+                {"id", window->id},
+                {"origin_x", window->originX},
+                {"origin_y", window->originY},
+                {"x", double(position.x - r.left) * window->width / (r.right - r.left)},
+                {"y", double(position.y - r.top) * window->height / (r.bottom - r.top)}};
+      auto request = VirtualFiles::submit(data, std::move(drop), window->hwnd);
+      if (request && (request->asyncStarted || VirtualFiles::wait(request)))
+        *effect = DROPEFFECT_COPY;
       return S_OK;
+    }
     auto drop = static_cast<HDROP>(storage.hGlobal);
     std::vector<std::wstring> paths;
     UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
@@ -880,6 +900,8 @@ void setClipboard(const Json &items) {
 }
 
 void publishClipboard() {
+  if (VirtualFiles::clipboard())
+    return;
   if (!OpenClipboard(controller))
     return;
   Json items = Json::object();
@@ -1332,6 +1354,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   }
   case WM_KEYDOWN:
+    if (wp == VK_ESCAPE && VirtualFiles::synchronousWaits) {
+      VirtualFiles::cancelDrops();
+      return 0;
+    }
+    [[fallthrough]];
   case WM_KEYUP:
   case WM_SYSKEYDOWN:
   case WM_SYSKEYUP:
@@ -1624,6 +1651,10 @@ void dispatchNetwork() {
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
+    if (message == VirtualFiles::CompletedMessage) {
+      VirtualFiles::drain();
+      return 0;
+    }
     if (message == FileDrag::StartMessage) {
       FileDrag::start(hwnd);
       return 0;
@@ -1641,11 +1672,15 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_TIMER) {
+      VirtualFiles::tick();
       sendJson({{"type", "ping"}, {"nonce", GetTickCount64()}});
       clientStats.report();
       return 0;
     }
     if (message == WM_CLOSE) {
+      running = false;
+      FileTree::cancelUploads();
+      VirtualFiles::cancel();
       PostQuitMessage(0);
       return 0;
     }
@@ -1779,9 +1814,11 @@ int wmain(int argc, wchar_t **argv) {
   if (mediaReceiver.joinable())
     mediaReceiver.join();
   decoder.join();
+  VirtualFiles::finishWorkers();
   for (auto &worker : fileWorkers) {
     worker.join();
   }
+  VirtualFiles::shutdown();
   closesocket(connection);
   cancelIncomingFiles();
   for (auto &[id, w] : windows)
