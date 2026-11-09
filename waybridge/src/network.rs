@@ -30,6 +30,7 @@ type QueuedFrame = (u8, Vec<u8>, Option<Instant>);
 #[derive(Default)]
 struct Queue {
     controls: VecDeque<Vec<u8>>,
+    cursor: Option<Vec<u8>>,
     frames: BTreeMap<u32, VecDeque<QueuedFrame>>,
     png_only: BTreeSet<u32>,
     in_flight: BTreeMap<u32, BTreeMap<u64, std::time::Instant>>,
@@ -70,10 +71,24 @@ pub struct Peer {
     split_media: bool,
     h264: bool,
     acknowledgements: bool,
+    cursor_v1: bool,
     media_attached: AtomicBool,
 }
 
 impl Peer {
+    pub fn cursor_enabled(&self) -> bool {
+        self.cursor_v1
+    }
+    pub fn cursor(&self, message: Value) {
+        if !self.cursor_v1 {
+            return;
+        }
+        let mut q = self.queue.lock().unwrap();
+        if !q.closed {
+            q.cursor = Some(serde_json::to_vec(&message).unwrap());
+        }
+        self.wake.notify_all();
+    }
     pub fn begin_resize(&self, id: u32, width: u32, height: u32, started: Instant) {
         self.queue.lock().unwrap().resizes.insert(
             id,
@@ -205,7 +220,8 @@ impl Peer {
                 let mut q = self.queue.lock().unwrap();
                 let frames_allowed = media || !self.split_media;
                 while !q.closed
-                    && ((media || (q.controls.is_empty() && q.bulk.is_empty()))
+                    && ((media
+                        || (q.controls.is_empty() && q.bulk.is_empty() && q.cursor.is_none()))
                         && (!frames_allowed || q.frames.is_empty()))
                 {
                     q = self.wake.wait(q).unwrap();
@@ -215,6 +231,8 @@ impl Peer {
                 }
                 if !media && !q.controls.is_empty() {
                     (protocol::JSON, q.controls.pop_front().unwrap(), None)
+                } else if !media && q.cursor.is_some() {
+                    (protocol::JSON, q.cursor.take().unwrap(), None)
                 } else if frames_allowed && !q.frames.is_empty() {
                     let id = *q
                         .frames
@@ -319,6 +337,7 @@ pub fn listen(
                         .is_some_and(|codecs| codecs.iter().any(|c| c == "h264_alpha")),
                     media_attached: AtomicBool::new(false),
                     acknowledgements: hello["frame_ack"].as_bool().unwrap_or(false),
+                    cursor_v1: hello["cursor_v1"].as_bool().unwrap_or(false),
                 });
                 let mut key = [0; 32];
                 if std::fs::File::open("/dev/urandom")
@@ -345,7 +364,7 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "codecs":["png_rgba","h264_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "codecs":["png_rgba","h264_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha","cursor_v1"], "cursor_v1":peer.cursor_v1}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

@@ -17,6 +17,7 @@
 #include "h264_decoder.h"
 #include "h264_decoder_cache.h"
 #include "image_decoder.h"
+#include "native_cursor.h"
 #include "third_party/json.hpp"
 #include <algorithm>
 #include <atomic>
@@ -42,6 +43,9 @@ std::atomic<bool> running{true};
 std::mutex sendMutex, inboxMutex;
 std::condition_variable inboxWake, frameWake;
 std::deque<Json> controls;
+Json pendingCursor;
+NativeCursor nativeCursor;
+bool cursorNegotiated = false;
 struct EncodedFrame {
   uint8_t kind = 0;
   std::vector<uint8_t> bytes;
@@ -266,7 +270,10 @@ void receiveLoop(SOCKET socket) {
             decoderGarbage.push_back(message.at("id").get<uint32_t>());
             frameWake.notify_all();
           }
-          controls.push_back(std::move(message));
+          if (message.value("type", "") == "cursor")
+            pendingCursor = std::move(message); // bounded latest-only animation state
+          else
+            controls.push_back(std::move(message));
         } else if ((packet[0] == 1 && size >= 37) || (packet[0] == 2 && size >= 61)) {
           uint32_t id = u32(packet.data() + 1);
           if (frames.size() >= 128 && !frames.count(id))
@@ -1050,6 +1057,19 @@ void acknowledge(RemoteWindow *w) {
   }
 }
 
+uint32_t cursorRoot(RemoteWindow *w) { return w->popup ? w->root : w->id; }
+void refreshCursor() {
+  POINT point{};
+  if (!cursorNegotiated || !GetCursorPos(&point)) return;
+  HWND under = WindowFromPoint(point);
+  for (auto &[id, w] : windows) {
+    if (w->hwnd == under && SendMessageW(under, WM_NCHITTEST, 0, MAKELPARAM(point.x, point.y)) == HTCLIENT) {
+      SetCursor(nativeCursor.handle(cursorRoot(w.get()), w->dpi));
+      break;
+    }
+  }
+}
+
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   auto w = reinterpret_cast<RemoteWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
   if (message == WM_NCCREATE) {
@@ -1060,6 +1080,13 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   if (!w)
     return DefWindowProcW(hwnd, message, wp, lp);
   switch (message) {
+  case WM_SETCURSOR:
+    // A relative-pointer lock must hide the cursor before applying remote shapes.
+    if (cursorNegotiated && LOWORD(lp) == HTCLIENT) {
+      SetCursor(nativeCursor.handle(cursorRoot(w), w->dpi));
+      return TRUE;
+    }
+    break;
   case WM_MOUSEACTIVATE:
     if (w->popup)
       return MA_NOACTIVATE;
@@ -1216,6 +1243,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   case WM_MOUSEMOVE:
     pointer(w, lp);
+    refreshCursor();
     if (!w->tracking) {
       TRACKMOUSEEVENT e{sizeof(e), TME_LEAVE, hwnd, 0};
       TrackMouseEvent(&e);
@@ -1316,10 +1344,12 @@ void destroyRemote(uint32_t id) {
 
 void dispatchNetwork() {
   std::deque<Json> pending;
+  Json cursor;
   std::map<uint32_t, std::shared_ptr<DecodedFrame>> pendingFrames;
   {
     std::lock_guard<std::mutex> guard(inboxMutex);
     pending.swap(controls);
+    cursor.swap(pendingCursor);
     pendingFrames.swap(decodedFrames);
   }
   inboxWake.notify_all();
@@ -1332,6 +1362,7 @@ void dispatchNetwork() {
         PostQuitMessage(1);
         return;
       }
+      cursorNegotiated = m.value("cursor_v1", false);
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
@@ -1508,6 +1539,8 @@ void dispatchNetwork() {
     else if (type == "error")
       std::cerr << m.value("message", "Remote error") << '\n';
   }
+  if (cursorNegotiated && !cursor.is_null() && nativeCursor.update(cursor))
+    refreshCursor();
   for (auto &[id, frame] : pendingFrames) {
     auto it = windows.find(id);
     if (it == windows.end())
@@ -1680,6 +1713,7 @@ int wmain(int argc, wchar_t **argv) {
             {"version", 3},
             {"split_media", true},
             {"frame_ack", true},
+            {"cursor_v1", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},

@@ -49,6 +49,18 @@ Client messages:
 
 Focus loss and disconnection release held keys/buttons. Stale loss/leave events only affect the window that still owns that focus. Keyboard focus is sent after mapping; popup grabs use the originating input serial. Each toplevel has an output and preferred fractional scale; viewporter and xdg-output are advertised, with integer buffer-scale fallback for older clients. Keyboard repeat is supplied by the receiving Wayland application; repeated Win32 keydown messages do not generate stuck keys.
 
+## Native cursor extension (`cursor_v1`)
+
+This optional extension keeps protocol v3 compatibility. The viewer opts in with `cursor_v1:true` in its control `hello`. A supporting server lists `cursor_v1` in `features` and echoes `cursor_v1:true` only when negotiated. No cursor packets are sent without opt-in. A new viewer connected to an older v3 server keeps its default native arrow.
+
+The server sends JSON `cursor` on the control connection: `id` is the pointer-focused root toplevel ID (also applies to its popups), `generation` is a monotonically increasing seat-local update number, and `kind` is `named`, `hidden`, or `bitmap`. `id:0` resets the cursor to the default. Apply an update only to the matching root's client area; never override native non-client resize/title-bar cursors or another application's cursor. Discard older generations. Reconnection resends current state and subsequent pointer events update ownership.
+
+- `named` carries `name`, a CSS/cursor-icon name such as `default`, `text`, `pointer`, `wait`, `ew-resize`, or `nwse-resize`. The viewer maps these to shared Windows system cursors. Names without an exact system equivalent may use an approximation/default arrow.
+- `hidden` hides the local cursor in the matching client area. It does not use process-global `ShowCursor` counters.
+- `bitmap` carries `format:"rgba8-premultiplied"`, `width`, `height`, `scale`, `hotspot_x`, `hotspot_y`, and `pixels` (canonical base64 of exactly `width*height*4` bytes). Pixels are top-down, row-major premultiplied RGBA, without a PNG header. Dimensions are `1..=256` per axis; `scale` is finite in `1..=4`. The hotspot is in **bitmap pixels**, within its dimensions. `scale` is source pixels per logical unit; the viewer scales pixels and hotspot by its window DPI / 96 / scale. Negative or outside Wayland hotspots are represented with transparent padding before these bounds are applied.
+
+The compositor supports both `wp_cursor_shape_manager_v1` and ordinary `wl_pointer.set_cursor` surfaces (including surface trees, buffer scale and animated commits). Custom cursor frame callbacks run independently of application-window damage and continue without a viewer. Bitmap capture/callbacks are capped at 30 updates per second and bounded before GPU allocation/import (at most 16 source surfaces, each at most 256×256, with at most 65,536 total source pixels); oversized or failed bitmaps use the default arrow. Each side retains only **one latest cursor message/bitmap**, replacing superseded animation updates. The server and viewer never place cursor animation into the H.264 reference queue. Each bitmap is at most 262,144 decoded bytes / 349,528 base64 characters; the viewer owns at most one custom `HCURSOR` and releases replaced handles.
+
 ## Clipboard
 
 Both directions send `{"type":"clipboard","items":{"<MIME>":"<base64>"}}`. Supported formats are `text/plain;charset=utf-8`, `text/plain`, and `image/png`. Maximum decoded size is 12 MiB per format. Linux clipboard reads are asynchronous and tagged with an ownership generation to discard stale responses. Windows tracks the clipboard sequence number to avoid echo loops.

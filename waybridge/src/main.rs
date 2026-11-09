@@ -1,4 +1,5 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
+mod cursor;
 mod metrics;
 mod network;
 mod protocol;
@@ -162,6 +163,8 @@ struct RemotePopup {
 type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 
 struct App {
+    cursor: cursor::Cursor,
+    _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState,
     dh: DisplayHandle,
     compositor: CompositorState,
     x11: x11::State,
@@ -312,6 +315,7 @@ impl App {
         let Some(remote) = self.windows.iter_mut().find(|w| w.id == id) else {
             return;
         };
+        self.cursor.dirty = true;
         remote.scale = scale;
         remote.dirty = true;
         for popup in self.remote_popups.iter_mut().filter(|p| p.root == id) {
@@ -391,6 +395,9 @@ impl App {
                     break;
                 }
             }
+        }
+        if self.pointer_window != Some(id) {
+            self.cursor.dirty = true;
         }
         self.pointer_window = Some(id);
         let pointer = self.seat.get_pointer().unwrap();
@@ -546,6 +553,7 @@ impl App {
         }
         pointer.frame(self);
         self.pointer_window = None;
+        self.cursor.dirty = true;
         self.drop_deadline = None;
         self.drop_accepted = false;
     }
@@ -586,6 +594,7 @@ impl App {
             "pointer" => self.pointer_message(id, &value),
             "leave" if self.pointer_window == Some(id) => {
                 self.pointer_window = None;
+                self.cursor.dirty = true;
                 let p = self.seat.get_pointer().unwrap();
                 p.motion(
                     self,
@@ -1059,6 +1068,7 @@ impl App {
             }
             popup.dirty = false;
         }
+        self.render_cursor();
         Ok(())
     }
 }
@@ -1212,6 +1222,15 @@ impl CompositorHandler for App {
     }
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        if let smithay::input::pointer::CursorImageStatus::Surface(cursor) = &self.cursor.image {
+            let mut root = surface.clone();
+            while let Some(parent) = get_parent(&root) {
+                root = parent;
+            }
+            if &root == cursor {
+                self.cursor.dirty = true;
+            }
+        }
         self.popups.commit(surface);
         if let Some(PopupKind::Xdg(p)) = self.popups.find_popup(surface) {
             if !p.is_initial_configure_sent() {
@@ -1483,7 +1502,9 @@ impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seats
     }
-    fn cursor_image(&mut self, _: &Seat<Self>, _: smithay::input::pointer::CursorImageStatus) {}
+    fn cursor_image(&mut self, _: &Seat<Self>, image: smithay::input::pointer::CursorImageStatus) {
+        self.cursor.image=image; self.cursor.dirty=true;
+    }
     fn focus_changed(&mut self, seat: &Seat<Self>, surface: Option<&Self::KeyboardFocus>) {
         use smithay::wayland::seat::WaylandFocus;
         set_data_device_focus(
@@ -1495,6 +1516,9 @@ impl SeatHandler for App {
         );
     }
 }
+impl smithay::wayland::tablet_manager::TabletSeatHandler for App {}
+smithay::delegate_cursor_shape!(App);
+
 impl SelectionHandler for App {
     type SelectionUserData = Clipboard;
     fn new_selection(
@@ -1714,6 +1738,8 @@ fn main() -> Result<()> {
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
     let mut app = App {
+        cursor: cursor::Cursor::default(),
+        _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<App>(&dh),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1801,6 +1827,7 @@ fn main() -> Result<()> {
                     app.x11.grab = None;
                     app.release_input();
                     app.peer = Some(peer);
+                    app.cursor.dirty = true;
                     for p in &mut app.remote_popups {
                         p.last_info = Value::Null;
                         p.dirty = true;
