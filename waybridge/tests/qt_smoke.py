@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Actual Qt Widgets at 175%: fractional buffers, alpha, focus, menus and dialogs."""
 import os
+import re
+import sys
 from pathlib import Path
 import re
 import socket
@@ -17,7 +19,7 @@ def main():
                     "tests/qt_app.cpp", "-o", "build/tests/qt-app", *flags], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="waybridge-qt-") as runtime:
         env = {**os.environ, "XDG_RUNTIME_DIR": runtime, "WAYLAND_DISPLAY": "qt-0",
-               "QT_QPA_PLATFORM": "wayland", "WAYLAND_DEBUG": "1"}
+               "QT_QPA_PLATFORM": "xcb" if "--x11" in sys.argv else "wayland", "WAYLAND_DEBUG": "1"}
         # Tests follow the remote monitor DPI, independent of the host desktop's Qt overrides.
         for name in ("QT_SCALE_FACTOR", "QT_SCREEN_SCALE_FACTORS", "QT_WAYLAND_DISABLE_WINDOWDECORATION"):
             env.pop(name, None)
@@ -25,27 +27,38 @@ def main():
             free.bind(("127.0.0.1", 0)); port = free.getsockname()[1]
         token = "qt-test-" + "6" * 40
         token_file = Path(runtime) / "token"; token_file.write_text(token); token_file.chmod(0o600)
+        if "--x11" in sys.argv:
+            env["WAYBRIDGE_TOOLTIP_TEST"]="1"
+            subprocess.run(["cc","tests/x11_frame_probe.c","-o","build/tests/x11-frame-probe","-lX11"],cwd=ROOT,check=True)
         processes = []
         app_path = ROOT / "build/tests/qt-app.log"
         with open(ROOT / "build/tests/qt-host.log", "w") as host_log, open(app_path, "w") as app_log:
             try:
                 host = subprocess.Popen([str(ROOT / "target/debug/waybridge"), "--socket", "qt-0",
-                                         "--listen", f"127.0.0.1:{port}", "--token-file", str(token_file)],
+                                         "--listen", f"127.0.0.1:{port}", "--token-file", str(token_file), *(["--xwayland"] if "--x11" in sys.argv else [])],
                                         env=env, stdout=host_log, stderr=host_log)
                 processes.append(host)
                 deadline = time.monotonic() + 10
                 while not (Path(runtime) / "qt-0").exists():
                     assert host.poll() is None and time.monotonic() < deadline
                     time.sleep(.05)
+                if "--x11" in sys.argv:
+                    while True:
+                        found=re.search(r'private rootless Xwayland ready display="(:\d+)"',(ROOT/"build/tests/qt-host.log").read_text())
+                        if found:break
+                        assert host.poll() is None and time.monotonic()<deadline;time.sleep(.05)
+                    env["DISPLAY"]=found[1]
                 viewer = Viewer(port, token, dpi=168)
+                if "--x11" in sys.argv:time.sleep(.1)
                 app = subprocess.Popen([str(ROOT / "build/tests/qt-app")], env=env, stdout=app_log, stderr=app_log)
                 processes.append(app)
-                infos = {}; latest = {}; closed = set()
+                infos = {}; latest = {}; closed = set(); grabs={}
 
                 def pump():
                     k, v = viewer.receive()
                     if k == "control" and v["type"] in ("window","popup"): infos[v["id"]] = v
                     elif k=="control" and v["type"]=="window_closed":closed.add(v["id"])
+                    elif k=="control" and v["type"]=="popup_grab":grabs[v["root"]]=v["active"]
                     elif k == "frame": latest[v[0]] = v
                     return k, v
 
@@ -62,8 +75,9 @@ def main():
                 until(lambda: "DPR 1.75" in app_path.read_text())
                 frame = until(lambda: latest.get(main_id) if latest.get(main_id, (0,0,0))[1:3] == (1680,1120) else None)
                 frame[-1].save(ROOT / "build/tests/qt-175.png")
-                alpha = until(lambda: latest.get(alpha_id) if latest.get(alpha_id,(0,0,0))[1:3] == (1680,1120) else None)[-1]
+                alpha = until(lambda: latest.get(alpha_id) if ("--x11" in sys.argv or latest.get(alpha_id,(0,0,0))[1:3] == (1680,1120)) else None)[-1]
                 alpha.save(ROOT / "build/tests/alpha.png")
+                if "--x11" in sys.argv:subprocess.run([str(ROOT/"build/tests/x11-frame-probe"),"Waybridge alpha fixture","32"],env=env,check=True)
                 w, h = alpha.size
                 assert alpha.getpixel((w//6,h//2)) == (255,0,0,255)
                 assert alpha.getpixel((w//2,h//2)) == (0,255,0,128), alpha.getpixel((w//2,h//2))
@@ -92,15 +106,22 @@ def main():
                 click(main_id,80,100)
                 menu = until(lambda: re.search(r"^MENU (-?\d+) (-?\d+) (\d+) (\d+)$", app_path.read_text(), re.M))
                 x,y,w,h = map(int, menu.groups())
-                click(main_id,x+w//2,y+h//2)
+                if "--x11" in sys.argv:
+                    popup=until(lambda:next((id for id,v in infos.items() if v["type"]=="popup" and v.get("input_popup",True) and id not in closed),None))
+                    click(popup,infos[popup]["width"]//2,infos[popup]["height"]//2)
+                else:click(main_id,x+w//2,y+h//2)
                 until(lambda: "ACTION\n" in app_path.read_text())
+                if "--x11" in sys.argv:
+                    tooltip_id=until(lambda:next((id for id,v in infos.items() if v.get("input_popup") is False and id not in closed),None))
+                    until(lambda:grabs.get(main_id) is False)
+                    assert tooltip_id not in closed,"tooltip must remain mapped while menu grab releases"
                 # Keyboard-triggered menus need a valid key serial after the key has been released.
                 click(main_id,80,40)
                 viewer.send(type="key",id=main_id,key=29,down=True)
                 key(main_id,50)
                 viewer.send(type="key",id=main_id,key=29,down=False)
                 until(lambda: len(re.findall(r"^MENU ",app_path.read_text(),re.M)) >= 2)
-                popup_id = until(lambda:next((id for id,v in infos.items() if v["type"]=="popup" and id not in closed),None))
+                popup_id = until(lambda:next((id for id,v in infos.items() if v["type"]=="popup" and v.get("input_popup",True) and id not in closed),None))
                 key(main_id,1)  # Escape must reach the grabbed popup.
                 until(lambda:popup_id in closed)
                 click(main_id,200,40);key(main_id,46)
@@ -108,7 +129,7 @@ def main():
                 # A real popup extends the parent without changing the parent's stream geometry.
                 parent_geometry = (infos[main_id]["width"], infos[main_id]["height"])
                 click(main_id,450,100)
-                overflow_id = until(lambda:next((id for id,v in infos.items() if v["type"]=="popup" and id not in closed),None))
+                overflow_id = until(lambda:next((id for id,v in infos.items() if v["type"]=="popup" and v.get("input_popup",True) and id not in closed),None))
                 overflow = infos[overflow_id]
                 until(lambda:latest.get(overflow_id))
                 assert overflow["x"]+overflow["width"] > parent_geometry[0] or overflow["y"]+overflow["height"] > parent_geometry[1],overflow
@@ -118,7 +139,7 @@ def main():
                 until(lambda:overflow_id in closed)
                 # Nested popups retain a separate native parent and input surface.
                 click(main_id,450,100)
-                overflow_id=until(lambda:next((id for id,v in infos.items() if v["type"]=="popup" and id not in closed),None))
+                overflow_id=until(lambda:next((id for id,v in infos.items() if v["type"]=="popup" and v.get("input_popup",True) and id not in closed),None))
                 overflow=infos[overflow_id]
                 click(overflow_id,overflow["width"]//2,overflow["height"]-12)
                 nested_id=until(lambda:next((id for id,v in infos.items() if v["type"]=="popup" and v["parent"]==overflow_id and id not in closed),None))
@@ -136,10 +157,10 @@ def main():
                 until(lambda: "DIALOG_TEXT c\n" in app_path.read_text())
                 # DPI changes while the application remains alive.
                 viewer.send(type="resize",id=main_id,width=800,height=500,dpi=120)
-                until(lambda: "DPR 1.25" in app_path.read_text())
+                if "--x11" not in sys.argv:until(lambda: "DPR 1.25" in app_path.read_text())
                 until(lambda: latest.get(main_id) if latest.get(main_id,(0,0,0))[1:3] == (1000,625) else None)
                 assert infos[alpha_id]["scale"] == 1.75, "per-window DPI must not change other windows"
-                print("PASS: actual Qt at 175%, 1680x1120 buffers, exact alpha 0/128/255, text input, stale focus/leave, pointer/keyboard popup grabs, Escape/focus restoration, modal dialog/parent, live 125% DPI change")
+                print(("X11/XCB: per-window presentation scale, shared Xft DPI; " if "--x11" in sys.argv else "") + "PASS: actual Qt at 175%, 1680x1120 buffers, exact alpha 0/128/255, text input, stale focus/leave, pointer/keyboard popup grabs, Escape/focus restoration, modal dialog/parent, live 125% DPI change")
                 viewer.sock.close()
             finally:
                 for p in reversed(processes):

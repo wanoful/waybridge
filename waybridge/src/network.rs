@@ -18,6 +18,12 @@ pub enum Event {
     Connected(Arc<Peer>),
     Message(Value),
     Disconnected,
+    Icon {
+        id: u32,
+        revision: u64,
+        app_id: String,
+        png: Option<Arc<Vec<u8>>>,
+    },
     Clipboard {
         generation: u64,
         mime: String,
@@ -33,6 +39,8 @@ struct Queue {
     audio_unacked: BTreeSet<u64>,
     repairs: VecDeque<Vec<u8>>,
     controls: VecDeque<Vec<u8>>,
+    cursor: Option<Vec<u8>>,
+    icons: BTreeMap<u32, Vec<u8>>,
     frames: BTreeMap<u32, VecDeque<QueuedFrame>>,
     png_only: BTreeSet<u32>,
     active_codec: BTreeMap<u32, waybridge_codec::Codec>,
@@ -90,6 +98,9 @@ pub struct Peer {
     split_media: bool,
     codecs: BTreeSet<waybridge_codec::Codec>,
     acknowledgements: bool,
+    cursor_v1: bool,
+    window_icon_v1: bool,
+    window_semantics_v1: bool,
     media_attached: AtomicBool,
 }
 
@@ -128,6 +139,45 @@ impl Peer {
             };
             protocol::write_packet(&mut socket, 3, &frame)?;
         }
+    }
+    pub fn cursor_enabled(&self) -> bool {
+        self.cursor_v1
+    }
+    pub fn cursor(&self, message: Value) {
+        if !self.cursor_v1 {
+            return;
+        }
+        let mut q = self.queue.lock().unwrap();
+        if !q.closed {
+            q.cursor = Some(serde_json::to_vec(&message).unwrap());
+        }
+        self.wake.notify_all();
+    }
+    pub fn icons_enabled(&self) -> bool {
+        self.window_icon_v1
+    }
+    pub fn window_icon(&self, id: u32, message: Value) -> bool {
+        if !self.window_icon_v1 {
+            return false;
+        }
+        let mut q = self.queue.lock().unwrap();
+        if q.closed
+            || q.closed_windows.contains(&id)
+            || (q.icons.len() >= 128 && !q.icons.contains_key(&id))
+        {
+            return false;
+        }
+        let bytes = serde_json::to_vec(&message).unwrap();
+        if bytes.len() > 132 * 1024 {
+            return false;
+        }
+        q.icons.insert(id, bytes);
+        self.wake.notify_all();
+        true
+    }
+
+    pub fn semantics_enabled(&self) -> bool {
+        self.window_semantics_v1
     }
     pub fn begin_resize(&self, id: u32, width: u32, height: u32, started: Instant) {
         self.queue.lock().unwrap().resizes.insert(
@@ -278,6 +328,7 @@ impl Peer {
         q.hdr_windows.remove(&id);
         q.in_flight.remove(&id);
         q.resizes.remove(&id);
+        q.icons.remove(&id);
     }
     /// File workers may wait for network capacity; the compositor never does.
     pub fn bulk(&self, message: Value) -> bool {
@@ -313,7 +364,11 @@ impl Peer {
                                 .as_ref()
                                 .is_none_or(|u| !u.ready() || u.can_send(size))
                     });
-                    let ready = (!media && (!q.controls.is_empty() || !q.bulk.is_empty()))
+                    let ready = (!media
+                        && (!q.controls.is_empty()
+                            || !q.bulk.is_empty()
+                            || q.cursor.is_some()
+                            || !q.icons.is_empty()))
                         || (frames_allowed && (!q.repairs.is_empty() || frame_ready));
                     if q.closed || ready {
                         break;
@@ -327,6 +382,10 @@ impl Peer {
                     (protocol::JSON, q.controls.pop_front().unwrap(), None)
                 } else if frames_allowed && !q.repairs.is_empty() {
                     (udp::REPAIR, q.repairs.pop_front().unwrap(), None)
+                } else if !media && q.cursor.is_some() {
+                    (protocol::JSON, q.cursor.take().unwrap(), None)
+                } else if !media && !q.icons.is_empty() {
+                    (protocol::JSON, q.icons.pop_first().unwrap().1, None)
                 } else if frames_allowed && !q.frames.is_empty() {
                     let id = q.next_frame().unwrap().0;
                     q.last_frame_id = id;
@@ -543,6 +602,9 @@ pub fn listen(
                         .collect(),
                     media_attached: AtomicBool::new(false),
                     acknowledgements: hello["frame_ack"].as_bool().unwrap_or(false),
+                    cursor_v1: hello["cursor_v1"].as_bool().unwrap_or(false),
+                    window_icon_v1: hello["window_icon_v1"].as_bool().unwrap_or(false),
+                    window_semantics_v1: hello["window_semantics_v1"].as_bool().unwrap_or(false),
                 });
                 let mut key = [0; 32];
                 if std::fs::File::open("/dev/urandom")
@@ -569,7 +631,7 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha","cursor_v1","window_icon_v1","window_semantics_v1","relative_pointer_locked","locked_pointer","ime_v3"]}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

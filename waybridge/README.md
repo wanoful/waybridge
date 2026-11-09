@@ -1,32 +1,148 @@
 # Waybridge 0.3.0
 
-这一版修复越界菜单引起父窗口缩小：每个 `xdg_popup` 映射为独立的 Windows 无边框 owned window，不进入任务栏、不抢激活。父窗口的尺寸和画面范围保持不变；嵌套菜单、父窗口移动、DPI、鼠标抓取、Esc 和关闭均单独处理，弹出位置按 Windows 工作区约束。
+这是整合了 14 项并行功能的 Linux → Windows 独立应用窗口原型。服务端是私有无头 Smithay Wayland 合成器，可选择启动 rootless Xwayland；不接入 KWin，不迁移已有桌面窗口。Windows 客户端为 Win32，提供 x64 和原生 ARM64 构建。功能来源见 [整合清单](../PARALLEL_FEATURES.md)，实际验收范围见 [VALIDATION.md](VALIDATION.md)。
 
-默认 60 FPS，采用固定截止时间调度；完全不透明的帧跳过反预乘颜色计算。媒体与窗口控制/文件使用分开的认证 TCP 连接，并用呈现确认限制每窗口最多两个在途帧，防止旧帧堆进 socket 缓冲区，两条连接都经过原来的 SSH 转发端口，不需要新增端口。
+每个顶层窗口对应一个 Windows 窗口，标题栏只由一端拥有；越界/嵌套菜单映射为独立 owned popup，不改变父窗口尺寸。绘制跟随 Windows DPI，Qt 分数缩放、透明 alpha、父子对话框与原生输入分别处理。断线保留应用，重连恢复窗口；旧焦点的按键、组合和指针锁定不会继续作用于新目标。
 
-`--codec auto` 在查看端支持时为顶层窗口启用 **NVENC H.264 超低延迟编码**。Windows 通过系统 Media Foundation/D3D11 解码为 GPU 纹理，再用 shader 结合无损 alpha 遮罩交给 DirectComposition。菜单继续使用无损 PNG。硬件不可用或硬解失败时按窗口回退 PNG；`--codec png` 可以强制使用无损图像。
+默认 `--codec auto` 在查看端支持时选择 NVENC H.264 超低延迟编码，菜单使用 PNG。可选 HEVC/AV1 保留独立无损 alpha。Windows 使用实际能力探测后的系统 Media Foundation/D3D11 解码和 DirectComposition；不可用或运行失败按窗口回退 PNG。`--codec png` 强制无损图像。默认 60 FPS，原始更新合并，编码引用帧有序，每窗口最多两个呈现确认在途帧。
 
-Windows 客户端会移除旧服务端码流中的填充 NAL，避免已实测的 Media Foundation 解码器滞留末帧并触发 PNG 回退；新服务端直接从编码输出移除这种填充。PNG 和透明遮罩通过 WIC 直接解码到上传缓冲区，减少原先 GDI+ 的中间转换。
+控制/文件、媒体与可选音频使用独立认证 TCP 连接，同一个 SSH 转发端口即可承载。UDP 是额外可直达端口，保留原 TCP 控制/补帧。编码、解码和文件 I/O 不在合成器/UI 事件循环执行。常见尺寸有界缓存，复用后仍强制新 epoch/独立关键帧；首次遇到新尺寸、资源限制和同步回读仍可能产生停顿。
 
-重复最大化/还原现在复用常用尺寸的编码器和解码器，切换后仍发送新 epoch 和完整 IDR。服务端闲置缓存全局最多两个、合计最多 4 Mi 像素；资源不足时清理缓存后重试。编码器冷启动期间出现更新尺寸时跳过已过时的原始帧。Windows 立即缩放现有画面，最大化/还原立即发送尺寸，交互拖动合并 resize。首次遇到新尺寸仍需初始化，不能据此保证完全无停顿。新服务端需要重新启动后才使用这些优化；新版客户端仍兼容之前的 v3 服务端。
+**请同时更新并重启两端，再启动远端应用。** 协议保持独立 v3，不兼容普通 Moonlight。Windows 要求 Windows 10/11；历史 H.264/透明呈现的 WoA 实测不能替代新功能和整合版的实机验收。本版仍是开发原型，HDR 是明确标记的 scRGB 子集。
 
-**需要同时更新两端到 0.3.0。** 停止旧服务端，重新启动应用并复制新的 Windows `.exe`。协议已升级为 v3，连接端口和基本启动命令不变。客户端要求 Windows 10/11。已在 Snapdragon 8cx Gen 3 / Adreno 690 实机验证 ARM64 客户端硬解、纹理呈现及静止/动画不回退；实际输入到显示的端到端延迟尚未测量。Linux NVENC 比特流、透明度和参考帧连续性已在本机 NVIDIA 显卡上测试。
+## 直接运行
 
-默认 CPU 路径仍存在同步 GPU 回读和 CPU→NVENC 输入拷贝；当前传输仍是 TCP/SSH，尚未接入 UDP/FEC 或 Sunshine/Moonlight 线协议。这是硬件媒体路径的第一版，不能据此承诺最终端到端延迟。
+构建产物：
 
-可用 `--codec hevc-nvenc` 或 `--codec av1-nvenc` 显式试用新编码；`auto` 仍使用
-H.264。两种新编码保留独立无损 alpha、尺寸 epoch、关键帧和两帧呈现确认。
-客户端通过系统 Media Foundation 枚举同步 D3D11-aware 解码器，并实际解码一个
-小关键帧得到 NV12 GPU 纹理后才广告该能力；不可用、初始化/解码/呈现失败时回退
-PNG。系统解码器安装情况、GPU/驱动和尺寸能力会影响可用性。新路径仅为 8-bit
-4:2:0 SDR，不包含 HDR。Linux NVENC 与码流/alpha 已实际验证；Windows/WoA
-新 codec 的硬解可用性、性能和应用体验尚待实机确认。
+- Linux：`target/release/waybridge`
+- Windows x64：`build/windows/waybridge-client.exe`。
+- Windows on ARM 原生 ARM64：`build/windows-arm64/waybridge-client.exe`。
 
-在实际 Windows 设备上先运行 `waybridge-client.exe --check-codecs` 查看能力。
-诊断探针支持 `waybridge-decode-probe.exe BITSTREAM SIZES WIDTH HEIGHT hevc|av1`；
-默认不指定 codec 时保持原 H.264 行为。Linux 可运行 `python tests/codecs_smoke.py`
-验证真实 NVENC、alpha、缓存尺寸切换、协商和回退；`python tests/windows_codecs_smoke.py`
-在私有 Wine/Xvfb 桌面验证未广告能力和安全 PNG 回退，不代替 Windows 硬解测试。
+两个 Windows 版本均只依赖系统 DLL，启动参数相同。WoA 设备可选用 ARM64 版，避免 x64 仿真开销。
+
+在 Linux 启动测试应用：
+
+```bash
+cd /home/wano/workspace/streaming/waybridge
+./target/release/waybridge -- weston-terminal
+```
+
+服务端默认创建 `waybridge-0` socket，监听 `127.0.0.1:49090`，与 Sunshine 的 47990 管理端口分开。首次运行在 `$XDG_RUNTIME_DIR/waybridge.token` 创建 0600 权限的认证 token。可以在另一个 Linux 终端读取这个文件，将 token 用于 Windows 客户端：
+
+```bash
+cat "$XDG_RUNTIME_DIR/waybridge.token"
+```
+
+把 `.exe` 复制到 Windows。在 PowerShell 中建立 SSH 隧道并保持运行：
+
+```powershell
+ssh -N -L 49090:127.0.0.1:49090 wano@<Linux-IP>
+```
+
+再开一个 PowerShell，启动客户端：
+
+```powershell
+.\waybridge-client.exe 127.0.0.1 49090 "<token>"
+```
+
+TCP 协议自身不加密，默认使用本地监听和 SSH 隧道；可选 UDP 媒体另有 AES-GCM 认证加密。认证握手和版本检查在任何窗口数据发送前完成；一次只允许一个查看端连接。
+
+应用可在服务端运行期间继续加入：
+
+```bash
+WAYLAND_DISPLAY=waybridge-0 weston-terminal
+```
+
+Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通过已有 D-Bus 服务打开到原桌面，需要使用应用的新实例参数，或用 `dbus-run-session -- <应用>` 启动独立实例。已有 KWin 窗口不会迁移到这个会话。
+
+可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc|hevc-nvenc|av1-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
+
+## 光标、图标与窗口语义
+
+光标、XDG 应用图标和窗口语义按 v3 能力自动协商。支持系统形状、隐藏、自定义/动画光标及 DPI 热点；自定义动画独立于窗口画面，最多 30 FPS。应用 PNG/SVG 图标在后台解析为 Windows 大小图标，找不到时使用默认图标；不执行 desktop 文件中的 Exec。
+
+已实现真正的 xdg-dialog 模态提示、动态 owner、最小/最大尺寸、全屏恢复、unmap/remap 与隐藏/最小化后的 suspended/低频回调。仅有 parent 关系不代表模态。输入区域与视觉透明度分别映射；排除的客户区像素使用 `HTTRANSPARENT`，只保证同一 UI 线程中的 Waybridge 窗口间穿透，不能点穿到其他进程或桌面。未实现 KDE 毛玻璃。
+
+## 相对鼠标与指针锁定
+
+实现 `zwp_relative_pointer_manager_v1` 与 locked-pointer 子集，Windows 使用 Raw Input、隐藏光标和裁剪。只有目标已映射、具有焦点、指针位于有效区域且无 popup grab 时才申请锁定，原生建立成功确认后才向应用报告 locked；消息使用 target/generation 拒绝过时输入。
+
+**Ctrl+Alt+Shift+F12** 紧急解锁。焦点丢失、弹出菜单、移动/缩放、约束移除、断线和退出均释放原生锁定并恢复当前光标。confined-pointer、未锁定的独立相对运动、popup 锁定及光标位置提示未启用。
+
+## Windows 本地输入法
+
+本版提供 Windows 本地 IME → Wayland `text-input-v3` 通道。需要更新并重新启动服务端及客户端，让应用发现新的 Wayland 全局接口；连接命令和协议版本仍为 v3。
+
+在远端应用输入框获得焦点后，可用 Windows 的 `Win+Space` 切换到微软拼音。候选窗口显示在 Windows；预编辑文字由远端应用绘制，确认后才提交文本。候选位置跟随应用报告的光标矩形，并考虑 Windows DPI、画面缩放及裁剪原点。切换窗口会取消旧预编辑，迟到的提交由焦点 generation 拒绝。英文文本走同一文本通道，Ctrl/Alt/Win 快捷键与导航按键继续转发。
+
+快捷键不会再额外提交其翻译字符，例如 Ctrl+Space 不会额外插入空格。组合输入结束或取消后，仍按住的 Ctrl/Shift 等修饰键会恢复同步，已经松开的键保持松开；AltGr 继续用于本地键盘布局的文本输入。
+
+已验证真实 Qt 和 Ghostty/GTK 在 175% 下的中文、emoji、预编辑/取消及焦点保护，也验证了 Wine 中原生 Win32 Unicode 输入到 Qt 的完整链路。**微软拼音实际候选面板、选词和快捷键切换还需在 WoA 实机验收**；Wine Unicode 注入不代表真实微软 IME 引擎测试。
+
+仅支持实现 `text-input-v3` 的 Wayland 应用；X11/XIM、文档重转换和周边文本查询暂未支持。应用周边文本不传到 Windows。如果程序被宿主环境强制使用 fcitx/ibus 模块，可在启动该远端实例时清除 `GTK_IM_MODULE` / `QT_IM_MODULE`，让它选择 Wayland 文本输入后端。
+
+## 会话音频（可选）
+
+使用 `--audio` 启动，例如 `./target/release/waybridge --audio -- ghostty`。Linux 需安装 `pactl` 和 `parec`（PulseAudio 客户端工具，亦可连接 PipeWire-Pulse）。服务端创建私有 sink，启动的应用通过 `PULSE_SINK` 加入；不修改系统默认输出。日志中的 `sink=waybridge-<pid>` 可用于之后加入的应用：`PULSE_SINK=waybridge-<pid> WAYLAND_DISPLAY=waybridge-0 <应用>`。直接使用 ALSA 或绕过 PulseAudio 的应用需要自行选择该输出。
+
+新版 Windows 客户端自动协商独立音频 TCP 连接，仍经过原来的 SSH 端口，使用 WASAPI 播放到默认输出设备。出现 `WASAPI 48 kHz stereo audio playback active` 表示音频设备已启动；设置 `WAYBRIDGE_NO_AUDIO=1` 可关闭客户端音频，`WAYBRIDGE_AUDIO_DEVICE` 可指定 WASAPI endpoint ID。无声卡或音频连接失败不影响画面。
+
+首版为 48 kHz、16-bit 双声道 PCM，每秒约 1.536 Mbit，不含协议开销；每包 10 ms，服务端待发队列最多 40 ms、在途最多 40 ms，客户端待播放队列最多 100 ms，另有系统缓冲。拥堵时丢弃旧 PCM，优先恢复实时播放。尚未接入 Opus、跨设备时钟同步、严格音画同步、麦克风或输出设备热切换。正常退出/SIGINT/SIGTERM 清理自身 sink；强制 SIGKILL 无法清理，遗留模块可按日志确认后手动卸载。音频应用应随会话退出。
+
+## 可选 X11 应用
+
+运行时需安装 `Xwayland`。例如在独立端口和 socket 测试：
+
+```bash
+./target/release/waybridge --xwayland \
+  --listen 127.0.0.1:49101 --socket waybridge-x11 \
+  --token-file "$XDG_RUNTIME_DIR/waybridge-x11.token" -- glxgears
+```
+
+Windows 通过对应的 SSH 转发连接 49101，使用该 token 文件。Windows 客户端无新增运行时依赖，已有 v3 客户端可显示 X11 窗口。
+
+日志 `private rootless Xwayland ready display=":1000"` 给出实际 DISPLAY，后续 X11 应用使用此值。显示号从 1000–4095 的空闲范围选取，同时避开现有文件和 abstract socket；只监听权限 0700 的文件系统 Unix socket，限同一 Linux 用户连接。启动命令自动获得 DISPLAY，原生 Wayland 应用仍可加入相同会话。例如（按日志替换 `:1000`）：
+
+```bash
+DISPLAY=:1000 QT_QPA_PLATFORM=xcb ./build/tests/qt-app
+WAYLAND_DISPLAY=waybridge-x11 QT_QPA_PLATFORM=wayland ./build/tests/qt-app
+```
+
+已接入独立顶层窗口、transient owner、无边框 override-redirect 菜单/嵌套菜单、原生移动后的点击路由、resize/关闭、键盘焦点、文本/PNG/URI 剪贴板及大文本 INCR。X11 菜单在 Windows 捕获鼠标时仍能越出父窗口，Tooltip 不建立输入捕获。剪贴板按代际丢弃过时读取，缓存写出最多 16 worker、每次最多 10 秒。
+
+Xft/DPI 和 X11 客户端密度为这个 X 服务器共享，初始跟随 Windows 连接 DPI；各 Windows 窗口的呈现仍独立缩放。实测 Qt/XCB 在 175% 创建 1680×1120 画面，改成 125% 呈现为 1000×625，但应用共享 Xft 密度仍为 175%。忽略 Xft/DPI 的旧软件可能需要应用自己的字体设置。X11 resize 仍由应用自行布局，不能等同原生 Wayland 的逐窗口密度协议。
+
+当前 X11 子集不含 PRIMARY、XDND 文件拖放桥、XIM/Windows IME、完整 EWMH fullscreen/尺寸提示及自动 Xwayland 崩溃重启。崩溃/关闭 X11 应用不会关闭其余 Wayland 窗口；正常退出/SIGINT/SIGTERM 回收私有 X socket 和锁。可以与本版的原生 Wayland、音频和媒体功能共用会话。
+
+## 使用数据交换
+
+- 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
+- Windows 资源管理器中复制文件或目录，传输完成后可在支持文件粘贴的 Linux 应用里粘贴；Linux 应用提供 `text/uri-list` 时，目录树下载后可粘贴到 Windows 资源管理器。两端会协商 `file_tree` 能力，保留层级、空目录、零字节文件和名称；旧端仍只支持普通文件。
+- 从 Windows 资源管理器拖文件或目录到远端窗口，先上传完整数据，再由合成器向目标应用协商 Copy 拖放。当前不会在上传期间显示远端拖动预览。
+- Windows 应用仅提供 `FILEDESCRIPTORW/A` + `FILECONTENTS`、没有 `CF_HDROP` 路径时，也可复制或拖入远端窗口。独立 COM worker 按文件获取并以 64 KiB 分块读取流；支持 Clone/Seek、顺序流、未知大小流的 Stat，以及最多 12 MiB 的已知大小 HGLOBAL。异步源在 Linux 提交后收到完成通知，同步拖入等完整接收后返回，等待期间 Esc 可取消。Linux 应用读取的是完成后保留的本地文件，尚未提供 FUSE 按需文件系统；IStorage 和未知大小 HGLOBAL 暂不支持。
+- Linux 应用提供标准文件/目录拖放时，可按住左键拖出远端窗口，到支持 Windows 虚拟文件的原生目标释放。文件内容按目标读取请求传输，无需先下载完整文件；支持异步提取、取消以及断线清理，始终使用 Copy，保留 Linux 源文件并保持剪贴板内容。仅接受 CF_HDROP 的目标暂不支持这一拖出路径。
+- 目录批次最多 128 个顶层项、512 个条目、16 层路径、总文件内容 8 GiB，单文件最多 1 GiB；相对路径最多 240 个 UTF-16 单元，单个名称最多 240 UTF-8 字节/UTF-16 单元。Windows 临时目录加完整相对路径还必须小于 MAX_PATH，超限会报错。仅 Copy，不保留权限、时间戳和硬链接关系。
+- 符号链接、NTFS reparse point（含 junction/云占位文件）、特殊文件、非本地 URI、Windows 保留名/ADS/尾点空格及同一父目录下的大小写冲突会拒绝整批，绝不静默覆盖或改名。Linux 拖出要求应用使用 Wayland data-device v3 并支持 Copy；一次一个出站操作，空闲超过 120 秒取消。
+- 未完成的私有目标树会在取消、错误、替换剪贴板或断线时清理。通过新协议完成的文件/目录批次保留在 Linux `$XDG_RUNTIME_DIR/waybridge-inbox/tree-<batch>/` 或 Windows `%TEMP%\Waybridge-tree-*`；旧普通文件路径分别为 `<transfer-id>/` 和 `%TEMP%\Waybridge-*`。应用可能延迟读取，成功后不立即删除；确认无消费者后可手动清理。原生拖出目标自己创建的文件由目标管理，Waybridge 不删除用户目标目录或源文件。
+
+应用对粘贴和拖入的数据类型有自己的限制；私有应用格式不做跨平台转换。
+
+## 可选 UDP/FEC 媒体通道
+
+默认继续使用 TCP/SSH。显式启用 UDP 时，在 Linux 增加 `--udp-listen <可达监听地址>:49091`；`--udp-mbps 200` 控制含校验片的发送速率上限，范围 1–1000 Mbit/s。它是固定速率节流，尚无自适应拥塞控制；应低于可用带宽。Windows 保留原来的 SSH 隧道和 TCP 启动参数，另设置：
+
+```powershell
+$env:WAYBRIDGE_UDP_HOST = "<Windows 能直接访问的 Linux 地址>"
+# 可选：NAT/代理暴露的端口与服务端监听端口不同时设置
+$env:WAYBRIDGE_UDP_PORT = "49091"
+.\waybridge-client.exe 127.0.0.1 49090 "<token>"
+```
+
+SSH `-L` 只转发 TCP，不能承载这个 UDP 通道；可使用局域网或已有 VPN 的地址，需允许该 UDP 端口。握手和媒体密钥仍走原控制连接，应保留 SSH。UDP 每会话、每方向使用独立随机 AES-256-GCM 密钥、唯一计数 nonce、认证分片和重放检查；认证成功前不向 UDP 地址发送画面。
+
+画面分为 1024-byte 数据片，每 8 片增加一片 XOR 校验，可恢复该组单片丢失；乱序重组后按原顺序送入解码器。其余丢包通过原 TCP 媒体连接补同一帧，保留 H.264/HEVC/AV1/Main10 引用链。每窗口的两帧呈现 credit 保持有效。UDP 不通时继续 TCP，已建立的 UDP 中断时用 TCP 补帧；当前不支持 UDP endpoint 漫游，需重连。协议仍为 v3，未协商的客户端不受影响。
+
+当前尚未实现动态码率、Reed–Solomon、多丢包低延迟 IDR 恢复或音频 UDP。全局最多 8 条未确认媒体消息、原始帧体合计最多 64 MiB（单条超大 TCP 帧只允许独占），包括 UDP 和 TCP fallback；补帧优先，不受这个新帧门限阻塞。接收端重组最多 16 条/96 MiB，缺失的头部 TCP 补帧可直接交付并排空后续消息。UDP 仅用于不超过 8 MiB 的帧，服务端修复缓存最多 16 条/32 MiB；超限新帧走 TCP。断线取消会逐包中断慢速发送。传输层按全局消息顺序交付，丢失一帧可能暂时阻塞其他窗口，不能据此保证弱网体验或端到端延迟优于 TCP。
 
 ## 可选 CUDA GL 颜色输入
 
@@ -46,7 +162,7 @@ NVENC 关键帧恢复。每个查看会话/窗口发生失败后不再反复尝�
 编入可选 interop；运行时动态加载系统 `libcuda.so.1`，不新增 libcudart/libnvrtc 运行依赖。
 缺失头文件的构建仍可正常运行，指定 `cuda` 时会记录原因并回退。PTX 来自仓库内
 kernel 源码，可用 `bash scripts/build-gpu-kernel.sh` 重新生成；预生成 PTX 需要
-兼容的 NVIDIA 驱动。此版仅支持 RGBA8 SDR，同 GPU 限制由 CUDA GL 查询校验。
+兼容的 NVIDIA 驱动。常规 CUDA 输入处理 RGBA8 SDR；下面的 HDR 模式另有 FP16→P010 路径。同 GPU 限制由 CUDA GL 查询校验。
 
 `python tests/gpu_smoke.py --benchmark` 检查真实 GL/CUDA/NVENC、每像素/alpha 和
 编码错误恢复，并输出 Release CPU/CUDA 对照到 `build/diagnostics/gpu-input-benchmark.json`。
@@ -89,74 +205,9 @@ BT.2020/PQ 描述、广义色域映射、HDR X11 应用和物理 Windows/WoA HDR
 `av1_main10_pq_alpha16` 能力，保留 60-byte 视频 header；kind6 留给 UDP repair。
 测试需要 NumPy、Pillow、CUDA 开发头及真实 NVENC。源码内 vendor Smithay 保留 Xwayland 补丁，并修复同尺寸 SHM 格式切换的纹理缓存。
 
-## 直接运行
-
-本机已构建 Linux 服务端和 x64、ARM64 Windows 客户端：
-
-- Linux：`target/release/waybridge`
-- Windows x64：`build/windows/waybridge-client.exe`。
-- Windows on ARM 原生 ARM64：`build/windows-arm64/waybridge-client.exe`。
-
-两个 Windows 版本均只依赖系统 DLL，启动参数相同。WoA 设备可选用 ARM64 版，避免 x64 仿真开销。
-
-在 Linux 启动测试应用：
-
-```bash
-cd /home/wano/workspace/streaming/waybridge
-./target/release/waybridge -- weston-terminal
-```
-
-服务端默认创建 `waybridge-0` socket，监听 `127.0.0.1:49090`，与 Sunshine 的 47990 管理端口分开。首次运行在 `$XDG_RUNTIME_DIR/waybridge.token` 创建 0600 权限的认证 token。可以在另一个 Linux 终端读取这个文件，将 token 用于 Windows 客户端：
-
-```bash
-cat "$XDG_RUNTIME_DIR/waybridge.token"
-```
-
-把 `.exe` 复制到 Windows。在 PowerShell 中建立 SSH 隧道并保持运行：
-
-```powershell
-ssh -N -L 49090:127.0.0.1:49090 wano@<Linux-IP>
-```
-
-再开一个 PowerShell，启动客户端：
-
-```powershell
-.\waybridge-client.exe 127.0.0.1 49090 "<token>"
-```
-
-原型协议自身不加密，默认使用本地监听和 SSH 隧道。认证握手和版本检查在任何窗口数据发送前完成；一次只允许一个查看端连接。
-
-应用可在服务端运行期间继续加入：
-
-```bash
-WAYLAND_DISPLAY=waybridge-0 weston-terminal
-```
-
-Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通过已有 D-Bus 服务打开到原桌面，需要使用应用的新实例参数，或用 `dbus-run-session -- <应用>` 启动独立实例。已有 KWin 窗口不会迁移到这个会话。
-
-可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc|hevc-nvenc|av1-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
-
-## 会话音频（可选）
-
-使用 `--audio` 启动，例如 `./target/release/waybridge --audio -- ghostty`。Linux 需安装 `pactl` 和 `parec`（PulseAudio 客户端工具，亦可连接 PipeWire-Pulse）。服务端创建私有 sink，启动的应用通过 `PULSE_SINK` 加入；不修改系统默认输出。日志中的 `sink=waybridge-<pid>` 可用于之后加入的应用：`PULSE_SINK=waybridge-<pid> WAYLAND_DISPLAY=waybridge-0 <应用>`。直接使用 ALSA 或绕过 PulseAudio 的应用需要自行选择该输出。
-
-新版 Windows 客户端自动协商独立音频 TCP 连接，仍经过原来的 SSH 端口，使用 WASAPI 播放到默认输出设备。出现 `WASAPI 48 kHz stereo audio playback active` 表示音频设备已启动；设置 `WAYBRIDGE_NO_AUDIO=1` 可关闭客户端音频，`WAYBRIDGE_AUDIO_DEVICE` 可指定 WASAPI endpoint ID。无声卡或音频连接失败不影响画面。
-
-首版为 48 kHz、16-bit 双声道 PCM，每秒约 1.536 Mbit，不含协议开销；每包 10 ms，服务端待发队列最多 40 ms、在途最多 40 ms，客户端待播放队列最多 100 ms，另有系统缓冲。拥堵时丢弃旧 PCM，优先恢复实时播放。尚未接入 Opus、跨设备时钟同步、严格音画同步、麦克风或输出设备热切换。正常退出/SIGINT/SIGTERM 清理自身 sink；强制 SIGKILL 无法清理，遗留模块可按日志确认后手动卸载。音频应用应随会话退出。
-
-## 使用数据交换
-
-- 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
-- Windows 资源管理器中复制文件，传输完成后可在支持文件粘贴的 Linux 应用里粘贴；Linux 应用提供 `text/uri-list` 时，文件下载后可粘贴到 Windows 资源管理器。
-- 从 Windows 资源管理器拖文件到远端窗口，先上传文件，再由合成器向目标应用协商 Copy 拖放。当前不会在上传期间显示远端拖动预览。
-- 单次最多 128 个普通文件，单文件最多 1 GiB。暂不支持目录、剪切/移动及 Linux → Windows 原生拖出。
-- Linux 收到的文件保留在 `$XDG_RUNTIME_DIR/waybridge-inbox/<transfer-id>/`；Windows 文件保留在 `%TEMP%\Waybridge-*`。不在粘贴后立即删除，因为应用可能延迟读取。临时文件可在不再需要后手动清理。
-
-应用对粘贴和拖入的数据类型有自己的限制；私有应用格式不做跨平台转换。
-
 ## 构建
 
-本机已有所需工具。Rust 依赖版本由 `Cargo.lock` 固定。Linux 需要 EGL/GLES、libdrm、Wayland、xkbcommon、FFmpeg（libavcodec/libavutil）开发文件及 pkg-config；使用 NVENC 还需要系统 FFmpeg 的对应 h264_nvenc/hevc_nvenc/av1_nvenc 编码器和 NVIDIA 驱动；构建原生 Windows 客户端需要 MinGW-w64、CMake 和 Ninja。
+Rust 依赖版本由 `Cargo.lock` 固定。Linux 需要 EGL/GLES、libdrm、Wayland、xkbcommon、FFmpeg（libavcodec/libavutil）开发文件及 pkg-config；使用 NVENC 还需要系统 FFmpeg 的对应 h264_nvenc/hevc_nvenc/av1_nvenc 编码器和 NVIDIA 驱动；构建原生 Windows 客户端需要 MinGW-w64、CMake 和 Ninja。
 
 ```bash
 ./scripts/build.sh
@@ -172,40 +223,46 @@ LLVM_MINGW_ROOT=/path/to/llvm-mingw ./scripts/build-windows-arm64.sh
 
 也可在 Windows 上使用 MSVC/CMake 构建 `client/`。客户端使用 Win32、D3D11、DXGI、DirectComposition、GDI+、系统 Media Foundation 和系统剪贴板 API，无 WSL 或 Qt 运行时依赖。
 
-## 验证
+
+按需功能依赖：X11 需要 `Xwayland`，音频需要 `pactl`/`parec` 和可用的 PulseAudio 或 PipeWire-Pulse；SVG 图标需要 `rsvg-convert`。CUDA/HDR 需要兼容 NVIDIA GPU/驱动及构建时 CUDA/GL 开发头；缺少 CUDA 头时仍可构建 CPU/PNG 路径。测试另需 Pillow、wl-clipboard、Wayland scanner、Qt6Widgets、Wine/Xvfb/MinGW；HDR 数值测试需要 NumPy。
+
+## 构建后的测试
+
+以下命令均在 `waybridge` 目录执行。测试使用私有 Wayland socket、端口、Wine prefix/Xvfb 和音频 null sink；组合测试不会替换已有 49090 服务或修改默认音频输出。
 
 ```bash
 ./scripts/test.sh
-# 可选：安装了 Wine 和 Xvfb 时，验证真正的 Windows .exe
-python tests/windows_smoke.py
-python tests/windows_smoke.py --csd
-python tests/windows_smoke.py --terminal
-python tests/windows_smoke.py --qt
-# 可选：需要 NVIDIA/NVENC；真实硬件编码、P 帧、alpha、奇数尺寸及回退
-python tests/hardware_smoke.py
-# 可选：真实 NVENC 尺寸切换、缓存淘汰、IDR/P 引用与回环耗时
-python tests/resize_smoke.py
-# 可选：安装了 Ghostty 时，验证真实 GTK 越界菜单
-python tests/ghostty_smoke.py
-# 可选：PulseAudio/PipeWire-Pulse 私有 sink、认证、流控及清理
-python tests/audio_smoke.py
-# 可选：真实 Windows PE → WASAPI → 私有 null sink 回录，不播放到宿主默认输出
-python tests/windows_audio_smoke.py
+python tests/session_integration_smoke.py
 ```
 
-`tests/smoke.py` 启动隔离的真实合成器和两个原生 Wayland 测试窗口，检查图像颜色/方向、尺寸、输入、断线、重连、双向文本/PNG/文件、文件拖放和路径校验。依赖 `python-pillow`、`wl-clipboard`、`wayland-scanner`、C 编译器。`tests/qt_smoke.py` 需要 Qt6Widgets 开发文件与 C++ 编译器，验证真实 Qt 的 175%/125% 动态缩放、精确透明度、文字输入、菜单和模态对话框；有 Dolphin 时还会在独立 D-Bus/配置目录中验证路径输入及导航。
+组合脚本同时启用 X11/音频/UDP/GPU/HDR，验证能力、独立音频认证、PNG-only 回退、Wayland+X11 共存、控制响应及共享退出清理；它不代表所有 14 项功能在一个真实 Windows 会话中完成验收。桌面+媒体检查点已通过，最终文件整合后的复测状态见 [VALIDATION.md](VALIDATION.md)。
 
-`tests/windows_smoke.py` 使用项目自己的 Wine prefix 与 Xvfb 显示，检查 `.exe` 的窗口像素、真实尺寸调整、原生剪贴板和文件拖放，不操作用户桌面。Wine 测试明确使用双缓冲 GDI 备用路径，不能代替在实际 Windows 机器上验证 DirectComposition 的透明合成和呈现效果。
+按所需功能选择额外测试；每条命令都需其对应依赖。
 
-## 在 Windows 实机检查这一版
+| 范围 | 测试入口（`python tests/<名称>.py`） |
+|---|---|
+| 原生 Windows 窗口/剪贴板/菜单 | `windows_smoke`，可加 `--csd` / `--terminal` / `--qt` / `--udp` |
+| 光标与图标 | `cursor_smoke`、`windows_cursor_smoke`、`app_icon_smoke`、`windows_app_icon_smoke` |
+| 模态/全屏/输入区域 | `window_semantics_smoke`、`windows_semantics_smoke` |
+| IME 与快捷键 | `ime_smoke`、`windows_ime_keys_smoke`、`ghostty_smoke --ime` |
+| 相对鼠标 | `relative_smoke`、`windows_relative_smoke` |
+| 原生拖出/目录/虚拟源 | `drag_out_smoke`、`tree_smoke`、`windows_drag_out_smoke`（可加 `--tree`）、`windows_virtual_smoke` |
+| X11/GLX/剪贴板 | `x11_smoke`、`x11_clipboard_smoke` |
+| PCM/WASAPI | `audio_smoke`、`windows_audio_smoke` |
+| 真实 NVENC/缓存/回退 | `hardware_smoke`、`codecs_smoke`、`resize_smoke`、`windows_codecs_smoke` |
+| CUDA 与故障恢复 | `gpu_smoke --binary target/debug/waybridge`；Release 对照使用 `--benchmark` |
+| UDP 故障/所有 codec/全局流控 | `windows_udp_smoke`、`udp_flow_smoke` |
+| HDR 数值/视频/Windows shader | `hdr_smoke`、`hdr_video_smoke`、`hdr_windows_smoke`、`hdr_preflight` |
 
-连接后应出现 `D3D11/DirectComposition presentation active`。硬件媒体路径成功时，Linux 另有 `NVENC ultra-low-latency encoder active` 和 `codec="H.264"`，Windows 有 `D3D11 hardware H.264 decoder active for window ...`。客户端启动时会打印 H.264 能力；若不可用，将继续使用 PNG。`GDI fallback` 代表备用绘制，不支持逐像素透明。
+Wine GUI 测试使用 GDI 备用呈现，不能据此验收真实 Windows GPU/透明显示。HDR 的离屏软件 D3D11 数值测试只验证 shader/WIC，不证明物理 HDR。测试输出位于各工作目录的 `build/tests/` 和 `build/diagnostics/`，不是随仓库提交的固定产物。
 
-1. Windows 保持 175% 缩放，打开 Ghostty 的越界菜单；检查父窗口大小和文字比例保持不变，菜单可正常操作，Esc、点击外部和嵌套菜单正常。
-2. 滚动终端、连续输入，检查两端实际启用的编码日志。对比 `--codec png` 与 `--codec auto`，使用相同窗口尺寸和内容。
-3. 自动测试构建后，可用 `WAYLAND_DISPLAY=waybridge-0 ./build/tests/qt-app` 打开验证应用。`Ctrl+O` 打开靠近右下角的越界/嵌套菜单；透明窗口左侧不透明红色、中间半透明绿色、右侧透出 Windows 背景。
+## Windows 实机检查与延迟日志
 
-诊断延迟时，在 Linux 启动：
+先运行 `waybridge-client.exe --check-codecs`。正常 GPU 呈现日志包含 `D3D11/DirectComposition presentation active`，视频解码日志标明具体 codec；`GDI fallback` 不支持逐像素透明。HDR 另用 `--check-hdr` 查询当前显示/能力，并在实际 HDR 显示器上检查 Main10、透明度及切回 SDR。程序不会替你启用系统 HDR。
+
+请重点验收 175% DPI、Ghostty 越界菜单、真实微软拼音候选/选词/焦点切换、Explorer 双向目录和拖出、Outlook/压缩软件虚拟源、锁定后紧急解锁、Windows 新 codec 及多显示器切换。Linux→Windows 拖出始终 Copy，目标必须接受虚拟文件；先用小文件、空目录和 Unicode 名称核对哈希与保留源文件。
+
+Linux：
 
 ```bash
 ./target/release/waybridge --stats --codec auto -- ghostty
@@ -218,21 +275,18 @@ $env:WAYBRIDGE_STATS = "1"
 .\waybridge-client.exe 127.0.0.1 49090 "<token>"
 ```
 
-Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG、发送及呈现确认往返的平均/最大耗时。Windows 记录解码排队、解码、UI 排队、提交呈现、GDI 备用绘制，以及控制通道 RTT。均为各端自身时钟上的阶段耗时，**不等于输入到显示的端到端延迟**；`present` 是提交耗时，不含最终显示器扫描输出。`send` 是写入 socket 的耗时；`display_roundtrip` 包含传输、客户端处理和呈现确认返回，也不等于单向显示延迟。
+Linux 记录合成、回读、编码排队、转换、编码、发送及呈现确认往返；Windows 记录解码排队/处理、UI 排队、呈现提交及控制 RTT。各端使用自身单调时钟；`present` 不含显示器扫描输出，`send` 只是 socket 写入，`display_roundtrip` 包含往返，均不等于物理输入到显示延迟。尺寸切换另有 `encoder_init`、`encoder_reuse`、`resize_first_encoded`、`resize_first_sent`、`decoder_create`、`decoder_reuse` 和 `resize_to_present`。
 
-尺寸切换另记录服务端 `encoder_init`、`encoder_reuse`（命中次数）、`resize_first_encoded`、`resize_first_sent`。后两项从开始处理 resize 到首个匹配目标像素尺寸的帧完成编码/写入 socket，跨越了应用重新布局、Wayland 提交、捕获及编码；不包含 Windows 解码与显示。Windows 的 `decoder_create`、`decoder_reuse` 和 `resize_to_present` 用于对照，其中 `resize_to_present` 从发送 resize 到匹配逻辑尺寸的帧提交呈现，也不包含最终屏幕扫描输出。
+开发诊断变量：`WAYBRIDGE_DPI=168` 强制 175%，`WAYBRIDGE_GDI=1` 强制备用呈现，`WAYBRIDGE_PNG=1` 禁用视频能力协商；清除变量恢复自动选择。新旧客户端、编译配置、窗口尺寸及网络路径应在性能对照时保持一致；当前没有输入到光子的测量或相对 Moonlight 的性能结论。
 
-开发诊断环境变量：`WAYBRIDGE_DPI=168` 强制 175%，`WAYBRIDGE_GDI=1` 强制备用绘制，`WAYBRIDGE_PNG=1` 禁用查看端 H.264 协商。正常使用跟随 Windows 的实际 DPI。清除环境变量恢复自动选择。
+## 当前限制
 
-## 当前边界与后续工作
+- 每个视频顶层窗口使用 NVENC 会话，尺寸/并发受硬件与驱动限制；申请失败回退 PNG。视频一般限制在 48×48–4096×2304，驱动可能拒绝更小尺寸；更大窗口走 PNG。SDR 视频是 8-bit 4:2:0，彩色文字可能不如 PNG 清晰；无 4:4:4。
+- CUDA/HDR 需要兼容的同一 NVIDIA GPU；透明 alpha、同步和 GPU 内复制仍存在。HDR 仅显式 Wayland scRGB，ICC、通用 parametric 色彩管理、HDR X11 和物理 Main10/HDR 验收未完成。
+- IME 仅 text-input-v3，不含 XIM、周边文本查询/重转换。X11 还缺 PRIMARY、XDND、完整 EWMH 及自动崩溃重启；忽略 Xft 的程序需自己的密度设置。
+- 指针锁定和输入区域为有限子集；未支持通用跨进程透明点穿、KDE 模糊或 confined-pointer。
+- 文件只 Copy，不保留权限/时间戳/硬链接，无断点续传、FUSE 或 IStorage。Explorer/Outlook/压缩软件与不响应 COM 取消的源仍需实机兼容性验证。
+- 音频无 Opus、麦克风、严格音画同步和设备热切换；UDP 为固定节流与全局有序流，无自适应拥塞控制或 endpoint 漫游，弱网可能跨窗口阻塞。
+- TCP 需外部 SSH/VPN 保护；无内建完整端到端加密、会话管理或 Sunshine/Moonlight 线协议兼容。SIGKILL 无法执行资源清理。
 
-- 扩展可选 CUDA GL 输入的驱动/多 GPU 兼容性与异步同步；增加 UDP/FEC 和拥塞控制。
-- 视频路径为 8-bit 4:2:0 SDR，彩色文字可能不如 PNG 清晰；默认 H.264，可选 HEVC/AV1 的 Windows 硬解仍需实机验证。4:4:4 和高刷新率仍需扩展；上方实验 scRGB HDR 子集仍为 partial。
-- 每个视频顶层窗口使用一个 NVENC 会话；会话数量受硬件/驱动限制，不能分配时回退 PNG。视频包尺寸范围为 48×48 至 4096×2304，各 codec 的实际最小尺寸另受驱动限制，不支持时走 PNG。
-- 完善模态协议、窗口状态和光标/输入区域映射。
-- 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。
-- 接入 Xwayland，完善输入法、相对鼠标、指针形状和显式同步。
-- 实现 Linux → Windows 原生拖出、目录和按需文件访问。
-- 完善音频压缩/同步/设备切换、断点续传、文件传输进度/取消、端到端加密及会话管理。
-
-普通 `wl_shm` 客户端和 DMA-BUF 导入已接通；各类 GPU 应用、驱动及大型应用组合仍需逐一验证。此版本不保证 “All 应用” 的兼容性。
+普通 SHM、DMA-BUF 和可选 Xwayland 已接通；大型应用、驱动、多 GPU 与物理 Windows 组合仍需逐项测试，不能保证“All 应用”。

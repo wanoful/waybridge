@@ -4,21 +4,10 @@ use anyhow::{bail, Context, Result};
 use std::{
     io::Read,
     process::{Child, Command, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Weak,
-    },
+    sync::{Arc, Mutex, Weak},
     thread::{self, JoinHandle},
     time::Instant,
 };
-
-static STOP: AtomicBool = AtomicBool::new(false);
-extern "C" fn stop(_: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
-}
-pub fn stopping() -> bool {
-    STOP.load(Ordering::Relaxed)
-}
 
 struct Sink {
     name: String,
@@ -92,12 +81,6 @@ pub struct Session {
 }
 impl Session {
     pub fn new() -> Result<Self> {
-        // Graceful SIGINT/SIGTERM is necessary to unload our own transient sink.
-        // The handler only writes a lock-free atomic; cleanup runs in the main thread.
-        unsafe {
-            libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
-            libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
-        }
         let name = format!("waybridge-{}", std::process::id());
         let loaded = Command::new("pactl")
             .args([
@@ -143,7 +126,7 @@ impl Session {
             let mut sequence = 0u64;
             let mut pcm = [0u8; 480 * 2 * 2]; // 10 ms, stereo signed 16-bit little endian.
             while stdout.read_exact(&mut pcm).is_ok() {
-                if stopping() {
+                if crate::shutdown::requested() {
                     break;
                 }
                 sequence = sequence.wrapping_add(1);
@@ -160,7 +143,7 @@ impl Session {
                     peer.audio_frame(frame);
                 }
             }
-            if !stopping() {
+            if !crate::shutdown::requested() {
                 tracing::warn!("audio capture ended; control and video remain available");
             }
         });

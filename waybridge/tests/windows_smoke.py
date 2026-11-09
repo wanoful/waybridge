@@ -25,7 +25,9 @@ def wait_for(check, seconds=15):
 def main():
     csd="--csd" in sys.argv
     terminal="--terminal" in sys.argv
-    qt="--qt" in sys.argv
+    x11="--x11" in sys.argv
+    ime="--ime" in sys.argv
+    qt="--qt" in sys.argv or ime
     udp="--udp" in sys.argv
     proxy=None
     subprocess.run(["bash","tests/build-fixture.sh"],cwd=ROOT,check=True)
@@ -63,21 +65,57 @@ def main():
             version=subprocess.run(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"--version"],env=wine_env,capture_output=True,text=True,timeout=15,check=True)
             assert "0.3.0" in version.stdout,version.stdout
             subprocess.run(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"--check-shaders"],env=wine_env,stdout=log,stderr=log,timeout=15,check=True)
-            host=subprocess.Popen([str(ROOT/"target/debug/waybridge"),"--socket","native-0","--listen",f"127.0.0.1:{port}","--token-file",str(token_file),"--codec",os.environ.get("WAYBRIDGE_TEST_CODEC","auto"),*(["--udp-listen",f"127.0.0.1:{udpport}"] if udp else [])],env=env,stdout=log,stderr=log)
+            host=subprocess.Popen([str(ROOT/"target/debug/waybridge"),"--socket","native-0","--listen",f"127.0.0.1:{port}","--token-file",str(token_file),"--codec",os.environ.get("WAYBRIDGE_TEST_CODEC","auto"),*(["--xwayland"] if x11 else []),*(["--udp-listen",f"127.0.0.1:{udpport}"] if udp else [])],env=env,stdout=log,stderr=log)
             processes.append(host);wait_for(lambda:(Path(runtime)/"native-0").exists())
+            if x11:
+                display=wait_for(lambda:re.search(r'private rootless Xwayland ready display="(:\d+)"',Path(log.name).read_text()))[1]
+                env["DISPLAY"]=display
+                env["WAYBRIDGE_INPUT_TRACE"]="1"
+                client=subprocess.Popen(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"127.0.0.1",str(port),token],env=wine_env,stdout=log,stderr=log)
+                processes.append(client);time.sleep(.3)
+
             app_log=open(ROOT/"build/tests/native-app.log","w+")
             if qt:
                 flags=subprocess.check_output(["pkg-config","--cflags","--libs","Qt6Widgets"],text=True).split()
                 subprocess.run(["c++","-std=c++17","-fPIC","-no-pie","tests/qt_app.cpp","-o","build/tests/qt-app",*flags],cwd=ROOT,check=True)
-                env["QT_QPA_PLATFORM"]="wayland"
+                env["QT_QPA_PLATFORM"]="xcb" if x11 else "wayland"
                 for name in ("QT_SCALE_FACTOR","QT_SCREEN_SCALE_FACTORS","QT_WAYLAND_DISABLE_WINDOWDECORATION"):env.pop(name,None)
+                if ime:
+                    env.pop('QT_IM_MODULE',None);env.pop('GTK_IM_MODULE',None)
+                    env['WAYLAND_DEBUG']='1'
             app=subprocess.Popen([str(ROOT/"build/tests/qt-app")] if qt else (["weston-terminal"] if terminal else [str(ROOT/"build/tests/test-app")]),env=env,stdout=app_log,stderr=app_log);processes.append(app)
-            client=subprocess.Popen(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"127.0.0.1",str(port),token],env=wine_env,stdout=log,stderr=log);processes.append(client)
+            if not x11:
+                client=subprocess.Popen(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"127.0.0.1",str(port),token],env=wine_env,stdout=log,stderr=log);processes.append(client)
             if qt:
                 wait_for(lambda:"DPR 1.75" in Path(app_log.name).read_text())
                 wait_for(lambda:probe("frame","server",check=False).returncode==0)
                 probe("click","140","70");probe("type","a")
                 wait_for(lambda:"TEXT a\n" in Path(app_log.name).read_text())
+                if ime:
+                    probe('unicode','你好🙂')
+                    wait_for(lambda:'TEXT a你好🙂\n' in Path(app_log.name).read_text())
+                    probe('type','b')
+                    wait_for(lambda:'TEXT a你好🙂b\n' in Path(app_log.name).read_text())
+                    caret=probe('caret').stdout
+                    coords=list(map(int,re.search(r'CARET (-?\d+) (-?\d+) (-?\d+) (-?\d+)',caret).groups()))
+                    assert coords[0]>20 and coords[1]>=20 and coords[3]>coords[1],coords
+                    remote_rects=re.findall(r'set_cursor_rectangle\((-?\d+), (-?\d+), (-?\d+), (-?\d+)\)',Path(app_log.name).read_text())
+                    assert remote_rects
+                    remote=list(map(int,remote_rects[-1]))
+                    assert abs(coords[0]-remote[0]*1.75)<=2 and abs(coords[1]-remote[1]*1.75)<=2,(coords,remote)
+                    probe('shortcut','A');probe('unicode','中文输入')
+                    wait_for(lambda:'TEXT 中文输入\n' in Path(app_log.name).read_text())
+                    probe('shortcut',' ')
+                    wait_for(lambda:'CTRL_SPACE\n' in Path(app_log.name).read_text())
+                    assert re.findall(r'^TEXT (.*)$',Path(app_log.name).read_text(),re.M)[-1]=='中文输入','shortcut must not also commit a translated space'
+                    probe('clipboard','IME copy baseline')
+                    wait_for(lambda:pasted('text/plain;charset=utf-8')==b'IME copy baseline')
+                    probe('shortcut','A');probe('ime-held-copy')
+                    wait_for(lambda:pasted('text/plain;charset=utf-8')=='中文输入'.encode())
+                    probe('unicode','保留🙂');probe('type','c')
+                    wait_for(lambda:'TEXT 保留🙂c\n' in Path(app_log.name).read_text())
+                    print('PASS: actual Win32 Unicode/emoji and English -> real Qt text-input-v3 at 175%; Ctrl+A, Ctrl+Space once, held Ctrl+C after controlled composition, no stuck Ctrl, native caret (Wine; Microsoft IME engine/candidate UI still needs physical Windows)')
+                    return
                 probe("click","140","175")
                 menu=wait_for(lambda:re.search(r"^MENU (-?\d+) (-?\d+) (\d+) (\d+)$",Path(app_log.name).read_text(),re.M))
                 x,y,w,h=map(int,menu.groups());probe("click",str(round((x+w/2)*1.75)),str(round((y+h/2)*1.75)))

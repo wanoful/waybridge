@@ -105,6 +105,7 @@ def main():
             assert kind == 0 and hello["type"] == "hello"
             for feature in ("cursor_v1", "window_icon_v1", "window_semantics_v1", "audio_pcm"):
                 assert hello[feature] is True, feature
+            assert {"file_drop_out", "file_tree", "locked_pointer", "ime_v3"} <= set(hello["features"])
             assert hello["udp_fec_v1"]["version"] == 1
             for channel in ("media", "audio"):
                 stream = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -131,7 +132,11 @@ def main():
             infos, seen, pong = {}, set(), False
             send(control, type="ping", nonce="combined-session")
             deadline = time.monotonic() + 20
-            while time.monotonic() < deadline and (len(seen) < 2 or not pong):
+            while time.monotonic() < deadline and (
+                len(seen) < 2 or not pong
+                or not any(info.get("x11") for info in infos.values())
+                or not any(not info.get("x11") for info in infos.values())
+            ):
                 ready, _, _ = select.select([control, media], [], [], 5)
                 assert ready, "media fallback or control stalled"
                 for stream in ready:
