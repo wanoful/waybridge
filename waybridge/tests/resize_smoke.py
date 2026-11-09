@@ -80,7 +80,10 @@ def main():
                 if os.getenv('WAYBRIDGE_REQUIRE_GPU')=='1': assert 'input="cuda"' in trace and 'CUDA GL capture failed' not in trace
             output.write_text(json.dumps({'binary':binary,'resizes':timings,'burst_first_frame_ms':burst_ms},indent=2)+'\n')
             times=[t['first_frame_ms'] for t in timings]
-            print(f'PASS: 10 real NVENC size switches, fresh IDRs and intact P references/alpha; first={times[0]:.2f}ms, warm average={sum(times[1:])/len(times[1:]):.2f}ms; report={output}')
+            # Keep the viewer, window and cached NVENC sessions alive: disconnect
+            # cleanup must not be responsible for releasing them before SIGTERM.
+            host.terminate()
+            assert host.wait(timeout=5)==0, 'live NVENC session shutdown failed'
         finally:
             if viewer:
                 viewer.media.close()
@@ -89,7 +92,12 @@ def main():
                 app.terminate()
                 app.wait(timeout=5)
             host.terminate()
-            host.wait(timeout=5)
+            try:
+                assert host.wait(timeout=5)==0, 'graceful NVENC session shutdown failed'
+            except subprocess.TimeoutExpired:
+                host.kill(); host.wait(timeout=5)
+                raise
+        print(f'PASS: 10 real NVENC size switches, fresh IDRs, intact P references/alpha and graceful cached-encoder shutdown; first={times[0]:.2f}ms, warm average={sum(times[1:])/len(times[1:]):.2f}ms; report={output}')
 
 
 if __name__=='__main__':

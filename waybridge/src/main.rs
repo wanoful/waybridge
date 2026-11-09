@@ -279,6 +279,7 @@ struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.encoder.shutdown();
         // Unregister every GL resource while the renderer/context still exists.
         let windows = &mut self.windows;
         let popups = &mut self.remote_popups;

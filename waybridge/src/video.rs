@@ -51,9 +51,11 @@ struct Queue {
     last_id: u32,
     forget: Vec<u32>,
     reset: bool,
+    closed: bool,
 }
 pub struct Encoder {
     queue: Arc<(Mutex<Queue>, Condvar)>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 struct Session {
     width: u32,
@@ -88,7 +90,7 @@ impl Encoder {
     pub fn new(codec: Option<nvenc::Codec>, fps: u32, bitrate: u32) -> Self {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let worker = queue.clone();
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let mut sessions: BTreeMap<u32, Session> = BTreeMap::new();
             let mut idle = VecDeque::<(u32, Session)>::new();
             let mut epoch = 0u32;
@@ -96,8 +98,11 @@ impl Encoder {
                 let (frame, reset, forget) = {
                     let (lock, wake) = &*worker;
                     let mut q = lock.lock().unwrap();
-                    while q.frames.is_empty() && !q.reset && q.forget.is_empty() {
+                    while q.frames.is_empty() && !q.reset && q.forget.is_empty() && !q.closed {
                         q = wake.wait(q).unwrap();
+                    }
+                    if q.closed {
+                        return;
                     }
                     let reset = std::mem::take(&mut q.reset);
                     let forget = std::mem::take(&mut q.forget);
@@ -150,6 +155,9 @@ impl Encoder {
                     // Keep the final raw update even if the application stops repainting under backpressure.
                     let (lock, wake) = &*worker;
                     let mut q = lock.lock().unwrap();
+                    if q.closed {
+                        return;
+                    }
                     if !q.frames.contains_key(&frame.id) {
                         q.bytes += frame.memory_bytes();
                         q.frames.insert(frame.id, frame);
@@ -412,11 +420,35 @@ impl Encoder {
                 }
             }
         });
-        Self { queue }
+        Self {
+            queue,
+            worker: Some(worker),
+        }
+    }
+    pub fn shutdown(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        {
+            let (lock, wake) = &*self.queue;
+            let mut q = lock.lock().unwrap();
+            q.closed = true;
+            q.frames.clear();
+            q.bytes = 0;
+            wake.notify_one();
+        }
+        // Release active and cached NVENC/CUDA sessions before EGL/driver teardown.
+        // Joining while holding the queue mutex would deadlock an idle worker.
+        if worker.join().is_err() {
+            tracing::warn!("video worker panicked during shutdown");
+        }
     }
     pub fn submit(&self, frame: Frame) {
         let (lock, wake) = &*self.queue;
         let mut q = lock.lock().unwrap();
+        if q.closed {
+            return;
+        }
         if let Some(old) = q.frames.remove(&frame.id) {
             q.bytes -= old.memory_bytes();
         }
@@ -446,6 +478,11 @@ impl Encoder {
         q.bytes = 0;
         q.reset = true;
         wake.notify_one();
+    }
+}
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 fn png(
