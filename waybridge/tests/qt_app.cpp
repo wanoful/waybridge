@@ -7,6 +7,7 @@
 #include <QMenu>
 #include <QPainter>
 #include <QPushButton>
+#include <QShortcut>
 #include <QTimer>
 #include <QWindow>
 #include <cstdio>
@@ -48,6 +49,8 @@ int main(int argc, char **argv) {
   QObject::connect(&edit, &QLineEdit::textChanged, [](const QString &text) {
     std::printf("TEXT %s\n", text.toUtf8().constData());
   });
+  auto spaceShortcut = new QShortcut(QKeySequence("Ctrl+Space"), &edit);
+  QObject::connect(spaceShortcut, &QShortcut::activated, [] { std::puts("CTRL_SPACE"); });
   QPushButton button("Open menu", &window);
   button.setGeometry(20, 80, 160, 40);
   button.setShortcut(QKeySequence("Ctrl+M"));

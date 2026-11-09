@@ -271,6 +271,25 @@ int wmain(int argc, wchar_t **argv) {
     Sleep(350);
     return 0;
   }
+  if (std::wstring(argv[1]) == L"ime-held-copy") {
+    auto key = [](WORD vk, bool down) {
+      INPUT input{};
+      input.type = INPUT_KEYBOARD;
+      input.ki.wScan = WORD(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+      input.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+      if (SendInput(1, &input, sizeof(input)) != 1) ExitProcess(31);
+      Sleep(150);
+    };
+    key(VK_CONTROL, true);
+    // Controlled boundaries exercise state restoration without claiming that
+    // Wine implements Microsoft's real composition/candidate engine.
+    SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, 0, 0);
+    SendMessageW(hwnd, WM_IME_ENDCOMPOSITION, 0, 0);
+    key('C', true); key('C', false);
+    key(VK_CONTROL, false);
+    Sleep(350);
+    return 0;
+  }
   if ((std::wstring(argv[1]) == L"type" || std::wstring(argv[1]) == L"unicode") && argc > 2) {
     for (const wchar_t *p = argv[2]; *p; ++p) {
       INPUT input[2]{};

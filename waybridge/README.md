@@ -67,6 +67,8 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 
 在远端应用输入框获得焦点后，可用 Windows 的 `Win+Space` 切换到微软拼音。候选窗口显示在 Windows；预编辑文字由远端应用绘制，确认后才提交文本。候选位置跟随应用报告的光标矩形，并考虑 Windows DPI、画面缩放及裁剪原点。切换窗口会取消旧预编辑，迟到的提交由焦点 generation 拒绝。英文文本走同一文本通道，Ctrl/Alt/Win 快捷键与导航按键继续转发。
 
+快捷键不会再额外提交其翻译字符，例如 Ctrl+Space 不会额外插入空格。组合输入结束或取消后，仍按住的 Ctrl/Shift 等修饰键会恢复同步，已经松开的键保持松开；AltGr 继续用于本地键盘布局的文本输入。
+
 已验证真实 Qt 和 Ghostty/GTK 在 175% 下的中文、emoji、预编辑/取消及焦点保护，也验证了 Wine 中原生 Win32 Unicode 输入到 Qt 的完整链路。**微软拼音实际候选面板、选词和快捷键切换还需在 WoA 实机验收**；Wine Unicode 注入不代表真实微软 IME 引擎测试。
 
 仅支持实现 `text-input-v3` 的 Wayland 应用；X11/XIM、文档重转换和周边文本查询暂未支持。应用周边文本不传到 Windows。如果程序被宿主环境强制使用 fcitx/ibus 模块，可在启动该远端实例时清除 `GTK_IM_MODULE` / `QT_IM_MODULE`，让它选择 Wayland 文本输入后端。
@@ -108,6 +110,8 @@ python tests/windows_smoke.py
 python tests/windows_smoke.py --csd
 python tests/windows_smoke.py --terminal
 python tests/windows_smoke.py --qt
+# 原生 SendInput 快捷键去重、受控组合结束/取消后的 Ctrl/Shift 和 Unicode
+python tests/windows_ime_keys_smoke.py
 # 可选：需要 NVIDIA/NVENC；真实硬件编码、P 帧、alpha、奇数尺寸及回退
 python tests/hardware_smoke.py
 # 可选：真实 NVENC 尺寸切换、缓存淘汰、IDR/P 引用与回环耗时

@@ -89,7 +89,16 @@ def main():
                     assert abs(coords[0]-remote[0]*1.75)<=2 and abs(coords[1]-remote[1]*1.75)<=2,(coords,remote)
                     probe('shortcut','A');probe('unicode','中文输入')
                     wait_for(lambda:'TEXT 中文输入\n' in Path(app_log.name).read_text())
-                    print('PASS: actual Win32 Unicode/emoji and English input -> real Qt text-input-v3 at 175%, no duplicate text, Ctrl+A replacement and native caret positioning (Wine; Microsoft IME candidate UI still needs physical Windows)')
+                    probe('shortcut',' ')
+                    wait_for(lambda:'CTRL_SPACE\n' in Path(app_log.name).read_text())
+                    assert re.findall(r'^TEXT (.*)$',Path(app_log.name).read_text(),re.M)[-1]=='中文输入','shortcut must not also commit a translated space'
+                    probe('clipboard','IME copy baseline')
+                    wait_for(lambda:pasted('text/plain;charset=utf-8')==b'IME copy baseline')
+                    probe('shortcut','A');probe('ime-held-copy')
+                    wait_for(lambda:pasted('text/plain;charset=utf-8')=='中文输入'.encode())
+                    probe('unicode','保留🙂');probe('type','c')
+                    wait_for(lambda:'TEXT 保留🙂c\n' in Path(app_log.name).read_text())
+                    print('PASS: actual Win32 Unicode/emoji and English -> real Qt text-input-v3 at 175%; Ctrl+A, Ctrl+Space once, held Ctrl+C after controlled composition, no stuck Ctrl, native caret (Wine; Microsoft IME engine/candidate UI still needs physical Windows)')
                     return
                 probe("click","140","175")
                 menu=wait_for(lambda:re.search(r"^MENU (-?\d+) (-?\d+) (\d+) (\d+)$",Path(app_log.name).read_text(),re.M))

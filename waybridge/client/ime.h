@@ -8,13 +8,19 @@
 #include <string>
 
 struct NativeIme {
-  bool initialized = false, enabled = false, composing = false;
+  bool initialized = false, enabled = false, composing = false, cancelling = false;
   uint32_t target = 0;
   uint64_t generation = 0, compositionGeneration = 0;
   wchar_t surrogate = 0;
   RECT lastCaret{0, 0, 1, 20};
   std::set<uint32_t> forwardedKeys;
+  // Keep the last keydown route after keyup: TranslateMessage can queue a
+  // character after the physical release. Raw shortcuts must not also commit
+  // that translated character through text-input-v3.
+  std::set<uint32_t> rawCharacterKeys;
   void cancel(HWND hwnd) {
+    bool previous = cancelling;
+    cancelling = true;
     if (composing) {
       if (auto context = ImmGetContext(hwnd)) {
         ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
@@ -23,6 +29,7 @@ struct NativeIme {
     }
     composing = false;
     surrogate = 0;
+    cancelling = previous;
   }
   void associate(HWND hwnd, bool active, uint32_t id, uint64_t serial) {
     if (initialized && enabled == active && target == id && generation == serial) return;
@@ -56,6 +63,26 @@ struct NativeIme {
            (key >= VK_NUMPAD0 && key <= VK_DIVIDE) ||
            (key >= VK_OEM_1 && key <= VK_OEM_3) ||
            (key >= VK_OEM_4 && key <= VK_OEM_8) || key == VK_OEM_102 || key == VK_PACKET;
+  }
+  bool shortcut(WPARAM key, LPARAM param) const {
+    bool win = (GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000);
+    // AltGr synthesizes Ctrl+RightAlt but produces text on the local layout.
+    // Query without mutating dead-key state (Windows 10 1607+, also required by
+    // the DPI APIs). Ctrl+RightAlt remains a shortcut on layouts with no text.
+    if (!win && (GetKeyState(VK_RMENU) & 0x8000) && (GetKeyState(VK_CONTROL) & 0x8000)) {
+      BYTE state[256]{};
+      wchar_t text[8]{};
+      if (GetKeyboardState(state)) {
+        int count = ToUnicodeEx(UINT(key), UINT((param >> 16) & 0xff), state, text, 8, 4,
+                                GetKeyboardLayout(0));
+        if (count < 0 || (count > 0 && text[0] >= 32 && text[0] != 127)) return false;
+      }
+    }
+    if (win || (GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000))
+      return true;
+    for (auto key : {29u, 97u, 56u, 100u, 125u, 126u})
+      if (forwardedKeys.count(key)) return true;
+    return false;
   }
   void caret(HWND hwnd, const RECT &rect) {
     if (!enabled || GetFocus() != hwnd) return;

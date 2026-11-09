@@ -1104,6 +1104,26 @@ void sendIme(RemoteWindow *window, const std::optional<std::wstring> &commit,
   sendJson(packet);
 }
 
+void synchronizeImeModifiers(RemoteWindow *window, uint32_t except = 0) {
+  auto &ime = window->ime;
+  if (ime.composing || ime.cancelling || GetFocus() != window->hwnd) return;
+  if (ime.enabled && (!imeStatus.value("enabled", false) ||
+                      imeStatus.value("generation", uint64_t(0)) != ime.generation ||
+                      imeStatus.value("id", 0u) != ime.target)) return;
+  static const std::pair<int, uint32_t> modifiers[] = {
+      {VK_LSHIFT, 42}, {VK_RSHIFT, 54}, {VK_LCONTROL, 29}, {VK_RCONTROL, 97},
+      {VK_LMENU, 56}, {VK_RMENU, 100}, {VK_LWIN, 125}, {VK_RWIN, 126}};
+  for (const auto &[native, key] : modifiers) {
+    if (key == except) continue;
+    bool held = (GetKeyState(native) & 0x8000) != 0;
+    bool forwarded = ime.forwardedKeys.count(key) != 0;
+    if (held == forwarded) continue;
+    if (held) ime.forwardedKeys.insert(key);
+    else ime.forwardedKeys.erase(key);
+    sendJson({{"type", "key"}, {"id", window->id}, {"key", key}, {"down", held}});
+  }
+}
+
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   auto w = reinterpret_cast<RemoteWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
   if (message == WM_NCCREATE) {
@@ -1264,6 +1284,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     for (auto key : w->ime.forwardedKeys)
       sendJson({{"type", "key"}, {"id", w->id}, {"key", key}, {"down", false}});
     w->ime.forwardedKeys.clear();
+    w->ime.rawCharacterKeys.clear();
     updateIme();
     return 0;
   case WM_IME_COMPOSITION:
@@ -1284,14 +1305,18 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     return DefWindowProcW(hwnd, message, wp, lp);
-  case WM_IME_ENDCOMPOSITION:
+  case WM_IME_ENDCOMPOSITION: {
+    bool current = w->ime.composing && w->ime.compositionGeneration == w->ime.generation;
     sendIme(w, {}, std::wstring());
     w->ime.composing = false;
+    if (current) synchronizeImeModifiers(w);
     return 0;
+  }
   case WM_IME_CHAR:
     return 0; // Result strings are committed exactly once through WM_IME_COMPOSITION.
   case WM_CHAR:
     if (w->ime.enabled && !w->ime.composing && wp >= 32 && wp != 127) {
+      if (w->ime.rawCharacterKeys.count(linuxKey(lp))) return 0;
       if (auto text = w->ime.character(wchar_t(wp))) sendIme(w, text, std::wstring());
     }
     return 0;
@@ -1405,14 +1430,13 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_SYSKEYUP:
     if (auto key = linuxKey(lp)) {
       bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-      bool shortcut = (GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000) ||
-                      (GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000);
-      for (auto modifier : {29u, 97u, 56u, 100u, 125u, 126u})
-        shortcut = shortcut || w->ime.forwardedKeys.count(modifier);
       if (down) {
+        w->ime.rawCharacterKeys.erase(key);
         if (wp == VK_PROCESSKEY || wp == VK_PACKET || w->ime.composing ||
-            (w->ime.enabled && NativeIme::printable(wp) && !shortcut)) return 0;
+            (w->ime.enabled && NativeIme::printable(wp) && !w->ime.shortcut(wp, lp))) return 0;
+        synchronizeImeModifiers(w, key);
         w->ime.forwardedKeys.insert(key);
+        w->ime.rawCharacterKeys.insert(key);
       } else if (!w->ime.forwardedKeys.erase(key)) return 0;
       sendJson({{"type", "key"}, {"id", w->id}, {"key", key}, {"down", down}});
     }
