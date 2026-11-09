@@ -17,6 +17,7 @@
 #include "h264_decoder.h"
 #include "h264_decoder_cache.h"
 #include "image_decoder.h"
+#include "audio.h"
 #include "third_party/json.hpp"
 #include <algorithm>
 #include <atomic>
@@ -51,6 +52,9 @@ std::map<uint32_t, std::deque<EncodedFrame>> frames;
 std::vector<uint32_t> decoderGarbage;
 std::atomic<SOCKET> mediaConnection{INVALID_SOCKET};
 std::thread mediaReceiver;
+std::thread audioReceiver;
+std::atomic<SOCKET> audioConnection{INVALID_SOCKET};
+AudioPlayback audioPlayback;
 std::string serverHost, serverPort, serverToken;
 using Clock = std::chrono::steady_clock;
 struct ClientStats {
@@ -365,6 +369,122 @@ void startMedia(const std::string &key) {
     else
       PostMessageW(controller, WM_CLOSE, 0, 0);
     mediaConnection = INVALID_SOCKET;
+    closesocket(socket);
+  });
+}
+
+void receiveAudio(SOCKET socket) {
+  bool ready = false;
+  uint64_t lastSequence = 0;
+  try {
+    uint8_t header[4];
+    while (running && readAll(socket, header, 4)) {
+      uint32_t size = u32(header);
+      if (!size || size > 19229) break;
+      std::vector<uint8_t> packet(size);
+      if (!readAll(socket, packet.data(), size)) break;
+      if (!ready) {
+        if (packet[0] != 0 || Json::parse(packet.begin()+1,packet.end()).value("type", "") != "audio_ready") break;
+        ready = true;
+        audioPlayback.start();
+        continue;
+      }
+      if (packet[0] != 3 || size < 29) break;
+      const uint8_t *p = packet.data()+1;
+      uint32_t frames = u32(p+8);
+      if (u32(p) != 48000 || p[4] != 0 || p[5] != 2 || p[6] != 0 || p[7] != 16 ||
+          !frames || frames > 4800 || size != 29 + frames*4) break;
+      uint64_t sequence = (uint64_t(u32(p+12)) << 32) | u32(p+16);
+      if (sequence <= lastSequence) continue;
+      lastSequence = sequence;
+      audioPlayback.push(p+28, size_t(frames)*4);
+      auto ack = Json({{"type", "audio_ack"}, {"sequence", sequence}}).dump();
+      uint32_t length = htonl(uint32_t(ack.size()+1));
+      std::vector<uint8_t> wire(5+ack.size());
+      memcpy(wire.data(), &length, 4); wire[4] = 0;
+      memcpy(wire.data()+5, ack.data(), ack.size());
+      size_t sent = 0;
+      while (running && sent < wire.size()) {
+        int n = send(socket, reinterpret_cast<const char *>(wire.data()+sent), int(wire.size()-sent), 0);
+        if (n <= 0) return;
+        sent += size_t(n);
+      }
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "Audio channel stopped: " << e.what() << '\n';
+  }
+}
+
+void startAudio(const std::string &key) {
+  if (audioReceiver.joinable())
+    return;
+  audioReceiver = std::thread([key] {
+    addrinfo hints{};
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;
+    addrinfo *addresses = nullptr;
+    SOCKET socket = INVALID_SOCKET;
+    if (getaddrinfo(serverHost.c_str(), serverPort.c_str(), &hints, &addresses) == 0) {
+      for (auto a = addresses; a && running; a = a->ai_next) {
+        socket = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (socket == INVALID_SOCKET)
+          continue;
+        u_long nonblocking = 1;
+        ioctlsocket(socket, FIONBIO, &nonblocking);
+        int result = connect(socket, a->ai_addr, int(a->ai_addrlen));
+        if (result && WSAGetLastError() == WSAEWOULDBLOCK) {
+          fd_set writes, errors;
+          FD_ZERO(&writes);
+          FD_ZERO(&errors);
+          FD_SET(socket, &writes);
+          FD_SET(socket, &errors);
+          timeval timeout{3, 0};
+          result = select(0, nullptr, &writes, &errors, &timeout) > 0 && FD_ISSET(socket, &writes)
+                       ? 0
+                       : -1;
+        }
+        nonblocking = 0;
+        ioctlsocket(socket, FIONBIO, &nonblocking);
+        if (!result)
+          break;
+        closesocket(socket);
+        socket = INVALID_SOCKET;
+      }
+      freeaddrinfo(addresses);
+    }
+    if (socket == INVALID_SOCKET || !running) {
+      if (socket != INVALID_SOCKET)
+        closesocket(socket);
+      std::cerr << "Audio channel unavailable; video continues\n";
+      return;
+    }
+    audioConnection = socket;
+    int one = 1;
+    setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char *>(&one), sizeof(one));
+    auto text = Json({{"type", "hello"},
+                      {"version", 3},
+                      {"token", serverToken},
+                      {"channel", "audio"},
+                      {"media_key", key}})
+                    .dump();
+    uint32_t length = htonl(uint32_t(text.size() + 1));
+    std::vector<uint8_t> wire(5 + text.size());
+    memcpy(wire.data(), &length, 4);
+    wire[4] = 0;
+    memcpy(wire.data() + 5, text.data(), text.size());
+    size_t sent = 0;
+    while (running && sent < wire.size()) {
+      int n = send(socket, reinterpret_cast<const char *>(wire.data() + sent),
+                   int(wire.size() - sent), 0);
+      if (n <= 0)
+        break;
+      sent += n;
+    }
+    if (sent == wire.size())
+      receiveAudio(socket);
+    else
+      std::cerr << "Audio channel unavailable; video continues\n";
+    audioConnection = INVALID_SOCKET;
     closesocket(socket);
   });
 }
@@ -1332,6 +1452,8 @@ void dispatchNetwork() {
         PostQuitMessage(1);
         return;
       }
+      if (m.value("audio_pcm", false))
+        startAudio(m.at("media_key").get<std::string>());
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
@@ -1613,6 +1735,7 @@ int wmain(int argc, wchar_t **argv) {
   if (Gdiplus::GdiplusStartup(&gdiplus, &startup, nullptr) != Gdiplus::Ok)
     return 1;
   OleInitialize(nullptr);
+  bool audioSupported = AudioPlayback::supported();
   bool mfStarted = MediaFoundation::get().available() &&
                    SUCCEEDED(MediaFoundation::get().Startup(MF_VERSION, MFSTARTUP_FULL));
   bool hardwareDecoder = mfStarted && H264Decoder::available();
@@ -1679,6 +1802,7 @@ int wmain(int argc, wchar_t **argv) {
   sendJson({{"type", "hello"},
             {"version", 3},
             {"split_media", true},
+            {"audio_pcm", audioSupported},
             {"frame_ack", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
@@ -1699,7 +1823,11 @@ int wmain(int argc, wchar_t **argv) {
   SOCKET media = mediaConnection.load();
   if (media != INVALID_SOCKET)
     shutdown(media, SD_BOTH);
+  SOCKET audio = audioConnection.load();
+  if (audio != INVALID_SOCKET) shutdown(audio, SD_BOTH);
   receiver.join();
+  if (audioReceiver.joinable()) audioReceiver.join();
+  audioPlayback.stop();
   if (mediaReceiver.joinable())
     mediaReceiver.join();
   decoder.join();

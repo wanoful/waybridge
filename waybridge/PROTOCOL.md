@@ -8,6 +8,14 @@ First client message: `{"type":"hello","version":3,"token":"...","dpi":168,"work
 
 A viewer requesting `split_media:true` opens a second TCP connection to the same address and port. Authenticate it with `{"type":"hello","version":3,"token":"...","channel":"media","media_key":"..."}`. Only the current viewer's random key is accepted, and only one media socket attaches. The server replies `media_ready`, then sends frame kinds 1/2 over this socket. Input, window control, clipboard and file messages stay on the control socket. Socket failure closes the session; reconnect restores live windows. Existing SSH forwarding carries both connections. Test/simple viewers may omit `split_media` to multiplex on one socket.
 
+## Optional audio connection
+
+Both hellos negotiate `audio_pcm:true`; the server only offers it with `--audio`. The viewer authenticates a separate TCP connection on the same listener using `{"type":"hello","version":3,"token":"...","channel":"audio","media_key":"..."}`. Only one audio channel attaches to the current viewer; it receives `audio_ready`. Failure of this optional channel leaves control/video running. It can use the existing SSH forward. Legacy v3 peers without the capability receive no audio.
+
+Audio packet kind **3** has a 28-byte big-endian header: `u32 rate`, `u16 channels`, `u16 bits`, `u32 frames`, `u64 sequence`, `u64 source_elapsed_us`, followed by interleaved signed **little-endian** PCM. This version emits 480 frames at 48000 Hz, stereo 16-bit (1920 PCM bytes, 10 ms). Timestamps are source-local and do not imply a synchronized viewer clock. Capture spans only the server's private session sink; no microphone or default monitor capture.
+
+The audio socket is duplex: after accepting a block into its bounded playback queue the viewer sends JSON `{"type":"audio_ack","sequence":N}` on **that socket**, with the normal packet framing. The server allows four outstanding packets, including socket buffers; a cumulative ACK must match an outstanding sequence (future ACKs grant no credit). At most four unsent blocks are retained, dropping the oldest. This does not change video presentation credits. The Windows PCM queue is capped at 100 ms, underruns insert silence, and overflow discards oldest samples. No automatic audio socket reconnection or A/V clock synchronization is implemented.
+
 ## Windows and input
 
 Server `window`: `id`, `title`, `app_id`, `width`, `height` (logical units), `scale`, optional `parent` window ID, `decoration`. The viewer uses `parent` as the native owner for transient dialogs. `decoration:"server"` selects a native Windows title bar after xdg-decoration negotiation; `"client"` keeps the app-rendered title bar and removes the Windows non-client frame. Repeated messages update metadata and can change decoration ownership without recreating the native window. `window_closed` removes the native window. IDs are stable for the lifetime of the host process and restored on reconnect.

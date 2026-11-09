@@ -61,6 +61,14 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 
 可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
 
+## 会话音频（可选）
+
+使用 `--audio` 启动，例如 `./target/release/waybridge --audio -- ghostty`。Linux 需安装 `pactl` 和 `parec`（PulseAudio 客户端工具，亦可连接 PipeWire-Pulse）。服务端创建私有 sink，启动的应用通过 `PULSE_SINK` 加入；不修改系统默认输出。日志中的 `sink=waybridge-<pid>` 可用于之后加入的应用：`PULSE_SINK=waybridge-<pid> WAYLAND_DISPLAY=waybridge-0 <应用>`。直接使用 ALSA 或绕过 PulseAudio 的应用需要自行选择该输出。
+
+新版 Windows 客户端自动协商独立音频 TCP 连接，仍经过原来的 SSH 端口，使用 WASAPI 播放到默认输出设备。出现 `WASAPI 48 kHz stereo audio playback active` 表示音频设备已启动；设置 `WAYBRIDGE_NO_AUDIO=1` 可关闭客户端音频，`WAYBRIDGE_AUDIO_DEVICE` 可指定 WASAPI endpoint ID。无声卡或音频连接失败不影响画面。
+
+首版为 48 kHz、16-bit 双声道 PCM，每秒约 1.536 Mbit，不含协议开销；每包 10 ms，服务端待发队列最多 40 ms、在途最多 40 ms，客户端待播放队列最多 100 ms，另有系统缓冲。拥堵时丢弃旧 PCM，优先恢复实时播放。尚未接入 Opus、跨设备时钟同步、严格音画同步、麦克风或输出设备热切换。正常退出/SIGINT/SIGTERM 清理自身 sink；强制 SIGKILL 无法清理，遗留模块可按日志确认后手动卸载。音频应用应随会话退出。
+
 ## 使用数据交换
 
 - 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
@@ -104,6 +112,10 @@ python tests/hardware_smoke.py
 python tests/resize_smoke.py
 # 可选：安装了 Ghostty 时，验证真实 GTK 越界菜单
 python tests/ghostty_smoke.py
+# 可选：PulseAudio/PipeWire-Pulse 私有 sink、认证、流控及清理
+python tests/audio_smoke.py
+# 可选：真实 Windows PE → WASAPI → 私有 null sink 回录，不播放到宿主默认输出
+python tests/windows_audio_smoke.py
 ```
 
 `tests/smoke.py` 启动隔离的真实合成器和两个原生 Wayland 测试窗口，检查图像颜色/方向、尺寸、输入、断线、重连、双向文本/PNG/文件、文件拖放和路径校验。依赖 `python-pillow`、`wl-clipboard`、`wayland-scanner`、C 编译器。`tests/qt_smoke.py` 需要 Qt6Widgets 开发文件与 C++ 编译器，验证真实 Qt 的 175%/125% 动态缩放、精确透明度、文字输入、菜单和模态对话框；有 Dolphin 时还会在独立 D-Bus/配置目录中验证路径输入及导航。
@@ -146,6 +158,6 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 - 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。
 - 接入 Xwayland，完善输入法、相对鼠标、指针形状和显式同步。
 - 实现 Linux → Windows 原生拖出、目录和按需文件访问。
-- 完善音频、断点续传、文件传输进度/取消、端到端加密及会话管理。
+- 完善音频压缩/同步/设备切换、断点续传、文件传输进度/取消、端到端加密及会话管理。
 
 普通 `wl_shm` 客户端和 DMA-BUF 导入已接通；各类 GPU 应用、驱动及大型应用组合仍需逐一验证。此版本不保证 “All 应用” 的兼容性。

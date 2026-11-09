@@ -1,5 +1,11 @@
 # Validation — 2026-11-09
 
+Opt-in private-session audio:
+
+- Real PulseAudio/PipeWire-Pulse null-sink capture emits 48 kHz stereo 16-bit PCM in 480-frame blocks. A second private sink's tone is excluded. Wrong session keys/tokens, duplicate audio sockets and peers without capability are rejected. Exactly four unacknowledged blocks stop socket output; future ACKs grant no credit and control ping remains responsive. Disconnecting audio leaves the control session alive. SIGTERM unloads only the owned module, and the default output is unchanged.
+- Actual x64 Windows PE under isolated Wine initializes WASAPI shared/event playback on an explicitly selected private null endpoint. Linux generated a stereo tone into the server's private sink; recording only the selected output monitor returned peaks L=12000/R=6000. No host-default endpoint is used or changed. This validates real socket-to-WASAPI sample delivery, not physical WoA device latency, dropouts, endpoint hotplug or A/V synchronization.
+- The audio code has bounded queues/credits and graceful shutdown. PCM is uncompressed; no Opus, microphone, synchronized A/V clocks or automatic device recovery. `pactl`/`parec` are runtime dependencies only when `--audio` is enabled.
+
 Maximize/restore resize checks:
 
 - The actual native FFmpeg/NVENC adapter measured roughly 101 ms to create a session and 70 ms to destroy one when alternating 960×640 / 2240×1400. Keeping both sizes and forcing independent SPS/PPS+IDR on reuse reduced warm first-frame encoding to about 3.1 ms. These adapter timings exclude capture, alpha and network processing.

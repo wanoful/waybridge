@@ -1,4 +1,5 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
+mod audio;
 mod metrics;
 mod network;
 mod protocol;
@@ -95,6 +96,9 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
+    /// Capture only this session's private PulseAudio/PipeWire-Pulse sink.
+    #[arg(long)]
+    audio: bool,
     /// Use an SSH tunnel to this loopback listener for the initial prototype.
     #[arg(long, default_value = "127.0.0.1:49090")]
     listen: String,
@@ -158,6 +162,7 @@ struct RemotePopup {
 type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 
 struct App {
+    audio: Option<audio::Session>,
     dh: DisplayHandle,
     compositor: CompositorState,
     shell: XdgShellState,
@@ -1488,7 +1493,12 @@ fn main() -> Result<()> {
     let dh = display.handle();
     let socket = ListeningSocket::bind(&args.socket)
         .context("binding private Wayland socket (already running?)")?;
-    let (events, tx) = network::listen(&args.listen, auth)?;
+    let audio = if args.audio {
+        Some(audio::Session::new()?)
+    } else {
+        None
+    };
+    let (events, tx) = network::listen(&args.listen, auth, audio.is_some())?;
     let compositor = CompositorState::new_v6::<App>(&dh);
     let shell = XdgShellState::new::<App>(&dh);
     let decorations = XdgDecorationState::new::<App>(&dh);
@@ -1539,6 +1549,7 @@ fn main() -> Result<()> {
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
     let mut app = App {
+        audio,
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1579,11 +1590,16 @@ fn main() -> Result<()> {
     };
     let mut children: Vec<Child> = Vec::new();
     if let Some(program) = args.command.first() {
+        let mut command = Command::new(program);
+        command
+            .args(&args.command[1..])
+            .env("WAYLAND_DISPLAY", &args.socket)
+            .env_remove("DISPLAY");
+        if let Some(audio) = &app.audio {
+            command.env("PULSE_SINK", audio.sink());
+        }
         children.push(
-            Command::new(program)
-                .args(&args.command[1..])
-                .env("WAYLAND_DISPLAY", &args.socket)
-                .env_remove("DISPLAY")
+            command
                 .spawn()
                 .with_context(|| format!("launching {program}"))?,
         );
@@ -1591,7 +1607,7 @@ fn main() -> Result<()> {
     tracing::info!(socket = %args.socket, token_file = %token_path.display(), "ready; launch apps with WAYLAND_DISPLAY set to this socket");
     let interval = Duration::from_secs_f64(1.0 / args.fps as f64);
     let mut next_frame = Instant::now();
-    loop {
+    while !audio::stopping() {
         while let Some(stream) = socket.accept()? {
             app.dh
                 .insert_client(stream, Arc::new(ClientState::default()))?;
@@ -1604,6 +1620,9 @@ fn main() -> Result<()> {
             let Ok(event) = events.try_recv() else { break };
             match event {
                 Event::Connected(peer) => {
+                    if let Some(audio) = &app.audio {
+                        audio.set_peer(Some(&peer));
+                    }
                     app.release_input();
                     app.peer = Some(peer);
                     for p in &mut app.remote_popups {
@@ -1630,6 +1649,9 @@ fn main() -> Result<()> {
                 }
                 Event::Message(value) => app.message(value),
                 Event::Disconnected => {
+                    if let Some(audio) = &app.audio {
+                        audio.set_peer(None);
+                    }
                     app.release_input();
                     app.encoder.reset();
                     app.focus(None);
@@ -1670,6 +1692,7 @@ fn main() -> Result<()> {
         children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
         std::thread::sleep(Duration::from_millis(2));
     }
+    Ok(())
 }
 
 fn dpi_scale(value: &Value) -> f64 {
