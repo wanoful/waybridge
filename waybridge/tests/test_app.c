@@ -20,6 +20,44 @@ static struct zxdg_decoration_manager_v1 *decoration_manager;
 static int client_decorated;
 static int alpha_fixture;
 static struct wl_data_device_manager *data_manager;
+static struct wl_data_device *data_device;
+static struct wl_data_source *drag_source;
+static void source_target(void *d, struct wl_data_source *source, const char *mime) {
+  (void)d; (void)source;
+  printf("SOURCE_TARGET %s\n", mime ? mime : "none"); fflush(stdout);
+}
+static void source_send(void *d, struct wl_data_source *source, const char *mime, int fd) {
+  (void)d; (void)source; (void)mime;
+  const char *path = getenv("WAYBRIDGE_TEST_DRAG_URIS");
+  int input = path ? open(path, O_RDONLY) : -1;
+  char bytes[4096]; ssize_t n;
+  if (input >= 0) {
+    while ((n = read(input, bytes, sizeof(bytes))) > 0) {
+      ssize_t offset = 0;
+      while (offset < n) { ssize_t written = write(fd, bytes + offset, n - offset); if (written <= 0) break; offset += written; }
+    }
+    close(input);
+  }
+  close(fd); printf("SOURCE_SEND\n"); fflush(stdout);
+}
+static void source_cancelled(void *d, struct wl_data_source *source) {
+  (void)d; wl_data_source_destroy(source); drag_source = NULL;
+  printf("SOURCE_CANCELLED\n"); fflush(stdout);
+}
+static void source_dropped(void *d, struct wl_data_source *source) {
+  (void)d; (void)source; printf("SOURCE_DROPPED\n"); fflush(stdout);
+}
+static void source_finished(void *d, struct wl_data_source *source) {
+  (void)d; wl_data_source_destroy(source); drag_source = NULL;
+  printf("SOURCE_FINISHED\n"); fflush(stdout);
+}
+static void source_action(void *d, struct wl_data_source *source, uint32_t action) {
+  (void)d; (void)source; printf("SOURCE_ACTION %u\n", action); fflush(stdout);
+}
+static const struct wl_data_source_listener source_listener = {
+  .target = source_target, .send = source_send, .cancelled = source_cancelled,
+  .dnd_drop_performed = source_dropped, .dnd_finished = source_finished, .action = source_action,
+};
 static struct wl_data_offer *drop_offer;
 static void offer_mime(void *d, struct wl_data_offer *o, const char *mime) {
   (void)d;
@@ -230,6 +268,15 @@ static void button(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32
   (void)s;
   (void)t;
   printf("BUTTON %u %u\n", b, state);
+  const char *drag_enabled = getenv("WAYBRIDGE_TEST_DRAG_ENABLED");
+  if (getenv("WAYBRIDGE_TEST_DRAG_URIS") && (!drag_enabled || access(drag_enabled, F_OK) == 0) && !drag_source && pointer_window &&
+      b == 272 && state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    drag_source = wl_data_device_manager_create_data_source(data_manager);
+    wl_data_source_add_listener(drag_source, &source_listener, NULL);
+    wl_data_source_offer(drag_source, "text/uri-list");
+    wl_data_source_set_actions(drag_source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+    wl_data_device_start_drag(data_device, drag_source, pointer_window->surface, NULL, s);
+  }
   if (client_decorated && pointer_window && b == 272 && state == WL_POINTER_BUTTON_STATE_PRESSED &&
       pointer_y >= 12 && pointer_y < 44) {
     struct window *w = pointer_window;
@@ -388,7 +435,8 @@ int main(int argc, char **argv) {
   struct wl_registry *registry = wl_display_get_registry(display);
   wl_registry_add_listener(registry, &registry_listener, NULL);
   wl_display_roundtrip(display);
-  wl_data_device_add_listener(wl_data_device_manager_get_data_device(data_manager, seat),
+  data_device = wl_data_device_manager_get_data_device(data_manager, seat);
+  wl_data_device_add_listener(data_device,
                               &device_listener, NULL);
   for (int i = 0; i < (argc > 1 ? 2 : 1); i++) {
     struct window *w = &windows[i];

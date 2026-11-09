@@ -31,7 +31,33 @@ int wmain(int argc, wchar_t **argv) {
                    info.hwndFocus == hwnd && info.hwndCaret == hwnd &&
                    info.rcCaret.left == (action == L"ready" ? 10 : 30) ? 0 : 4;
   }
-  if (action == L"generation-start") {
+  if (action == L"ole-start" || action == L"ole-composition") {
+    key(VK_CONTROL, true);
+    key('C', true); key('C', false);
+    POINT point{60, 70};
+    ClientToScreen(hwnd, &point);
+    SetCursorPos(point.x, point.y);
+    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+    Sleep(200);
+    if (action == L"ole-composition")
+      SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, 0, 0);
+    SetCursorPos(1100, 850);
+  } else if (action == L"ole-suspended") {
+    GUITHREADINFO info{};
+    info.cbSize = sizeof(info);
+    return GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, nullptr), &info) &&
+                   !info.hwndCaret ? 0 : 5;
+  } else if (action == L"ole-end") {
+    // A late composition end must not restore the still physically held Ctrl
+    // while the native OLE loop owns input. Release Ctrl inside that loop too.
+    SendMessageW(hwnd, WM_IME_ENDCOMPOSITION, 0, 0);
+    key(VK_CONTROL, false);
+    key(VK_ESCAPE, true); key(VK_ESCAPE, false);
+    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+    Sleep(200);
+  } else if (action == L"late-copy-character") {
+    SendMessageW(hwnd, WM_CHAR, L'c', LPARAM(1 | (MapVirtualKeyW('C', MAPVK_VK_TO_VSC) << 16)));
+  } else if (action == L"generation-start") {
     key(VK_CONTROL, true);
     SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, 0, 0);
   } else if (action == L"old-end") {

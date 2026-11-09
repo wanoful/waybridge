@@ -75,3 +75,172 @@ Download from Linux file selection:
 Windows creates local staged files, then publishes CF_HDROP. A new local clipboard selection supersedes an older download. Bulk transmission is bounded and happens on a worker thread; it does not wait for network capacity on the compositor thread.
 
 v3 supports 128 files per batch and 1 GiB per regular file. It supports Copy semantics only. File paths from one system are never passed directly to applications on the other system.
+
+### Native Linux → Windows file drag
+
+Opt in with `file_drop_out:true` in the viewer hello; the server advertises
+`file_drop_out` in `features`. This extension uses JSON on the control socket,
+independent of clipboard ownership and `files_*` batches. It supports one active
+outbound operation, at most 128 regular files of 1 GiB each, and COPY only. Sources
+must offer `text/uri-list` and COPY through wl_data_device v3 or newer. Directories,
+final-component symlinks, nonlocal/non-UTF-8 URIs, unsupported Windows names and
+case-insensitive name collisions are rejected. Source files are never deleted.
+
+1. Server `drag_offer`: unique `drag` u64, source window `id`, `action:"copy"`, and
+   `files:[{id,name,size}]`; file IDs are consecutive from zero. This transfers only
+   metadata. A worker reads the URI list with a 10-second deadline and 1 MiB limit,
+   opens/pins source files, and validates their type and size.
+2. The viewer continues normal Wayland input while inside streamed windows. On
+   leaving them with the real left button still held it sends `drag_claim {drag}`
+   and suspends ordinary pointer/button forwarding for that gesture. The compositor
+   routes the grab to a private, unmapped Wayland data-device target. Once COPY is
+   negotiated it sends `drag_ready {drag}`. Native focus/capture changes during
+   this handoff must not release the Wayland grab. Held keys are released and
+   focus changes are deferred until the gesture ends, preventing stuck modifiers.
+3. Only while that same real left-button gesture is still held, Windows calls
+   `DoDragDrop` with `DROPEFFECT_COPY`, exposing `FileGroupDescriptorW` and
+   `FileContents`/`IStream` virtual files. It never starts a drag after an early
+   release and never publishes Linux paths or nonexistent CF_HDROP paths. Targets
+   requiring CF_HDROP alone are not supported by this outbound extension.
+4. `drag_read {drag,request,file,offset,length}` requests an independent range;
+   `request` is unique within the operation, `length` is 1..65536, and at most
+   eight requests may be outstanding. `drag_data {drag,request,data}` returns
+   base64 bytes (possibly fewer at EOF), or `{drag,request,error}`. No file bytes
+   are sent until requested. The server has a bounded worker/queue, checks file
+   identity metadata for in-place changes, and rejects oversized/invalid reads.
+   Windows delivers responses directly from its socket receiver to waiting
+   streams, independently of the UI inbox. Read failures/timeouts fail the copy.
+5. On real button release the viewer sends `drag_drop {drag}` before completing
+   the native drop. This releases the Wayland grab over the private target and
+   produces `dnd_drop_performed`; it does not finish the source. Then
+   `drag_result {drag,success,effect}` reports native completion (`effect` is
+   `"copy"` or `"none"`). With `IDataObjectAsyncCapability`, success waits for
+   `EndOperation`; returning from `DoDragDrop` alone does not release source files.
+6. Success finishes the private offer; failure destroys/cancels it. Smithay emits
+   the corresponding source terminal event. `drag_end {drag,success}` retires the
+   operation on the viewer. Source destruction, disconnect, read failure, rejection,
+   Esc and a 120-second idle timeout cancel the operation. Repeated/stale terminal
+   messages are ignored. No cancelled source is later marked finished.
+
+Opened source descriptors live until completion/cancellation. Streams support
+Read/Seek/Stat/Clone and bounded memory, with no full-file staging or destination
+temporary files. The target owns files it creates. No move/delete acknowledgement
+is accepted, and clipboard contents are unaffected.
+
+### Directory trees (`file_tree`)
+
+Both sides opt in through viewer hello `file_tree:true` and server feature
+`file_tree`. Flat `upload_*`/`files_*` messages remain supported; a peer without
+this capability receives regular files only, with the original 128-file limit.
+No additional binary packet kinds are used.
+
+The Windows frontend also imports true virtual sources with no CF_HDROP using
+FILEGROUPDESCRIPTORW/A plus per-descriptor FILECONTENTS. This uses the same
+`tree_upload_*` protocol; the wire manifest never contains source-local paths.
+Original descriptor indices are preserved when requesting contents, while missing
+parent directories are synthesized before strict manifest validation. Directory
+descriptors require no content medium.
+
+An apartment-marshaled IDataObject feeds the single MTA upload worker. File
+contents are acquired one file at a time and read in 64 KiB chunks; a returned
+IStream is cloned and rewound when supported, with sequential non-seekable streams
+accepted from their initial position. Missing FD_FILESIZE requires IStream::Stat;
+known-size HGLOBAL contents are supported up to 12 MiB. IStorage and unknown-size
+HGLOBAL contents are rejected. E_PENDING is retried within a 30-second progress
+deadline. Streams, storage media and source references are released on failure,
+source loss, clipboard epoch change, target loss or disconnect. Windows additionally
+requests COM call cancellation; Wine lacks this API and cancels after a finite
+provider call returns. A provider that never returns or ignores OS cancellation
+still requires source-process recovery; untrusted providers are not isolated in
+a broker process.
+
+For async-enabled IDataObjectAsyncCapability sources, StartOperation precedes
+worker access and EndOperation runs on the source-facing STA only after Linux
+commit acknowledgement or failure. Other OLE drops keep Drop open with COM-aware
+message dispatch until the full tree succeeds/fails, returning COPY/NONE
+accordingly; Escape cancels this synchronous wait. Async COPY acceptance means
+the import was scheduled, with final success reported by EndOperation. Linux
+publishes only complete destination-local paths; there is no lazy FUSE filesystem
+or remote IStream backing Linux application reads. Successful imports retain the
+same private inbox lifetime as filesystem tree imports, and never delete source
+items. Windows/Outlook/archive-provider compatibility requires real-Windows tests.
+
+A tree manifest is a parent-before-child array of
+`{id,name,kind,size}`. IDs are consecutive from zero, `kind` is `"file"` or
+`"directory"`, and directory size is zero. `name` is a **relative** `/`-separated
+path including the selected top-level basename. Explicit directory entries
+preserve empty directories; repeated basenames under different parents are valid.
+Only the top-level entries become clipboard/drop URIs or CF_HDROP paths.
+
+Limits apply to the entire batch: 128 roots, 512 entries, 16 path components,
+1 GiB per file, 8 GiB total file bytes, 240 UTF-16 code units per relative path,
+and 240 UTF-8 bytes/UTF-16 code units per component. Empty components, `.`, `..`,
+absolute/drive/UNC paths, backslashes, controls, ADS/colon syntax, Windows reserved
+names, trailing dots/spaces, duplicate IDs/paths and case-insensitive collisions
+are rejected before destination creation. Parents must already be declared
+directories with exactly matching spelling. There is no implicit rename or
+overwrite. Win32 staging additionally requires the complete temporary path to fit
+MAX_PATH; longer paths fail with an error rather than truncation.
+
+Symlinks, NTFS reparse points (including junctions/cloud placeholders), and special
+files fail the entire batch. Linux inspects through O_PATH and walks relative to
+pinned directory fds, without following links or opening a device/FIFO for I/O.
+Windows opens/inspects reparse points and denies source replacement while handles
+are held. File contents/names are copied; permissions, executable bits, timestamps
+and hard-link identity are not preserved. Detected source changes fail the copy.
+
+Linux clipboard → Windows:
+
+1. `tree_begin {batch,epoch,entries}` after validating/opening the complete source
+   manifest. `batch` is the Linux clipboard generation.
+2. `tree_chunk {batch,file,data}` for file entries, at most 65536 decoded bytes.
+   Directories and zero-byte files require no chunks.
+3. `tree_done {batch}`, or `tree_error {batch,message}`. Only exact-length,
+   complete trees are published from a fresh private staging directory. A newer
+   batch, local selection, failure or disconnect removes unfinished staging.
+
+Windows → Linux (clipboard and incoming OLE drop):
+
+1. `tree_upload_begin {batch,epoch,drop,entries}`; `drop` defaults to false.
+   The server validates the manifest and creates a fresh private tree, then
+   acknowledges `tree_upload_ready {batch,stage:"begin"}`.
+2. `tree_upload_chunk {batch,file,data}` (64 KiB decoded maximum), followed by
+   `tree_upload_end {batch,file}` for **every file**, including zero-byte files.
+3. `tree_upload_commit {batch,drop,...}` must match the begin purpose. With
+   `drop:true`, target `id`, `x`, `y`, `origin_x`, `origin_y` have the existing
+   upload-drop meanings. The server offers top-level destination-local URIs only
+   after every file is finalized, then acknowledges stage `"commit"`.
+4. `tree_upload_cancel {batch}` or `tree_upload_error {batch,message}` retires
+   unfinished uploads. Already committed files are retained. Queued chunks for
+   retired batches are ignored, avoiding repeated error/control-queue floods.
+
+There are at most two active server upload trees. The Windows client uses one
+upload worker and at most two pending requests, reports a full queue, cancels
+superseded clipboard requests, and preserves explicit queued drop requests. Begin
+and commit acknowledgements have 10-second deadlines. Disconnect releases jobs,
+source handles and unfinished destination trees.
+
+`file_tree_epoch {epoch}` advances a viewer-local counter when its local clipboard
+changes (excluding its own remote publications). It cancels pending Linux export
+reads/workers. File download begins carry the captured epoch; clipboard upload
+begin/commit must match the current epoch. Drop uploads are independent of
+clipboard epochs. A stale epoch cannot overwrite a newer local selection.
+Linux clipboard messages additionally carry `generation`; receivers ignore older
+formats and give a completed file batch precedence over text formats from that
+same generation. Duplicate/stale file begins are ignored.
+
+For native Linux → Windows drag, `drag_offer` adds `tree:true` and its `files`
+array uses this manifest. FILEDESCRIPTORW names use Windows relative separators;
+directory descriptors set FILE_ATTRIBUTE_DIRECTORY. FILECONTENTS/lindex and
+`drag_read` refer to the original manifest indices, including directory slots,
+but only file slots provide streams. The existing real-button handoff, COPY-only
+and asynchronous completion rules apply. Native targets own and clean up any
+destination files they create; Waybridge only removes its own private staging.
+
+Completed clipboard/drop trees remain at
+`$XDG_RUNTIME_DIR/waybridge-inbox/tree-<batch>/` or `%TEMP%\Waybridge-tree-*` so
+applications can read them later. They may be manually removed once consumers no
+longer need them. Copy/cancellation never deletes source files. Virtual directory
+descriptors and all four directions are tested with real Wayland and native OLE
+probes under Wine/Xvfb; Windows Explorer/third-party compatibility still needs
+Windows 10/11 device validation.

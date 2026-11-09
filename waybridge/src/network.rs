@@ -6,7 +6,7 @@ use std::{
     io,
     net::{TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{sync_channel, Receiver, SyncSender},
         Arc, Condvar, Mutex, Weak,
     },
@@ -15,6 +15,10 @@ use std::{
 };
 
 pub enum Event {
+    DragFiles {
+        id: u64,
+        result: Result<crate::drag::Export, String>,
+    },
     Connected(Arc<Peer>),
     Message(Value),
     Disconnected,
@@ -67,6 +71,9 @@ impl Queue {
 pub struct Peer {
     queue: Mutex<Queue>,
     wake: Condvar,
+    file_tree: bool,
+    file_epoch: AtomicU64,
+    file_export_generation: AtomicU64,
     split_media: bool,
     h264: bool,
     acknowledgements: bool,
@@ -74,6 +81,23 @@ pub struct Peer {
 }
 
 impl Peer {
+    pub fn file_tree(&self) -> bool {
+        self.file_tree
+    }
+    pub fn file_epoch(&self) -> u64 {
+        self.file_epoch.load(Ordering::Relaxed)
+    }
+    pub fn set_file_epoch(&self, epoch: u64) {
+        self.file_epoch.store(epoch, Ordering::Relaxed);
+    }
+    pub fn begin_file_export(&self, generation: u64) {
+        self.file_export_generation
+            .store(generation, Ordering::Relaxed);
+    }
+    pub fn file_export_current(&self, generation: u64) -> bool {
+        !self.is_closed() && self.file_export_generation.load(Ordering::Relaxed) == generation
+    }
+
     pub fn begin_resize(&self, id: u32, width: u32, height: u32, started: Instant) {
         self.queue.lock().unwrap().resizes.insert(
             id,
@@ -313,6 +337,9 @@ pub fn listen(
                 let peer = Arc::new(Peer {
                     queue: Mutex::new(Queue::default()),
                     wake: Condvar::new(),
+                    file_tree: hello["file_tree"].as_bool().unwrap_or(false),
+                    file_epoch: AtomicU64::new(0),
+                    file_export_generation: AtomicU64::new(0),
                     split_media: hello["split_media"].as_bool().unwrap_or(false),
                     h264: hello["codecs"]
                         .as_array()
@@ -345,7 +372,7 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "codecs":["png_rgba","h264_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha","ime_v3"]}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "codecs":["png_rgba","h264_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","file_drop_out","file_tree","window_decorations","dpi","alpha","ime_v3"]}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

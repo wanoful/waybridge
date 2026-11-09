@@ -217,7 +217,8 @@ int wmain(int argc, wchar_t **argv) {
                ? 0
                : 23;
   }
-  if (std::wstring(argv[1]) == L"popup-click" && argc > 2) {
+  if ((std::wstring(argv[1]) == L"popup-click" ||
+       std::wstring(argv[1]) == L"popup-click-stale-leave") && argc > 2) {
     HWND popup = FindWindowW(L"WaybridgePopup", nullptr);
     if (!popup)
       return 20;
@@ -228,6 +229,10 @@ int wmain(int argc, wchar_t **argv) {
       y += r.bottom - r.top;
     SetCursorPos((r.left + r.right) / 2, r.top + y);
     mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+    if (std::wstring(argv[1]) == L"popup-click-stale-leave") {
+      Sleep(20);
+      SendMessageW(hwnd, WM_MOUSELEAVE, 0, 0);
+    }
     Sleep(50);
     mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
     Sleep(350);
