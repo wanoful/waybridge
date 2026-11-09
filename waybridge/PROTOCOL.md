@@ -190,13 +190,15 @@ continues to receive ordinary absolute input. Popup locks and cursor-position hi
 are not implemented.
 
 When a lock's target is mapped, has keyboard focus in its root toplevel, contains the
-pointer in its input/constraint region, and no popup grab is active, the server sends
+pointer in its input/constraint region, and no popup grab or outbound file drag is active, the server sends
 `{"type":"pointer_lock","id":1,"generation":7,"active":true}`. `id` is the root
 window; generation is a nonzero server-process-lifetime u64 and changes for every
 request, including reconnect/recreation. The viewer must verify native focus and
 establish Raw Input, a hidden cursor and native clipping before replying
 `{"type":"pointer_lock_ack","id":1,"generation":7,"active":true}`. Only then does
 the compositor send Wayland `locked`. A native failure replies `active:false`.
+Native OLE input ownership also rejects new locks. Before entering DoDragDrop the
+viewer releases any previous lock; delayed requests cannot re-clip the OLE cursor.
 A request expires after two seconds without a valid acknowledgement. Absolute
 positions are held at the anchor during pending/active lock.
 
