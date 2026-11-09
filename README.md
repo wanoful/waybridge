@@ -4,6 +4,8 @@ Linux 应用在 Windows 上显示为独立原生窗口的开发原型。服务�
 
 项目在 [waybridge](waybridge/) 中。`sunshine/` 和 `moonlight/` 是本地参考用的上游源码，不纳入本仓库；版本记录在 [upstreams.json](upstreams.json)。**当前原型使用独立的 H.264＋alpha／PNG 协议，媒体与控制使用分开的 TCP 连接，还不能直接用普通 Moonlight 连接**。Sunshine/Moonlight 线协议集成尚未实现。
 
+新增功能的首版已分别在独立 worktree 提交，见 [并行功能分支与测试清单](PARALLEL_FEATURES.md)。根目录当前是基础原型与 IME 分支，尚未合入其他功能；HDR 为实验 scRGB 子集。
+
 已实现：
 
 - 多个 Wayland 顶层窗口对应多个 Win32 窗口。
@@ -18,6 +20,6 @@ Linux 应用在 Windows 上显示为独立原生窗口的开发原型。服务�
 - Windows 文件拖入远端窗口，在 Wayland 侧完成文件拖放。
 - 会话断线保留应用，重连恢复窗口，断线释放按键。
 
-这是开发原型，已在 Snapdragon 8cx Gen 3 / Adreno 690 实机验证原生 ARM64 硬解和尺寸切换；仍缺少 AV1、音频、X11/XIM 接入、输入法重转换及 Linux → Windows 直接拖出文件。微软拼音实际候选面板、更广泛的设备兼容性和输入到显示的端到端延迟仍需验证。
+这是开发原型，基础 ARM64 硬解和尺寸切换已在 Snapdragon 8cx Gen 3 / Adreno 690 实机验证。AV1、音频、X11 和 Linux → Windows 拖出等新增分支的实机验收仍待进行；XIM 与输入法重转换尚未实现。微软拼音实际候选面板、更广泛的设备兼容性和输入到显示的端到端延迟仍需验证。
 
 详见 [运行说明与当前边界](waybridge/README.md)、[协议](waybridge/PROTOCOL.md)。
