@@ -284,6 +284,17 @@ public:
       reserved -= old->second.reserved;
       frames.erase(old);
     }
+    if (message == next && active) {
+      deliver(kind, std::vector<uint8_t>(p + 9, p + size));
+      feedback(Json{{"type", "udp_ack"}, {"message", next}});
+      require(++next != 0);
+      drain();
+      if (!loggedRepair) {
+        std::cout << "UDP frame repaired over TCP\n" << std::flush;
+        loggedRepair = true;
+      }
+      return;
+    }
     require(frames.size() < 16 && reserved + total <= Budget);
     Frame f;
     f.kind = kind;

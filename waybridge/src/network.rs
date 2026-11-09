@@ -49,6 +49,16 @@ struct ResizeTiming {
 }
 
 impl Queue {
+    fn next_frame(&self) -> Option<(u32, usize)> {
+        self.frames
+            .range((
+                std::ops::Bound::Excluded(self.last_frame_id),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .or_else(|| self.frames.first_key_value())
+            .and_then(|(id, frames)| frames.front().map(|(_, bytes, _)| (*id, bytes.len())))
+    }
     fn resize_marker(&mut self, id: u32, bytes: &[u8]) -> Option<Instant> {
         let resize = self.resizes.get_mut(&id)?;
         if bytes.len() < 12
@@ -198,6 +208,9 @@ impl Peer {
         true
     }
     fn close(&self) {
+        if let Some(udp) = &self.udp {
+            udp.cancel();
+        }
         self.queue.lock().unwrap().closed = true;
         self.wake.notify_all();
     }
@@ -207,10 +220,19 @@ impl Peer {
             let (kind, bytes, resize) = {
                 let mut q = self.queue.lock().unwrap();
                 let frames_allowed = media || !self.split_media;
-                while !q.closed
-                    && ((media || (q.controls.is_empty() && q.bulk.is_empty()))
-                        && (!frames_allowed || (q.frames.is_empty() && q.repairs.is_empty())))
-                {
+                loop {
+                    let frame_ready = q.next_frame().is_some_and(|(_, size)| {
+                        !media
+                            || self
+                                .udp
+                                .as_ref()
+                                .is_none_or(|u| !u.ready() || u.can_send(size))
+                    });
+                    let ready = (!media && (!q.controls.is_empty() || !q.bulk.is_empty()))
+                        || (frames_allowed && (!q.repairs.is_empty() || frame_ready));
+                    if q.closed || ready {
+                        break;
+                    }
                     q = self.wake.wait(q).unwrap();
                 }
                 if q.closed {
@@ -221,16 +243,7 @@ impl Peer {
                 } else if frames_allowed && !q.repairs.is_empty() {
                     (udp::REPAIR, q.repairs.pop_front().unwrap(), None)
                 } else if frames_allowed && !q.frames.is_empty() {
-                    let id = *q
-                        .frames
-                        .range((
-                            std::ops::Bound::Excluded(q.last_frame_id),
-                            std::ops::Bound::Unbounded,
-                        ))
-                        .next()
-                        .or_else(|| q.frames.first_key_value())
-                        .unwrap()
-                        .0;
+                    let id = q.next_frame().unwrap().0;
                     q.last_frame_id = id;
                     let frame = q.frames.get_mut(&id).unwrap().pop_front().unwrap();
                     if q.frames[&id].is_empty() {
@@ -391,6 +404,9 @@ pub fn listen(
                                     if value["type"] == "udp_ack" {
                                         if let Some(n) = value["message"].as_u64() {
                                             udp.ack(n);
+                                            // Writer checks budget while holding q; synchronize the wake predicate.
+                                            let _q = peer.queue.lock().unwrap();
+                                            peer.wake.notify_all();
                                         }
                                         continue;
                                     }

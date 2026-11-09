@@ -76,7 +76,7 @@ SSH `-L` 只转发 TCP，不能承载这个 UDP 通道；可使用局域网或�
 
 画面分为 1024-byte 数据片，每 8 片增加一片 XOR 校验，可恢复该组单片丢失；乱序重组后按原顺序送入解码器。其余丢包通过原 TCP 媒体连接补同一帧，保留 H.264 引用链。每窗口的两帧呈现 credit 保持有效。UDP 不通时继续 TCP，已建立的 UDP 中断时用 TCP 补帧；当前不支持 UDP endpoint 漫游，需重连。协议仍为 v3，未协商的客户端不受影响。
 
-此分支尚未实现动态码率、Reed–Solomon、多丢包低延迟 IDR 恢复或音频 UDP。重组最多 16 条消息/96 MiB，UDP 仅用于不超过 8 MiB 的帧，服务端修复缓存最多 16 条/32 MiB；超限新帧走 TCP，异常重组溢出断开会话而非破坏参考链。传输层按全局消息顺序交付，丢失一帧可能暂时阻塞其他窗口，不能据此保证弱网体验或端到端延迟优于 TCP。
+此分支尚未实现动态码率、Reed–Solomon、多丢包低延迟 IDR 恢复或音频 UDP。全局最多 8 条未确认媒体消息、原始帧体合计最多 64 MiB（单条超大 TCP 帧只允许独占），包括 UDP 和 TCP fallback；补帧优先，不受这个新帧门限阻塞。接收端重组最多 16 条/96 MiB，缺失的头部 TCP 补帧可直接交付并排空后续消息。UDP 仅用于不超过 8 MiB 的帧，服务端修复缓存最多 16 条/32 MiB；超限新帧走 TCP。断线取消会逐包中断慢速发送。传输层按全局消息顺序交付，丢失一帧可能暂时阻塞其他窗口，不能据此保证弱网体验或端到端延迟优于 TCP。
 
 ## 使用数据交换
 
@@ -123,6 +123,7 @@ python tests/resize_smoke.py
 python tests/ghostty_smoke.py
 # 可选：实际 PE/CNG UDP 解密、丢包/乱序/重复/损坏、XOR/TCP 修复、真实 NVENC P 链
 python tests/windows_udp_smoke.py
+python tests/udp_flow_smoke.py
 python tests/windows_smoke.py --udp --qt
 ```
 

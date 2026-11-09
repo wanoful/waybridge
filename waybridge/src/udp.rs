@@ -11,7 +11,10 @@ use std::{
     collections::BTreeMap,
     io,
     net::{SocketAddr, TcpStream, UdpSocket},
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -53,6 +56,14 @@ struct Cache {
     next: u64,
     bytes: usize,
     frames: BTreeMap<u64, Cached>,
+    pending: BTreeMap<u64, usize>,
+    pending_bytes: usize,
+}
+impl Cache {
+    fn can_send(&self, size: usize) -> bool {
+        self.pending.len() < 8
+            && (self.pending.is_empty() || self.pending_bytes + size <= 64 * 1024 * 1024)
+    }
 }
 pub struct Transport {
     socket: Arc<UdpSocket>,
@@ -64,6 +75,7 @@ pub struct Transport {
     counter: Mutex<u64>,
     cache: Mutex<Cache>,
     pace: Duration,
+    cancelled: AtomicBool,
 }
 pub struct Hub {
     socket: Arc<UdpSocket>,
@@ -107,9 +119,14 @@ impl Hub {
             endpoint: Mutex::new(None),
             counter: Mutex::new(0),
             cache: Mutex::new(Cache::default()),
+            cancelled: AtomicBool::new(false),
             pace: Duration::from_secs_f64(1100.0 * 8.0 / (f64::from(self.mbps) * 1_000_000.0)),
         });
-        *self.current.lock().unwrap() = Arc::downgrade(&session);
+        let mut current = self.current.lock().unwrap();
+        if let Some(old) = current.upgrade() {
+            old.cancel();
+        }
+        *current = Arc::downgrade(&session);
         Ok(session)
     }
 }
@@ -119,7 +136,8 @@ impl Transport {
     }
     fn bind(&self, packet: &[u8], address: SocketAddr) {
         // The only client datagram is a 1-byte encrypted HELLO/keepalive. Authenticate before reply/allocation.
-        if packet.len() != 37
+        if self.cancelled.load(Ordering::Relaxed)
+            || packet.len() != 37
             || &packet[..4] != b"WBU1"
             || packet[4..12] != self.session.to_be_bytes()
         {
@@ -145,13 +163,35 @@ impl Transport {
         }
         *endpoint = Some((address, Instant::now(), count));
     }
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "UDP session ended",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    pub fn can_send(&self, size: usize) -> bool {
+        self.cache.lock().unwrap().can_send(size)
+    }
     pub fn ready(&self) -> bool {
         self.endpoint.lock().unwrap().is_some()
     }
     pub fn ack(&self, message: u64) {
         let mut c = self.cache.lock().unwrap();
-        if message > c.next {
+        if !c.pending.contains_key(&message) {
             return;
+        }
+        let pending: Vec<_> = c.pending.range(..=message).map(|(n, _)| *n).collect();
+        for n in pending {
+            if let Some(size) = c.pending.remove(&n) {
+                c.pending_bytes -= size;
+            }
         }
         let done: Vec<_> = c.frames.range(..=message).map(|(n, _)| *n).collect();
         for n in done {
@@ -161,6 +201,9 @@ impl Transport {
         }
     }
     pub fn retry(&self, message: u64) -> Option<Vec<u8>> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut c = self.cache.lock().unwrap();
         let v = c.frames.get_mut(&message)?;
         if v.retry.elapsed() < Duration::from_millis(50) {
@@ -170,6 +213,7 @@ impl Transport {
         Some(repair(message, v.kind, &v.body))
     }
     pub fn send(&self, kind: u8, body: &[u8], tcp: &mut TcpStream) -> io::Result<()> {
+        self.check_cancelled()?;
         let (address, alive) = self
             .endpoint
             .lock()
@@ -178,11 +222,19 @@ impl Transport {
             .unwrap();
         let (message, use_udp) = {
             let mut c = self.cache.lock().unwrap();
+            if !c.can_send(body.len()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "UDP global credits exhausted",
+                ));
+            }
             c.next = c
                 .next
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("UDP message sequence exhausted"))?;
             let message = c.next;
+            c.pending.insert(message, body.len());
+            c.pending_bytes += body.len();
             let use_udp = alive
                 && !body.is_empty()
                 && body.len() <= MAX_FRAME
@@ -202,11 +254,13 @@ impl Transport {
             (message, use_udp)
         };
         if !use_udp {
+            self.check_cancelled()?;
             return protocol::write_packet(tcp, REPAIR, &repair(message, kind, body));
         }
         let count = body.len().div_ceil(CHUNK);
         let mut next = Instant::now();
         let mut send = |typ: u8, index: usize, payload: &[u8]| -> io::Result<()> {
+            self.check_cancelled()?;
             let mut plain = Vec::with_capacity(20 + payload.len());
             plain.extend([typ, kind]);
             plain.extend((index as u16).to_be_bytes());
@@ -230,6 +284,7 @@ impl Transport {
             if let Some(delay) = next.checked_duration_since(Instant::now()) {
                 thread::sleep(delay);
             }
+            self.check_cancelled()?;
             self.socket.send_to(&wire, address)?;
             next += self.pace;
             Ok(())
@@ -242,10 +297,12 @@ impl Transport {
                     *a ^= b;
                 }
                 if send(1, index, block).is_err() {
+                    self.check_cancelled()?;
                     return protocol::write_packet(tcp, REPAIR, &repair(message, kind, body));
                 }
             }
             if send(2, first, &parity).is_err() {
+                self.check_cancelled()?;
                 return protocol::write_packet(tcp, REPAIR, &repair(message, kind, body));
             }
         }
@@ -267,6 +324,7 @@ mod tests {
             endpoint: Mutex::new(None),
             counter: Mutex::new(0),
             cache: Mutex::new(Cache::default()),
+            cancelled: AtomicBool::new(false),
             pace: Duration::ZERO,
         };
         let make = |number, secret: &[u8]| {
