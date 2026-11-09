@@ -242,6 +242,27 @@ uint32_t u32(const uint8_t *p) {
   return ntohl(n);
 }
 
+void queueMedia(uint8_t kind, std::vector<uint8_t> bytes) {
+  if ((kind != 1 || bytes.size() < 36) && (kind != 2 || bytes.size() < 60))
+    throw std::runtime_error("invalid media frame");
+  uint32_t id = u32(bytes.data());
+  std::unique_lock<std::mutex> guard(inboxMutex);
+  if (frames.size() >= 128 && !frames.count(id))
+    throw std::runtime_error("too many media windows");
+  if (kind == 2)
+    frameWake.wait(guard,
+                   [&] { return !running || !frames.count(id) || frames.at(id).size() < 4; });
+  if (!running)
+    return;
+  auto &queue = frames[id];
+  if (kind == 1)
+    queue.clear();
+  queue.push_back({kind, std::move(bytes), Clock::now()});
+  frameWake.notify_all();
+}
+#include "udp_media.h"
+UdpMedia udpMedia;
+
 void receiveLoop(SOCKET socket) {
   try {
     while (running) {
@@ -254,6 +275,23 @@ void receiveLoop(SOCKET socket) {
       std::vector<uint8_t> packet(size);
       if (!readAll(socket, packet.data(), size))
         break;
+      if (packet[0] == 6) {
+        udpMedia.repair(packet.data() + 1, packet.size() - 1);
+        continue;
+      }
+      if (packet[0] == 1 || packet[0] == 2) {
+        uint8_t kind = packet[0];
+        packet.erase(packet.begin());
+        queueMedia(kind, std::move(packet));
+        continue;
+      }
+      if (packet[0] == 0) {
+        auto message = Json::parse(packet.begin() + 1, packet.end());
+        if (message.value("type", "") == "udp_start") {
+          udpMedia.activate();
+          continue;
+        }
+      }
       bool control = packet[0] == 0;
       {
         std::unique_lock<std::mutex> guard(inboxMutex);
@@ -267,22 +305,6 @@ void receiveLoop(SOCKET socket) {
             frameWake.notify_all();
           }
           controls.push_back(std::move(message));
-        } else if ((packet[0] == 1 && size >= 37) || (packet[0] == 2 && size >= 61)) {
-          uint32_t id = u32(packet.data() + 1);
-          if (frames.size() >= 128 && !frames.count(id))
-            break;
-          if (packet[0] == 2)
-            frameWake.wait(
-                guard, [&] { return !running || !frames.count(id) || frames.at(id).size() < 4; });
-          if (!running)
-            break;
-          uint8_t kind = packet[0];
-          packet.erase(packet.begin());
-          auto &queue = frames[id];
-          if (kind == 1)
-            queue.clear();
-          queue.push_back({kind, std::move(packet), Clock::now()});
-          frameWake.notify_all();
         } else
           break;
       }
@@ -1332,6 +1354,8 @@ void dispatchNetwork() {
         PostQuitMessage(1);
         return;
       }
+      if (m.contains("udp_fec_v1"))
+        udpMedia.start(m["udp_fec_v1"], queueMedia, sendJson);
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
@@ -1679,6 +1703,7 @@ int wmain(int argc, wchar_t **argv) {
   sendJson({{"type", "hello"},
             {"version", 3},
             {"split_media", true},
+            {"udp_fec_v1", UdpMedia::requested()},
             {"frame_ack", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
@@ -1696,6 +1721,7 @@ int wmain(int argc, wchar_t **argv) {
   inboxWake.notify_all();
   frameWake.notify_all();
   shutdown(connection, SD_BOTH);
+  udpMedia.stop();
   SOCKET media = mediaConnection.load();
   if (media != INVALID_SOCKET)
     shutdown(media, SD_BOTH);

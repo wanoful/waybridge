@@ -61,6 +61,23 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 
 可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
 
+## 可选 UDP/FEC 媒体通道
+
+默认继续使用 TCP/SSH。显式启用 UDP 时，在 Linux 增加 `--udp-listen <可达监听地址>:49091`；`--udp-mbps 200` 控制含校验片的发送速率上限，范围 1–1000 Mbit/s。它是固定速率节流，尚无自适应拥塞控制；应低于可用带宽。Windows 保留原来的 SSH 隧道和 TCP 启动参数，另设置：
+
+```powershell
+$env:WAYBRIDGE_UDP_HOST = "<Windows 能直接访问的 Linux 地址>"
+# 可选：NAT/代理暴露的端口与服务端监听端口不同时设置
+$env:WAYBRIDGE_UDP_PORT = "49091"
+.\waybridge-client.exe 127.0.0.1 49090 "<token>"
+```
+
+SSH `-L` 只转发 TCP，不能承载这个 UDP 通道；可使用局域网或已有 VPN 的地址，需允许该 UDP 端口。握手和媒体密钥仍走原控制连接，应保留 SSH。UDP 每会话、每方向使用独立随机 AES-256-GCM 密钥、唯一计数 nonce、认证分片和重放检查；认证成功前不向 UDP 地址发送画面。
+
+画面分为 1024-byte 数据片，每 8 片增加一片 XOR 校验，可恢复该组单片丢失；乱序重组后按原顺序送入解码器。其余丢包通过原 TCP 媒体连接补同一帧，保留 H.264 引用链。每窗口的两帧呈现 credit 保持有效。UDP 不通时继续 TCP，已建立的 UDP 中断时用 TCP 补帧；当前不支持 UDP endpoint 漫游，需重连。协议仍为 v3，未协商的客户端不受影响。
+
+此分支尚未实现动态码率、Reed–Solomon、多丢包低延迟 IDR 恢复或音频 UDP。重组最多 16 条消息/96 MiB，UDP 仅用于不超过 8 MiB 的帧，服务端修复缓存最多 16 条/32 MiB；超限新帧走 TCP，异常重组溢出断开会话而非破坏参考链。传输层按全局消息顺序交付，丢失一帧可能暂时阻塞其他窗口，不能据此保证弱网体验或端到端延迟优于 TCP。
+
 ## 使用数据交换
 
 - 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
@@ -104,6 +121,9 @@ python tests/hardware_smoke.py
 python tests/resize_smoke.py
 # 可选：安装了 Ghostty 时，验证真实 GTK 越界菜单
 python tests/ghostty_smoke.py
+# 可选：实际 PE/CNG UDP 解密、丢包/乱序/重复/损坏、XOR/TCP 修复、真实 NVENC P 链
+python tests/windows_udp_smoke.py
+python tests/windows_smoke.py --udp --qt
 ```
 
 `tests/smoke.py` 启动隔离的真实合成器和两个原生 Wayland 测试窗口，检查图像颜色/方向、尺寸、输入、断线、重连、双向文本/PNG/文件、文件拖放和路径校验。依赖 `python-pillow`、`wl-clipboard`、`wayland-scanner`、C 编译器。`tests/qt_smoke.py` 需要 Qt6Widgets 开发文件与 C++ 编译器，验证真实 Qt 的 175%/125% 动态缩放、精确透明度、文字输入、菜单和模态对话框；有 Dolphin 时还会在独立 D-Bus/配置目录中验证路径输入及导航。
@@ -139,7 +159,7 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 
 ## 当前边界与后续工作
 
-- 改进 GPU 直接送入编码器与异步回读，减少 CPU 往返；增加 UDP/FEC 和拥塞控制。
+- 改进 GPU 直接送入编码器与异步回读，减少 CPU 往返；完善 UDP 自适应拥塞控制和多丢包恢复。
 - 首版硬件路径为 H.264 4:2:0 SDR，彩色文字可能不如 PNG 清晰；4:4:4、HEVC/AV1、HDR 和高刷新率仍需扩展、验证。
 - 每个视频顶层窗口使用一个 NVENC 会话；会话数量受硬件/驱动限制，不能分配时回退 PNG。视频支持范围为 48×48 至 4096×2304，其他尺寸走 PNG。
 - 完善模态协议、窗口状态和光标/输入区域映射。

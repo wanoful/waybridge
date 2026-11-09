@@ -1,5 +1,5 @@
 //! One authenticated viewer; bounded input, priority control, latest-frame-only video.
-use crate::protocol;
+use crate::{protocol, udp};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -29,6 +29,7 @@ type QueuedFrame = (u8, Vec<u8>, Option<Instant>);
 
 #[derive(Default)]
 struct Queue {
+    repairs: VecDeque<Vec<u8>>,
     controls: VecDeque<Vec<u8>>,
     frames: BTreeMap<u32, VecDeque<QueuedFrame>>,
     png_only: BTreeSet<u32>,
@@ -65,6 +66,7 @@ impl Queue {
 }
 
 pub struct Peer {
+    udp: Option<Arc<udp::Transport>>,
     queue: Mutex<Queue>,
     wake: Condvar,
     split_media: bool,
@@ -200,13 +202,14 @@ impl Peer {
         self.wake.notify_all();
     }
     fn write_loop(&self, mut socket: TcpStream, media: bool) -> io::Result<()> {
+        let mut udp_started = false;
         loop {
             let (kind, bytes, resize) = {
                 let mut q = self.queue.lock().unwrap();
                 let frames_allowed = media || !self.split_media;
                 while !q.closed
                     && ((media || (q.controls.is_empty() && q.bulk.is_empty()))
-                        && (!frames_allowed || q.frames.is_empty()))
+                        && (!frames_allowed || (q.frames.is_empty() && q.repairs.is_empty())))
                 {
                     q = self.wake.wait(q).unwrap();
                 }
@@ -215,6 +218,8 @@ impl Peer {
                 }
                 if !media && !q.controls.is_empty() {
                     (protocol::JSON, q.controls.pop_front().unwrap(), None)
+                } else if frames_allowed && !q.repairs.is_empty() {
+                    (udp::REPAIR, q.repairs.pop_front().unwrap(), None)
                 } else if frames_allowed && !q.frames.is_empty() {
                     let id = *q
                         .frames
@@ -238,7 +243,22 @@ impl Peer {
             };
             self.wake.notify_all();
             let start = std::time::Instant::now();
-            protocol::write_packet(&mut socket, kind, &bytes)?;
+            if media
+                && matches!(kind, protocol::FRAME | protocol::VIDEO)
+                && self.udp.as_ref().is_some_and(|u| u.ready())
+            {
+                if !udp_started {
+                    protocol::write_packet(
+                        &mut socket,
+                        protocol::JSON,
+                        b"{\"type\":\"udp_start\"}",
+                    )?;
+                    udp_started = true;
+                }
+                self.udp.as_ref().unwrap().send(kind, &bytes, &mut socket)?;
+            } else {
+                protocol::write_packet(&mut socket, kind, &bytes)?;
+            }
             if kind != protocol::JSON {
                 crate::metrics::record("send", start.elapsed());
                 if let Some(started) = resize {
@@ -259,6 +279,7 @@ type MediaSession = Arc<Mutex<Option<(String, Weak<Peer>)>>>;
 pub fn listen(
     address: &str,
     token: String,
+    udp: Option<Arc<udp::Hub>>,
 ) -> anyhow::Result<(Receiver<Event>, SyncSender<Event>)> {
     let listener = TcpListener::bind(address)?;
     tracing::info!(address = %listener.local_addr()?, "viewer listener ready");
@@ -269,8 +290,13 @@ pub fn listen(
     thread::spawn(move || {
         for socket in listener.incoming() {
             let Ok(mut socket) = socket else { continue };
-            let (token, tx, occupied, session) =
-                (token.clone(), tx.clone(), occupied.clone(), session.clone());
+            let (token, tx, occupied, session, udp) = (
+                token.clone(),
+                tx.clone(),
+                occupied.clone(),
+                session.clone(),
+                udp.clone(),
+            );
             // Authentication is handled outside the compositor loop and cannot stall Wayland.
             thread::spawn(move || {
                 let _ = socket.set_nodelay(true);
@@ -310,7 +336,16 @@ pub fn listen(
                 if occupied.swap(true, Ordering::SeqCst) {
                     return;
                 }
+                let udp = if hello["udp_fec_v1"] == true
+                    && hello["split_media"] == true
+                    && hello["frame_ack"] == true
+                {
+                    udp.and_then(|hub| hub.session().ok())
+                } else {
+                    None
+                };
                 let peer = Arc::new(Peer {
+                    udp,
                     queue: Mutex::new(Queue::default()),
                     wake: Condvar::new(),
                     split_media: hello["split_media"].as_bool().unwrap_or(false),
@@ -345,13 +380,33 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "codecs":["png_rgba","h264_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "codecs":["png_rgba","h264_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);
                     while let Ok((protocol::JSON, body)) = protocol::read_packet(&mut socket) {
                         match serde_json::from_slice::<Value>(&body) {
                             Ok(value) => {
+                                if let Some(udp) = &peer.udp {
+                                    if value["type"] == "udp_ack" {
+                                        if let Some(n) = value["message"].as_u64() {
+                                            udp.ack(n);
+                                        }
+                                        continue;
+                                    }
+                                    if value["type"] == "udp_retry" {
+                                        if let Some(bytes) =
+                                            value["message"].as_u64().and_then(|n| udp.retry(n))
+                                        {
+                                            let mut q = peer.queue.lock().unwrap();
+                                            if q.repairs.len() < 4 {
+                                                q.repairs.push_back(bytes);
+                                                peer.wake.notify_all();
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
                                 if tx.send(Event::Message(value)).is_err() {
                                     break;
                                 }

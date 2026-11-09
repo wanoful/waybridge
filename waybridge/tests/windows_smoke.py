@@ -26,6 +26,8 @@ def main():
     csd="--csd" in sys.argv
     terminal="--terminal" in sys.argv
     qt="--qt" in sys.argv
+    udp="--udp" in sys.argv
+    proxy=None
     subprocess.run(["bash","tests/build-fixture.sh"],cwd=ROOT,check=True)
     subprocess.run(["x86_64-w64-mingw32-g++","-municode","-static","-O2","tests/windows_probe.cpp","-o","build/tests/windows-probe.exe","-lgdi32","-lshell32","-lole32","-luuid"],cwd=ROOT,check=True)
     prefix=ROOT/"build/wine-smoke";prefix.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -42,6 +44,11 @@ def main():
         if csd:env["WAYBRIDGE_FIXTURE_CSD"]="1"
         else:env.pop("WAYBRIDGE_FIXTURE_CSD",None)
         with socket.socket() as free:free.bind(("127.0.0.1",0));port=free.getsockname()[1]
+        if udp:
+            from udp_proxy import Proxy
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as free:free.bind(("127.0.0.1",0));udpport=free.getsockname()[1]
+            proxy=Proxy(("127.0.0.1",udpport),faults=True)
+            wine_env.update(WAYBRIDGE_UDP_HOST="127.0.0.1",WAYBRIDGE_UDP_PORT=str(proxy.port))
         token="native-smoke-"+"8"*40;token_file=Path(runtime)/"token";token_file.write_text(token);token_file.chmod(0o600)
         def probe(*args,check=True):
             return subprocess.run(["wine",str(ROOT/"build/tests/windows-probe.exe"),*args],env=wine_env,capture_output=True,text=True,timeout=20,check=check)
@@ -56,7 +63,7 @@ def main():
             version=subprocess.run(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"--version"],env=wine_env,capture_output=True,text=True,timeout=15,check=True)
             assert "0.3.0" in version.stdout,version.stdout
             subprocess.run(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"--check-shaders"],env=wine_env,stdout=log,stderr=log,timeout=15,check=True)
-            host=subprocess.Popen([str(ROOT/"target/debug/waybridge"),"--socket","native-0","--listen",f"127.0.0.1:{port}","--token-file",str(token_file)],env=env,stdout=log,stderr=log)
+            host=subprocess.Popen([str(ROOT/"target/debug/waybridge"),"--socket","native-0","--listen",f"127.0.0.1:{port}","--token-file",str(token_file),*(["--udp-listen",f"127.0.0.1:{udpport}"] if udp else [])],env=env,stdout=log,stderr=log)
             processes.append(host);wait_for(lambda:(Path(runtime)/"native-0").exists())
             app_log=open(ROOT/"build/tests/native-app.log","w+")
             if qt:
@@ -149,12 +156,18 @@ def main():
             print("PASS: single decoration owner ("+("CSD fallback; move, maximize, restore, minimize, close" if csd else "negotiated native Windows frame")+")")
             app_log.close()
         finally:
+            if proxy:
+                proxy.close()
             subprocess.run(["wineserver","-k"],env=wine_env,stdout=log,stderr=log,timeout=10)
             for p in reversed(processes):
                 if p.poll() is None:
                     p.terminate()
                     try:p.wait(timeout=3)
                     except subprocess.TimeoutExpired:p.kill();p.wait()
+            if proxy:
+                assert proxy.received>0,"test must carry actual UDP shards"
+                log.flush()
+                assert "UDP ordered media active" in Path(log.name).read_text()
 
 
 if __name__=="__main__":main()

@@ -1,5 +1,12 @@
 # Validation — 2026-11-09
 
+Optional encrypted UDP/FEC:
+
+- A real x64 PE receiver uses the production `UdpMedia` implementation and Windows CNG AES-256-GCM against Rust/ring. 24 PNG frames are exact and ordered both without faults and through a private UDP proxy injecting drops, corrupted tags, duplicates and reordering. Both actual XOR reconstruction and TCP frame repair are exercised. No host-network settings or running services are changed.
+- Real NVENC H.264 sends 24 IDR/P access units through the same fault injector; complete FFmpeg decoding verifies the reference chain, colors and exact independent alpha 0/128/255. The harness also blackholes UDP mid-stream and expects continued TCP repair delivery. Delivered sequences are strictly increasing without duplicates; all requested access units decode successfully. Artifacts are `build/tests/udp-*.bin`, `windows-udp.log`.
+- Full native Windows client under Wine/Xvfb passes real Qt at 175%: input, overflowing/nested popups, native owner movement, unchanged parent geometry and owned dialogs while carrying actual fault-injected UDP shards. Wine exercises the GDI fallback; physical WoA UDP/Wi-Fi latency remains unmeasured.
+- Rust authentication tests reject wrong keys, tampered tags, nonce zero, replays and authenticated endpoint rebinding; new sessions and directions have fresh independent keys. Existing core/Qt/Dolphin/Ghostty regressions pass with default TCP. Reassembly/cache/repair queues are bounded. This is fixed pacing + 8+1 XOR + TCP repair, not Moonlight's full congestion/packet recovery stack.
+
 Maximize/restore resize checks:
 
 - The actual native FFmpeg/NVENC adapter measured roughly 101 ms to create a session and 70 ms to destroy one when alternating 960×640 / 2240×1400. Keeping both sizes and forcing independent SPS/PPS+IDR on reuse reduced warm first-frame encoding to about 3.1 ms. These adapter timings exclude capture, alpha and network processing.
