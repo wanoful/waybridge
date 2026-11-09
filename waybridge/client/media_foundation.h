@@ -8,6 +8,7 @@
 // PNG and DirectComposition must remain usable when mfplat.dll or the decoder is absent.
 struct MediaFoundation {
   HMODULE library = nullptr;
+  decltype(&MFTEnumEx) EnumTransforms = nullptr;
   decltype(&MFStartup) Startup = nullptr;
   decltype(&MFShutdown) Shutdown = nullptr;
   decltype(&MFCreateDXGIDeviceManager) CreateDXGIDeviceManager = nullptr;
@@ -25,6 +26,7 @@ struct MediaFoundation {
     library = LoadLibraryW(L"mfplat.dll");
     if (!library)
       return;
+    EnumTransforms = procedure<decltype(EnumTransforms)>("MFTEnumEx");
     Startup = procedure<decltype(Startup)>("MFStartup");
     Shutdown = procedure<decltype(Shutdown)>("MFShutdown");
     CreateDXGIDeviceManager =

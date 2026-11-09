@@ -19,12 +19,16 @@ void wb_encoder_free(struct wb_encoder *encoder) {
     free(encoder);
 }
 
-struct wb_encoder *wb_encoder_new(int width, int height, int fps, int bitrate, char *error, size_t size) {
+struct wb_encoder *wb_encoder_new_codec(int kind, int width, int height, int fps, int bitrate, char *error, size_t size) {
     struct wb_encoder *encoder=calloc(1,sizeof(*encoder));
     if (!encoder) return NULL;
     int result=AVERROR(ENOMEM);
-    const AVCodec *codec=avcodec_find_encoder_by_name("h264_nvenc");
-    if (!codec) { snprintf(error,size,"h264_nvenc is unavailable in the system FFmpeg"); goto failed; }
+    const char *name=kind==2?"h264_nvenc":kind==4?"hevc_nvenc":kind==5?"av1_nvenc":NULL;
+    if (!name || width<48 || width>4096 || height<48 || height>2304 || fps<1 || fps>120 || bitrate<1000 || bitrate>200000) {
+        snprintf(error,size,"invalid codec, dimensions or rate"); goto failed;
+    }
+    const AVCodec *codec=avcodec_find_encoder_by_name(name);
+    if (!codec) { snprintf(error,size,"%s is unavailable in the system FFmpeg",name); goto failed; }
     encoder->codec=avcodec_alloc_context3(codec);
     encoder->frame=av_frame_alloc(); encoder->packet=av_packet_alloc();
     if (!encoder->codec || !encoder->frame || !encoder->packet) goto failed_error;
@@ -42,29 +46,33 @@ struct wb_encoder *wb_encoder_new(int width, int height, int fps, int bitrate, c
     av_dict_set(&options,"preset","p1",0);
     av_dict_set(&options,"tune","ull",0);
     av_dict_set(&options,"rc","cbr",0);
-    av_dict_set(&options,"cbr_padding","0",0);
+    if (kind==2) av_dict_set(&options,"cbr_padding","0",0);
     av_dict_set(&options,"rc-lookahead","0",0);
     av_dict_set(&options,"zerolatency","1",0);
     av_dict_set(&options,"delay","0",0);
     av_dict_set(&options,"forced-idr","1",0);
     // Give streaming decoders an explicit access-unit boundary, including when updates go idle.
-    av_dict_set(&options,"aud","1",0);
-    av_dict_set(&options,"profile","high",0);
+    if (kind!=5) av_dict_set(&options,"aud","1",0);
+    if (kind!=5) av_dict_set(&options,"profile",kind==2?"high":"main",0);
     result=avcodec_open2(ctx,codec,&options);
     av_dict_free(&options);
     if (result<0) goto failed_error;
-    // Some NVENC/driver combinations emit CBR filler even with cbr_padding=0.
-    // Trailing filler makes the Windows H.264 MFT hold the final picture until
-    // another access unit arrives. Remove only non-picture filler NALs; retain
-    // the rate-control configuration, timestamps and complete reference chain.
-    const AVBitStreamFilter *filter=av_bsf_get_by_name("filter_units");
+    // Codec-specific framing: never interpret AV1 OBU bytes as H.264 NALs.
+    // Strip non-picture filler without touching picture/reference payloads.
+    const AVBitStreamFilter *filter=av_bsf_get_by_name(kind==5?"av1_metadata":"filter_units");
     if (!filter) { result=AVERROR_BSF_NOT_FOUND; goto failed_error; }
     result=av_bsf_alloc(filter,&encoder->filter);
     if (result<0) goto failed_error;
     result=avcodec_parameters_from_context(encoder->filter->par_in,ctx);
     if (result<0) goto failed_error;
     encoder->filter->time_base_in=ctx->time_base;
-    result=av_opt_set(encoder->filter->priv_data,"remove_types","12",0);
+    if (kind==5) {
+        result=av_opt_set(encoder->filter->priv_data,"td","insert",0);
+        if (result<0) goto failed_error;
+        result=av_opt_set(encoder->filter->priv_data,"delete_padding","1",0);
+    } else {
+        result=av_opt_set(encoder->filter->priv_data,"remove_types",kind==2?"12":"38",0);
+    }
     if (result<0) goto failed_error;
     result=av_bsf_init(encoder->filter);
     if (result<0) goto failed_error;
@@ -77,6 +85,11 @@ failed_error:
     av_strerror(result,error,size);
 failed:
     wb_encoder_free(encoder);return NULL;
+}
+
+// Retain the original H.264 ABI for existing native fixtures and integrations.
+struct wb_encoder *wb_encoder_new(int width, int height, int fps, int bitrate, char *error, size_t size) {
+    return wb_encoder_new_codec(2,width,height,fps,bitrate,error,size);
 }
 
 // Output storage remains owned by the encoder until the next call.

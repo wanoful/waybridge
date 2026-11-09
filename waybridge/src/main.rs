@@ -113,10 +113,10 @@ struct Args {
     quality: u8,
     #[arg(long, default_value = "us")]
     layout: String,
-    /// Media codec. Auto enables NVENC only for viewers advertising H.264/alpha support.
-    #[arg(long,default_value="auto",value_parser=["auto","png","h264-nvenc"])]
+    /// Media codec. Auto remains H.264; HEVC/AV1 require explicit selection and viewer support.
+    #[arg(long,default_value="auto",value_parser=["auto","png","h264-nvenc","hevc-nvenc","av1-nvenc"])]
     codec: String,
-    /// Per-stream H.264 bitrate in kilobits/s.
+    /// Per-stream video bitrate in kilobits/s.
     #[arg(long,default_value_t=30000,value_parser=clap::value_parser!(u32).range(1000..=200000))]
     bitrate: u32,
     /// Log same-clock pipeline stage average/max durations every two seconds.
@@ -636,7 +636,20 @@ impl App {
             }
             "codec_fallback" => {
                 if let Some(peer) = &self.peer {
-                    peer.fallback(id);
+                    let codec = if value["codec"].is_null() {
+                        None
+                    } else {
+                        let Some(codec) = waybridge_codec::Codec::ALL
+                            .into_iter()
+                            .find(|codec| value["codec"].as_str() == Some(codec.capability()))
+                        else {
+                            return;
+                        };
+                        Some(codec)
+                    };
+                    if !peer.fallback(id, codec) {
+                        return;
+                    }
                 }
                 if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                     w.dirty = true;
@@ -1575,7 +1588,16 @@ fn main() -> Result<()> {
         default_scale: 1.0,
         focused_window: None,
         last_interaction: None,
-        encoder: video::Encoder::new(args.codec != "png", args.fps, args.bitrate),
+        encoder: video::Encoder::new(
+            match args.codec.as_str() {
+                "png" => None,
+                "hevc-nvenc" => Some(waybridge_codec::Codec::Hevc),
+                "av1-nvenc" => Some(waybridge_codec::Codec::Av1),
+                _ => Some(waybridge_codec::Codec::H264),
+            },
+            args.fps,
+            args.bitrate,
+        ),
     };
     let mut children: Vec<Child> = Vec::new();
     if let Some(program) = args.command.first() {

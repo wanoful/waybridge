@@ -5,7 +5,7 @@
 
 // The decode thread shares a small pool across windows. Keep common restore /
 // maximized sizes warm without accumulating a decoder for every drag position.
-class H264DecoderCache {
+class VideoDecoderCache {
   std::vector<std::unique_ptr<H264Decoder>> idle;
 
 public:
@@ -21,20 +21,22 @@ public:
       idle.erase(idle.begin());
     }
   }
-  std::unique_ptr<H264Decoder> acquire(UINT width, UINT height, bool &reused) {
+  std::unique_ptr<H264Decoder> acquire(UINT width, UINT height, bool &reused, uint8_t codec = 2) {
     for (auto it = idle.begin(); it != idle.end(); ++it) {
-      if (!(*it)->matches(width, height))
+      if (!(*it)->matches(width, height, codec))
         continue;
       auto decoder = std::move(*it);
       idle.erase(it);
-      // Each epoch starts with SPS/PPS + IDR. Discard all old stream state and
+      // Each epoch starts with codec headers and an independent keyframe. Discard old state and
       // timestamps while retaining the decoder's allocated hardware surfaces.
       decoder->restart();
       reused = true;
       return decoder;
     }
     reused = false;
-    return std::make_unique<H264Decoder>(width, height);
+    return std::make_unique<H264Decoder>(width, height, codec);
   }
   void clear() { idle.clear(); }
 };
+
+using H264DecoderCache = VideoDecoderCache;

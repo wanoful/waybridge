@@ -56,7 +56,7 @@ def main():
             version=subprocess.run(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"--version"],env=wine_env,capture_output=True,text=True,timeout=15,check=True)
             assert "0.3.0" in version.stdout,version.stdout
             subprocess.run(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"--check-shaders"],env=wine_env,stdout=log,stderr=log,timeout=15,check=True)
-            host=subprocess.Popen([str(ROOT/"target/debug/waybridge"),"--socket","native-0","--listen",f"127.0.0.1:{port}","--token-file",str(token_file)],env=env,stdout=log,stderr=log)
+            host=subprocess.Popen([str(ROOT/"target/debug/waybridge"),"--socket","native-0","--listen",f"127.0.0.1:{port}","--token-file",str(token_file),"--codec",os.environ.get("WAYBRIDGE_TEST_CODEC","auto")],env=env,stdout=log,stderr=log)
             processes.append(host);wait_for(lambda:(Path(runtime)/"native-0").exists())
             app_log=open(ROOT/"build/tests/native-app.log","w+")
             if qt:

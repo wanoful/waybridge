@@ -14,6 +14,20 @@ Windows 客户端会移除旧服务端码流中的填充 NAL，避免已实测�
 
 Linux 仍存在同步 GPU 回读和 CPU→NVENC 输入拷贝；当前传输仍是 TCP/SSH，尚未接入 UDP/FEC 或 Sunshine/Moonlight 线协议。这是硬件媒体路径的第一版，不能据此承诺最终端到端延迟。
 
+可用 `--codec hevc-nvenc` 或 `--codec av1-nvenc` 显式试用新编码；`auto` 仍使用
+H.264。两种新编码保留独立无损 alpha、尺寸 epoch、关键帧和两帧呈现确认。
+客户端通过系统 Media Foundation 枚举同步 D3D11-aware 解码器，并实际解码一个
+小关键帧得到 NV12 GPU 纹理后才广告该能力；不可用、初始化/解码/呈现失败时回退
+PNG。系统解码器安装情况、GPU/驱动和尺寸能力会影响可用性。新路径仅为 8-bit
+4:2:0 SDR，不包含 HDR。Linux NVENC 与码流/alpha 已实际验证；Windows/WoA
+新 codec 的硬解可用性、性能和应用体验尚待实机确认。
+
+在实际 Windows 设备上先运行 `waybridge-client.exe --check-codecs` 查看能力。
+诊断探针支持 `waybridge-decode-probe.exe BITSTREAM SIZES WIDTH HEIGHT hevc|av1`；
+默认不指定 codec 时保持原 H.264 行为。Linux 可运行 `python tests/codecs_smoke.py`
+验证真实 NVENC、alpha、缓存尺寸切换、协商和回退；`python tests/windows_codecs_smoke.py`
+在私有 Wine/Xvfb 桌面验证未广告能力和安全 PNG 回退，不代替 Windows 硬解测试。
+
 ## 直接运行
 
 本机已构建 Linux 服务端和 x64、ARM64 Windows 客户端：
@@ -59,7 +73,7 @@ WAYLAND_DISPLAY=waybridge-0 weston-terminal
 
 Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通过已有 D-Bus 服务打开到原桌面，需要使用应用的新实例参数，或用 `dbus-run-session -- <应用>` 启动独立实例。已有 KWin 窗口不会迁移到这个会话。
 
-可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
+可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc|hevc-nvenc|av1-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
 
 ## 使用数据交换
 
@@ -73,7 +87,7 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 
 ## 构建
 
-本机已有所需工具。Rust 依赖版本由 `Cargo.lock` 固定。Linux 需要 EGL/GLES、libdrm、Wayland、xkbcommon、FFmpeg（libavcodec/libavutil）开发文件及 pkg-config；使用 NVENC 还需要系统 FFmpeg 的 h264_nvenc 编码器和 NVIDIA 驱动；构建原生 Windows 客户端需要 MinGW-w64、CMake 和 Ninja。
+本机已有所需工具。Rust 依赖版本由 `Cargo.lock` 固定。Linux 需要 EGL/GLES、libdrm、Wayland、xkbcommon、FFmpeg（libavcodec/libavutil）开发文件及 pkg-config；使用 NVENC 还需要系统 FFmpeg 的对应 h264_nvenc/hevc_nvenc/av1_nvenc 编码器和 NVIDIA 驱动；构建原生 Windows 客户端需要 MinGW-w64、CMake 和 Ninja。
 
 ```bash
 ./scripts/build.sh
@@ -112,7 +126,7 @@ python tests/ghostty_smoke.py
 
 ## 在 Windows 实机检查这一版
 
-连接后应出现 `D3D11/DirectComposition presentation active`。硬件媒体路径成功时，Linux 另有 `NVENC H.264 ultra-low-latency encoder active`，Windows 有 `D3D11 hardware H.264 decoder active for window ...`。客户端启动时会打印 H.264 能力；若不可用，将继续使用 PNG。`GDI fallback` 代表备用绘制，不支持逐像素透明。
+连接后应出现 `D3D11/DirectComposition presentation active`。硬件媒体路径成功时，Linux 另有 `NVENC ultra-low-latency encoder active` 和 `codec="H.264"`，Windows 有 `D3D11 hardware H.264 decoder active for window ...`。客户端启动时会打印 H.264 能力；若不可用，将继续使用 PNG。`GDI fallback` 代表备用绘制，不支持逐像素透明。
 
 1. Windows 保持 175% 缩放，打开 Ghostty 的越界菜单；检查父窗口大小和文字比例保持不变，菜单可正常操作，Esc、点击外部和嵌套菜单正常。
 2. 滚动终端、连续输入，检查两端实际启用的编码日志。对比 `--codec png` 与 `--codec auto`，使用相同窗口尺寸和内容。
@@ -140,8 +154,8 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 ## 当前边界与后续工作
 
 - 改进 GPU 直接送入编码器与异步回读，减少 CPU 往返；增加 UDP/FEC 和拥塞控制。
-- 首版硬件路径为 H.264 4:2:0 SDR，彩色文字可能不如 PNG 清晰；4:4:4、HEVC/AV1、HDR 和高刷新率仍需扩展、验证。
-- 每个视频顶层窗口使用一个 NVENC 会话；会话数量受硬件/驱动限制，不能分配时回退 PNG。视频支持范围为 48×48 至 4096×2304，其他尺寸走 PNG。
+- 视频路径为 8-bit 4:2:0 SDR，彩色文字可能不如 PNG 清晰；默认 H.264，可选 HEVC/AV1 的 Windows 硬解仍需实机验证。4:4:4、HDR 和高刷新率仍需扩展、验证。
+- 每个视频顶层窗口使用一个 NVENC 会话；会话数量受硬件/驱动限制，不能分配时回退 PNG。视频包尺寸范围为 48×48 至 4096×2304，各 codec 的实际最小尺寸另受驱动限制，不支持时走 PNG。
 - 完善模态协议、窗口状态和光标/输入区域映射。
 - 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。
 - 接入 Xwayland，完善输入法、相对鼠标、指针形状和显式同步。

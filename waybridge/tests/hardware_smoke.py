@@ -6,9 +6,10 @@ from PIL import Image
 from smoke import ROOT
 
 class Viewer:
-    def __init__(self,port,token):
+    def __init__(self,port,token,codec="h264_alpha",kind=2):
+        self.kind=kind
         self.control=socket.create_connection(('127.0.0.1',port),timeout=10)
-        self.send(type='hello',version=3,token=token,split_media=True,frame_ack=True,codecs=['png_rgba','h264_alpha'])
+        self.send(type='hello',version=3,token=token,split_media=True,frame_ack=True,codecs=['png_rgba']+([codec] if isinstance(codec,str) else list(codec)))
         kind,hello=self.packet(self.control)
         assert kind==0 and hello['codec']=='mixed'
         # An authenticated connection with the wrong media capability must not steal the media socket.
@@ -45,16 +46,16 @@ class Viewer:
             if check(kind,value):return value
         raise AssertionError('missing NVENC packet; see hardware-host.log')
     def video(self,ack=True):
-        body=self.until(lambda k,v:k==2)
+        body=self.until(lambda k,v:k==self.kind)
         id,w,h,seq,lw,lh,x,y,epoch,cw,ch,key,color,alpha=struct.unpack('>IIIQiiiiIIIIII',body[:60])
         assert len(body)==60+color+alpha
         if ack:self.send(type='frame_ack',id=id,sequence=seq)
         mask=Image.open(io.BytesIO(body[60+color:])).convert('L') if alpha else Image.new('L',(w,h),255)
-        return dict(id=id,w=w,h=h,seq=seq,epoch=epoch,cw=cw,ch=ch,key=key,color=body[60:60+color],alpha=mask)
+        return dict(kind=self.kind,id=id,w=w,h=h,seq=seq,epoch=epoch,cw=cw,ch=ch,key=key,color=body[60:60+color],alpha=mask)
 
 def decoded(frames):
     w,h=frames[0]['cw'],frames[0]['ch']
-    data=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','h264','-i','pipe:0','-f','rawvideo','-pix_fmt','rgba','pipe:1'],input=b''.join(f['color'] for f in frames),capture_output=True,check=True,timeout=15).stdout
+    data=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f',{2:'h264',4:'hevc',5:'obu'}[frames[0].get('kind',2)],'-i','pipe:0','-f','rawvideo','-pix_fmt','rgba','pipe:1'],input=b''.join(f['color'] for f in frames),capture_output=True,check=True,timeout=15).stdout
     assert len(data)==len(frames)*w*h*4,(len(data),len(frames),w,h)
     image=Image.frombytes('RGBA',(w,h),data[-w*h*4:]).crop((0,0,frames[-1]['w'],frames[-1]['h']))
     image.putalpha(frames[-1]['alpha']);return image

@@ -52,6 +52,7 @@ std::vector<uint32_t> decoderGarbage;
 std::atomic<SOCKET> mediaConnection{INVALID_SOCKET};
 std::thread mediaReceiver;
 std::string serverHost, serverPort, serverToken;
+std::set<uint8_t> supportedVideoKinds;
 using Clock = std::chrono::steady_clock;
 struct ClientStats {
   struct Stage {
@@ -88,6 +89,7 @@ double millis(Clock::duration duration) {
 struct DecodedFrame {
   int width = 0, height = 0, logicalWidth = 0, logicalHeight = 0, originX = 0, originY = 0;
   uint64_t sequence = 0;
+  uint8_t codec = 0;
   std::vector<uint8_t> bgra, alpha;
   VideoSurface video;
   Clock::time_point decoded, received;
@@ -267,11 +269,11 @@ void receiveLoop(SOCKET socket) {
             frameWake.notify_all();
           }
           controls.push_back(std::move(message));
-        } else if ((packet[0] == 1 && size >= 37) || (packet[0] == 2 && size >= 61)) {
+        } else if ((packet[0] == 1 && size >= 37) || (VideoDecoder::videoKind(packet[0]) && size >= 61)) {
           uint32_t id = u32(packet.data() + 1);
           if (frames.size() >= 128 && !frames.count(id))
             break;
-          if (packet[0] == 2)
+          if (VideoDecoder::videoKind(packet[0]))
             frameWake.wait(
                 guard, [&] { return !running || !frames.count(id) || frames.at(id).size() < 4; });
           if (!running)
@@ -407,6 +409,7 @@ void decodeLoop() {
   auto images = std::make_unique<ImageDecoder>();
   struct State {
     uint32_t epoch = 0;
+    uint8_t kind = 0;
     std::unique_ptr<H264Decoder> decoder;
     std::map<uint64_t, std::shared_ptr<DecodedFrame>> pending;
   };
@@ -449,11 +452,12 @@ void decodeLoop() {
           Clock::now() - state.pending.begin()->second->received > std::chrono::milliseconds(1500))
         stalled.push_back(window);
     for (auto window : stalled) {
-      std::cerr << "H264 decoder produced no frame; requesting PNG fallback for window " << window
+      std::cerr << "Video decoder produced no frame; requesting PNG fallback for window " << window
                 << '\n';
+      auto kind = videoStates.at(window).kind;
       videoStates.erase(window);
       disabled.insert(window);
-      sendJson({{"type", "codec_fallback"}, {"id", window}});
+      sendJson({{"type", "codec_fallback"}, {"id", window}, {"codec", VideoDecoder::capability(kind)}});
     }
     if (!id || closed.count(id))
       continue;
@@ -478,36 +482,41 @@ void decodeLoop() {
         frame->logicalHeight > 8192)
       continue;
     std::vector<std::shared_ptr<DecodedFrame>> completed;
-    if (encoded.kind == 2) {
+    if (VideoDecoder::videoKind(encoded.kind)) {
+      frame->codec = encoded.kind;
       if (disabled.count(id))
         continue;
       try {
+        if (!supportedVideoKinds.count(encoded.kind))
+          throw std::runtime_error("Server selected an unadvertised video codec");
         if (bytes.size() < 60)
-          throw std::runtime_error("Invalid H264 header");
+          throw std::runtime_error("Invalid video header");
         uint32_t epoch = u32(bytes.data() + 36), cw = u32(bytes.data() + 40),
                  ch = u32(bytes.data() + 44), key = u32(bytes.data() + 48),
                  color = u32(bytes.data() + 52), alpha = u32(bytes.data() + 56);
-        if (cw < width || ch < height || cw > 4096 || ch > 2304 ||
+        if (cw < width || ch < height || cw > 4096 || ch > 2304 || (cw & 1) || (ch & 1) || key > 1 ||
             uint64_t(color) + alpha + 60 != bytes.size() || !color)
-          throw std::runtime_error("Invalid H264 dimensions/length");
+          throw std::runtime_error("Invalid video dimensions/length");
         auto &state = videoStates[id];
-        if (!state.decoder || state.epoch != epoch) {
+        if (!state.decoder || state.epoch != epoch || state.kind != encoded.kind ||
+            !state.decoder->matches(cw, ch, encoded.kind)) {
           if (!key)
-            throw std::runtime_error("New H264 epoch did not start with an IDR");
+            throw std::runtime_error("New video epoch did not start with an independent keyframe");
           state.pending.clear();
           auto initStarted = Clock::now();
           decoderCache.recycle(std::move(state.decoder));
           bool reused = false;
-          state.decoder = decoderCache.acquire(cw, ch, reused);
+          state.decoder = decoderCache.acquire(cw, ch, reused, encoded.kind);
           clientStats.record(reused ? "decoder_reuse" : "decoder_create",
                              millis(Clock::now() - initStarted));
           state.epoch = epoch;
-          std::cout << "D3D11 hardware H.264 decoder active for window " << id << '\n';
+          state.kind = encoded.kind;
+          std::cout << "D3D11 hardware " << VideoDecoder::name(encoded.kind) << " decoder active for window " << id << '\n';
         }
         if (alpha) {
           auto maskStarted = Clock::now();
           if (!images->decode(bytes.data() + 60 + color, alpha, width, height, true, frame->alpha))
-            throw std::runtime_error("Invalid H264 alpha mask");
+            throw std::runtime_error("Invalid video alpha mask");
           clientStats.record("alpha_decode", millis(Clock::now() - maskStarted));
         }
         state.pending[frame->sequence] = frame;
@@ -515,7 +524,7 @@ void decodeLoop() {
           throw std::runtime_error("Hardware decoder buffered too many frames");
         auto videoStarted = Clock::now();
         auto surfaces = state.decoder->decode(bytes.data() + 60, color, frame->sequence);
-        clientStats.record("h264_transform", millis(Clock::now() - videoStarted));
+        clientStats.record(encoded.kind == 2 ? "h264_transform" : encoded.kind == 4 ? "hevc_transform" : "av1_transform", millis(Clock::now() - videoStarted));
         for (auto &surface : surfaces) {
           auto found = state.pending.find(surface.sequence);
           if (found == state.pending.end())
@@ -526,11 +535,12 @@ void decodeLoop() {
           state.pending.erase(found);
         }
       } catch (const std::exception &e) {
-        std::cerr << "H264 decode failed for window " << id << ": " << e.what()
+        std::cerr << VideoDecoder::name(encoded.kind) << " decode failed for window " << id << ": " << e.what()
                   << "; requesting PNG fallback\n";
         videoStates.erase(id);
         disabled.insert(id);
-        sendJson({{"type", "codec_fallback"}, {"id", id}});
+        sendJson({{"type", "codec_fallback"}, {"id", id},
+                  {"codec", VideoDecoder::capability(encoded.kind)}});
         continue;
       }
     } else {
@@ -543,7 +553,8 @@ void decodeLoop() {
         continue;
       completed.push_back(frame);
     }
-    clientStats.record(encoded.kind == 2 ? "h264_decode" : "png_decode",
+    clientStats.record(encoded.kind == 2 ? "h264_decode" : encoded.kind == 4 ? "hevc_decode" :
+                       encoded.kind == 5 ? "av1_decode" : "png_decode",
                        millis(Clock::now() - started));
     for (auto &ready : completed) {
       ready->decoded = Clock::now();
@@ -1525,8 +1536,9 @@ void dispatchNetwork() {
       if (!w->presentation ||
           !w->presentation->presentVideo(frame->video.texture.Get(), frame->video.subresource,
                                          frame->width, frame->height, frame->alpha, imageRect(w))) {
-        std::cerr << "H264 GPU presentation failed; requesting PNG fallback\n";
-        sendJson({{"type", "codec_fallback"}, {"id", id}});
+        std::cerr << "Video GPU presentation failed; requesting PNG fallback\n";
+        sendJson({{"type", "codec_fallback"}, {"id", id},
+                  {"codec", VideoDecoder::capability(frame->codec)}});
         continue;
       }
     } else if (w->presentation && !w->presentation->present(frame->bgra.data(), frame->width,
@@ -1592,6 +1604,17 @@ BOOL WINAPI consoleControl(DWORD) {
 }
 
 int wmain(int argc, wchar_t **argv) {
+  if (argc == 2 && std::wstring(argv[1]) == L"--check-codecs") {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    auto &mf = MediaFoundation::get();
+    bool started = mf.available() && SUCCEEDED(mf.Startup(MF_VERSION, MFSTARTUP_FULL));
+    for (uint8_t kind : {2, 4, 5})
+      std::cout << VideoDecoder::name(kind) << " capability="
+                << (started && VideoDecoder::available(kind) ? "available" : "unavailable") << '\n';
+    if (started) mf.Shutdown();
+    CoUninitialize();
+    return 0;
+  }
   if (argc == 2 && std::wstring(argv[1]) == L"--version") {
     std::cout << "Waybridge client " << WAYBRIDGE_VERSION << '\n';
     return 0;
@@ -1615,9 +1638,15 @@ int wmain(int argc, wchar_t **argv) {
   OleInitialize(nullptr);
   bool mfStarted = MediaFoundation::get().available() &&
                    SUCCEEDED(MediaFoundation::get().Startup(MF_VERSION, MFSTARTUP_FULL));
-  bool hardwareDecoder = mfStarted && H264Decoder::available();
-  if (GetEnvironmentVariableW(L"WAYBRIDGE_PNG", nullptr, 0))
-    hardwareDecoder = false;
+  bool videoEnabled = !GetEnvironmentVariableW(L"WAYBRIDGE_PNG", nullptr, 0);
+  bool hardwareDecoder = videoEnabled && mfStarted && H264Decoder::available();
+  if (hardwareDecoder) supportedVideoKinds.insert(2);
+  for (uint8_t kind : {4, 5}) {
+    bool available = videoEnabled && mfStarted && VideoDecoder::available(kind);
+    if (available) supportedVideoKinds.insert(kind);
+    std::cout << VideoDecoder::name(kind) << " GPU decoder capability: "
+              << (available ? "verified NV12 texture" : "unavailable; not advertised") << '\n';
+  }
   std::cout << "H.264 hardware decoder capability: "
             << (hardwareDecoder ? "available" : "unavailable; using PNG") << '\n';
   pngFormat = RegisterClipboardFormatW(L"PNG");
@@ -1674,8 +1703,8 @@ int wmain(int argc, wchar_t **argv) {
   serverPort = utf8(argv[2]);
   serverToken = utf8(argv[3]);
   Json codecs = Json::array({"png_rgba"});
-  if (hardwareDecoder)
-    codecs.push_back("h264_alpha");
+  for (auto kind : supportedVideoKinds)
+    codecs.push_back(VideoDecoder::capability(kind));
   sendJson({{"type", "hello"},
             {"version", 3},
             {"split_media", true},

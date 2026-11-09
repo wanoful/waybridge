@@ -32,6 +32,7 @@ struct Queue {
     controls: VecDeque<Vec<u8>>,
     frames: BTreeMap<u32, VecDeque<QueuedFrame>>,
     png_only: BTreeSet<u32>,
+    active_codec: BTreeMap<u32, waybridge_codec::Codec>,
     in_flight: BTreeMap<u32, BTreeMap<u64, std::time::Instant>>,
     closed_windows: BTreeSet<u32>,
     last_frame_id: u32,
@@ -68,7 +69,7 @@ pub struct Peer {
     queue: Mutex<Queue>,
     wake: Condvar,
     split_media: bool,
-    h264: bool,
+    codecs: BTreeSet<waybridge_codec::Codec>,
     acknowledgements: bool,
     media_attached: AtomicBool,
 }
@@ -121,8 +122,8 @@ impl Peer {
         }
         self.wake.notify_all();
     }
-    pub fn h264(&self, id: u32) -> bool {
-        self.h264 && !self.queue.lock().unwrap().png_only.contains(&id)
+    pub fn supports(&self, codec: waybridge_codec::Codec, id: u32) -> bool {
+        self.codecs.contains(&codec) && !self.queue.lock().unwrap().png_only.contains(&id)
     }
     pub fn video_ready(&self, id: u32) -> bool {
         let q = self.queue.lock().unwrap();
@@ -151,7 +152,7 @@ impl Peer {
     pub fn is_closed(&self) -> bool {
         self.queue.lock().unwrap().closed
     }
-    pub fn video_frame(&self, id: u32, bytes: Vec<u8>) {
+    pub fn video_frame(&self, id: u32, codec: waybridge_codec::Codec, bytes: Vec<u8>) {
         let mut q = self.queue.lock().unwrap();
         if !q.closed && !q.closed_windows.contains(&id) && !q.png_only.contains(&id) {
             if self.acknowledgements {
@@ -160,25 +161,36 @@ impl Peer {
                     std::time::Instant::now(),
                 );
             }
+            q.active_codec.insert(id, codec);
             let resize = q.resize_marker(id, &bytes);
-            q.frames
-                .entry(id)
-                .or_default()
-                .push_back((protocol::VIDEO, bytes, resize));
+            q.frames.entry(id).or_default().push_back((
+                match codec {
+                    waybridge_codec::Codec::H264 => protocol::VIDEO,
+                    waybridge_codec::Codec::Hevc => protocol::HEVC_VIDEO,
+                    waybridge_codec::Codec::Av1 => protocol::AV1_VIDEO,
+                },
+                bytes,
+                resize,
+            ));
         }
         self.wake.notify_all();
     }
-    pub fn fallback(&self, id: u32) {
+    pub fn fallback(&self, id: u32, codec: Option<waybridge_codec::Codec>) -> bool {
         let mut q = self.queue.lock().unwrap();
+        if codec.is_some_and(|codec| q.active_codec.get(&id) != Some(&codec)) {
+            return false;
+        }
         q.png_only.insert(id);
         q.frames.remove(&id);
         q.in_flight.remove(&id);
         self.wake.notify_all();
+        true
     }
     pub fn forget_window(&self, id: u32) {
         let mut q = self.queue.lock().unwrap();
         q.frames.remove(&id);
         q.closed_windows.insert(id);
+        q.active_codec.remove(&id);
         q.in_flight.remove(&id);
         q.resizes.remove(&id);
     }
@@ -314,9 +326,14 @@ pub fn listen(
                     queue: Mutex::new(Queue::default()),
                     wake: Condvar::new(),
                     split_media: hello["split_media"].as_bool().unwrap_or(false),
-                    h264: hello["codecs"]
-                        .as_array()
-                        .is_some_and(|codecs| codecs.iter().any(|c| c == "h264_alpha")),
+                    codecs: waybridge_codec::Codec::ALL
+                        .into_iter()
+                        .filter(|codec| {
+                            hello["codecs"].as_array().is_some_and(|codecs| {
+                                codecs.iter().any(|c| c == codec.capability())
+                            })
+                        })
+                        .collect(),
                     media_attached: AtomicBool::new(false),
                     acknowledgements: hello["frame_ack"].as_bool().unwrap_or(false),
                 });
@@ -345,7 +362,7 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "codecs":["png_rgba","h264_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

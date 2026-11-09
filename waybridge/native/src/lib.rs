@@ -4,7 +4,8 @@ use std::{
 };
 
 unsafe extern "C" {
-    fn wb_encoder_new(
+    fn wb_encoder_new_codec(
+        kind: c_int,
         width: c_int,
         height: c_int,
         fps: c_int,
@@ -24,6 +25,32 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+/// Wire kinds are explicit: kind 3 is reserved for audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Codec {
+    H264 = 2,
+    Hevc = 4,
+    Av1 = 5,
+}
+impl Codec {
+    pub const ALL: [Self; 3] = [Self::H264, Self::Hevc, Self::Av1];
+    pub fn capability(self) -> &'static str {
+        match self {
+            Self::H264 => "h264_alpha",
+            Self::Hevc => "hevc_alpha",
+            Self::Av1 => "av1_alpha",
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+            Self::Av1 => "AV1",
+        }
+    }
+}
+
 pub struct Encoder {
     handle: NonNull<c_void>,
     bytes: usize,
@@ -31,6 +58,15 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self, String> {
+        Self::with_codec(Codec::H264, width, height, fps, bitrate)
+    }
+    pub fn with_codec(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<Self, String> {
         if !(48..=4096).contains(&width)
             || !(48..=2304).contains(&height)
             || !(1..=120).contains(&fps)
@@ -40,7 +76,8 @@ impl Encoder {
         }
         let mut error = [0 as c_char; 256];
         let pointer = unsafe {
-            wb_encoder_new(
+            wb_encoder_new_codec(
+                codec as c_int,
                 width as c_int,
                 height as c_int,
                 fps as c_int,

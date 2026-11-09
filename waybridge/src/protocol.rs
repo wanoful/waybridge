@@ -6,6 +6,9 @@ pub const MAX_PACKET: usize = 72 * 1024 * 1024;
 pub const JSON: u8 = 0;
 pub const FRAME: u8 = 1;
 pub const VIDEO: u8 = 2;
+// Kind 3 is reserved for audio. New codecs are explicitly negotiated.
+pub const HEVC_VIDEO: u8 = 4;
+pub const AV1_VIDEO: u8 = 5;
 
 pub fn read_packet(reader: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
     let mut header = [0; 4];

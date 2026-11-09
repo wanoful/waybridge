@@ -37,6 +37,7 @@ pub struct Encoder {
 struct Session {
     width: u32,
     height: u32,
+    codec: nvenc::Codec,
     owner: Weak<Peer>,
     encoder: Option<nvenc::Encoder>,
     failed: bool,
@@ -62,7 +63,7 @@ fn trim_idle(idle: &mut VecDeque<(u32, Session)>) {
 }
 
 impl Encoder {
-    pub fn new(hardware: bool, fps: u32, bitrate: u32) -> Self {
+    pub fn new(codec: Option<nvenc::Codec>, fps: u32, bitrate: u32) -> Self {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let worker = queue.clone();
         thread::spawn(move || {
@@ -107,9 +108,10 @@ impl Encoder {
                 if frame.peer.is_closed() || frame.peer.window_closed(frame.id) {
                     continue;
                 }
-                let use_video = hardware
+                let selected_codec = codec.unwrap_or(nvenc::Codec::H264);
+                let use_video = codec.is_some()
                     && frame.video_eligible
-                    && frame.peer.h264(frame.id)
+                    && frame.peer.supports(selected_codec, frame.id)
                     && frame.width >= 48
                     && frame.height >= 48
                     && frame.width <= 4096
@@ -133,7 +135,10 @@ impl Encoder {
                             .is_some_and(|peer| Arc::ptr_eq(&peer, &frame.peer))
                     };
                     let recreate = sessions.get(&frame.id).is_none_or(|s| {
-                        s.width != frame.width || s.height != frame.height || !same_owner(s)
+                        s.width != frame.width
+                            || s.height != frame.height
+                            || s.codec != selected_codec
+                            || !same_owner(s)
                     });
                     if recreate {
                         epoch = epoch.wrapping_add(1);
@@ -141,6 +146,7 @@ impl Encoder {
                             *id == frame.id
                                 && s.width == frame.width
                                 && s.height == frame.height
+                                && s.codec == selected_codec
                                 && same_owner(s)
                         });
                         let mut next = cached.map(|index| idle.remove(index).unwrap().1);
@@ -162,6 +168,7 @@ impl Encoder {
                         let mut next = next.take().unwrap_or(Session {
                             width: frame.width,
                             height: frame.height,
+                            codec: selected_codec,
                             owner: Arc::downgrade(&frame.peer),
                             encoder: None,
                             failed: false,
@@ -175,12 +182,23 @@ impl Encoder {
                     let session = sessions.get_mut(&frame.id).unwrap();
                     if !session.failed && session.encoder.is_none() {
                         let started = Instant::now();
-                        let mut result =
-                            nvenc::Encoder::new(frame.width, frame.height, fps, bitrate);
+                        let mut result = nvenc::Encoder::with_codec(
+                            selected_codec,
+                            frame.width,
+                            frame.height,
+                            fps,
+                            bitrate,
+                        );
                         if result.is_err() && !idle.is_empty() {
                             // Cached sessions must never make another window lose hardware video.
                             idle.clear();
-                            result = nvenc::Encoder::new(frame.width, frame.height, fps, bitrate);
+                            result = nvenc::Encoder::with_codec(
+                                selected_codec,
+                                frame.width,
+                                frame.height,
+                                fps,
+                                bitrate,
+                            );
                         }
                         metrics::record("encoder_init", started.elapsed());
                         match result {
@@ -190,7 +208,8 @@ impl Encoder {
                                     id = frame.id,
                                     width = frame.width,
                                     height = frame.height,
-                                    "NVENC H.264 ultra-low-latency encoder active"
+                                    codec = selected_codec.name(),
+                                    "NVENC ultra-low-latency encoder active"
                                 );
                             }
                             Err(error) => {
@@ -279,7 +298,7 @@ impl Encoder {
                                 }
                                 body.extend(color);
                                 body.extend(mask);
-                                frame.peer.video_frame(frame.id, body);
+                                frame.peer.video_frame(frame.id, selected_codec, body);
                                 continue;
                             }
                             Err(error) => {
