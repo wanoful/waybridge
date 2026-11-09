@@ -1,5 +1,7 @@
 # Waybridge 0.3.0
 
+本分支增加可选的 rootless Xwayland：X11 应用继续以独立 Windows 窗口显示，可与原生 Wayland 应用共存。包含小范围 Smithay 修复，详见 `vendor/smithay/PATCHES.md`；未修改系统 Cargo 缓存或桌面合成器。
+
 这一版修复越界菜单引起父窗口缩小：每个 `xdg_popup` 映射为独立的 Windows 无边框 owned window，不进入任务栏、不抢激活。父窗口的尺寸和画面范围保持不变；嵌套菜单、父窗口移动、DPI、鼠标抓取、Esc 和关闭均单独处理，弹出位置按 Windows 工作区约束。
 
 默认 60 FPS，采用固定截止时间调度；完全不透明的帧跳过反预乘颜色计算。媒体与窗口控制/文件使用分开的认证 TCP 连接，并用呈现确认限制每窗口最多两个在途帧，防止旧帧堆进 socket 缓冲区，两条连接都经过原来的 SSH 转发端口，不需要新增端口。
@@ -61,6 +63,31 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 
 可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
 
+## 可选 X11 应用
+
+运行时需安装 `Xwayland`。例如在独立端口和 socket 测试：
+
+```bash
+./target/release/waybridge --xwayland \
+  --listen 127.0.0.1:49101 --socket waybridge-x11 \
+  --token-file "$XDG_RUNTIME_DIR/waybridge-x11.token" -- glxgears
+```
+
+Windows 通过对应的 SSH 转发连接 49101，使用该 token 文件。Windows 客户端无新增运行时依赖，已有 v3 客户端可显示 X11 窗口。
+
+日志 `private rootless Xwayland ready display=":1000"` 给出实际 DISPLAY，后续 X11 应用使用此值。显示号从 1000–4095 的空闲范围选取，同时避开现有文件和 abstract socket；只监听权限 0700 的文件系统 Unix socket，限同一 Linux 用户连接。启动命令自动获得 DISPLAY，原生 Wayland 应用仍可加入相同会话。例如（按日志替换 `:1000`）：
+
+```bash
+DISPLAY=:1000 QT_QPA_PLATFORM=xcb ./build/tests/qt-app
+WAYLAND_DISPLAY=waybridge-x11 QT_QPA_PLATFORM=wayland ./build/tests/qt-app
+```
+
+已接入独立顶层窗口、transient owner、无边框 override-redirect 菜单/嵌套菜单、原生移动后的点击路由、resize/关闭、键盘焦点、文本/PNG/URI 剪贴板及大文本 INCR。X11 菜单在 Windows 捕获鼠标时仍能越出父窗口，Tooltip 不建立输入捕获。剪贴板按代际丢弃过时读取，缓存写出最多 16 worker、每次最多 10 秒。
+
+Xft/DPI 和 X11 客户端密度为这个 X 服务器共享，初始跟随 Windows 连接 DPI；各 Windows 窗口的呈现仍独立缩放。实测 Qt/XCB 在 175% 创建 1680×1120 画面，改成 125% 呈现为 1000×625，但应用共享 Xft 密度仍为 175%。忽略 Xft/DPI 的旧软件可能需要应用自己的字体设置。X11 resize 仍由应用自行布局，不能等同原生 Wayland 的逐窗口密度协议。
+
+当前 X11 子集不含 PRIMARY、XDND 文件拖放桥、XIM/Windows IME、完整 EWMH fullscreen/尺寸提示及自动 Xwayland 崩溃重启。崩溃/关闭 X11 应用不会关闭其余 Wayland 窗口；正常退出/SIGINT/SIGTERM 回收私有 X socket 和锁。普通 Wayland 功能和其他并行分支尚未在此分支整合。
+
 ## 使用数据交换
 
 - 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
@@ -104,6 +131,13 @@ python tests/hardware_smoke.py
 python tests/resize_smoke.py
 # 可选：安装了 Ghostty 时，验证真实 GTK 越界菜单
 python tests/ghostty_smoke.py
+# 可选：Xwayland + mesa-utils 的真实 GLX 动画、重连、共存和退出清理
+python tests/x11_smoke.py
+# 可选：Qt/XCB 175%/125%、ARGB frame visual/colormap、菜单与 Tooltip 捕获
+python tests/qt_smoke.py --x11
+python tests/x11_clipboard_smoke.py
+# 可选：Windows PE → X11 Qt，需 Wine/Xvfb
+python tests/windows_smoke.py --x11 --qt
 ```
 
 `tests/smoke.py` 启动隔离的真实合成器和两个原生 Wayland 测试窗口，检查图像颜色/方向、尺寸、输入、断线、重连、双向文本/PNG/文件、文件拖放和路径校验。依赖 `python-pillow`、`wl-clipboard`、`wayland-scanner`、C 编译器。`tests/qt_smoke.py` 需要 Qt6Widgets 开发文件与 C++ 编译器，验证真实 Qt 的 175%/125% 动态缩放、精确透明度、文字输入、菜单和模态对话框；有 Dolphin 时还会在独立 D-Bus/配置目录中验证路径输入及导航。
@@ -144,7 +178,7 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 - 每个视频顶层窗口使用一个 NVENC 会话；会话数量受硬件/驱动限制，不能分配时回退 PNG。视频支持范围为 48×48 至 4096×2304，其他尺寸走 PNG。
 - 完善模态协议、窗口状态和光标/输入区域映射。
 - 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。
-- 接入 Xwayland，完善输入法、相对鼠标、指针形状和显式同步。
+- 完善 X11 的 XIM/XDND/EWMH、多屏密度及崩溃恢复；整合输入法、相对鼠标、指针形状和显式同步。
 - 实现 Linux → Windows 原生拖出、目录和按需文件访问。
 - 完善音频、断点续传、文件传输进度/取消、端到端加密及会话管理。
 

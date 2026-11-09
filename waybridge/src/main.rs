@@ -4,6 +4,7 @@ mod network;
 mod protocol;
 mod transfer;
 mod video;
+mod x11;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -100,6 +101,9 @@ struct Args {
     listen: String,
     #[arg(long, default_value = "waybridge-0")]
     socket: String,
+    /// Launch a private rootless Xwayland server for legacy X11 applications.
+    #[arg(long)]
+    xwayland: bool,
     /// Authentication token file; created with mode 0600 if absent.
     #[arg(long)]
     token_file: Option<PathBuf>,
@@ -160,6 +164,7 @@ type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 struct App {
     dh: DisplayHandle,
     compositor: CompositorState,
+    x11: x11::State,
     shell: XdgShellState,
     _decorations: XdgDecorationState,
     _fractional_scale: FractionalScaleManagerState,
@@ -220,9 +225,33 @@ impl App {
 
     fn focus(&mut self, id: Option<u32>) {
         let id = id.map(|id| self.root_id(id));
+        // Override-redirect menus keep their owning X11 window's keyboard focus.
+        let id = id.and_then(|id| {
+            if let Some(x) = self.window(id).and_then(|w| w.x11_surface().cloned()) {
+                if x.is_override_redirect() {
+                    return x
+                        .is_transient_for()
+                        .and_then(|parent| {
+                            self.windows
+                                .iter()
+                                .find(|w| {
+                                    w.window.x11_surface().is_some_and(|x| {
+                                        x.window_id() == parent && !x.is_override_redirect()
+                                    })
+                                })
+                                .map(|w| w.id)
+                        })
+                        .or(self.focused_window);
+                }
+            }
+            Some(id)
+        });
         let id = id.filter(|id| self.window(*id).is_some());
         let changed = self.focused_window != id;
         if changed {
+            if let Some(root) = self.x11.grab.filter(|root| Some(*root) != id) {
+                self.x11_cancel_popup(root);
+            }
             self.release_input();
             if let Some(root) = self
                 .focused_window
@@ -240,9 +269,27 @@ impl App {
             pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), self.time());
         }
         self.focused_window = id;
+        if changed {
+            if let Some(x) = id
+                .and_then(|id| self.window(id))
+                .and_then(|w| w.x11_surface().cloned())
+            {
+                if let Some(wm) = self.x11.wm.as_mut() {
+                    let _ = wm.raise_window(&x);
+                }
+            }
+        }
         let surface = id
             .and_then(|id| self.windows.iter().find(|w| w.id == id && w.mapped))
-            .and_then(|w| w.window.wl_surface().map(|s| s.into_owned()));
+            .and_then(|w| {
+                if let Some(x) = w.window.x11_surface() {
+                    Some(x11::KeyboardFocus::X11(x.clone()))
+                } else {
+                    w.window
+                        .wl_surface()
+                        .map(|s| x11::KeyboardFocus::Wayland(s.into_owned()))
+                }
+            });
         let keyboard = self.seat.get_keyboard().unwrap();
         // An active popup owns keyboard focus until its grab ends.
         if changed && keyboard.is_grabbed() {
@@ -253,7 +300,9 @@ impl App {
         }
         for w in &self.windows {
             if w.window.set_activated(Some(w.id) == id) {
-                w.window.toplevel().unwrap().send_pending_configure();
+                if let Some(top) = w.window.toplevel() {
+                    top.send_pending_configure();
+                }
             }
         }
     }
@@ -271,7 +320,9 @@ impl App {
         remote
             .output
             .change_current_state(mode, None, Some(Scale::Fractional(scale)), None);
-        let root = remote.window.wl_surface().unwrap().into_owned();
+        let Some(root) = remote.window.wl_surface().map(|s| s.into_owned()) else {
+            return;
+        };
         set_surface_scale(&root, &remote.output, scale);
         for (popup, _) in PopupManager::popups_for_surface(&root) {
             set_surface_scale(popup.wl_surface(), &remote.output, scale);
@@ -306,9 +357,41 @@ impl App {
         } else {
             position += window.geometry().loc.to_f64();
         }
-        let hit = window
+        let mut hit = window
             .surface_under(position, WindowSurfaceType::ALL)
             .map(|(surface, origin)| (surface, origin.to_f64()));
+        // Windows captures menu mouse events on the owner. X11 menus are independent
+        // rootless surfaces, so reproduce their hit test before handing input to Xwayland.
+        if let Some(root) = window.x11_surface().filter(|_| self.x11.grab == Some(id)) {
+            hit = window
+                .wl_surface()
+                .map(|s| (s.into_owned(), (0.0, 0.0).into()));
+            let root_location = self
+                .x11
+                .geometries
+                .get(&root.window_id())
+                .map_or(root.geometry().loc, |g| g.loc);
+            for popup in self.windows.iter().rev() {
+                let Some(x) = popup.window.x11_surface().filter(|x| {
+                    x11::input_popup(x) && popup.last_info["root"].as_u64() == Some(u64::from(id))
+                }) else {
+                    continue;
+                };
+                let location = self
+                    .x11
+                    .geometries
+                    .get(&x.window_id())
+                    .map_or(x.geometry().loc, |g| g.loc)
+                    - root_location;
+                let local = position - location.to_f64();
+                if let Some((surface, origin)) =
+                    popup.window.surface_under(local, WindowSurfaceType::ALL)
+                {
+                    hit = Some((surface, (location + origin).to_f64()));
+                    break;
+                }
+            }
+        }
         self.pointer_window = Some(id);
         let pointer = self.seat.get_pointer().unwrap();
         pointer.motion(
@@ -481,6 +564,7 @@ impl App {
             "ping" => self.control(json!({"type":"pong","nonce":value["nonce"]})),
             "hello" => {
                 self.default_scale = dpi_scale(&value);
+                self.x11_scale(self.default_scale);
                 let mode = monitor_mode(&value, self.output.current_mode().unwrap().refresh);
                 self.output.change_current_state(
                     mode,
@@ -620,6 +704,15 @@ impl App {
                             started,
                         );
                     }
+                    if let Some(x) = window.x11_surface() {
+                        let mut geometry = x.geometry();
+                        geometry.size = (width, height).into();
+                        let _ = x.configure(geometry);
+                        if let Some(maximized) = value["maximized"].as_bool() {
+                            let _ = x.set_maximized(maximized);
+                        }
+                        return;
+                    }
                     let top = window.toplevel().unwrap();
                     top.with_pending_state(|s| {
                         s.size = Some((width, height).into());
@@ -659,6 +752,7 @@ impl App {
                         self.release_input();
                     }
                 }
+                self.x11_cancel_popup(id);
             }
             "cancel_input"
                 if self.focused_window == Some(id) || self.pointer_window == Some(id) =>
@@ -667,7 +761,12 @@ impl App {
             }
             "close" => {
                 if let Some(window) = self.window(id) {
-                    window.toplevel().unwrap().send_close();
+                    if let Some(top) = window.toplevel() {
+                        top.send_close();
+                    }
+                    if let Some(x) = window.x11_surface() {
+                        let _ = x.close();
+                    }
                 }
             }
             "clipboard" => {
@@ -691,6 +790,13 @@ impl App {
                 }
                 self.clipboard_generation += 1; // discard reads from a superseded Linux selection
                 self.clipboard = contents.clone();
+                self.x11.clipboard_generation = None;
+                if let Some(wm) = self.x11.wm.as_mut() {
+                    let _ = wm.new_selection(
+                        SelectionTarget::Clipboard,
+                        Some(contents.keys().cloned().collect()),
+                    );
+                }
                 let seat = self.seat.clone();
                 set_data_device_selection(
                     &self.dh,
@@ -731,6 +837,13 @@ impl App {
                             let contents = BTreeMap::from([("text/uri-list".to_string(), uris)]);
                             self.clipboard_generation += 1;
                             self.clipboard = contents.clone();
+                            self.x11.clipboard_generation = None;
+                            if let Some(wm) = self.x11.wm.as_mut() {
+                                let _ = wm.new_selection(
+                                    SelectionTarget::Clipboard,
+                                    Some(vec!["text/uri-list".into()]),
+                                );
+                            }
                             set_data_device_selection(
                                 &self.dh,
                                 &self.seat,
@@ -804,8 +917,16 @@ impl App {
             .iter()
             .filter_map(|w| w.window.wl_surface().map(|s| (s.into_owned(), w.id)))
             .collect();
+        let x11_windows: Vec<_> = self
+            .windows
+            .iter()
+            .filter_map(|w| w.window.x11_surface().map(|x| (x.clone(), w.id)))
+            .collect();
+        let focused = self.focused_window;
         for remote in &mut self.windows {
-            let top = remote.window.toplevel().unwrap();
+            let Some(surface) = remote.window.wl_surface().map(|s| s.into_owned()) else {
+                continue;
+            };
             let bbox = stream_geometry(&remote.window);
             let size = bbox.size;
             let pixels: smithay::utils::Size<i32, smithay::utils::Physical> =
@@ -828,26 +949,51 @@ impl App {
             {
                 continue;
             }
-            let native_decoration =
-                top.current_state().decoration_mode == Some(DecorationMode::ServerSide);
-            let parent_id = top
-                .parent()
-                .and_then(|p| parent_ids.iter().find(|(s, _)| s == &p).map(|(_, id)| *id));
-            let info = with_states(top.wl_surface(), |states| {
-                let s = states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .unwrap()
-                    .lock()
-                    .unwrap();
-                json!({"type":"window", "id":remote.id, "title":s.title.clone().unwrap_or_default(), "app_id":s.app_id.clone().unwrap_or_default(), "width":size.w, "height":size.h,
+            let info = if let Some(x) = remote.window.x11_surface() {
+                x11::info(
+                    x,
+                    remote.id,
+                    size,
+                    remote.scale,
+                    &x11_windows,
+                    &self.x11.geometries,
+                    focused,
+                )
+            } else {
+                let top = remote.window.toplevel().unwrap();
+                let native_decoration =
+                    top.current_state().decoration_mode == Some(DecorationMode::ServerSide);
+                let parent_id = top
+                    .parent()
+                    .and_then(|p| parent_ids.iter().find(|(s, _)| s == &p).map(|(_, id)| *id));
+                with_states(top.wl_surface(), |states| {
+                    let s = states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .unwrap()
+                        .lock()
+                        .unwrap();
+                    json!({"type":"window", "id":remote.id, "title":s.title.clone().unwrap_or_default(), "app_id":s.app_id.clone().unwrap_or_default(), "width":size.w, "height":size.h,
                     "scale": remote.scale,
                     "parent": parent_id,
                     "decoration":if native_decoration {"server"}else{"client"}})
-            });
+                })
+            };
             if let Some(peer) = &self.peer {
                 if !remote.announced || remote.last_info != info {
                     peer.control(info.clone());
+                }
+                if info["type"] == "popup" && info["input_popup"] == true {
+                    if let Some(root) = info["root"].as_u64().and_then(|n| u32::try_from(n).ok()) {
+                        if self.x11.grab != Some(root) {
+                            if let Some(old) = self.x11.grab.replace(root) {
+                                peer.control(
+                                    json!({"type":"popup_grab","root":old,"active":false}),
+                                );
+                            }
+                            peer.control(json!({"type":"popup_grab","root":root,"active":true}));
+                        }
+                    }
                 }
                 remote.last_info = info;
                 remote.announced = true;
@@ -855,7 +1001,7 @@ impl App {
                     remote.frame_sequence += 1;
                     let mut frame = capture_surface(
                         &mut self.renderer,
-                        top.wl_surface(),
+                        &surface,
                         remote.id,
                         remote.frame_sequence,
                         bbox,
@@ -864,7 +1010,7 @@ impl App {
                         &mut remote.target_size,
                         peer.clone(),
                     )?;
-                    frame.video_eligible = true;
+                    frame.video_eligible = remote.last_info["type"] == "window";
                     self.encoder.submit(frame);
                 }
             }
@@ -877,6 +1023,7 @@ impl App {
                 |_, _| Some(remote.output.clone()),
             );
         }
+        self.refresh_x11_grab();
         for popup in &mut self.remote_popups {
             let Some(root) = self.windows.iter().find(|w| w.id == popup.root) else {
                 continue;
@@ -917,6 +1064,11 @@ impl App {
 }
 
 fn stream_geometry(window: &Window) -> Rectangle<i32, Logical> {
+    if window.is_x11() {
+        if let Some(surface) = window.wl_surface() {
+            return bbox_from_surface_tree(&surface, (0, 0));
+        }
+    }
     window.geometry()
 }
 
@@ -1052,7 +1204,11 @@ impl CompositorHandler for App {
         &mut self.compositor
     }
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor
+        if let Some(x) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+            &x.compositor_state
+        } else {
+            &client.get_data::<ClientState>().unwrap().compositor
+        }
     }
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
@@ -1228,7 +1384,7 @@ impl XdgShellHandler for App {
             // The popup grab forwards this only once the last grabbed popup has ended.
             self.seat.get_keyboard().unwrap().set_focus(
                 self,
-                Some(root),
+                Some(root.into()),
                 SERIAL_COUNTER.next_serial(),
             );
         }
@@ -1289,7 +1445,7 @@ impl XdgShellHandler for App {
         let seat = self.seat.clone();
         if let Ok(grab) = self
             .popups
-            .grab_popup::<Self>(root.clone(), popup, &seat, serial)
+            .grab_popup::<Self>(root.clone().into(), popup, &seat, serial)
         {
             let root_id = self
                 .windows
@@ -1321,15 +1477,22 @@ impl XdgShellHandler for App {
     }
 }
 impl SeatHandler for App {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = x11::KeyboardFocus;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seats
     }
     fn cursor_image(&mut self, _: &Seat<Self>, _: smithay::input::pointer::CursorImageStatus) {}
-    fn focus_changed(&mut self, seat: &Seat<Self>, surface: Option<&WlSurface>) {
-        set_data_device_focus(&self.dh, seat, surface.and_then(|s| s.client()));
+    fn focus_changed(&mut self, seat: &Seat<Self>, surface: Option<&Self::KeyboardFocus>) {
+        use smithay::wayland::seat::WaylandFocus;
+        set_data_device_focus(
+            &self.dh,
+            seat,
+            surface
+                .and_then(|s| s.wl_surface())
+                .and_then(|s| s.client()),
+        );
     }
 }
 impl SelectionHandler for App {
@@ -1347,8 +1510,18 @@ impl SelectionHandler for App {
         let generation = self.clipboard_generation;
         self.clipboard.clear();
         self.control(json!({"type":"clipboard", "items":{}}));
-        let Some(source) = source else { return };
+        self.x11.clipboard_generation = None;
+        let Some(source) = source else {
+            if let Some(wm) = self.x11.wm.as_mut() {
+                let _ = wm.new_selection(SelectionTarget::Clipboard, None);
+            }
+            return;
+        };
         let types = source.mime_types();
+        self.x11.clipboard_generation = None;
+        if let Some(wm) = self.x11.wm.as_mut() {
+            let _ = wm.new_selection(SelectionTarget::Clipboard, Some(types.clone()));
+        }
         for mime in [
             "text/plain;charset=utf-8",
             "text/plain",
@@ -1488,6 +1661,8 @@ fn main() -> Result<()> {
     let dh = display.handle();
     let socket = ListeningSocket::bind(&args.socket)
         .context("binding private Wayland socket (already running?)")?;
+    let mut xloop = smithay::reexports::calloop::EventLoop::<App>::try_new()?;
+    let x11 = x11::start(&dh, xloop.handle(), args.xwayland)?;
     let (events, tx) = network::listen(&args.listen, auth)?;
     let compositor = CompositorState::new_v6::<App>(&dh);
     let shell = XdgShellState::new::<App>(&dh);
@@ -1543,6 +1718,7 @@ fn main() -> Result<()> {
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
         compositor,
+        x11,
         shell,
         _decorations: decorations,
         _fractional_scale: fractional_scale,
@@ -1578,12 +1754,29 @@ fn main() -> Result<()> {
         encoder: video::Encoder::new(args.codec != "png", args.fps, args.bitrate),
     };
     let mut children: Vec<Child> = Vec::new();
+    if args.xwayland {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.x11.display.is_none() && !app.x11.failed && Instant::now() < deadline {
+            display.dispatch_clients(&mut app)?;
+            display.flush_clients()?;
+            xloop.dispatch(Some(Duration::from_millis(1)), &mut app)?;
+        }
+        if app.x11.display.is_none() {
+            bail!("private Xwayland startup failed; see Xwayland logs");
+        }
+    }
     if let Some(program) = args.command.first() {
+        let mut command = Command::new(program);
+        command
+            .args(&args.command[1..])
+            .env("WAYLAND_DISPLAY", &args.socket);
+        if let Some(number) = app.x11.display {
+            command.env("DISPLAY", format!(":{number}"));
+        } else {
+            command.env_remove("DISPLAY");
+        }
         children.push(
-            Command::new(program)
-                .args(&args.command[1..])
-                .env("WAYLAND_DISPLAY", &args.socket)
-                .env_remove("DISPLAY")
+            command
                 .spawn()
                 .with_context(|| format!("launching {program}"))?,
         );
@@ -1591,7 +1784,8 @@ fn main() -> Result<()> {
     tracing::info!(socket = %args.socket, token_file = %token_path.display(), "ready; launch apps with WAYLAND_DISPLAY set to this socket");
     let interval = Duration::from_secs_f64(1.0 / args.fps as f64);
     let mut next_frame = Instant::now();
-    loop {
+    while !x11::stopping() {
+        xloop.dispatch(Some(Duration::ZERO), &mut app)?;
         while let Some(stream) = socket.accept()? {
             app.dh
                 .insert_client(stream, Arc::new(ClientState::default()))?;
@@ -1604,6 +1798,7 @@ fn main() -> Result<()> {
             let Ok(event) = events.try_recv() else { break };
             match event {
                 Event::Connected(peer) => {
+                    app.x11.grab = None;
                     app.release_input();
                     app.peer = Some(peer);
                     for p in &mut app.remote_popups {
@@ -1630,6 +1825,10 @@ fn main() -> Result<()> {
                 }
                 Event::Message(value) => app.message(value),
                 Event::Disconnected => {
+                    if let Some(root) = app.x11.grab {
+                        app.x11_cancel_popup(root);
+                        app.x11.grab = None;
+                    }
                     app.release_input();
                     app.encoder.reset();
                     app.focus(None);
@@ -1642,12 +1841,29 @@ fn main() -> Result<()> {
                     bytes,
                 } if generation == app.clipboard_generation => {
                     if mime == "text/uri-list" {
+                        if app.x11.clipboard_generation == Some(generation) {
+                            app.clipboard.insert(mime.clone(), bytes.clone());
+                            set_data_device_selection(
+                                &app.dh,
+                                &app.seat,
+                                app.clipboard.keys().cloned().collect(),
+                                Arc::new(app.clipboard.clone()),
+                            );
+                        }
                         if let Some(peer) = &app.peer {
                             transfer::export(peer.clone(), generation, bytes);
                         }
                         continue;
                     }
                     app.clipboard.insert(mime, bytes);
+                    if app.x11.clipboard_generation == Some(generation) {
+                        set_data_device_selection(
+                            &app.dh,
+                            &app.seat,
+                            app.clipboard.keys().cloned().collect(),
+                            Arc::new(app.clipboard.clone()),
+                        );
+                    }
                     let items: BTreeMap<_, _> = app
                         .clipboard
                         .iter()
@@ -1670,6 +1886,11 @@ fn main() -> Result<()> {
         children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
         std::thread::sleep(Duration::from_millis(2));
     }
+    if let Some(token) = app.x11.token.take() {
+        xloop.handle().remove(token);
+    }
+    drop(xloop);
+    Ok(())
 }
 
 fn dpi_scale(value: &Value) -> f64 {

@@ -2,13 +2,26 @@
 #include <QApplication>
 #include <QDialog>
 #include <QLineEdit>
+#include <QLabel>
 #include <QKeySequence>
 #include <QMenu>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
 #include <QTimer>
 #include <QWindow>
 #include <cstdio>
+#include <cstdlib>
+
+class MouseTrace : public QObject {
+  bool eventFilter(QObject *object,QEvent *event) override {
+    if(event->type()==QEvent::MouseButtonPress || event->type()==QEvent::MouseButtonRelease){
+      auto e=static_cast<QMouseEvent*>(event);
+      std::printf("MOUSE %s %d %.2f %.2f global %.2f %.2f\n",object->metaObject()->className(),int(event->type()),e->position().x(),e->position().y(),e->globalPosition().x(),e->globalPosition().y());
+    }
+    return false;
+  }
+};
 
 class AlphaWindow : public QWidget {
 public:
@@ -30,6 +43,8 @@ public:
 int main(int argc, char **argv) {
   QApplication app(argc, argv);
   setvbuf(stdout, nullptr, _IOLBF, 0);
+  MouseTrace trace;
+  if(std::getenv("WAYBRIDGE_INPUT_TRACE"))app.installEventFilter(&trace);
   QWidget window;
   window.setWindowTitle("Waybridge Qt fixture");
   window.resize(960, 640);
@@ -42,6 +57,9 @@ int main(int argc, char **argv) {
   button.setGeometry(20, 80, 160, 40);
   button.setShortcut(QKeySequence("Ctrl+M"));
   QMenu menu(&window);
+  QLabel tooltip("Persistent X11 tooltip",nullptr,Qt::ToolTip);
+  tooltip.setAttribute(Qt::WA_ShowWithoutActivating);
+  if(std::getenv("WAYBRIDGE_TOOLTIP_TEST"))QObject::connect(&menu,&QMenu::aboutToShow,[&]{tooltip.move(10,500);tooltip.show();});
   auto action = menu.addAction("Choose item");
   QObject::connect(action, &QAction::triggered, [] { std::puts("ACTION"); });
   QObject::connect(&button, &QPushButton::clicked, [&] {

@@ -26,6 +26,7 @@ def main():
     csd="--csd" in sys.argv
     terminal="--terminal" in sys.argv
     qt="--qt" in sys.argv
+    x11="--x11" in sys.argv
     subprocess.run(["bash","tests/build-fixture.sh"],cwd=ROOT,check=True)
     subprocess.run(["x86_64-w64-mingw32-g++","-municode","-static","-O2","tests/windows_probe.cpp","-o","build/tests/windows-probe.exe","-lgdi32","-lshell32","-lole32","-luuid"],cwd=ROOT,check=True)
     prefix=ROOT/"build/wine-smoke";prefix.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -56,16 +57,24 @@ def main():
             version=subprocess.run(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"--version"],env=wine_env,capture_output=True,text=True,timeout=15,check=True)
             assert "0.3.0" in version.stdout,version.stdout
             subprocess.run(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"--check-shaders"],env=wine_env,stdout=log,stderr=log,timeout=15,check=True)
-            host=subprocess.Popen([str(ROOT/"target/debug/waybridge"),"--socket","native-0","--listen",f"127.0.0.1:{port}","--token-file",str(token_file)],env=env,stdout=log,stderr=log)
+            host=subprocess.Popen([str(ROOT/"target/debug/waybridge"),"--socket","native-0","--listen",f"127.0.0.1:{port}","--token-file",str(token_file),*(["--xwayland"] if x11 else [])],env=env,stdout=log,stderr=log)
             processes.append(host);wait_for(lambda:(Path(runtime)/"native-0").exists())
+            if x11:
+                display=wait_for(lambda:re.search(r'private rootless Xwayland ready display="(:\d+)"',Path(log.name).read_text()))[1]
+                env["DISPLAY"]=display
+                env["WAYBRIDGE_INPUT_TRACE"]="1"
+                client=subprocess.Popen(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"127.0.0.1",str(port),token],env=wine_env,stdout=log,stderr=log)
+                processes.append(client);time.sleep(.3)
+
             app_log=open(ROOT/"build/tests/native-app.log","w+")
             if qt:
                 flags=subprocess.check_output(["pkg-config","--cflags","--libs","Qt6Widgets"],text=True).split()
                 subprocess.run(["c++","-std=c++17","-fPIC","-no-pie","tests/qt_app.cpp","-o","build/tests/qt-app",*flags],cwd=ROOT,check=True)
-                env["QT_QPA_PLATFORM"]="wayland"
+                env["QT_QPA_PLATFORM"]="xcb" if x11 else "wayland"
                 for name in ("QT_SCALE_FACTOR","QT_SCREEN_SCALE_FACTORS","QT_WAYLAND_DISABLE_WINDOWDECORATION"):env.pop(name,None)
             app=subprocess.Popen([str(ROOT/"build/tests/qt-app")] if qt else (["weston-terminal"] if terminal else [str(ROOT/"build/tests/test-app")]),env=env,stdout=app_log,stderr=app_log);processes.append(app)
-            client=subprocess.Popen(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"127.0.0.1",str(port),token],env=wine_env,stdout=log,stderr=log);processes.append(client)
+            if not x11:
+                client=subprocess.Popen(["wine",str(ROOT/"build/windows/waybridge-client.exe"),"127.0.0.1",str(port),token],env=wine_env,stdout=log,stderr=log);processes.append(client)
             if qt:
                 wait_for(lambda:"DPR 1.75" in Path(app_log.name).read_text())
                 wait_for(lambda:probe("frame","server",check=False).returncode==0)

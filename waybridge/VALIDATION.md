@@ -1,5 +1,14 @@
 # Validation — 2026-11-09
 
+Rootless X11 backend:
+
+- Actual `glxgears` renders changing GLX frames through Xwayland/GLES into an independent native-framed remote window, resizes to 600×400, retains its ID/content across viewer reconnect, and coexists with a real native Wayland client. Closing the X11 window leaves the Wayland client responsive. SIGTERM cleans the private 0700 filesystem X socket. An unlocked pre-existing test X socket remains the same inode when startup fails; foreign sockets are never deleted.
+- Real Qt/XCB follows shared 175% Xft DPI, renders 1680×1120 with exact alpha 0/128/255, accepts real clicks/keys and late-focus handling, opens independent overflow/nested menus and a transient dialog, and presents 1000×625 after a per-window 125% resize. The test keeps a non-input Tooltip mapped while closing the menu and requires `popup_grab:false`. A native Xlib probe verifies the original ARGB32 child and its reparent frame have matching visual/depth/colormap, with a nonzero colormap.
+- Actual x64 Windows PE in private Wine/Xvfb reaches the X11 Qt application at 175%, including native frame/input, overflow/nested menus, owner movement, root mouse capture and dialog focus. Wine uses the buffered GDI fallback; actual Windows/ARM64 X11 display quality and latency remain unmeasured.
+- Real X11 selections exchange large Unicode/emoji (288 KiB plus suffix, including actual INCR) and exact PNG bytes with both Wayland `wl-copy`/`wl-paste` and the viewer protocol. Source replacement/generations pass. Nonblocking XWM pipe writes are completed off the compositor with bounded workers/deadline; forwarded native Wayland providers receive a blocking write descriptor.
+- Smithay 0.7 is vendored with documented fixes for fractional initial X geometry, ARGB reparent frame visual/depth/client colormap, prompt clipboard/XSettings flush, custom MIME atom lookup, existing socket ownership and same-size SHM format/alpha cache reuse. The latter supports the separate experimental HDR branch's FP16↔ARGB transition. Registry contents and the host desktop are unchanged.
+- Default Wayland/Qt/Dolphin/Ghostty and core clipboard/file/decorations regressions pass. X11 is an explicit runtime option; no full XIM/XDND/EWMH, arbitrary legacy DPI, multi-GPU or all-application compatibility claim is made.
+
 Maximize/restore resize checks:
 
 - The actual native FFmpeg/NVENC adapter measured roughly 101 ms to create a session and 70 ms to destroy one when alternating 960×640 / 2240×1400. Keeping both sizes and forcing independent SPS/PPS+IDR on reuse reduced warm first-frame encoding to about 3.1 ms. These adapter timings exclude capture, alpha and network processing.
