@@ -8,6 +8,7 @@ from PIL import Image
 from hardware_smoke import ROOT
 
 def main():
+    subprocess.run(['cmake','--build',str(ROOT/'build/windows'),'--target','waybridge-hdr-alpha-probe'],check=True)
     prefix=ROOT/'build/wine-hdr';prefix.mkdir(mode=0o700,parents=True,exist_ok=True)
     with open(ROOT/'build/tests/hdr-windows.log','w') as log:
         r,w=os.pipe();xvfb=subprocess.Popen(['Xvfb','-displayfd',str(w),'-screen','0','1280x1024x24','-nolisten','tcp'],pass_fds=[w],stdout=log,stderr=log);os.close(w)
