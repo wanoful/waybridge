@@ -3,11 +3,13 @@
 #include <QDialog>
 #include <QLineEdit>
 #include <QLabel>
+#include <QInputMethodEvent>
 #include <QKeySequence>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
+#include <QShortcut>
 #include <QTimer>
 #include <QWindow>
 #include <cstdio>
@@ -20,6 +22,15 @@ class MouseTrace : public QObject {
       std::printf("MOUSE %s %d %.2f %.2f global %.2f %.2f\n",object->metaObject()->className(),int(event->type()),e->position().x(),e->position().y(),e->globalPosition().x(),e->globalPosition().y());
     }
     return false;
+  }
+};
+
+class ImeEdit : public QLineEdit {
+public:
+  using QLineEdit::QLineEdit;
+  void inputMethodEvent(QInputMethodEvent *event) override {
+    std::printf("PREEDIT %s\n", event->preeditString().toUtf8().constData());
+    QLineEdit::inputMethodEvent(event);
   }
 };
 
@@ -48,11 +59,13 @@ int main(int argc, char **argv) {
   QWidget window;
   window.setWindowTitle("Waybridge Qt fixture");
   window.resize(960, 640);
-  QLineEdit edit(&window);
+  ImeEdit edit(&window);
   edit.setGeometry(20, 20, 300, 40);
   QObject::connect(&edit, &QLineEdit::textChanged, [](const QString &text) {
     std::printf("TEXT %s\n", text.toUtf8().constData());
   });
+  auto spaceShortcut = new QShortcut(QKeySequence("Ctrl+Space"), &edit);
+  QObject::connect(spaceShortcut, &QShortcut::activated, [] { std::puts("CTRL_SPACE"); });
   QPushButton button("Open menu", &window);
   button.setGeometry(20, 80, 160, 40);
   button.setShortcut(QKeySequence("Ctrl+M"));

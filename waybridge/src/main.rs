@@ -1,6 +1,7 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
 mod cursor;
 mod app_icon;
+mod ime;
 mod metrics;
 mod network;
 mod protocol;
@@ -176,6 +177,7 @@ struct App {
     relative: relative_input::RelativeInput,
     _relative_manager: RelativePointerManagerState,
     _constraints: PointerConstraintsState,
+    ime: ime::Ime,
     dh: DisplayHandle,
     compositor: CompositorState,
     x11: x11::State,
@@ -314,6 +316,9 @@ impl App {
         if !keyboard.is_grabbed() {
             keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
         }
+        // Smithay 0.7 does not call SeatHandler::focus_changed when focus becomes None.
+        self.ime.focus(keyboard.current_focus());
+        self.publish_ime();
         for w in &self.windows {
             if w.window.set_activated(Some(w.id) == id) {
                 if let Some(top) = w.window.toplevel() {
@@ -586,6 +591,7 @@ impl App {
             .unwrap_or(0);
         match value["type"].as_str().unwrap_or("") {
             "window_state" => self.native_window_state(id, &value),
+            "ime" => self.ime_message(&value),
             "frame_ack" => {
                 if let Some(peer) = &self.peer {
                     peer.acknowledge(id, value["sequence"].as_u64().unwrap_or(0));
@@ -1682,6 +1688,8 @@ impl SeatHandler for App {
                 .and_then(|s| s.wl_surface())
                 .and_then(|s| s.client()),
         );
+        self.ime.focus(surface.and_then(|s| s.wl_surface()).map(|s| s.into_owned()));
+        self.publish_ime();
     }
 }
 impl smithay::wayland::tablet_manager::TabletSeatHandler for App {}
@@ -1921,6 +1929,7 @@ fn main() -> Result<()> {
         relative: relative_input::RelativeInput::default(),
         _relative_manager: RelativePointerManagerState::new::<App>(&dh),
         _constraints: PointerConstraintsState::new::<App>(&dh),
+        ime: ime::Ime::new(&dh),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -2011,6 +2020,8 @@ fn main() -> Result<()> {
                     app.peer = Some(peer);
                     app.cursor.dirty = true;
                     app.configure_capabilities();
+                    app.ime.republish();
+                    app.publish_ime();
                     for p in &mut app.remote_popups {
                         p.last_info = Value::Null;
                         p.dirty = true;
@@ -2102,6 +2113,12 @@ fn main() -> Result<()> {
                 }
                 Event::Clipboard { .. } => {}
             }
+        }
+        if app
+            .ime
+            .focus(app.seat.get_keyboard().unwrap().current_focus())
+        {
+            app.publish_ime();
         }
         if Instant::now() >= next_frame {
             app.render()?;

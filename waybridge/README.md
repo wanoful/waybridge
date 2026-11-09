@@ -134,6 +134,10 @@ python tests/windows_app_icon_smoke.py
 python tests/hardware_smoke.py
 # 可选：真实 NVENC 尺寸切换、缓存淘汰、IDR/P 引用与回环耗时
 python tests/resize_smoke.py
+# 可选：真实 Qt、Ghostty 和 Win32 → Wayland 文本输入
+python tests/ime_smoke.py
+python tests/ghostty_smoke.py --ime
+python tests/windows_smoke.py --ime
 # 可选：安装了 Ghostty 时，验证真实 GTK 越界菜单
 python tests/ghostty_smoke.py
 # 可选：Xwayland + mesa-utils 的真实 GLX 动画、重连、共存和退出清理

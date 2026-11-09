@@ -21,6 +21,7 @@
 #include "native_icon.h"
 #include "window_semantics.h"
 #include "relative_input.h"
+#include "ime.h"
 #include "third_party/json.hpp"
 #include <algorithm>
 #include <atomic>
@@ -119,6 +120,7 @@ struct RemoteWindow {
   std::string appId;
   uint64_t iconRevision = 0;
   NativeWindowState state;
+  NativeIme ime;
   uint32_t id;
   HWND hwnd = nullptr;
   int width = 960, height = 640;
@@ -141,6 +143,8 @@ struct RemoteWindow {
   int lastWorkWidth = 0, lastWorkHeight = 0, lastWorkX = INT_MIN, lastWorkY = INT_MIN;
 };
 std::map<uint32_t, std::unique_ptr<RemoteWindow>> windows;
+Json imeStatus;
+void updateIme();
 uint32_t grabbedRoot = 0;
 bool iconsNegotiated = false;
 std::unique_ptr<ImageDecoder> iconDecoder;
@@ -1182,6 +1186,75 @@ bool acceptsInput(RemoteWindow *w, LPARAM lp) {
          y = double(point.y - r.top) * w->height / (r.bottom - r.top);
   return w->state.accepts(x, y, w->originX, w->originY, w->width, w->height);
 }
+void updateIme() {
+  RemoteWindow *target = nullptr, *host = nullptr;
+  if (imeStatus.is_object() && imeStatus.value("enabled", false)) {
+    auto found = windows.find(imeStatus.value("id", 0u));
+    if (found != windows.end()) {
+      target = found->second.get();
+      host = target;
+      if (target->popup) {
+        auto root = windows.find(target->root);
+        host = root == windows.end() ? nullptr : root->second.get();
+      }
+    }
+  }
+  uint64_t generation = imeStatus.is_object() ? imeStatus.value("generation", uint64_t(0)) : 0;
+  for (auto &[id, window] : windows) {
+    if (!window->popup)
+      window->ime.associate(window->hwnd, window.get() == host && GetFocus() == window->hwnd,
+                            target ? target->id : 0, generation);
+  }
+  if (!host || !target || !host->ime.enabled || !imeStatus.contains("rectangle")) return;
+  const auto &caret = imeStatus.at("rectangle");
+  if (!caret.is_array() || caret.size() != 4) return;
+  RECT image = imageRect(target);
+  double sx = double(image.right - image.left) / std::max(1, target->width);
+  double sy = double(image.bottom - image.top) / std::max(1, target->height);
+  RECT rect{LONG(image.left + (caret[0].get<int>() - target->originX) * sx),
+            LONG(image.top + (caret[1].get<int>() - target->originY) * sy), 0, 0};
+  rect.right = rect.left + std::max(1L, LONG(caret[2].get<int>() * sx));
+  rect.bottom = rect.top + std::max(1L, LONG(caret[3].get<int>() * sy));
+  if (target != host) MapWindowPoints(target->hwnd, host->hwnd, reinterpret_cast<POINT *>(&rect), 2);
+  host->ime.caret(host->hwnd, rect);
+}
+
+void sendIme(RemoteWindow *window, const std::optional<std::wstring> &commit,
+             const std::optional<std::wstring> &preedit, LONG cursor = 0) {
+  auto &ime = window->ime;
+  if (!ime.enabled) return;
+  Json packet{{"type", "ime"}, {"id", ime.target},
+              {"generation", ime.composing ? ime.compositionGeneration : ime.generation}};
+  if (commit) packet["commit"] = utf8(*commit);
+  if (preedit) {
+    size_t pos = size_t(std::clamp<LONG>(cursor, 0, LONG(preedit->size())));
+    if (pos && pos < preedit->size() && (*preedit)[pos] >= 0xdc00 && (*preedit)[pos] <= 0xdfff &&
+        (*preedit)[pos-1] >= 0xd800 && (*preedit)[pos-1] <= 0xdbff) --pos;
+    packet["preedit"] = utf8(*preedit);
+    packet["cursor_begin"] = packet["cursor_end"] = utf8(preedit->substr(0, pos)).size();
+  }
+  sendJson(packet);
+}
+
+void synchronizeImeModifiers(RemoteWindow *window, uint32_t except = 0) {
+  auto &ime = window->ime;
+  if (ime.composing || ime.cancelling || GetFocus() != window->hwnd) return;
+  if (ime.enabled && (!imeStatus.value("enabled", false) ||
+                      imeStatus.value("generation", uint64_t(0)) != ime.generation ||
+                      imeStatus.value("id", 0u) != ime.target)) return;
+  static const std::pair<int, uint32_t> modifiers[] = {
+      {VK_LSHIFT, 42}, {VK_RSHIFT, 54}, {VK_LCONTROL, 29}, {VK_RCONTROL, 97},
+      {VK_LMENU, 56}, {VK_RMENU, 100}, {VK_LWIN, 125}, {VK_RWIN, 126}};
+  for (const auto &[native, key] : modifiers) {
+    if (key == except) continue;
+    bool held = (GetKeyState(native) & 0x8000) != 0;
+    bool forwarded = ime.forwardedKeys.count(key) != 0;
+    if (held == forwarded) continue;
+    if (held) ime.forwardedKeys.insert(key);
+    else ime.forwardedKeys.erase(key);
+    sendJson({{"type", "key"}, {"id", window->id}, {"key", key}, {"down", held}});
+  }
+}
 
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   auto w = reinterpret_cast<RemoteWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1364,13 +1437,77 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     if (w->popup)
       return 0;
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", true}});
+    updateIme();
     return 0;
   case WM_KILLFOCUS:
     if (relativeInput.active(hwnd))
       releasePointer();
     if (w->popup)
       return 0;
+    if (w->ime.composing) sendIme(w, {}, std::wstring());
+    w->ime.cancel(hwnd);
+    w->ime.forwardedKeys.clear();
+    DestroyCaret();
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", false}});
+    return 0;
+  case WM_IME_SETCONTEXT:
+    return DefWindowProcW(hwnd, message, wp,
+                         w->ime.enabled ? lp & ~ISC_SHOWUICOMPOSITIONWINDOW : lp);
+  case WM_IME_REQUEST:
+    if (w->ime.enabled && wp == IMR_QUERYCHARPOSITION && lp) {
+      auto position = reinterpret_cast<IMECHARPOSITION *>(lp);
+      if (position->dwSize < sizeof(*position)) return 0;
+      RECT caret = w->ime.lastCaret;
+      POINT point{caret.left, caret.top};
+      ClientToScreen(hwnd, &point);
+      position->pt = point;
+      position->cLineHeight = UINT(std::max(1L, caret.bottom - caret.top));
+      GetWindowRect(hwnd, &position->rcDocument);
+      return TRUE;
+    }
+    break;
+  case WM_IME_STARTCOMPOSITION:
+    if (!w->ime.enabled) return DefWindowProcW(hwnd, message, wp, lp);
+    w->ime.composing = true;
+    w->ime.compositionGeneration = w->ime.generation;
+    for (auto key : w->ime.forwardedKeys)
+      sendJson({{"type", "key"}, {"id", w->id}, {"key", key}, {"down", false}});
+    w->ime.forwardedKeys.clear();
+    w->ime.rawCharacterKeys.clear();
+    updateIme();
+    return 0;
+  case WM_IME_COMPOSITION:
+    if (w->ime.enabled) {
+      if (auto context = ImmGetContext(hwnd)) {
+        std::optional<std::wstring> result, preedit;
+        LONG cursor = 0;
+        if (lp & GCS_RESULTSTR) { result = NativeIme::string(context, GCS_RESULTSTR); preedit = L""; }
+        if (lp & GCS_COMPSTR) {
+          preedit = NativeIme::string(context, GCS_COMPSTR);
+          cursor = ImmGetCompositionStringW(context, GCS_CURSORPOS, nullptr, 0);
+          if (cursor < 0 && preedit) cursor = LONG(preedit->size());
+        }
+        if (!lp) preedit = L"";
+        ImmReleaseContext(hwnd, context);
+        sendIme(w, result, preedit, cursor);
+      }
+      return 0;
+    }
+    return DefWindowProcW(hwnd, message, wp, lp);
+  case WM_IME_ENDCOMPOSITION: {
+    bool current = w->ime.composing && w->ime.compositionGeneration == w->ime.generation;
+    sendIme(w, {}, std::wstring());
+    w->ime.composing = false;
+    if (current) synchronizeImeModifiers(w);
+    return 0;
+  }
+  case WM_IME_CHAR:
+    return 0; // Result strings are committed exactly once through WM_IME_COMPOSITION.
+  case WM_CHAR:
+    if (w->ime.enabled && !w->ime.composing && wp >= 32 && wp != 127) {
+      if (w->ime.rawCharacterKeys.count(linuxKey(lp))) return 0;
+      if (auto text = w->ime.character(wchar_t(wp))) sendIme(w, text, std::wstring());
+    }
     return 0;
   case WM_DISPLAYCHANGE:
   case WM_SETTINGCHANGE:
@@ -1412,6 +1549,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         sendResize(w);
       }
     }
+    updateIme();
     return 0;
   case WM_TIMER:
     KillTimer(hwnd, 1);
@@ -1470,6 +1608,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
                       : (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) ? 0x111
                                                                                : 0x112;
     if (down) {
+      if (w->ime.composing) {
+        sendIme(w, {}, std::wstring());
+        w->ime.cancel(hwnd);
+      }
       if (!w->popup)
         SetFocus(hwnd);
       if (!grabbedRoot && !relativeInput.active())
@@ -1499,11 +1641,18 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       releasePointer();
       return 0;
     }
-    if (auto key = linuxKey(lp))
-      sendJson({{"type", "key"},
-                {"id", w->id},
-                {"key", key},
-                {"down", message == WM_KEYDOWN || message == WM_SYSKEYDOWN}});
+    if (auto key = linuxKey(lp)) {
+      bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+      if (down) {
+        w->ime.rawCharacterKeys.erase(key);
+        if (wp == VK_PROCESSKEY || wp == VK_PACKET || w->ime.composing ||
+            (w->ime.enabled && NativeIme::printable(wp) && !w->ime.shortcut(wp, lp))) return 0;
+        synchronizeImeModifiers(w, key);
+        w->ime.forwardedKeys.insert(key);
+        w->ime.rawCharacterKeys.insert(key);
+      } else if (!w->ime.forwardedKeys.erase(key)) return 0;
+      sendJson({{"type", "key"}, {"id", w->id}, {"key", key}, {"down", down}});
+    }
     return 0;
   case WM_CLOSE:
     if (relativeInput.active(hwnd))
@@ -1604,6 +1753,8 @@ void dispatchNetwork() {
         ShowWindow(w->hwnd, SW_SHOWNOACTIVATE);
       reconcileWindows();
       sendWindowState(w);
+    } else if (type == "ime_state") {
+      imeStatus = m;
     } else if (type == "pong") {
       clientStats.record("control_rtt", double(GetTickCount64() - m.at("nonce").get<uint64_t>()));
     } else if (type == "window") {
@@ -1899,6 +2050,7 @@ void dispatchNetwork() {
         SetCapture(w->hwnd);
     }
   }
+  updateIme();
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {

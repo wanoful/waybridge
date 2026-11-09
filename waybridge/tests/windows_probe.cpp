@@ -258,22 +258,61 @@ int wmain(int argc, wchar_t **argv) {
   }
   if (std::wstring(argv[1]) == L"shortcut" && argc > 2) {
     UINT vk = argv[2][0];
-    UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-    SendMessageW(hwnd, WM_KEYDOWN, VK_CONTROL, 1 | (0x1d << 16));
-    SendMessageW(hwnd, WM_KEYDOWN, vk, 1 | (scan << 16));
-    SendMessageW(hwnd, WM_KEYUP, vk, 1 | (scan << 16) | (1u << 30) | (1u << 31));
-    SendMessageW(hwnd, WM_KEYUP, VK_CONTROL, 1 | (0x1d << 16) | (1u << 30) | (1u << 31));
+    INPUT input[4]{};
+    for (auto &i : input) i.type = INPUT_KEYBOARD;
+    input[0].ki.wVk = VK_CONTROL; input[1].ki.wVk = WORD(vk);
+    input[2].ki.wVk = WORD(vk); input[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    input[3].ki.wVk = VK_CONTROL; input[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    for (auto &i : input) {
+      i.ki.wScan = WORD(MapVirtualKeyW(i.ki.wVk, MAPVK_VK_TO_VSC));
+      i.ki.dwFlags |= KEYEVENTF_SCANCODE;
+    }
+    SendInput(4, input, sizeof(INPUT));
     Sleep(350);
     return 0;
   }
-  if (std::wstring(argv[1]) == L"type" && argc > 2) {
+  if (std::wstring(argv[1]) == L"ime-held-copy") {
+    auto key = [](WORD vk, bool down) {
+      INPUT input{};
+      input.type = INPUT_KEYBOARD;
+      input.ki.wScan = WORD(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+      input.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+      if (SendInput(1, &input, sizeof(input)) != 1) ExitProcess(31);
+      Sleep(150);
+    };
+    key(VK_CONTROL, true);
+    // Controlled boundaries exercise state restoration without claiming that
+    // Wine implements Microsoft's real composition/candidate engine.
+    SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, 0, 0);
+    SendMessageW(hwnd, WM_IME_ENDCOMPOSITION, 0, 0);
+    key('C', true); key('C', false);
+    key(VK_CONTROL, false);
+    Sleep(350);
+    return 0;
+  }
+  if ((std::wstring(argv[1]) == L"type" || std::wstring(argv[1]) == L"unicode") && argc > 2) {
     for (const wchar_t *p = argv[2]; *p; ++p) {
-      UINT vk = LOBYTE(VkKeyScanW(*p));
-      UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-      SendMessageW(hwnd, WM_KEYDOWN, vk, 1 | (scan << 16));
-      SendMessageW(hwnd, WM_KEYUP, vk, 1 | (scan << 16) | (1u << 30) | (1u << 31));
+      INPUT input[2]{};
+      for (auto &i : input) i.type = INPUT_KEYBOARD;
+      if (std::wstring(argv[1]) == L"unicode") {
+        input[0].ki.wScan = input[1].ki.wScan = *p;
+        input[0].ki.dwFlags = input[1].ki.dwFlags = KEYEVENTF_UNICODE;
+      } else {
+        input[0].ki.wVk = input[1].ki.wVk = LOBYTE(VkKeyScanW(*p));
+        input[0].ki.wScan = input[1].ki.wScan = WORD(MapVirtualKeyW(input[0].ki.wVk, MAPVK_VK_TO_VSC));
+        input[0].ki.dwFlags = input[1].ki.dwFlags = KEYEVENTF_SCANCODE;
+      }
+      input[1].ki.dwFlags |= KEYEVENTF_KEYUP;
+      SendInput(2, input, sizeof(INPUT));
     }
     Sleep(300);
+    return 0;
+  }
+  if (std::wstring(argv[1]) == L"caret") {
+    GUITHREADINFO info{}; info.cbSize = sizeof(info);
+    if (!GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, nullptr), &info) || info.hwndCaret != hwnd) return 30;
+    std::cout << "CARET " << info.rcCaret.left << ' ' << info.rcCaret.top << ' '
+              << info.rcCaret.right << ' ' << info.rcCaret.bottom << '\n';
     return 0;
   }
   if (std::wstring(argv[1]) == L"owner") {
