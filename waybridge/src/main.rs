@@ -1,4 +1,5 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
+mod drag;
 mod metrics;
 mod network;
 mod protocol;
@@ -42,7 +43,10 @@ use smithay::{
         },
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
-            protocol::{wl_buffer, wl_seat, wl_surface::WlSurface},
+            protocol::{
+                wl_buffer, wl_data_device_manager::DndAction, wl_data_source::WlDataSource,
+                wl_seat, wl_surface::WlSurface,
+            },
             Client, Display, DisplayHandle, ListeningSocket, Resource,
         },
     },
@@ -62,8 +66,8 @@ use smithay::{
         selection::{
             data_device::{
                 request_data_device_client_selection, set_data_device_focus,
-                set_data_device_selection, start_dnd, ClientDndGrabHandler, DataDeviceHandler,
-                DataDeviceState, ServerDndGrabHandler, SourceMetadata,
+                set_data_device_selection, start_dnd, with_source_metadata, ClientDndGrabHandler,
+                DataDeviceHandler, DataDeviceState, ServerDndGrabHandler, SourceMetadata,
             },
             wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler, SelectionSource, SelectionTarget,
@@ -83,12 +87,16 @@ use std::{
     io::{Read, Write},
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt},
-        io::OwnedFd,
+        io::{AsFd, OwnedFd},
         net::UnixStream,
     },
     path::PathBuf,
     process::{Child, Command},
-    sync::{mpsc::SyncSender, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::SyncSender,
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -157,7 +165,25 @@ struct RemotePopup {
 
 type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 
+struct OutboundDrag {
+    id: u64,
+    window: u32,
+    source: WlDataSource,
+    cancelled: Arc<AtomicBool>,
+    files: Option<drag::Export>,
+    external: bool,
+    ready: bool,
+    dropped: bool,
+    deferred_focus: Option<Option<u32>>,
+    activity: Instant,
+}
+
 struct App {
+    drag_sink: Option<drag::Sink>,
+    drag_surface: Option<WlSurface>,
+    drag_enabled: bool,
+    next_drag: u64,
+    outbound: Option<OutboundDrag>,
     dh: DisplayHandle,
     compositor: CompositorState,
     shell: XdgShellState,
@@ -219,6 +245,14 @@ impl App {
     }
 
     fn focus(&mut self, id: Option<u32>) {
+        // Native OLE capture/focus changes must not cancel the Wayland source.
+        if self.external_drag_input() {
+            if let Some(drag) = &mut self.outbound {
+                drag.deferred_focus = Some(id);
+            }
+            self.release_keys();
+            return;
+        }
         let id = id.map(|id| self.root_id(id));
         let id = id.filter(|id| self.window(*id).is_some());
         let changed = self.focused_window != id;
@@ -402,6 +436,170 @@ impl App {
         }
     }
 
+    fn external_drag_input(&self) -> bool {
+        self.outbound
+            .as_ref()
+            .is_some_and(|d| d.external && !d.dropped)
+    }
+
+    fn end_outbound(&mut self, success: bool) {
+        let Some(drag) = self.outbound.take() else {
+            return;
+        };
+        drag.cancelled.store(true, Ordering::Relaxed);
+        let success = success && drag.external && drag.dropped;
+        if drag.external && !drag.dropped {
+            let pointer = self.seat.get_pointer().unwrap();
+            pointer.motion(
+                self,
+                None,
+                &MotionEvent {
+                    location: pointer.current_location(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: self.time(),
+                },
+            );
+            if self.pressed_buttons.remove(&0x110) {
+                pointer.button(
+                    self,
+                    &ButtonEvent {
+                        button: 0x110,
+                        state: ButtonState::Released,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: self.time(),
+                    },
+                );
+            }
+            pointer.frame(self);
+        }
+        if drag.external {
+            self.release_keys();
+            if let Some(focus) = drag.deferred_focus {
+                self.focus(focus);
+            }
+            if let Some(sink) = &mut self.drag_sink {
+                sink.finish(success);
+            }
+        }
+        self.control(json!({"type":"drag_end","drag":drag.id,"success":success}));
+        // Dropping Export cancels its bounded worker and closes source files.
+    }
+
+    fn drag_message(&mut self, message: &Value) {
+        let Some(id) = message["drag"].as_u64() else {
+            return;
+        };
+        let Some(drag) = self.outbound.as_mut().filter(|d| d.id == id) else {
+            return;
+        };
+        drag.activity = Instant::now();
+        match message["type"].as_str().unwrap_or("") {
+            "drag_claim"
+                if !drag.external
+                    && drag.files.is_some()
+                    && self.pressed_buttons.contains(&0x110) =>
+            {
+                let Some(surface) = self.drag_surface.clone() else {
+                    self.end_outbound(false);
+                    return;
+                };
+                if self.pressed_buttons.len() != 1 {
+                    self.end_outbound(false);
+                    return;
+                }
+                drag.external = true;
+                self.release_keys();
+                let serial = SERIAL_COUNTER.next_serial();
+                if let Some(sink) = &mut self.drag_sink {
+                    sink.arm(serial.into());
+                }
+                let pointer = self.seat.get_pointer().unwrap();
+                let location = pointer.current_location();
+                pointer.motion(
+                    self,
+                    Some((surface, location)),
+                    &MotionEvent {
+                        location,
+                        serial,
+                        time: self.time(),
+                    },
+                );
+                pointer.frame(self);
+            }
+            "drag_drop" if drag.external && drag.ready && !drag.dropped => {
+                drag.dropped = true;
+                let deferred_focus = drag.deferred_focus.take();
+                self.release_keys();
+                if self.pressed_buttons.remove(&0x110) {
+                    let pointer = self.seat.get_pointer().unwrap();
+                    pointer.button(
+                        self,
+                        &ButtonEvent {
+                            button: 0x110,
+                            state: ButtonState::Released,
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: self.time(),
+                        },
+                    );
+                    pointer.frame(self);
+                }
+                if let Some(focus) = deferred_focus {
+                    self.focus(focus);
+                }
+            }
+            "drag_claim" if !drag.external => self.end_outbound(false),
+            "drag_result" => self.end_outbound(message["success"].as_bool() == Some(true)),
+            "drag_read" if drag.external && drag.ready => {
+                let valid = (|| {
+                    let request = message["request"].as_u64()?;
+                    let file = usize::try_from(message["file"].as_u64()?).ok()?;
+                    let offset = message["offset"].as_u64()?;
+                    let length = usize::try_from(message["length"].as_u64()?).ok()?;
+                    if length == 0 || length > drag::MAX_READ {
+                        return None;
+                    }
+                    let files = drag.files.as_ref()?;
+                    Some(files.read(drag::ReadRequest {
+                        request,
+                        file,
+                        offset,
+                        length,
+                    }))
+                })()
+                .unwrap_or(false);
+                if !valid {
+                    self.control(json!({"type":"drag_data","drag":id,"request":message["request"],"error":"invalid read or busy transfer"}));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pump_outbound(&mut self) -> Result<()> {
+        if let Some(sink) = &mut self.drag_sink {
+            sink.pump()?;
+        }
+        let source_window_gone = self.outbound.as_ref().is_some_and(|drag| {
+            !drag.dropped && !self.windows.iter().any(|w| w.id == drag.window && w.mapped)
+        });
+        if let Some(drag) = &mut self.outbound {
+            if source_window_gone
+                || !drag.source.alive()
+                || drag.activity.elapsed() > Duration::from_secs(120)
+            {
+                self.end_outbound(false);
+            } else if drag.external
+                && !drag.ready
+                && self.drag_sink.as_ref().is_some_and(|s| s.accepted())
+            {
+                drag.ready = true;
+                let id = drag.id;
+                self.control(json!({"type":"drag_ready","drag":id}));
+            }
+        }
+        Ok(())
+    }
+
     fn read_pending_clipboard(&mut self) {
         // Smithay calls new_selection before installing the new provider on the seat.
         // Read only after dispatch_clients returns, otherwise we read the previous owner.
@@ -437,7 +635,7 @@ impl App {
         }
     }
 
-    fn release_input(&mut self) {
+    fn release_keys(&mut self) {
         let keyboard = self.seat.get_keyboard().unwrap();
         for key in std::mem::take(&mut self.pressed_keys) {
             keyboard.input::<(), _>(
@@ -449,6 +647,9 @@ impl App {
                 |_, _, _| FilterResult::Forward,
             );
         }
+    }
+    fn release_input(&mut self) {
+        self.release_keys();
         let pointer = self.seat.get_pointer().unwrap();
         for button in std::mem::take(&mut self.pressed_buttons) {
             pointer.button(
@@ -473,6 +674,9 @@ impl App {
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0);
         match value["type"].as_str().unwrap_or("") {
+            "drag_claim" | "drag_drop" | "drag_result" | "drag_read" => {
+                self.drag_message(&value);
+            }
             "frame_ack" => {
                 if let Some(peer) = &self.peer {
                     peer.acknowledge(id, value["sequence"].as_u64().unwrap_or(0));
@@ -480,6 +684,7 @@ impl App {
             }
             "ping" => self.control(json!({"type":"pong","nonce":value["nonce"]})),
             "hello" => {
+                self.drag_enabled = value["file_drop_out"].as_bool().unwrap_or(false);
                 self.default_scale = dpi_scale(&value);
                 let mode = monitor_mode(&value, self.output.current_mode().unwrap().refresh);
                 self.output.change_current_state(
@@ -499,8 +704,8 @@ impl App {
                     self.focus(None);
                 }
             }
-            "pointer" => self.pointer_message(id, &value),
-            "leave" if self.pointer_window == Some(id) => {
+            "pointer" if !self.external_drag_input() => self.pointer_message(id, &value),
+            "leave" if self.pointer_window == Some(id) && !self.external_drag_input() => {
                 self.pointer_window = None;
                 let p = self.seat.get_pointer().unwrap();
                 p.motion(
@@ -514,7 +719,7 @@ impl App {
                 );
                 p.frame(self);
             }
-            "button" => {
+            "button" if !self.external_drag_input() => {
                 if value["x"].is_number() && value["y"].is_number() {
                     self.pointer_message(id, &value);
                 }
@@ -555,7 +760,9 @@ impl App {
                 );
                 pointer.frame(self);
             }
-            "key" if self.focused_window == Some(self.root_id(id)) => {
+            "key"
+                if self.focused_window == Some(self.root_id(id)) && !self.external_drag_input() =>
+            {
                 let key = value["key"].as_u64().unwrap_or(u64::MAX);
                 if key > 767 {
                     return;
@@ -1048,6 +1255,14 @@ impl XdgDecorationHandler for App {
 }
 
 impl CompositorHandler for App {
+    fn new_surface(&mut self, surface: &WlSurface) {
+        if surface
+            .client()
+            .is_some_and(|c| c.get_data::<ClientState>().is_some_and(|s| s.drag_sink))
+        {
+            self.drag_surface = Some(surface.clone());
+        }
+    }
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor
     }
@@ -1386,7 +1601,62 @@ impl DataControlHandler for App {
         &self.data_control
     }
 }
-impl ClientDndGrabHandler for App {}
+impl ClientDndGrabHandler for App {
+    fn started(&mut self, source: Option<WlDataSource>, _: Option<WlSurface>, _: Seat<Self>) {
+        if !self.drag_enabled
+            || self.outbound.is_some()
+            || self.drag_surface.is_none()
+            || self.pressed_buttons.len() != 1
+            || !self.pressed_buttons.contains(&0x110)
+        {
+            return;
+        }
+        let Some(source) = source.filter(|s| s.version() >= 3) else {
+            return;
+        };
+        let supported = with_source_metadata(&source, |m| {
+            m.mime_types.iter().any(|s| s == "text/uri-list")
+                && m.dnd_action.contains(DndAction::Copy)
+        })
+        .unwrap_or(false);
+        if !supported {
+            return;
+        }
+        let Some(peer) = self.peer.clone() else {
+            return;
+        };
+        let Ok((read, write)) = UnixStream::pair() else {
+            return;
+        };
+        self.next_drag += 1;
+        let id = self.next_drag;
+        let window = self.focused_window.unwrap_or(0);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if !drag::prepare(id, read, peer, self.events.clone(), cancelled.clone()) {
+            return;
+        }
+        source.send("text/uri-list".into(), write.as_fd());
+        self.outbound = Some(OutboundDrag {
+            id,
+            window,
+            source,
+            cancelled,
+            files: None,
+            external: false,
+            ready: false,
+            dropped: false,
+            deferred_focus: None,
+            activity: Instant::now(),
+        });
+    }
+    fn dropped(&mut self, _: Option<WlSurface>, validated: bool, _: Seat<Self>) {
+        if let Some(drag) = &self.outbound {
+            if !drag.dropped && (!drag.external || !validated) {
+                self.end_outbound(false);
+            }
+        }
+    }
+}
 impl ServerDndGrabHandler for App {
     fn accept(&mut self, mime: Option<String>, _: Seat<Self>) {
         self.drop_accepted = mime.as_deref() == Some("text/uri-list");
@@ -1410,6 +1680,7 @@ impl ServerDndGrabHandler for App {
 
 #[derive(Default)]
 struct ClientState {
+    drag_sink: bool,
     compositor: CompositorClientState,
 }
 impl ClientData for ClientState {
@@ -1539,6 +1810,11 @@ fn main() -> Result<()> {
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
     let mut app = App {
+        drag_sink: None,
+        drag_surface: None,
+        drag_enabled: false,
+        next_drag: 0,
+        outbound: None,
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1577,6 +1853,15 @@ fn main() -> Result<()> {
         last_interaction: None,
         encoder: video::Encoder::new(args.codec != "png", args.fps, args.bitrate),
     };
+    let (sink_server, sink_client) = UnixStream::pair()?;
+    app.dh.insert_client(
+        sink_server,
+        Arc::new(ClientState {
+            drag_sink: true,
+            ..ClientState::default()
+        }),
+    )?;
+    app.drag_sink = Some(drag::Sink::new(sink_client)?);
     let mut children: Vec<Child> = Vec::new();
     if let Some(program) = args.command.first() {
         children.push(
@@ -1597,6 +1882,7 @@ fn main() -> Result<()> {
                 .insert_client(stream, Arc::new(ClientState::default()))?;
         }
         display.dispatch_clients(&mut app)?;
+        app.pump_outbound()?;
         app.finish_file_drop();
         app.read_pending_clipboard();
         // Bound input work per cycle so a busy peer cannot starve Wayland or rendering.
@@ -1629,7 +1915,25 @@ fn main() -> Result<()> {
                     }
                 }
                 Event::Message(value) => app.message(value),
+                Event::DragFiles { id, result } => {
+                    if let Some(drag) = app.outbound.as_mut().filter(|d| d.id == id) {
+                        match result {
+                            Ok(files) => {
+                                let manifest = files.manifest.clone();
+                                let window = drag.window;
+                                drag.files = Some(files);
+                                app.control(json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"action":"copy"}));
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "outbound drag not supported");
+                                app.end_outbound(false);
+                            }
+                        }
+                    }
+                }
                 Event::Disconnected => {
+                    app.end_outbound(false);
+                    app.drag_enabled = false;
                     app.release_input();
                     app.encoder.reset();
                     app.focus(None);

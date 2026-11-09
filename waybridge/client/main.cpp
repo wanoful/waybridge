@@ -225,6 +225,8 @@ void sendJson(const Json &value) {
     shutdown(connection, SD_BOTH);
   }
 }
+#include "file_drag.h"
+
 bool readAll(SOCKET socket, void *bytes, size_t n) {
   auto p = static_cast<char *>(bytes);
   while (n && running) {
@@ -255,13 +257,19 @@ void receiveLoop(SOCKET socket) {
       if (!readAll(socket, packet.data(), size))
         break;
       bool control = packet[0] == 0;
+      Json incoming;
+      if (control) {
+        incoming = Json::parse(packet.begin() + 1, packet.end());
+        if (FileDrag::receive(incoming)) continue;
+      }
       {
         std::unique_lock<std::mutex> guard(inboxMutex);
         if (control) {
-          inboxWake.wait(guard, [] { return controls.size() < 128 || !running; });
-          if (!running)
-            break;
-          auto message = Json::parse(packet.begin() + 1, packet.end());
+          // Never stop the receiver behind a UI queue: IStream may be waiting
+          // on this thread while the STA is inside an OLE data callback.
+          if (controls.size() >= 128) throw std::runtime_error("Control inbox full");
+          if (!running) break;
+          auto message = std::move(incoming);
           if (message.value("type", "") == "window_closed") {
             decoderGarbage.push_back(message.at("id").get<uint32_t>());
             frameWake.notify_all();
@@ -292,6 +300,7 @@ void receiveLoop(SOCKET socket) {
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
   }
+  FileDrag::disconnect();
   PostMessageW(controller, WM_CLOSE, 0, 0);
 }
 
@@ -1215,6 +1224,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_MOUSEMOVE:
+    FileDrag::maybeClaim();
+    if (FileDrag::ownsInput()) return 0;
     pointer(w, lp);
     if (!w->tracking) {
       TRACKMOUSEEVENT e{sizeof(e), TME_LEAVE, hwnd, 0};
@@ -1257,6 +1268,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_LBUTTONUP:
   case WM_RBUTTONUP:
   case WM_MBUTTONUP: {
+    if (FileDrag::ownsInput()) {
+      if (message == WM_LBUTTONUP) FileDrag::releasedBeforeStart();
+      return 0;
+    }
     bool down = message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN;
     uint32_t button = (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)   ? 0x110
                       : (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) ? 0x111
@@ -1325,6 +1340,12 @@ void dispatchNetwork() {
   inboxWake.notify_all();
   for (auto &m : pending) {
     std::string type = m.value("type", "");
+    HWND sourceWindow = nullptr;
+    if (type == "drag_offer") {
+      auto found = windows.find(m.value("id", uint32_t(0)));
+      if (found != windows.end()) sourceWindow = found->second->hwnd;
+    }
+    if (FileDrag::control(m, controller, sourceWindow)) continue;
     if (type == "hello") {
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
       if (m.value("version", 0) != 3 || m.value("codec", "") != "mixed") {
@@ -1560,6 +1581,10 @@ void dispatchNetwork() {
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
+    if (message == FileDrag::StartMessage) {
+      FileDrag::start(hwnd);
+      return 0;
+    }
     if (message == NetworkReady) {
       dispatchNetwork();
       return 0;
@@ -1680,6 +1705,7 @@ int wmain(int argc, wchar_t **argv) {
             {"version", 3},
             {"split_media", true},
             {"frame_ack", true},
+            {"file_drop_out", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},
@@ -1693,6 +1719,7 @@ int wmain(int argc, wchar_t **argv) {
     DispatchMessageW(&msg);
   }
   running = false;
+  FileDrag::disconnect();
   inboxWake.notify_all();
   frameWake.notify_all();
   shutdown(connection, SD_BOTH);

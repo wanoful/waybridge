@@ -67,3 +67,54 @@ Download from Linux file selection:
 Windows creates local staged files, then publishes CF_HDROP. A new local clipboard selection supersedes an older download. Bulk transmission is bounded and happens on a worker thread; it does not wait for network capacity on the compositor thread.
 
 v3 supports 128 files per batch and 1 GiB per regular file. It supports Copy semantics only. File paths from one system are never passed directly to applications on the other system.
+
+### Native Linux → Windows file drag
+
+Opt in with `file_drop_out:true` in the viewer hello; the server advertises
+`file_drop_out` in `features`. This extension uses JSON on the control socket,
+independent of clipboard ownership and `files_*` batches. It supports one active
+outbound operation, at most 128 regular files of 1 GiB each, and COPY only. Sources
+must offer `text/uri-list` and COPY through wl_data_device v3 or newer. Directories,
+final-component symlinks, nonlocal/non-UTF-8 URIs, unsupported Windows names and
+case-insensitive name collisions are rejected. Source files are never deleted.
+
+1. Server `drag_offer`: unique `drag` u64, source window `id`, `action:"copy"`, and
+   `files:[{id,name,size}]`; file IDs are consecutive from zero. This transfers only
+   metadata. A worker reads the URI list with a 10-second deadline and 1 MiB limit,
+   opens/pins source files, and validates their type and size.
+2. The viewer continues normal Wayland input while inside streamed windows. On
+   leaving them with the real left button still held it sends `drag_claim {drag}`
+   and suspends ordinary pointer/button forwarding for that gesture. The compositor
+   routes the grab to a private, unmapped Wayland data-device target. Once COPY is
+   negotiated it sends `drag_ready {drag}`. Native focus/capture changes during
+   this handoff must not release the Wayland grab. Held keys are released and
+   focus changes are deferred until the gesture ends, preventing stuck modifiers.
+3. Only while that same real left-button gesture is still held, Windows calls
+   `DoDragDrop` with `DROPEFFECT_COPY`, exposing `FileGroupDescriptorW` and
+   `FileContents`/`IStream` virtual files. It never starts a drag after an early
+   release and never publishes Linux paths or nonexistent CF_HDROP paths. Targets
+   requiring CF_HDROP alone are not supported by this outbound extension.
+4. `drag_read {drag,request,file,offset,length}` requests an independent range;
+   `request` is unique within the operation, `length` is 1..65536, and at most
+   eight requests may be outstanding. `drag_data {drag,request,data}` returns
+   base64 bytes (possibly fewer at EOF), or `{drag,request,error}`. No file bytes
+   are sent until requested. The server has a bounded worker/queue, checks file
+   identity metadata for in-place changes, and rejects oversized/invalid reads.
+   Windows delivers responses directly from its socket receiver to waiting
+   streams, independently of the UI inbox. Read failures/timeouts fail the copy.
+5. On real button release the viewer sends `drag_drop {drag}` before completing
+   the native drop. This releases the Wayland grab over the private target and
+   produces `dnd_drop_performed`; it does not finish the source. Then
+   `drag_result {drag,success,effect}` reports native completion (`effect` is
+   `"copy"` or `"none"`). With `IDataObjectAsyncCapability`, success waits for
+   `EndOperation`; returning from `DoDragDrop` alone does not release source files.
+6. Success finishes the private offer; failure destroys/cancels it. Smithay emits
+   the corresponding source terminal event. `drag_end {drag,success}` retires the
+   operation on the viewer. Source destruction, disconnect, read failure, rejection,
+   Esc and a 120-second idle timeout cancel the operation. Repeated/stale terminal
+   messages are ignored. No cancelled source is later marked finished.
+
+Opened source descriptors live until completion/cancellation. Streams support
+Read/Seek/Stat/Clone and bounded memory, with no full-file staging or destination
+temporary files. The target owns files it creates. No move/delete acknowledgement
+is accepted, and clipboard contents are unaffected.

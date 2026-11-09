@@ -66,7 +66,8 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 - 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
 - Windows 资源管理器中复制文件，传输完成后可在支持文件粘贴的 Linux 应用里粘贴；Linux 应用提供 `text/uri-list` 时，文件下载后可粘贴到 Windows 资源管理器。
 - 从 Windows 资源管理器拖文件到远端窗口，先上传文件，再由合成器向目标应用协商 Copy 拖放。当前不会在上传期间显示远端拖动预览。
-- 单次最多 128 个普通文件，单文件最多 1 GiB。暂不支持目录、剪切/移动及 Linux → Windows 原生拖出。
+- Linux 应用提供标准文件拖放时，可按住左键拖出远端窗口，到支持 Windows 虚拟文件的原生目标释放。文件内容按目标读取请求传输，无需先下载完整文件；支持异步提取、取消以及断线清理，始终使用 Copy，保留 Linux 源文件并保持剪贴板内容。仅接受 CF_HDROP 的目标暂不支持这一拖出路径。
+- 单次最多 128 个普通文件，单文件最多 1 GiB。暂不支持目录、剪切/移动。拖出首版不支持符号链接、非本地 URI、Windows 不兼容文件名及同批大小写冲突名称；要求应用使用 Wayland data-device v3 并支持 Copy，同时只处理一个出站操作，空闲超过 120 秒取消。
 - Linux 收到的文件保留在 `$XDG_RUNTIME_DIR/waybridge-inbox/<transfer-id>/`；Windows 文件保留在 `%TEMP%\Waybridge-*`。不在粘贴后立即删除，因为应用可能延迟读取。临时文件可在不再需要后手动清理。
 
 应用对粘贴和拖入的数据类型有自己的限制；私有应用格式不做跨平台转换。
@@ -98,6 +99,10 @@ python tests/windows_smoke.py
 python tests/windows_smoke.py --csd
 python tests/windows_smoke.py --terminal
 python tests/windows_smoke.py --qt
+# Linux → Windows 原生虚拟文件拖出：真实 Wayland + 私有接收端
+python tests/drag_out_smoke.py
+# 原生 OLE 同步/异步提取、Seek/Clone、取消与断线（独立 Wine/Xvfb）
+python tests/windows_drag_out_smoke.py
 # 可选：需要 NVIDIA/NVENC；真实硬件编码、P 帧、alpha、奇数尺寸及回退
 python tests/hardware_smoke.py
 # 可选：真实 NVENC 尺寸切换、缓存淘汰、IDR/P 引用与回环耗时
@@ -117,6 +122,7 @@ python tests/ghostty_smoke.py
 1. Windows 保持 175% 缩放，打开 Ghostty 的越界菜单；检查父窗口大小和文字比例保持不变，菜单可正常操作，Esc、点击外部和嵌套菜单正常。
 2. 滚动终端、连续输入，检查两端实际启用的编码日志。对比 `--codec png` 与 `--codec auto`，使用相同窗口尺寸和内容。
 3. 自动测试构建后，可用 `WAYLAND_DISPLAY=waybridge-0 ./build/tests/qt-app` 打开验证应用。`Ctrl+O` 打开靠近右下角的越界/嵌套菜单；透明窗口左侧不透明红色、中间半透明绿色、右侧透出 Windows 背景。
+4. 在远端文件管理器中选择多个普通文件（包含 Unicode 名称、空文件和较大文件），拖到 Windows Explorer/桌面并松开；核对名称、大小和哈希、确认 Linux 源文件和剪贴板仍保留。分别检查 Esc、拒绝目标、传输中断线、按住 Ctrl 拖动后继续输入。出站拖出目前通过的是独立原生 OLE 测试目标的 Wine 验证，Windows 10/11 Explorer 与第三方目标仍需实机完成这一项验收。
 
 诊断延迟时，在 Linux 启动：
 
@@ -145,7 +151,7 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 - 完善模态协议、窗口状态和光标/输入区域映射。
 - 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。
 - 接入 Xwayland，完善输入法、相对鼠标、指针形状和显式同步。
-- 实现 Linux → Windows 原生拖出、目录和按需文件访问。
+- 扩展目录传输、Windows → Linux 虚拟文件导入及通用按需文件访问；在 Windows 10/11 实机验收 Explorer 与第三方应用的出站虚拟文件兼容性。
 - 完善音频、断点续传、文件传输进度/取消、端到端加密及会话管理。
 
 普通 `wl_shm` 客户端和 DMA-BUF 导入已接通；各类 GPU 应用、驱动及大型应用组合仍需逐一验证。此版本不保证 “All 应用” 的兼容性。
