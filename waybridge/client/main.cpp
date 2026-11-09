@@ -130,6 +130,7 @@ struct RemoteWindow {
   bool sizing = false, resizePending = false;
   Clock::time_point resizeSent;
   UINT lastDpi = 0;
+  int lastHdr = -1;
   int lastWorkWidth = 0, lastWorkHeight = 0, lastWorkX = INT_MIN, lastWorkY = INT_MIN;
 };
 std::map<uint32_t, std::unique_ptr<RemoteWindow>> windows;
@@ -516,8 +517,16 @@ void decodeLoop() {
         }
         if (alpha) {
           auto maskStarted = Clock::now();
-          if (!images->decode(bytes.data() + 60 + color, alpha, width, height, true, frame->alpha))
+          if (!images->decode(bytes.data() + 60 + color, alpha, width, height, true, frame->alpha,
+                              VideoDecoder::hdr(encoded.kind)))
             throw std::runtime_error("Invalid video alpha mask");
+          if (VideoDecoder::hdr(encoded.kind)) {
+            for (size_t p = 0; p + 1 < frame->alpha.size(); p += 2) {
+              uint16_t a = uint16_t(frame->alpha[p]) | (uint16_t(frame->alpha[p + 1]) << 8);
+              if (a > 0x3c00 && a != 0x8000)
+                throw std::runtime_error("Invalid FP16 alpha");
+            }
+          }
           clientStats.record("alpha_decode", millis(Clock::now() - maskStarted));
         }
         state.pending[frame->sequence] = frame;
@@ -525,7 +534,10 @@ void decodeLoop() {
           throw std::runtime_error("Hardware decoder buffered too many frames");
         auto videoStarted = Clock::now();
         auto surfaces = state.decoder->decode(bytes.data() + 60, color, frame->sequence);
-        clientStats.record(encoded.kind == 2 ? "h264_transform" : encoded.kind == 4 ? "hevc_transform" : "av1_transform", millis(Clock::now() - videoStarted));
+        clientStats.record(encoded.kind == 2                          ? "h264_transform"
+                           : (encoded.kind == 4 || encoded.kind == 7) ? "hevc_transform"
+                                                                      : "av1_transform",
+                           millis(Clock::now() - videoStarted));
         for (auto &surface : surfaces) {
           auto found = state.pending.find(surface.sequence);
           if (found == state.pending.end())
@@ -554,8 +566,10 @@ void decodeLoop() {
         continue;
       completed.push_back(frame);
     }
-    clientStats.record(encoded.kind == 2 ? "h264_decode" : encoded.kind == 4 ? "hevc_decode" :
-                       encoded.kind == 5 ? "av1_decode" : "png_decode",
+    clientStats.record(encoded.kind == 2                          ? "h264_decode"
+                       : (encoded.kind == 4 || encoded.kind == 7) ? "hevc_decode"
+                       : (encoded.kind == 5 || encoded.kind == 8) ? "av1_decode"
+                                                                  : "png_decode",
                        millis(Clock::now() - started));
     for (auto &ready : completed) {
       ready->decoded = Clock::now();
@@ -1011,7 +1025,19 @@ void setPopupGrab(uint32_t root, bool active) {
   }
 }
 
+void sendColorMode(RemoteWindow *w) {
+  bool capable = supportedVideoKinds.count(7) || supportedVideoKinds.count(8);
+  bool active = capable && w->presentation && HdrCapabilities::active(w->hwnd);
+  if (w->lastHdr != int(active)) {
+    w->lastHdr = int(active);
+    sendJson({{"type", "color_mode"},
+              {"id", w->id},
+              {"hdr", active},
+              {"color_space", active ? "bt2020_pq" : "bt709_sdr"}});
+  }
+}
 void sendResize(RemoteWindow *w) {
+  sendColorMode(w);
   if (w->popup || IsIconic(w->hwnd))
     return;
   RECT rect;
@@ -1194,6 +1220,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", false}});
     return 0;
+  case WM_MOVE:
+    if (!w->popup)
+      sendColorMode(w);
+    break;
   case WM_DISPLAYCHANGE:
   case WM_SETTINGCHANGE:
     sendResize(w);
@@ -1536,9 +1566,11 @@ void dispatchNetwork() {
     if (frame->video.texture) {
       if (!w->presentation ||
           !w->presentation->presentVideo(frame->video.texture.Get(), frame->video.subresource,
-                                         frame->width, frame->height, frame->alpha, imageRect(w))) {
+                                         frame->width, frame->height, frame->alpha, imageRect(w),
+                                         VideoDecoder::hdr(frame->codec))) {
         std::cerr << "Video GPU presentation failed; requesting PNG fallback\n";
-        sendJson({{"type", "codec_fallback"}, {"id", id},
+        sendJson({{"type", "codec_fallback"},
+                  {"id", id},
                   {"codec", VideoDecoder::capability(frame->codec)}});
         continue;
       }
@@ -1583,6 +1615,9 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_TIMER) {
+      for (auto &entry : windows)
+        if (!entry.second->popup)
+          sendColorMode(entry.second.get());
       sendJson({{"type", "ping"}, {"nonce", GetTickCount64()}});
       clientStats.report();
       return 0;
@@ -1605,6 +1640,11 @@ BOOL WINAPI consoleControl(DWORD) {
 }
 
 int wmain(int argc, wchar_t **argv) {
+  if (argc == 2 && std::wstring(argv[1]) == L"--check-hdr-shaders") {
+    auto report = Presentation::validateHdrPixels();
+    std::cout << report.dump() << '\n';
+    return report.value("verified", false) ? 0 : 2;
+  }
   if (argc == 2 && std::wstring(argv[1]) == L"--check-hdr") {
     std::cout << HdrCapabilities::inspect().dump() << '\n';
     return 0;
@@ -1613,7 +1653,7 @@ int wmain(int argc, wchar_t **argv) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     auto &mf = MediaFoundation::get();
     bool started = mf.available() && SUCCEEDED(mf.Startup(MF_VERSION, MFSTARTUP_FULL));
-    for (uint8_t kind : {2, 4, 5})
+    for (uint8_t kind : {2, 4, 5, 7, 8})
       std::cout << VideoDecoder::name(kind) << " capability="
                 << (started && VideoDecoder::available(kind) ? "available" : "unavailable") << '\n';
     if (started) mf.Shutdown();
@@ -1645,12 +1685,29 @@ int wmain(int argc, wchar_t **argv) {
                    SUCCEEDED(MediaFoundation::get().Startup(MF_VERSION, MFSTARTUP_FULL));
   bool videoEnabled = !GetEnvironmentVariableW(L"WAYBRIDGE_PNG", nullptr, 0);
   bool hardwareDecoder = videoEnabled && mfStarted && H264Decoder::available();
-  if (hardwareDecoder) supportedVideoKinds.insert(2);
-  for (uint8_t kind : {4, 5}) {
-    bool available = videoEnabled && mfStarted && VideoDecoder::available(kind);
-    if (available) supportedVideoKinds.insert(kind);
+  if (hardwareDecoder)
+    supportedVideoKinds.insert(2);
+  bool hdrEnabled = GetEnvironmentVariableW(L"WAYBRIDGE_HDR", nullptr, 0) != 0;
+  bool hdrPresentation = false;
+  if (hdrEnabled) {
+    auto report = HdrCapabilities::inspect();
+    if (report.value("hardware_device", false) &&
+        report.value("fp16_composition_swapchain", false) &&
+        report.value("scrgb_color_space", false) && report.value("fp16_values_preserved", false)) {
+      auto pixels = Presentation::validateHdrPixels();
+      hdrPresentation = pixels.value("verified", false) && pixels.value("p010_plane_views", false);
+    }
+  }
+  for (uint8_t kind : {4, 5, 7, 8}) {
+    bool available = videoEnabled && mfStarted && (!VideoDecoder::hdr(kind) || hdrPresentation) &&
+                     VideoDecoder::available(kind);
+    if (available)
+      supportedVideoKinds.insert(kind);
     std::cout << VideoDecoder::name(kind) << " GPU decoder capability: "
-              << (available ? "verified NV12 texture" : "unavailable; not advertised") << '\n';
+              << (available ? (VideoDecoder::hdr(kind) ? "verified P010 texture"
+                                                       : "verified NV12 texture")
+                            : "unavailable; not advertised")
+              << '\n';
   }
   std::cout << "H.264 hardware decoder capability: "
             << (hardwareDecoder ? "available" : "unavailable; using PNG") << '\n';
@@ -1714,8 +1771,8 @@ int wmain(int argc, wchar_t **argv) {
             {"version", 3},
             {"split_media", true},
             {"frame_ack", true},
-            {"hdr", false},
-            {"color_spaces", Json::array({"bt709_sdr"})},
+            {"hdr", supportedVideoKinds.count(7) > 0 || supportedVideoKinds.count(8) > 0},
+            {"color_spaces", Json::array({"bt709_sdr", "bt2020_pq"})},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},

@@ -9,6 +9,9 @@ pub const VIDEO: u8 = 2;
 // Kind 3 is reserved for audio. New codecs are explicitly negotiated.
 pub const HEVC_VIDEO: u8 = 4;
 pub const AV1_VIDEO: u8 = 5;
+// 6 is reserved for authenticated UDP repair containers.
+pub const HEVC_HDR_VIDEO: u8 = 7;
+pub const AV1_HDR_VIDEO: u8 = 8;
 
 pub fn read_packet(reader: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
     let mut header = [0; 4];

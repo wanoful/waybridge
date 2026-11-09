@@ -24,4 +24,8 @@ lto = "thin"
 
 [workspace]
 members = ["native"]
+exclude = ["vendor/smithay"]
 resolver = "2"
+
+[patch.crates-io]
+smithay = { path = "vendor/smithay" }

@@ -1,5 +1,6 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
 mod color;
+mod color_management;
 mod metrics;
 mod network;
 mod protocol;
@@ -100,6 +101,9 @@ struct Args {
     /// Inspect real render/codec precision without opening a viewer listener or changing a display.
     #[arg(long)]
     check_hdr: bool,
+    /// Experimental explicitly tagged Windows-scRGB surfaces (not general ICC HDR).
+    #[arg(long,default_value="off",value_parser=["off","experimental-scrgb"])]
+    hdr: String,
     /// Use an SSH tunnel to this loopback listener for the initial prototype.
     #[arg(long, default_value = "127.0.0.1:49090")]
     listen: String,
@@ -168,6 +172,8 @@ struct RemotePopup {
 type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 
 struct App {
+    color_programs: Option<color::Programs>,
+    _color_manager: Option<GlobalId>,
     gpu_device: Option<Rc<waybridge_codec::GpuDevice>>,
     video_codec: Option<waybridge_codec::Codec>,
     dh: DisplayHandle,
@@ -669,6 +675,14 @@ impl App {
                     top.send_pending_configure();
                 }
             }
+            "color_mode" if self.windows.iter().any(|w| w.id == id) => {
+                if let (Some(peer), Some(enabled)) = (&self.peer, value["hdr"].as_bool()) {
+                    peer.set_hdr(id, enabled);
+                }
+                if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
+                    w.dirty = true;
+                }
+            }
             "codec_fallback" => {
                 if let Some(peer) = &self.peer {
                     let codec = if value["codec"].is_null() {
@@ -913,11 +927,17 @@ impl App {
                         &mut remote.target_size,
                         peer.clone(),
                         self.gpu_device.as_ref().filter(|_| {
-                            self.video_codec
-                                .is_some_and(|codec| peer.supports(codec, remote.id))
-                                && peer.gpu_allowed(remote.id)
+                            self.video_codec.is_some_and(|codec| {
+                                peer.supports(codec, remote.id)
+                                    || (peer.hdr_allowed(remote.id)
+                                        && codec
+                                            .hdr_variant()
+                                            .is_some_and(|c| peer.supports(c, remote.id)))
+                            }) && peer.gpu_allowed(remote.id)
                         }),
                         &mut remote.gpu_source,
+                        self.color_programs.as_ref(),
+                        self.video_codec.and_then(|c| c.hdr_variant()),
                     )?;
                     frame.video_eligible = true;
                     self.encoder.submit(frame);
@@ -963,6 +983,8 @@ impl App {
                         peer.clone(),
                         None,
                         &mut popup.gpu_source,
+                        self.color_programs.as_ref(),
+                        None,
                     )?;
                     self.encoder.submit(frame);
                 }
@@ -998,7 +1020,23 @@ fn capture_surface(
     peer: Arc<Peer>,
     gpu_device: Option<&Rc<waybridge_codec::GpuDevice>>,
     gpu_source: &mut Option<waybridge_codec::GpuSource>,
+    color_programs: Option<&color::Programs>,
+    hdr_codec: Option<waybridge_codec::Codec>,
 ) -> Result<video::Frame> {
+    let color_ids = color_programs
+        .map(|_| color::scrgb_ids(surface))
+        .unwrap_or_default();
+    let linear_scene = !color_ids.is_empty();
+    let capture_format = if linear_scene {
+        Fourcc::Abgr16161616f
+    } else {
+        Fourcc::Abgr8888
+    };
+    // FP16 goes through a color-aware path; the original CUDA RGBA8 kernel must
+    // never silently reinterpret half-float samples as eight-bit data.
+    let gpu_device = gpu_device.filter(|_| {
+        !linear_scene || (peer.hdr_allowed(id) && hdr_codec.is_some_and(|c| peer.supports(c, id)))
+    });
     let size = bbox.size;
     let pixels = size.to_physical_precise_round(scale);
     if pixels.w <= 0
@@ -1012,9 +1050,11 @@ fn capture_surface(
     if gpu_device.is_none() && gpu_source.is_some() {
         renderer.with_context(|_| drop(gpu_source.take()))?;
     }
-    if *target_size != (pixels.w, pixels.h) {
+    if *target_size != (pixels.w, pixels.h)
+        || target.as_ref().and_then(|target| target.format()) != Some(capture_format)
+    {
         renderer.with_context(|_| drop(gpu_source.take()))?;
-        *target = Some(renderer.create_buffer(Fourcc::Abgr8888, (pixels.w, pixels.h).into())?);
+        *target = Some(renderer.create_buffer(capture_format, (pixels.w, pixels.h).into())?);
         *target_size = (pixels.w, pixels.h);
     }
     let started = Instant::now();
@@ -1030,10 +1070,38 @@ fn capture_surface(
     let mut bound = renderer.bind(target.as_mut().unwrap())?;
     let damage = Rectangle::from_size(pixels);
     let mut source_object = (0i32, 0i32);
+    let mut fp16 = if linear_scene {
+        vec![0u8; pixels.w as usize * pixels.h as usize * 8]
+    } else {
+        vec![]
+    };
     {
         let mut frame = renderer.render(&mut bound, pixels, Transform::Flipped180)?;
         frame.clear(Color32F::new(0., 0., 0., 0.), &[damage])?;
-        draw_render_elements(&mut frame, scale, &elements, &[damage])?;
+        if linear_scene {
+            let colored = color::color_elements(elements, &color_ids, color_programs.unwrap());
+            draw_render_elements(&mut frame, scale, &colored, &[damage])?;
+            if gpu_device.is_none() {
+                frame.with_context(|gl| unsafe {
+                    use smithay::backend::renderer::gles::ffi;
+                    let mut pack = 0;
+                    gl.GetIntegerv(ffi::PIXEL_PACK_BUFFER_BINDING, &mut pack);
+                    gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+                    gl.ReadPixels(
+                        0,
+                        0,
+                        pixels.w,
+                        pixels.h,
+                        ffi::RGBA,
+                        ffi::HALF_FLOAT,
+                        fp16.as_mut_ptr().cast(),
+                    );
+                    gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pack as u32);
+                })?;
+            }
+        } else {
+            draw_render_elements(&mut frame, scale, &elements, &[damage])?;
+        }
         if gpu_device.is_some() {
             frame.with_context(|gl| unsafe {
                 use smithay::backend::renderer::gles::ffi;
@@ -1069,11 +1137,12 @@ fn capture_surface(
                 return Err("expected a public GL renderbuffer framebuffer attachment".into());
             }
             if gpu_source.is_none() {
-                *gpu_source = Some(waybridge_codec::GpuSource::new(
+                *gpu_source = Some(waybridge_codec::GpuSource::new_mode(
                     device.clone(),
                     source_object.1 as u32,
                     pixels.w as u32,
                     pixels.h as u32,
+                    linear_scene,
                 )?);
                 tracing::info!(
                     id,
@@ -1107,6 +1176,44 @@ fn capture_surface(
                 tracing::warn!(id,%error,"CUDA GL capture failed; using CPU color path for this viewer/window");
             }
         }
+    }
+    if linear_scene {
+        if gpu_device.is_some() {
+            let mut frame = renderer.render(&mut bound, pixels, Transform::Flipped180)?;
+            frame.with_context(|gl| unsafe {
+                use smithay::backend::renderer::gles::ffi;
+                let mut pack = 0;
+                gl.GetIntegerv(ffi::PIXEL_PACK_BUFFER_BINDING, &mut pack);
+                gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+                gl.ReadPixels(
+                    0,
+                    0,
+                    pixels.w,
+                    pixels.h,
+                    ffi::RGBA,
+                    ffi::HALF_FLOAT,
+                    fp16.as_mut_ptr().cast(),
+                );
+                gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, pack as u32);
+            })?;
+            frame.finish()?.wait()?;
+        }
+        let started = Instant::now();
+        let rgba = color::tonemap_fp16(&fp16, pixels.w as usize, pixels.h as usize, true);
+        metrics::record("hdr_tonemap_cpu", started.elapsed());
+        return Ok(video::Frame {
+            id,
+            width: pixels.w as u32,
+            height: pixels.h as u32,
+            sequence,
+            geometry: [size.w, size.h, bbox.loc.x, bbox.loc.y],
+            rgba,
+            gpu: None,
+            straight: true,
+            peer,
+            video_eligible: false,
+            enqueued: Instant::now(),
+        });
     }
     let started = Instant::now();
     let mapping = renderer.copy_framebuffer(
@@ -1636,7 +1743,9 @@ fn main() -> Result<()> {
         "av1-nvenc" => Some(waybridge_codec::Codec::Av1),
         _ => Some(waybridge_codec::Codec::H264),
     };
-    let gpu_device = if args.gpu_input == "cuda" && video_codec.is_some() {
+    let gpu_device = if (args.gpu_input == "cuda" || args.hdr == "experimental-scrgb")
+        && video_codec.is_some()
+    {
         match renderer.with_context(|_| waybridge_codec::GpuDevice::new())? {
             Ok(device) => {
                 tracing::info!("CUDA GL color input available (opt-in)");
@@ -1650,15 +1759,40 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let color_programs = if args.hdr == "experimental-scrgb" {
+        match color::validate_fp16(&mut renderer).and_then(|()| color::Programs::new(&mut renderer))
+        {
+            Ok(programs) => Some(programs),
+            Err(error) => {
+                tracing::warn!(%error,"experimental color management unavailable; retaining SDR");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut display = Display::<App>::new()?;
     let dh = display.handle();
     let socket = ListeningSocket::bind(&args.socket)
         .context("binding private Wayland socket (already running?)")?;
-    let (events, tx) = network::listen(&args.listen, auth)?;
+    let (events, tx) = network::listen(
+        &args.listen,
+        auth,
+        color_programs.is_some()
+            && gpu_device.is_some()
+            && video_codec.is_some_and(|c| c.hdr_variant().is_some()),
+    )?;
     let compositor = CompositorState::new_v6::<App>(&dh);
     let shell = XdgShellState::new::<App>(&dh);
     let decorations = XdgDecorationState::new::<App>(&dh);
-    let shm = ShmState::new::<App>(&dh, vec![]);
+    let shm = ShmState::new::<App>(
+        &dh,
+        if color_programs.is_some() {
+            vec![smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr16161616f]
+        } else {
+            vec![]
+        },
+    );
     let mut seats = SeatState::new();
     let mut seat = seats.new_wl_seat(&dh, "waybridge");
     seat.add_keyboard(
@@ -1705,6 +1839,10 @@ fn main() -> Result<()> {
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
     let mut app = App {
+        _color_manager: color_programs
+            .as_ref()
+            .map(|_| color_management::register(&dh)),
+        color_programs,
         gpu_device,
         video_codec,
         data_device: DataDeviceState::new::<App>(&dh),

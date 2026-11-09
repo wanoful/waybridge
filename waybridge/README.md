@@ -54,11 +54,40 @@ kernel 源码，可用 `bash scripts/build-gpu-kernel.sh` 重新生成；预生�
 降到 1.67/2.40 ms；1440p 从约 10.80/15.35 ms 降到 2.40/3.37 ms。这些是本机
 合成测试的阶段耗时，不是物理输入到屏幕延迟，也不代表其他设备性能。
 
-HDR 当前处于实验开发的 **partial** 状态。`waybridge --check-hdr` 在私有离屏 EGL
-上下文测量 RGB10/FP16 像素精度和真实 Main10 编解码，不打开查看端监听；Windows
-`waybridge-client.exe --check-hdr` 只读查询活动显示器的 HDR 模式，并验证离屏
-FP16/scRGB composition swapchain 能力，不更改显示设置。硬件就绪不代表当前应用
-流已经 HDR：默认链路仍明确协商 8-bit BT.709 SDR。
+## 实验 scRGB HDR 子集（partial）
+
+默认仍为 8-bit BT.709 SDR。服务端显式使用
+`--hdr experimental-scrgb --codec hevc-nvenc`（或 `av1-nvenc`）；Windows
+PowerShell 设置 `$env:WAYBRIDGE_HDR="1"` 后运行客户端。此模式要求同一 NVIDIA
+GPU 执行 GL/CUDA/NVENC，自动为 HDR 开启 CUDA 输入；`auto` 仍保持 H.264 SDR。
+
+只有通过 `wp_color_manager_v1.create_windows_scrgb` 明确标记的 Wayland surface
+才进入 HDR。RGB 是线性 Rec.709/scRGB，每单位为 80 nits。surface tree 在真正的
+RGBA16F target 合成；未标记的 SDR 子表面先从 sRGB 转线性再混合。CUDA 反预乘、
+转换 BT.2020/PQ/P010，NVENC 输出 HEVC/AV1 Main10。透明度独立以 16-bit PNG
+存储 **原始 FP16 alpha 位**，没有量化成 8 位；成功路径不回读颜色，透明帧仍回读
+每像素 2 字节 alpha，并保留一张 GPU SDR 备用图。不是全程零拷贝。
+
+查看端须实际解码 Main10 探针得到 P010 GPU 纹理，验证 P010 plane views、精度和
+FP16/scRGB composition swapchain，才广告 HDR。每个窗口仅在其显示器已处于 HDR
+模式时请求 HDR；窗口移动/显示设置变化会重新检查。P010/PQ shader 转回线性 scRGB
+并以预乘 FP16 交给 DirectComposition。不更改系统 HDR 设置。显示器 SDR、缺解码器、
+GPU/编码错误或不支持的色域/非有限源值都会回退 SDR：线性 Rec.709 按
+`rgb/(1+luminance)` 做 Reinhard 映射后转 sRGB。解码/呈现错误按窗口回退 PNG。
+
+这是可验证的首个 HDR 子集，**整体 HDR 仍是 partial**。ICC、任意 parametric
+BT.2020/PQ 描述、广义色域映射、HDR X11 应用和物理 Windows/WoA HDR 显示/MFT
+仍未完成验证。超出 BT.2020 正值 0–10000 nit 的 scRGB 不会被裁剪后冒充正确 HDR。
+一般应用若未明确标记 scRGB，仍按 SDR 处理；SDR 首选/output 描述保持真实。
+
+`waybridge --check-hdr` 离屏测量 RGB10/FP16 和真实 Main10 编解码，不创建
+会话/监听。`waybridge-client.exe --check-hdr` 只读查询显示模式及 FP16 能力；
+`--check-hdr-shaders` 离屏执行实际 P010/PQ/scRGB shader 数值测试。Linux 可运行
+`python tests/hdr_smoke.py`、`python tests/hdr_video_smoke.py`；私有 Wine/Xvfb 数值
+与原始 alpha 检查为 `python tests/hdr_windows_smoke.py`，不代替物理 HDR 显示验收。
+协议 v3 为 HDR 使用 kind7/8 与 `hevc_main10_pq_alpha16` /
+`av1_main10_pq_alpha16` 能力，保留 60-byte 视频 header；kind6 留给 UDP repair。
+测试需要 NumPy、Pillow、CUDA 开发头及真实 NVENC。源码内 vendor Smithay 保留 Xwayland 补丁，并修复同尺寸 SHM 格式切换的纹理缓存。
 
 ## 直接运行
 
@@ -186,7 +215,7 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 ## 当前边界与后续工作
 
 - 扩展可选 CUDA GL 输入的驱动/多 GPU 兼容性与异步同步；增加 UDP/FEC 和拥塞控制。
-- 视频路径为 8-bit 4:2:0 SDR，彩色文字可能不如 PNG 清晰；默认 H.264，可选 HEVC/AV1 的 Windows 硬解仍需实机验证。4:4:4、HDR 和高刷新率仍需扩展、验证。
+- 视频路径为 8-bit 4:2:0 SDR，彩色文字可能不如 PNG 清晰；默认 H.264，可选 HEVC/AV1 的 Windows 硬解仍需实机验证。4:4:4 和高刷新率仍需扩展；上方实验 scRGB HDR 子集仍为 partial。
 - 每个视频顶层窗口使用一个 NVENC 会话；会话数量受硬件/驱动限制，不能分配时回退 PNG。视频包尺寸范围为 48×48 至 4096×2304，各 codec 的实际最小尺寸另受驱动限制，不支持时走 PNG。
 - 完善模态协议、窗口状态和光标/输入区域映射。
 - 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。

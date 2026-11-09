@@ -61,14 +61,34 @@ pub enum Codec {
     H264 = 2,
     Hevc = 4,
     Av1 = 5,
+    HevcHdr = 7,
+    Av1Hdr = 8,
 }
 impl Codec {
-    pub const ALL: [Self; 3] = [Self::H264, Self::Hevc, Self::Av1];
+    pub const ALL: [Self; 5] = [
+        Self::H264,
+        Self::Hevc,
+        Self::Av1,
+        Self::HevcHdr,
+        Self::Av1Hdr,
+    ];
+    pub fn hdr(self) -> bool {
+        matches!(self, Self::HevcHdr | Self::Av1Hdr)
+    }
+    pub fn hdr_variant(self) -> Option<Self> {
+        match self {
+            Self::Hevc => Some(Self::HevcHdr),
+            Self::Av1 => Some(Self::Av1Hdr),
+            _ => None,
+        }
+    }
     pub fn capability(self) -> &'static str {
         match self {
             Self::H264 => "h264_alpha",
             Self::Hevc => "hevc_alpha",
             Self::Av1 => "av1_alpha",
+            Self::HevcHdr => "hevc_main10_pq_alpha16",
+            Self::Av1Hdr => "av1_main10_pq_alpha16",
         }
     }
     pub fn name(self) -> &'static str {
@@ -76,6 +96,8 @@ impl Codec {
             Self::H264 => "H.264",
             Self::Hevc => "HEVC",
             Self::Av1 => "AV1",
+            Self::HevcHdr => "HEVC Main10 PQ",
+            Self::Av1Hdr => "AV1 Main10 PQ",
         }
     }
 }

@@ -134,6 +134,17 @@ fn measure(renderer: &mut GlesRenderer, format: Fourcc) -> Result<Value> {
         )
     }
 }
+pub fn validate_fp16(renderer: &mut GlesRenderer) -> Result<()> {
+    let measured = measure(renderer, Fourcc::Abgr16161616f);
+    renderer.downscale_filter(TextureFilter::Linear)?;
+    renderer.upscale_filter(TextureFilter::Linear)?;
+    let report = measured?;
+    anyhow::ensure!(
+        report["preserves_more_than_8bit"] == true && report["preserves_above_sdr_white"] == true,
+        "FP16 renderer loses HDR precision/range"
+    );
+    Ok(())
+}
 pub fn preflight(renderer: &mut GlesRenderer) -> Value {
     let probe = |result: Result<Value>| {
         result.unwrap_or_else(|error| json!({"available":false,"error":error.to_string()}))
@@ -146,7 +157,202 @@ pub fn preflight(renderer: &mut GlesRenderer) -> Value {
         }
         Err(error) => json!({"verified":false,"error":error}),
     };
-    json!({"streaming_hdr":false,"status":"partial-preflight","wire_color_spaces":["bt709_sdr"],"current_capture_bits":8,
+    json!({"streaming_hdr":false,"status":"partial-experimental-scrgb","wire_color_spaces":["bt709_sdr"],"current_capture_bits":8,
         "gl_rgb10":rgb10,"gl_fp16":fp16,"nvenc_hevc_main10":codec(waybridge_codec::Codec::Hevc),"nvenc_av1_main10":codec(waybridge_codec::Codec::Av1),
-        "missing":["Wayland color descriptions and per-surface color conversion","FP16 application capture into P010 Main10 transport","Windows P010 decoding and scRGB FP16 composition"]})
+        "experimental_subset":{"source":"explicit wp_color_manager_v1 WindowsScRGB, 80 nits/unit","capture":"RGBA16F linear composition","transport":"CUDA P010 BT2020/PQ HEVC/AV1 Main10, raw FP16 alpha16","default_enabled":false}, "limitations":["ICC and parametric descriptions are not supported","physical Windows HDR display and Main10 MFT remain unverified","requires same NVIDIA GL/CUDA/NVENC GPU; unsupported gamut uses SDR tone map"]})
+}
+
+use smithay::backend::renderer::{
+    element::{surface::WaylandSurfaceTexture, Element, Id, RenderElement},
+    gles::{GlesError, GlesFrame, GlesTexProgram},
+    utils::{CommitCounter, DamageSet, OpaqueRegions},
+};
+use smithay::utils::{Buffer as BufferCoord, Physical, Scale as FactorScale};
+
+pub struct Programs {
+    linear: GlesTexProgram,
+    sdr: GlesTexProgram,
+}
+impl Programs {
+    pub fn new(renderer: &mut GlesRenderer) -> Result<Self> {
+        let sdr = HIGH_PRECISION_TEXTURE.replace(
+            "gl_FragColor=color*alpha;",
+            r#"
+            float a=color.a;
+            vec3 s=a>0.000001?clamp(color.rgb/a,0.0,1.0):vec3(0.0);
+            vec3 low=s/12.92;
+            vec3 high=pow((s+0.055)/1.055,vec3(2.4));
+            vec3 linear=mix(low,high,step(vec3(0.04045),s));
+            gl_FragColor=vec4(linear*a,a)*alpha;
+        "#,
+        );
+        Ok(Self {
+            linear: renderer.compile_custom_texture_shader(HIGH_PRECISION_TEXTURE, &[])?,
+            sdr: renderer.compile_custom_texture_shader(sdr, &[])?,
+        })
+    }
+}
+pub fn scrgb_ids(root: &WlSurface) -> HashSet<Id> {
+    let mut ids = HashSet::new();
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
+        |surface, states, _| {
+            if states
+                .cached_state
+                .get::<crate::color_management::SurfaceColor>()
+                .current()
+                .scrgb
+            {
+                ids.insert(Id::from_wayland_resource(surface));
+            }
+        },
+        |_, _, _| true,
+    );
+    ids
+}
+pub struct ColorElement {
+    inner: WaylandSurfaceRenderElement<GlesRenderer>,
+    scrgb: bool,
+    linear: GlesTexProgram,
+    sdr: GlesTexProgram,
+}
+pub fn color_elements(
+    elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    ids: &HashSet<Id>,
+    programs: &Programs,
+) -> Vec<ColorElement> {
+    elements
+        .into_iter()
+        .map(|inner| {
+            let scrgb = ids.contains(inner.id());
+            ColorElement {
+                inner,
+                scrgb,
+                linear: programs.linear.clone(),
+                sdr: programs.sdr.clone(),
+            }
+        })
+        .collect()
+}
+impl Element for ColorElement {
+    fn id(&self) -> &Id {
+        self.inner.id()
+    }
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+    fn src(&self) -> Rectangle<f64, BufferCoord> {
+        self.inner.src()
+    }
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+    fn geometry(&self, scale: FactorScale<f64>) -> Rectangle<i32, Physical> {
+        self.inner.geometry(scale)
+    }
+    fn damage_since(
+        &self,
+        scale: FactorScale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.inner.damage_since(scale, commit)
+    }
+    fn opaque_regions(&self, scale: FactorScale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.inner.opaque_regions(scale)
+    }
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+}
+impl RenderElement<GlesRenderer> for ColorElement {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, BufferCoord>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque: &[Rectangle<i32, Physical>],
+    ) -> std::result::Result<(), GlesError> {
+        if !self.scrgb {
+            if let WaylandSurfaceTexture::SolidColor(color) = self.inner.texture() {
+                let a = color.a();
+                let convert = |value: f32| {
+                    let s = if a > 0. {
+                        (value / a).clamp(0., 1.)
+                    } else {
+                        0.
+                    };
+                    if s <= 0.04045 {
+                        s / 12.92
+                    } else {
+                        ((s + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                return frame.draw_solid(
+                    dst,
+                    damage,
+                    Color32F::new(
+                        convert(color.r()) * a,
+                        convert(color.g()) * a,
+                        convert(color.b()) * a,
+                        a,
+                    ) * self.inner.alpha(),
+                );
+            }
+        }
+        frame.override_default_tex_program(
+            if self.scrgb {
+                self.linear.clone()
+            } else {
+                self.sdr.clone()
+            },
+            vec![],
+        );
+        let result = self.inner.draw(frame, src, dst, damage, opaque);
+        frame.clear_tex_program_override();
+        result
+    }
+}
+pub fn tonemap_fp16(data: &[u8], width: usize, height: usize, flip: bool) -> Vec<u8> {
+    let mut rgba = vec![0; width * height * 4];
+    let gamma = |value: f32| {
+        if value <= 0.0031308 {
+            12.92 * value
+        } else {
+            1.055 * value.powf(1. / 2.4) - 0.055
+        }
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let offset = ((if flip { height - 1 - y } else { y }) * width + x) * 8;
+            let read = |c| {
+                f16_to_f32(u16::from_ne_bytes([
+                    data[offset + c * 2],
+                    data[offset + c * 2 + 1],
+                ]))
+            };
+            let alpha = if read(3).is_finite() {
+                read(3).clamp(0., 1.)
+            } else {
+                0.
+            };
+            let mut color = [0f32; 3];
+            for (c, value) in color.iter_mut().enumerate() {
+                let v = if alpha > 0. { read(c) / alpha } else { 0. };
+                *value = if v.is_finite() { v.max(0.) } else { 0. };
+            }
+            let luma = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+            for c in 0..3 {
+                rgba[(y * width + x) * 4 + c] =
+                    (gamma((color[c] / (1. + luma)).clamp(0., 1.)) * 255.).round() as u8;
+            }
+            rgba[(y * width + x) * 4 + 3] = (alpha * 255.).round() as u8;
+        }
+    }
+    rgba
 }

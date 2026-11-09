@@ -8,11 +8,12 @@ use std::{
 unsafe extern "C" {
     fn wb_gpu_device_new(error: *mut c_char, size: usize) -> *mut c_void;
     fn wb_gpu_device_free(device: *mut c_void);
-    fn wb_gpu_source_new(
+    fn wb_gpu_source_new_mode(
         device: *mut c_void,
         renderbuffer: u32,
         width: c_int,
         height: c_int,
+        hdr: c_int,
         error: *mut c_char,
         size: usize,
     ) -> *mut c_void;
@@ -61,6 +62,7 @@ pub struct GpuSource {
     _device: Rc<GpuDevice>,
     width: u32,
     height: u32,
+    hdr: bool,
 }
 impl GpuSource {
     /// The GL renderbuffer must remain alive and unmapped until this source is
@@ -71,13 +73,24 @@ impl GpuSource {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
+        Self::new_mode(device, renderbuffer, width, height, false)
+    }
+    /// HDR registers RGBA16F and produces limited P010/PQ plus a GPU SDR fallback.
+    pub fn new_mode(
+        device: Rc<GpuDevice>,
+        renderbuffer: u32,
+        width: u32,
+        height: u32,
+        hdr: bool,
+    ) -> Result<Self, String> {
         let mut error = [0 as c_char; 512];
         let handle = unsafe {
-            wb_gpu_source_new(
+            wb_gpu_source_new_mode(
                 device.handle.as_ptr(),
                 renderbuffer,
                 width as c_int,
                 height as c_int,
+                i32::from(hdr),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -88,6 +101,7 @@ impl GpuSource {
                 _device: device,
                 width,
                 height,
+                hdr,
             })
             .ok_or_else(|| message(&error))
     }
@@ -108,6 +122,7 @@ impl GpuSource {
                 handle,
                 width: self.width,
                 height: self.height,
+                hdr: self.hdr,
             })
             .ok_or_else(|| message(&error))
     }
@@ -123,15 +138,21 @@ pub struct GpuFrame {
     handle: NonNull<c_void>,
     width: u32,
     height: u32,
+    hdr: bool,
 }
 // The CUDA kernel is complete and GL resource unmapped before construction.
 // AVFrame/AVBufferRef own independent GPU storage and a CUDA device reference;
 // FFmpeg pushes that context on whichever thread releases/encodes the frame.
 unsafe impl Send for GpuFrame {}
 impl GpuFrame {
+    pub fn hdr(&self) -> bool {
+        self.hdr
+    }
     pub(crate) fn av_frame(&self) -> *mut c_void {
         unsafe { wb_gpu_frame_avframe(self.handle.as_ptr()) }
     }
+    /// Empty means opaque. SDR is L8; HDR contains native-endian raw FP16 bits
+    /// (two bytes per pixel), preserved verbatim by the alpha16 PNG transport.
     pub fn alpha(&self) -> &[u8] {
         let mut length = 0;
         let pointer = unsafe { wb_gpu_frame_alpha(self.handle.as_ptr(), &mut length) };
@@ -148,7 +169,8 @@ impl GpuFrame {
         unsafe { wb_gpu_frame_device(self.handle.as_ptr()) }
     }
     /// Explicit emergency CPU fallback; never used by successful GPU encoding.
-    /// Pixels are already straight RGBA, with their original lossless alpha.
+    /// Pixels are straight RGBA8. HDR downloads its independently generated
+    /// SDR tone-map, including explicitly quantized eight-bit fallback alpha.
     pub fn download(&self) -> Result<Vec<u8>, String> {
         let mut rgba = vec![0; self.width as usize * self.height as usize * 4];
         let status =

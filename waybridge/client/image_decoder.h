@@ -15,8 +15,8 @@ public:
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                      IID_PPV_ARGS(&factory));
   }
-  bool decode(const uint8_t *bytes, size_t length, UINT width, UINT height,
-              bool grayscale, std::vector<uint8_t> &pixels) {
+  bool decode(const uint8_t *bytes, size_t length, UINT width, UINT height, bool grayscale,
+              std::vector<uint8_t> &pixels, bool halfAlpha = false) {
     if (!factory || !length || length > MAXDWORD || !width || !height || width > 8192 ||
         height > 8192 || uint64_t(width) * height > 16777216)
       return false;
@@ -36,18 +36,22 @@ public:
     if (FAILED(frame->GetSize(&actualWidth, &actualHeight)) || actualWidth != width ||
         actualHeight != height)
       return false;
-    UINT stride = width * (grayscale ? 1 : 4);
+    UINT stride = width * (halfAlpha ? 2 : grayscale ? 1 : 4);
     pixels.resize(size_t(stride) * height);
     GUID format{};
     if (FAILED(frame->GetPixelFormat(&format)))
       return false;
-    const GUID &wanted = grayscale ? GUID_WICPixelFormat8bppGray : GUID_WICPixelFormat32bppPBGRA;
+    const GUID &wanted = halfAlpha   ? GUID_WICPixelFormat16bppGray
+                         : grayscale ? GUID_WICPixelFormat8bppGray
+                                     : GUID_WICPixelFormat32bppPBGRA;
+    if (halfAlpha && format != wanted)
+      return false;
     if (format == wanted)
       return SUCCEEDED(frame->CopyPixels(nullptr, stride, UINT(pixels.size()), pixels.data()));
     Microsoft::WRL::ComPtr<IWICFormatConverter> converted;
     return SUCCEEDED(factory->CreateFormatConverter(&converted)) &&
-           SUCCEEDED(converted->Initialize(frame.Get(), wanted, WICBitmapDitherTypeNone, nullptr,
-                                            0, WICBitmapPaletteTypeCustom)) &&
+           SUCCEEDED(converted->Initialize(frame.Get(), wanted, WICBitmapDitherTypeNone, nullptr, 0,
+                                           WICBitmapPaletteTypeCustom)) &&
            SUCCEEDED(converted->CopyPixels(nullptr, stride, UINT(pixels.size()), pixels.data()));
   }
 };

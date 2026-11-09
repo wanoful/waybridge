@@ -24,8 +24,9 @@ static struct wb_encoder *wb_encoder_new_input(int kind, int width, int height, 
     struct wb_encoder *encoder=calloc(1,sizeof(*encoder));
     if (!encoder) return NULL;
     int result=AVERROR(ENOMEM);
-    const char *name=kind==2?"h264_nvenc":kind==4?"hevc_nvenc":kind==5?"av1_nvenc":NULL;
-    if (!name || width<48 || width>4096 || height<48 || height>2304 || fps<1 || fps>120 || bitrate<1000 || bitrate>200000) {
+    int hdr=kind==7||kind==8;
+    const char *name=kind==2?"h264_nvenc":(kind==4||kind==7)?"hevc_nvenc":(kind==5||kind==8)?"av1_nvenc":NULL;
+    if (!name || (hdr && !gpu) || width<48 || width>4096 || height<48 || height>2304 || fps<1 || fps>120 || bitrate<1000 || bitrate>200000) {
         snprintf(error,size,"invalid codec, dimensions or rate"); goto failed;
     }
     const AVCodec *codec=avcodec_find_encoder_by_name(name);
@@ -39,7 +40,7 @@ static struct wb_encoder *wb_encoder_new_input(int kind, int width, int height, 
     ctx->pix_fmt=gpu?AV_PIX_FMT_CUDA:AV_PIX_FMT_RGBA;
     if (gpu) {
         if (gpu->format!=AV_PIX_FMT_CUDA || !gpu->hw_frames_ctx || gpu->width!=ctx->width || gpu->height!=ctx->height ||
-            ((AVHWFramesContext *)gpu->hw_frames_ctx->data)->sw_format!=AV_PIX_FMT_RGBA) {
+            ((AVHWFramesContext *)gpu->hw_frames_ctx->data)->sw_format!=(hdr?AV_PIX_FMT_P010LE:AV_PIX_FMT_RGBA)) {
             result=AVERROR(EINVAL); goto failed_error;
         }
         ctx->hw_frames_ctx=av_buffer_ref(gpu->hw_frames_ctx);
@@ -51,8 +52,8 @@ static struct wb_encoder *wb_encoder_new_input(int kind, int width, int height, 
     ctx->rc_buffer_size=(int)(ctx->bit_rate/fps);
     ctx->gop_size=fps*2; ctx->max_b_frames=0;
     ctx->flags|=AV_CODEC_FLAG_LOW_DELAY;
-    ctx->color_range=AVCOL_RANGE_MPEG; ctx->colorspace=AVCOL_SPC_BT709;
-    ctx->color_primaries=AVCOL_PRI_BT709; ctx->color_trc=AVCOL_TRC_BT709;
+    ctx->color_range=AVCOL_RANGE_MPEG; ctx->colorspace=hdr?AVCOL_SPC_BT2020_NCL:AVCOL_SPC_BT709;
+    ctx->color_primaries=hdr?AVCOL_PRI_BT2020:AVCOL_PRI_BT709; ctx->color_trc=hdr?AVCOL_TRC_SMPTE2084:AVCOL_TRC_BT709;
     AVDictionary *options=NULL;
     av_dict_set(&options,"preset","p1",0);
     av_dict_set(&options,"tune","ull",0);
@@ -63,21 +64,21 @@ static struct wb_encoder *wb_encoder_new_input(int kind, int width, int height, 
     av_dict_set(&options,"delay","0",0);
     av_dict_set(&options,"forced-idr","1",0);
     // Give streaming decoders an explicit access-unit boundary, including when updates go idle.
-    if (kind!=5) av_dict_set(&options,"aud","1",0);
-    if (kind!=5) av_dict_set(&options,"profile",kind==2?"high":"main",0);
+    if (kind!=5 && kind!=8) av_dict_set(&options,"aud","1",0);
+    if (kind!=5 && kind!=8) av_dict_set(&options,"profile",kind==2?"high":hdr?"main10":"main",0);
     result=avcodec_open2(ctx,codec,&options);
     av_dict_free(&options);
     if (result<0) goto failed_error;
     // Codec-specific framing: never interpret AV1 OBU bytes as H.264 NALs.
     // Strip non-picture filler without touching picture/reference payloads.
-    const AVBitStreamFilter *filter=av_bsf_get_by_name(kind==5?"av1_metadata":"filter_units");
+    const AVBitStreamFilter *filter=av_bsf_get_by_name((kind==5||kind==8)?"av1_metadata":"filter_units");
     if (!filter) { result=AVERROR_BSF_NOT_FOUND; goto failed_error; }
     result=av_bsf_alloc(filter,&encoder->filter);
     if (result<0) goto failed_error;
     result=avcodec_parameters_from_context(encoder->filter->par_in,ctx);
     if (result<0) goto failed_error;
     encoder->filter->time_base_in=ctx->time_base;
-    if (kind==5) {
+    if (kind==5||kind==8) {
         result=av_opt_set(encoder->filter->priv_data,"td","insert",0);
         if (result<0) goto failed_error;
         result=av_opt_set(encoder->filter->priv_data,"delete_padding","1",0);

@@ -3,6 +3,7 @@
 #include "media_foundation.h"
 #include "h264_bitstream.h"
 #include "video_capability_samples.h"
+#include "hdr_capability_samples.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mftransform.h>
@@ -36,8 +37,8 @@ class VideoDecoder {
       check(transform->GetOutputAvailableType(0, i, &type), "Video output types");
       GUID subtype{};
       type->GetGUID(MF_MT_SUBTYPE, &subtype);
-      if (subtype == MFVideoFormat_NV12) {
-        check(transform->SetOutputType(0, type.Get(), 0), "Video NV12 output");
+      if (subtype == (hdr(kind) ? MFVideoFormat_P010 : MFVideoFormat_NV12)) {
+        check(transform->SetOutputType(0, type.Get(), 0), "Video texture output");
         return;
       }
     }
@@ -90,19 +91,31 @@ public:
     check(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "Video restart epoch");
   }
   static const char *name(uint8_t codec) {
-    return codec == 2 ? "H.264" : codec == 4 ? "HEVC" : codec == 5 ? "AV1" : "invalid";
+    return codec == 2   ? "H.264"
+           : codec == 4 ? "HEVC"
+           : codec == 5 ? "AV1"
+           : codec == 7 ? "HEVC Main10 PQ"
+           : codec == 8 ? "AV1 Main10 PQ"
+                        : "invalid";
   }
-  static bool videoKind(uint8_t codec) { return codec == 2 || codec == 4 || codec == 5; }
+  static bool hdr(uint8_t codec) { return codec == 7 || codec == 8; }
+  static bool videoKind(uint8_t codec) {
+    return codec == 2 || codec == 4 || codec == 5 || hdr(codec);
+  }
   static const char *capability(uint8_t codec) {
-    return codec == 2 ? "h264_alpha" : codec == 4 ? "hevc_alpha" : "av1_alpha";
+    return codec == 2   ? "h264_alpha"
+           : codec == 4 ? "hevc_alpha"
+           : codec == 5 ? "av1_alpha"
+           : codec == 7 ? "hevc_main10_pq_alpha16"
+                        : "av1_main10_pq_alpha16";
   }
   static GUID subtype(uint8_t codec) {
     // Standard Media Foundation subtype GUIDs derive from the registered FOURCC.
     if (codec == 2)
       return MFVideoFormat_H264;
-    if (codec == 4)
+    if (codec == 4 || codec == 7)
       return MFVideoFormat_HEVC;
-    if (codec == 5)
+    if (codec == 5 || codec == 8)
       return MFVideoFormat_AV1;
     throw std::runtime_error("Unknown video codec");
   }
@@ -122,16 +135,20 @@ public:
              SUCCEEDED(attributes->GetUINT32(MF_SA_D3D11_AWARE, &aware)) && aware;
     }
     // Do not advertise an installed software decoder or merely an awareness flag.
-    // A real access unit must yield a correctly timestamped NV12 GPU texture.
+    // A real access unit must yield a correctly timestamped NV12/P010 GPU texture.
     try {
       VideoDecoder test(256, 256, codec);
       auto output = codec == 4 ? test.decode(HevcCapabilitySample, sizeof(HevcCapabilitySample), 1)
-                               : test.decode(Av1CapabilitySample, sizeof(Av1CapabilitySample), 1);
+                    : codec == 5 ? test.decode(Av1CapabilitySample, sizeof(Av1CapabilitySample), 1)
+                    : codec == 7
+                        ? test.decode(HevcHdrCapabilitySample, sizeof(HevcHdrCapabilitySample), 1)
+                        : test.decode(Av1HdrCapabilitySample, sizeof(Av1HdrCapabilitySample), 1);
       if (output.size() != 1 || output[0].sequence != 1 || !output[0].texture)
         return false;
       D3D11_TEXTURE2D_DESC desc{};
       output[0].texture->GetDesc(&desc);
-      return desc.Format == DXGI_FORMAT_NV12 && desc.Width >= 256 && desc.Height >= 256;
+      return desc.Format == (hdr(codec) ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12) &&
+             desc.Width >= 256 && desc.Height >= 256;
     } catch (...) {
       return false;
     }
@@ -151,7 +168,8 @@ public:
     if (!videoKind(kind) || !enumerate)
       throw std::runtime_error("Video decoder enumeration unavailable");
     MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, subtype(kind)};
-    MFT_REGISTER_TYPE_INFO output{MFMediaType_Video, MFVideoFormat_NV12};
+    MFT_REGISTER_TYPE_INFO output{MFMediaType_Video,
+                                  hdr(kind) ? MFVideoFormat_P010 : MFVideoFormat_NV12};
     IMFActivate **found = nullptr;
     UINT count = 0;
     check(enumerate(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
@@ -176,7 +194,7 @@ public:
         manager.Reset();
       }
     }
-    throw std::runtime_error("No synchronous D3D11/NV12 decoder for selected codec");
+    throw std::runtime_error("No synchronous D3D11 texture decoder for selected codec");
   }
 
 private:
@@ -220,8 +238,15 @@ private:
     check(MediaFoundation::get().CreateMediaType(&input), "Video input type");
     input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     input->SetGUID(MF_MT_SUBTYPE, subtype(kind));
-    if (kind == 4)
-      input->SetUINT32(MF_MT_MPEG2_PROFILE, 1); // HEVC Main profile_idc (8-bit 4:2:0).
+    if (kind == 4 || kind == 7)
+      input->SetUINT32(MF_MT_MPEG2_PROFILE,
+                       kind == 7 ? 2 : 1); // HEVC Main=1 / Main10=2 profile_idc.
+    if (hdr(kind)) {
+      input->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT2020);
+      input->SetUINT32(MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_2084);
+      input->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT2020_10);
+      input->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235);
+    }
     MFSetAttributeSize(input.Get(), MF_MT_FRAME_SIZE, width, height);
     MFSetAttributeRatio(input.Get(), MF_MT_FRAME_RATE, 60, 1);
     MFSetAttributeRatio(input.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);

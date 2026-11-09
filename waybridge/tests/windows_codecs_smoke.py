@@ -44,7 +44,7 @@ def main():
             report = json.loads(hdr.stdout)
             assert report['streaming_hdr'] is False and report['current_decoder_format'] == 'NV12' and report['current_swapchain_format'] == 'BGRA8', report
             assert 'HEVC capability=unavailable'  in result.stdout and 'AV1 capability=unavailable' in result.stdout, result.stdout
-            for kind, capability, name in ((4, 'hevc_alpha', 'HEVC'), (5, 'av1_alpha', 'AV1')):
+            for kind, capability, name in ((4,'hevc_alpha','HEVC'),(5,'av1_alpha','AV1'),(7,'hevc_main10_pq_alpha16','HEVC Main10'),(8,'av1_main10_pq_alpha16','AV1 Main10')):
                 with socket.socket() as listener:
                     listener.bind(('127.0.0.1', 0)); listener.listen(); listener.settimeout(15)
                     port = listener.getsockname()[1]
@@ -53,15 +53,15 @@ def main():
                     sock, _ = listener.accept(); sock.settimeout(12)
                     with sock:
                         hello = packet(sock)
-                        assert hello['codecs'] == ['png_rgba'], hello
+                        assert hello['codecs'] == ['png_rgba'] and hello['hdr'] is False, hello
                         control(sock, type='hello', version=3, codec='mixed', split_media=False, codecs=['png_rgba', 'h264_alpha', 'hevc_alpha', 'av1_alpha'])
                         title = f'Waybridge {name} fallback'
                         control(sock, type='window', id=1, title=title, app_id='waybridge.test', width=400, height=300, scale=1, decoration='server')
                         # Unexpected/unadvertised video must be rejected without breaking PNG.
                         # A complete native NVENC key access unit is included, not a fake codec payload.
                         import re
-                        header = (ROOT/'client/video_capability_samples.h').read_text()
-                        label = 'Hevc' if kind == 4 else 'Av1'
+                        header = (ROOT/('client/hdr_capability_samples.h' if kind>=7 else 'client/video_capability_samples.h')).read_text()
+                        label = {4:'Hevc',5:'Av1',7:'HevcHdr',8:'Av1Hdr'}[kind]
                         array = re.search(label + r'CapabilitySample\[\] = \{(.*?)\};', header, re.S).group(1)
                         data = bytes(int(value,16) for value in re.findall(r'0x([0-9a-f]{2})', array))
                         video = struct.pack('>IIIQiiiiIIIIII', 1,256,256,1,400,300,0,0,1,256,256,1,len(data),0) + data
@@ -89,7 +89,7 @@ def main():
                             raise AssertionError(result.stdout + result.stderr)
                     client.wait(timeout=10)
                     assert client.returncode == 0
-            print('PASS: actual PE refuses HEVC/AV1 capability without a GPU path, rejects unadvertised native streams with codec-bound fallback, then presents exact PNG pixels; no actual Windows HEVC/AV1 hardware decode claim')
+            print('PASS: actual PE refuses HEVC/AV1 SDR and Main10 HDR capability without a GPU path, rejects unadvertised native streams with codec-bound fallback, then presents exact PNG pixels; no actual Windows HEVC/AV1 hardware decode claim')
         finally:
             for process in reversed(processes):
                 if process.poll() is None:

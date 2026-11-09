@@ -130,8 +130,16 @@ impl Encoder {
                 if frame.peer.is_closed() || frame.peer.window_closed(frame.id) {
                     continue;
                 }
-                let selected_codec = codec.unwrap_or(nvenc::Codec::H264);
+                let selected_codec = if frame.gpu.as_ref().is_some_and(|f| f.hdr()) {
+                    codec
+                        .and_then(|c| c.hdr_variant())
+                        .unwrap_or(nvenc::Codec::HevcHdr)
+                } else {
+                    codec.unwrap_or(nvenc::Codec::H264)
+                };
                 let use_video = codec.is_some()
+                    && (!selected_codec.hdr()
+                        || codec.and_then(|c| c.hdr_variant()) == Some(selected_codec))
                     && frame.video_eligible
                     && frame.peer.supports(selected_codec, frame.id)
                     && frame.width >= 48
@@ -262,6 +270,8 @@ impl Encoder {
                         if latest.width != frame.width
                             || latest.height != frame.height
                             || latest.input_key() != frame.input_key()
+                            || latest.gpu.as_ref().is_some_and(|f| f.hdr())
+                                != frame.gpu.as_ref().is_some_and(|f| f.hdr())
                             || !Arc::ptr_eq(&latest.peer, &frame.peer)
                         {
                             continue;
@@ -321,7 +331,11 @@ impl Encoder {
                                         &alpha,
                                         frame.width,
                                         frame.height,
-                                        image::ExtendedColorType::L8,
+                                        if selected_codec.hdr() {
+                                            image::ExtendedColorType::L16
+                                        } else {
+                                            image::ExtendedColorType::L8
+                                        },
                                     )
                                     .unwrap_or_default()
                                 };
@@ -384,6 +398,15 @@ impl Encoder {
                         &png,
                     );
                     if bytes.len() < protocol::MAX_PACKET {
+                        // PNG resets the client's hardware decoder. Preserve an
+                        // optional idle encoder, but returning to any video must
+                        // create a fresh epoch and independent keyframe.
+                        if let Some(previous) = sessions.remove(&frame.id) {
+                            if previous.encoder.is_some() {
+                                idle.push_back((frame.id, previous));
+                                trim_idle(&mut idle);
+                            }
+                        }
                         frame.peer.frame(frame.id, bytes);
                     }
                 }

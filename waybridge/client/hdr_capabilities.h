@@ -36,7 +36,7 @@ struct HdrCapabilities {
   static nlohmann::json inspect() {
     using Json = nlohmann::json;
     Json result = {{"streaming_hdr", false},
-                   {"status", "partial-preflight"},
+                   {"status", "partial-experimental-scrgb"},
                    {"current_decoder_format", "NV12"},
                    {"current_swapchain_format", "BGRA8"},
                    {"current_wire_color_spaces", Json::array({"bt709_sdr"})},
@@ -128,7 +128,7 @@ struct HdrCapabilities {
       }
     }
     result["reason"] =
-        "render/monitor capabilities do not yet enable a color-managed Main10/P010 streaming path";
+        "experimental HDR requires WAYBRIDGE_HDR=1, verified Main10/P010 hardware decoder and shader/plane support, plus active HDR on the window monitor; this diagnostic alone does not enable streaming";
     return result;
   }
 };

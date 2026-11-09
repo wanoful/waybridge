@@ -35,6 +35,7 @@ struct Queue {
     active_codec: BTreeMap<u32, waybridge_codec::Codec>,
     gpu_disabled: BTreeSet<u32>,
     gpu_refresh: BTreeSet<u32>,
+    hdr_windows: BTreeSet<u32>,
     in_flight: BTreeMap<u32, BTreeMap<u64, std::time::Instant>>,
     closed_windows: BTreeSet<u32>,
     last_frame_id: u32,
@@ -127,6 +128,17 @@ impl Peer {
     pub fn supports(&self, codec: waybridge_codec::Codec, id: u32) -> bool {
         self.codecs.contains(&codec) && !self.queue.lock().unwrap().png_only.contains(&id)
     }
+    pub fn hdr_allowed(&self, id: u32) -> bool {
+        self.queue.lock().unwrap().hdr_windows.contains(&id)
+    }
+    pub fn set_hdr(&self, id: u32, enabled: bool) {
+        let mut q = self.queue.lock().unwrap();
+        if enabled {
+            q.hdr_windows.insert(id);
+        } else {
+            q.hdr_windows.remove(&id);
+        }
+    }
     pub fn gpu_allowed(&self, id: u32) -> bool {
         !self.queue.lock().unwrap().gpu_disabled.contains(&id)
     }
@@ -185,6 +197,8 @@ impl Peer {
                     waybridge_codec::Codec::H264 => protocol::VIDEO,
                     waybridge_codec::Codec::Hevc => protocol::HEVC_VIDEO,
                     waybridge_codec::Codec::Av1 => protocol::AV1_VIDEO,
+                    waybridge_codec::Codec::HevcHdr => protocol::HEVC_HDR_VIDEO,
+                    waybridge_codec::Codec::Av1Hdr => protocol::AV1_HDR_VIDEO,
                 },
                 bytes,
                 resize,
@@ -210,6 +224,7 @@ impl Peer {
         q.active_codec.remove(&id);
         q.gpu_disabled.remove(&id);
         q.gpu_refresh.remove(&id);
+        q.hdr_windows.remove(&id);
         q.in_flight.remove(&id);
         q.resizes.remove(&id);
     }
@@ -290,6 +305,7 @@ type MediaSession = Arc<Mutex<Option<(String, Weak<Peer>)>>>;
 pub fn listen(
     address: &str,
     token: String,
+    hdr_enabled: bool,
 ) -> anyhow::Result<(Receiver<Event>, SyncSender<Event>)> {
     let listener = TcpListener::bind(address)?;
     tracing::info!(address = %listener.local_addr()?, "viewer listener ready");
@@ -348,9 +364,15 @@ pub fn listen(
                     codecs: waybridge_codec::Codec::ALL
                         .into_iter()
                         .filter(|codec| {
-                            hello["codecs"].as_array().is_some_and(|codecs| {
-                                codecs.iter().any(|c| c == codec.capability())
-                            })
+                            (!codec.hdr()
+                                || (hdr_enabled
+                                    && hello["hdr"].as_bool() == Some(true)
+                                    && hello["color_spaces"].as_array().is_some_and(|spaces| {
+                                        spaces.iter().any(|s| s == "bt2020_pq")
+                                    })))
+                                && hello["codecs"].as_array().is_some_and(|codecs| {
+                                    codecs.iter().any(|c| c == codec.capability())
+                                })
                         })
                         .collect(),
                     media_attached: AtomicBool::new(false),
@@ -381,7 +403,7 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "hdr":false, "color_spaces":["bt709_sdr"], "color_depths":[8], "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key, "hdr":hdr_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","window_decorations","dpi","alpha"]}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);
