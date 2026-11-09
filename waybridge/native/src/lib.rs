@@ -1,3 +1,5 @@
+mod gpu;
+pub use gpu::{GpuDevice, GpuFrame, GpuSource};
 use std::{
     ffi::{c_char, c_int, c_void, CStr},
     ptr::NonNull,
@@ -13,6 +15,25 @@ unsafe extern "C" {
         error: *mut c_char,
         size: usize,
     ) -> *mut c_void;
+    fn wb_encoder_new_gpu_codec(
+        kind: c_int,
+        width: c_int,
+        height: c_int,
+        fps: c_int,
+        bitrate: c_int,
+        frame: *const c_void,
+        error: *mut c_char,
+        size: usize,
+    ) -> *mut c_void;
+    fn wb_encoder_encode_gpu(
+        encoder: *mut c_void,
+        frame: *mut c_void,
+        sequence: i64,
+        force_idr: c_int,
+        output: *mut *const u8,
+        pts: *mut i64,
+        key: *mut c_int,
+    ) -> c_int;
     fn wb_encoder_free(encoder: *mut c_void);
     fn wb_encoder_encode(
         encoder: *mut c_void,
@@ -67,6 +88,26 @@ impl Encoder {
         fps: u32,
         bitrate: u32,
     ) -> Result<Self, String> {
+        Self::new_input(codec, width, height, fps, bitrate, None)
+    }
+    pub fn with_gpu(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        frame: &GpuFrame,
+    ) -> Result<Self, String> {
+        Self::new_input(codec, width, height, fps, bitrate, Some(frame))
+    }
+    fn new_input(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        frame: Option<&GpuFrame>,
+    ) -> Result<Self, String> {
         if !(48..=4096).contains(&width)
             || !(48..=2304).contains(&height)
             || !(1..=120).contains(&fps)
@@ -76,15 +117,28 @@ impl Encoder {
         }
         let mut error = [0 as c_char; 256];
         let pointer = unsafe {
-            wb_encoder_new_codec(
-                codec as c_int,
-                width as c_int,
-                height as c_int,
-                fps as c_int,
-                bitrate as c_int,
-                error.as_mut_ptr(),
-                error.len(),
-            )
+            if let Some(frame) = frame {
+                wb_encoder_new_gpu_codec(
+                    codec as c_int,
+                    width as c_int,
+                    height as c_int,
+                    fps as c_int,
+                    bitrate as c_int,
+                    frame.av_frame(),
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            } else {
+                wb_encoder_new_codec(
+                    codec as c_int,
+                    width as c_int,
+                    height as c_int,
+                    fps as c_int,
+                    bitrate as c_int,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            }
         };
         NonNull::new(pointer)
             .map(|handle| Self {
@@ -120,6 +174,38 @@ impl Encoder {
                 &mut key,
             )
         };
+        Self::packet(sequence, force_idr, output, pts, key, result)
+    }
+    pub fn encode_gpu(
+        &mut self,
+        frame: &mut GpuFrame,
+        sequence: u64,
+        force_idr: bool,
+    ) -> Result<(Vec<u8>, bool), String> {
+        let mut output = std::ptr::null();
+        let mut pts = 0;
+        let mut key = 0;
+        let result = unsafe {
+            wb_encoder_encode_gpu(
+                self.handle.as_ptr(),
+                frame.av_frame(),
+                sequence as i64,
+                i32::from(force_idr),
+                &mut output,
+                &mut pts,
+                &mut key,
+            )
+        };
+        Self::packet(sequence, force_idr, output, pts, key, result)
+    }
+    fn packet(
+        sequence: u64,
+        force_idr: bool,
+        output: *const u8,
+        pts: i64,
+        key: c_int,
+        result: c_int,
+    ) -> Result<(Vec<u8>, bool), String> {
         if result <= 0 || pts != sequence as i64 || (force_idr && key == 0) {
             return Err(format!(
                 "NVENC output mismatch ({result}, pts {pts}, expected {sequence})"

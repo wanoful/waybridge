@@ -19,9 +19,30 @@ pub struct Frame {
     pub sequence: u64,
     pub geometry: [i32; 4],
     pub rgba: Vec<u8>,
+    pub gpu: Option<nvenc::GpuFrame>,
+    pub straight: bool,
     pub peer: Arc<Peer>,
     pub video_eligible: bool,
     pub enqueued: Instant,
+}
+impl Frame {
+    fn memory_bytes(&self) -> usize {
+        self.gpu
+            .as_ref()
+            .map_or(self.rgba.len(), |frame| frame.memory_bytes())
+    }
+    fn input_key(&self) -> usize {
+        self.gpu.as_ref().map_or(0, |frame| frame.device_key())
+    }
+    fn download_gpu(&mut self) -> Result<(), String> {
+        if let Some(gpu) = self.gpu.take() {
+            let started = Instant::now();
+            self.rgba = gpu.download()?;
+            self.straight = true;
+            metrics::record("gpu_fallback_readback", started.elapsed());
+        }
+        Ok(())
+    }
 }
 #[derive(Default)]
 struct Queue {
@@ -38,6 +59,7 @@ struct Session {
     width: u32,
     height: u32,
     codec: nvenc::Codec,
+    input_key: usize,
     owner: Weak<Peer>,
     encoder: Option<nvenc::Encoder>,
     failed: bool,
@@ -91,7 +113,7 @@ impl Encoder {
                     let frame = id.map(|id| {
                         q.last_id = id;
                         let frame = q.frames.remove(&id).unwrap();
-                        q.bytes -= frame.rgba.len();
+                        q.bytes -= frame.memory_bytes();
                         frame
                     });
                     (frame, reset, forget)
@@ -121,7 +143,7 @@ impl Encoder {
                     let (lock, wake) = &*worker;
                     let mut q = lock.lock().unwrap();
                     if !q.frames.contains_key(&frame.id) {
-                        q.bytes += frame.rgba.len();
+                        q.bytes += frame.memory_bytes();
                         q.frames.insert(frame.id, frame);
                     }
                     let _ = wake.wait_timeout(q, Duration::from_millis(2)).unwrap();
@@ -138,6 +160,7 @@ impl Encoder {
                         s.width != frame.width
                             || s.height != frame.height
                             || s.codec != selected_codec
+                            || s.input_key != frame.input_key()
                             || !same_owner(s)
                     });
                     if recreate {
@@ -147,6 +170,7 @@ impl Encoder {
                                 && s.width == frame.width
                                 && s.height == frame.height
                                 && s.codec == selected_codec
+                                && s.input_key == frame.input_key()
                                 && same_owner(s)
                         });
                         let mut next = cached.map(|index| idle.remove(index).unwrap().1);
@@ -169,6 +193,7 @@ impl Encoder {
                             width: frame.width,
                             height: frame.height,
                             codec: selected_codec,
+                            input_key: frame.input_key(),
                             owner: Arc::downgrade(&frame.peer),
                             encoder: None,
                             failed: false,
@@ -182,23 +207,30 @@ impl Encoder {
                     let session = sessions.get_mut(&frame.id).unwrap();
                     if !session.failed && session.encoder.is_none() {
                         let started = Instant::now();
-                        let mut result = nvenc::Encoder::with_codec(
-                            selected_codec,
-                            frame.width,
-                            frame.height,
-                            fps,
-                            bitrate,
-                        );
+                        let create = || {
+                            if let Some(gpu) = &frame.gpu {
+                                nvenc::Encoder::with_gpu(
+                                    selected_codec,
+                                    frame.width,
+                                    frame.height,
+                                    fps,
+                                    bitrate,
+                                    gpu,
+                                )
+                            } else {
+                                nvenc::Encoder::with_codec(
+                                    selected_codec,
+                                    frame.width,
+                                    frame.height,
+                                    fps,
+                                    bitrate,
+                                )
+                            }
+                        };
+                        let mut result = create();
                         if result.is_err() && !idle.is_empty() {
-                            // Cached sessions must never make another window lose hardware video.
                             idle.clear();
-                            result = nvenc::Encoder::with_codec(
-                                selected_codec,
-                                frame.width,
-                                frame.height,
-                                fps,
-                                bitrate,
-                            );
+                            result = create();
                         }
                         metrics::record("encoder_init", started.elapsed());
                         match result {
@@ -209,11 +241,15 @@ impl Encoder {
                                     width = frame.width,
                                     height = frame.height,
                                     codec = selected_codec.name(),
+                                    input = if frame.gpu.is_some() { "cuda" } else { "cpu" },
                                     "NVENC ultra-low-latency encoder active"
                                 );
                             }
                             Err(error) => {
                                 session.failed = true;
+                                if frame.gpu.is_some() {
+                                    frame.peer.disable_gpu(frame.id);
+                                }
                                 tracing::warn!(id=frame.id,%error,"NVENC unavailable; using lossless PNG");
                             }
                         }
@@ -225,25 +261,33 @@ impl Encoder {
                     if let Some(latest) = q.frames.get(&frame.id) {
                         if latest.width != frame.width
                             || latest.height != frame.height
+                            || latest.input_key() != frame.input_key()
                             || !Arc::ptr_eq(&latest.peer, &frame.peer)
                         {
                             continue;
                         }
                         let latest = q.frames.remove(&frame.id).unwrap();
-                        q.bytes -= latest.rgba.len();
+                        q.bytes -= latest.memory_bytes();
                         frame = latest;
                         queue_wait = frame.enqueued.elapsed();
                     }
                 }
                 metrics::record("encode_queue", queue_wait);
                 let conversion = Instant::now();
-                let transparent = frame.rgba.chunks_exact(4).any(|p| p[3] != 255);
+                let transparent = frame.gpu.as_ref().map_or_else(
+                    || frame.rgba.chunks_exact(4).any(|p| p[3] != 255),
+                    |gpu| !gpu.alpha().is_empty(),
+                );
                 let alpha = if use_video && transparent {
-                    frame.rgba.chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>()
+                    if let Some(gpu) = &frame.gpu {
+                        gpu.alpha().to_vec()
+                    } else {
+                        frame.rgba.chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>()
+                    }
                 } else {
                     vec![]
                 };
-                if transparent {
+                if transparent && !frame.straight {
                     for p in frame.rgba.chunks_exact_mut(4) {
                         let a = p[3] as u32;
                         if a == 255 {
@@ -254,13 +298,19 @@ impl Encoder {
                                 as u8;
                         }
                     }
+                    frame.straight = true;
                 }
                 metrics::record("unpremultiply", conversion.elapsed());
                 if use_video {
                     let session = sessions.get_mut(&frame.id).unwrap();
                     if let Some(encoder) = session.encoder.as_mut() {
                         let started = Instant::now();
-                        match encoder.encode(&frame.rgba, frame.sequence, session.force_idr) {
+                        let result = if let Some(gpu) = &mut frame.gpu {
+                            encoder.encode_gpu(gpu, frame.sequence, session.force_idr)
+                        } else {
+                            encoder.encode(&frame.rgba, frame.sequence, session.force_idr)
+                        };
+                        match result {
                             Ok((color, key)) => {
                                 session.force_idr = false;
                                 metrics::record("nvenc", started.elapsed());
@@ -305,9 +355,17 @@ impl Encoder {
                                 tracing::warn!(id=frame.id,%error,"NVENC failed; falling back to PNG");
                                 session.encoder = None;
                                 session.failed = true;
+                                if frame.gpu.is_some() {
+                                    frame.peer.disable_gpu(frame.id);
+                                }
                             }
                         }
                     }
+                }
+                if let Err(error) = frame.download_gpu() {
+                    frame.peer.disable_gpu(frame.id);
+                    tracing::warn!(id=frame.id,%error,"GPU readback fallback failed; requesting fresh CPU capture");
+                    continue;
                 }
                 let started = Instant::now();
                 if let Ok(png) = png(
@@ -337,15 +395,15 @@ impl Encoder {
         let (lock, wake) = &*self.queue;
         let mut q = lock.lock().unwrap();
         if let Some(old) = q.frames.remove(&frame.id) {
-            q.bytes -= old.rgba.len();
+            q.bytes -= old.memory_bytes();
         }
-        while q.bytes + frame.rgba.len() > 128 * 1024 * 1024 {
+        while q.bytes + frame.memory_bytes() > 128 * 1024 * 1024 {
             let Some((_, old)) = q.frames.pop_first() else {
                 return;
             };
-            q.bytes -= old.rgba.len();
+            q.bytes -= old.memory_bytes();
         }
-        q.bytes += frame.rgba.len();
+        q.bytes += frame.memory_bytes();
         q.frames.insert(frame.id, frame);
         wake.notify_one();
     }
@@ -353,7 +411,7 @@ impl Encoder {
         let (lock, wake) = &*self.queue;
         let mut q = lock.lock().unwrap();
         if let Some(frame) = q.frames.remove(&id) {
-            q.bytes -= frame.rgba.len();
+            q.bytes -= frame.memory_bytes();
         }
         q.forget.push(id);
         wake.notify_one();

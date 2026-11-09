@@ -10,7 +10,7 @@ Linux 应用在 Windows 上显示为独立原生窗口的开发原型。服务�
 - 鼠标、键盘、滚轮、焦点、关闭及真实应用尺寸调整。
 - 跟随 Windows 显示器 DPI 的应用绘制，Qt 分数缩放、菜单抓取与对话框父子关系。
 - Windows D3D11/DirectComposition 保留帧呈现和透明度合成；编码、解码在后台线程。
-- NVENC H.264 低延迟编码、Windows GPU 解码、独立越界菜单和有界尺寸缓存。
+- NVENC H.264 低延迟编码、可选 HEVC/AV1 与 CUDA GL 颜色输入、Windows GPU 解码、独立越界菜单和有界尺寸缓存。
 - Windows x64 和原生 ARM64 客户端构建。
 - 双向文本、PNG 图片剪贴板。
 - 双向文件复制粘贴，64 KiB 分块传输。

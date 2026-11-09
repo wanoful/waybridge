@@ -33,6 +33,8 @@ struct Queue {
     frames: BTreeMap<u32, VecDeque<QueuedFrame>>,
     png_only: BTreeSet<u32>,
     active_codec: BTreeMap<u32, waybridge_codec::Codec>,
+    gpu_disabled: BTreeSet<u32>,
+    gpu_refresh: BTreeSet<u32>,
     in_flight: BTreeMap<u32, BTreeMap<u64, std::time::Instant>>,
     closed_windows: BTreeSet<u32>,
     last_frame_id: u32,
@@ -125,6 +127,21 @@ impl Peer {
     pub fn supports(&self, codec: waybridge_codec::Codec, id: u32) -> bool {
         self.codecs.contains(&codec) && !self.queue.lock().unwrap().png_only.contains(&id)
     }
+    pub fn gpu_allowed(&self, id: u32) -> bool {
+        !self.queue.lock().unwrap().gpu_disabled.contains(&id)
+    }
+    pub fn disable_gpu(&self, id: u32) {
+        let mut q = self.queue.lock().unwrap();
+        if q.closed || q.closed_windows.contains(&id) {
+            return;
+        }
+        if q.gpu_disabled.insert(id) {
+            q.gpu_refresh.insert(id);
+        }
+    }
+    pub fn take_gpu_refresh(&self, id: u32) -> bool {
+        self.queue.lock().unwrap().gpu_refresh.remove(&id)
+    }
     pub fn video_ready(&self, id: u32) -> bool {
         let q = self.queue.lock().unwrap();
         !q.closed
@@ -191,6 +208,8 @@ impl Peer {
         q.frames.remove(&id);
         q.closed_windows.insert(id);
         q.active_codec.remove(&id);
+        q.gpu_disabled.remove(&id);
+        q.gpu_refresh.remove(&id);
         q.in_flight.remove(&id);
         q.resizes.remove(&id);
     }

@@ -100,7 +100,7 @@ def compositor(kind):
         token = "codec-test-" + "b" * 40
         token_file = Path(runtime) / "token"
         token_file.write_text(token); token_file.chmod(0o600)
-        host = subprocess.Popen([str(ROOT / "target/debug/waybridge"), "--listen", f"127.0.0.1:{port}", "--socket", "codec-0", "--token-file", str(token_file), "--codec", cli, "--stats"], env=env, stdout=log, stderr=log)
+        host = subprocess.Popen([str(ROOT / "target/debug/waybridge"), "--listen", f"127.0.0.1:{port}", "--socket", "codec-0", "--token-file", str(token_file), "--codec", cli, "--stats"]+(["--gpu-input", os.environ["WAYBRIDGE_GPU_INPUT"]] if os.getenv("WAYBRIDGE_GPU_INPUT") else []), env=env, stdout=log, stderr=log)
         app = viewer = None
         try:
             wait_socket(host, Path(runtime) / "codec-0")
@@ -157,6 +157,9 @@ def compositor(kind):
             recovered = viewer.video()
             assert recovered['key'] == 1 and recovered['epoch'] != previous
             check_alpha([recovered])
+            if os.getenv('WAYBRIDGE_REQUIRE_GPU') == '1':
+                trace = (ROOT / f"build/tests/codecs-{kind}.log").read_text()
+                assert 'input="cuda"' in trace and 'CUDA GL capture failed' not in trace, trace
             print(f"PASS: {capability} real compositor IDR/key + inter references, exact alpha, 2-credit pause/resume, codec-bound fallback, odd size and cached resize epochs, capability gating and reconnect")
         finally:
             if viewer:
@@ -174,7 +177,7 @@ def auto():
             free.bind(('127.0.0.1', 0)); port = free.getsockname()[1]
         token = 'auto-codec-' + 'c'*40
         file = Path(runtime)/'token'; file.write_text(token); file.chmod(0o600)
-        host = subprocess.Popen([str(ROOT/'target/debug/waybridge'), '--listen', f'127.0.0.1:{port}', '--socket', 'auto-0', '--token-file', str(file)], env=env, stdout=log, stderr=log)
+        host = subprocess.Popen([str(ROOT/'target/debug/waybridge'), '--listen', f'127.0.0.1:{port}', '--socket', 'auto-0', '--token-file', str(file)]+(['--gpu-input',os.environ['WAYBRIDGE_GPU_INPUT']] if os.getenv('WAYBRIDGE_GPU_INPUT') else []), env=env, stdout=log, stderr=log)
         app = viewer = None
         try:
             wait_socket(host, Path(runtime)/'auto-0')

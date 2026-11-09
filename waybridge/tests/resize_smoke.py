@@ -25,7 +25,7 @@ def main():
         token_path.write_text(token)
         token_path.chmod(0o600)
         binary = os.environ.get('WAYBRIDGE_HOST_BINARY', str(ROOT/'target/debug/waybridge'))
-        host = subprocess.Popen([binary, '--listen', f'127.0.0.1:{port}', '--socket', 'resize-0', '--token-file', str(token_path), '--codec', 'h264-nvenc', '--stats'], env=env, stdout=log, stderr=log)
+        host = subprocess.Popen([binary, '--listen', f'127.0.0.1:{port}', '--socket', 'resize-0', '--token-file', str(token_path), '--codec', 'h264-nvenc', '--stats']+(['--gpu-input',os.environ['WAYBRIDGE_GPU_INPUT']] if os.getenv('WAYBRIDGE_GPU_INPUT') else []), env=env, stdout=log, stderr=log)
         app = viewer = None
         try:
             end = time.monotonic()+10
@@ -77,6 +77,7 @@ def main():
             if os.environ.get('WAYBRIDGE_RESIZE_BASELINE')!='1':
                 trace=output.with_suffix('.log').read_text()
                 assert 'encoder_reuse' in trace and 'resize_first_sent' in trace
+                if os.getenv('WAYBRIDGE_REQUIRE_GPU')=='1': assert 'input="cuda"' in trace and 'CUDA GL capture failed' not in trace
             output.write_text(json.dumps({'binary':binary,'resizes':timings,'burst_first_frame_ms':burst_ms},indent=2)+'\n')
             times=[t['first_frame_ms'] for t in timings]
             print(f'PASS: 10 real NVENC size switches, fresh IDRs and intact P references/alpha; first={times[0]:.2f}ms, warm average={sum(times[1:])/len(times[1:]):.2f}ms; report={output}')

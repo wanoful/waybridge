@@ -47,6 +47,12 @@ unsupported formats and presentation errors all request this safe PNG fallback;
 reconnect creates fresh session state. There is no software codec fallback hidden
 behind an advertised GPU capability. HDR, P010 and 4:4:4 are not implemented here.
 
+`--gpu-input cuda` changes only server-local color capture/encoder input. Wire
+codec kinds, straight color semantics, independent lossless alpha, epoch/keyframe
+rules and two presentation credits do not change. Successful CUDA color input has
+no CPU color round trip; transparent alpha still reads back independently. GPU
+failure may send an independent PNG, then resume CPU NVENC under a fresh epoch.
+
 Server `popup`: `id`, `root` toplevel ID, `parent` surface ID (possibly another popup), `x`, `y` relative to the root's streamed client origin, logical `width`, `height`, and `scale`. Map to an owned top-level `WS_POPUP` without activation/taskbar entry, not a clipped `WS_CHILD`. Position uses the root client's Windows screen origin and DPI. Parent and popup sizes are independent. `window_closed` applies to either kind. `popup_grab` carries `root` and `active`; the viewer routes captured mouse input through the root while the Wayland popup grab is active. `popup_cancel` with root `id` dismisses the grab after native capture loss.
 
 Server `window_action`: `id`, `action` (`move`, `resize`, `minimize`, `maximize`, `restore`), optional `edge` using xdg_toplevel resize-edge values. These requests originate in the application's client-side title bar. Move/resize requests require a valid same-client pointer grab. The viewer runs the native Windows action. Its resulting geometry/state is sent back through `resize`.

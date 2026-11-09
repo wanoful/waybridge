@@ -12,7 +12,7 @@ Windows 客户端会移除旧服务端码流中的填充 NAL，避免已实测�
 
 **需要同时更新两端到 0.3.0。** 停止旧服务端，重新启动应用并复制新的 Windows `.exe`。协议已升级为 v3，连接端口和基本启动命令不变。客户端要求 Windows 10/11。已在 Snapdragon 8cx Gen 3 / Adreno 690 实机验证 ARM64 客户端硬解、纹理呈现及静止/动画不回退；实际输入到显示的端到端延迟尚未测量。Linux NVENC 比特流、透明度和参考帧连续性已在本机 NVIDIA 显卡上测试。
 
-Linux 仍存在同步 GPU 回读和 CPU→NVENC 输入拷贝；当前传输仍是 TCP/SSH，尚未接入 UDP/FEC 或 Sunshine/Moonlight 线协议。这是硬件媒体路径的第一版，不能据此承诺最终端到端延迟。
+默认 CPU 路径仍存在同步 GPU 回读和 CPU→NVENC 输入拷贝；当前传输仍是 TCP/SSH，尚未接入 UDP/FEC 或 Sunshine/Moonlight 线协议。这是硬件媒体路径的第一版，不能据此承诺最终端到端延迟。
 
 可用 `--codec hevc-nvenc` 或 `--codec av1-nvenc` 显式试用新编码；`auto` 仍使用
 H.264。两种新编码保留独立无损 alpha、尺寸 epoch、关键帧和两帧呈现确认。
@@ -27,6 +27,32 @@ PNG。系统解码器安装情况、GPU/驱动和尺寸能力会影响可用性�
 默认不指定 codec 时保持原 H.264 行为。Linux 可运行 `python tests/codecs_smoke.py`
 验证真实 NVENC、alpha、缓存尺寸切换、协商和回退；`python tests/windows_codecs_smoke.py`
 在私有 Wine/Xvfb 桌面验证未广告能力和安全 PNG 回退，不代替 Windows 硬解测试。
+
+## 可选 CUDA GL 颜色输入
+
+在同一 NVIDIA GPU 上，可用 `--gpu-input cuda` 显式启用 GL renderbuffer → CUDA
+→ NVENC 输入；默认 `cpu` 保持原路径。实现通过公开 GL framebuffer attachment
+查询取得资源，CUDA kernel 在 GPU 上反预乘并处理方向/奇数尺寸，再交给 FFmpeg
+CUDA RGBA 帧。成功路径不把颜色读回 CPU，也不从 CPU 上传颜色；仍有 GPU 内部
+复制、同步及 NVENC 色彩转换，因此不是整条管线零拷贝。
+
+透明窗口仍将无损 alpha 以每像素 1 字节读回 CPU 并压为 PNG；完全不透明时只读
+4 字节透明度标志，不回读整张 alpha。GL/CUDA 交接和 alpha 回读目前是同步的。
+PNG、弹出窗口和不支持的 codec/尺寸继续走 CPU。初始化/注册失败保留 CPU 输入；
+GPU 编码失败保留当前帧的 PNG，触发一次新的 CPU 捕获，并以新 epoch 的 CPU
+NVENC 关键帧恢复。每个查看会话/窗口发生失败后不再反复尝试 GPU 路径。
+
+正常构建仅在 `WAYBRIDGE_CUDA_ROOT`（默认 `/opt/cuda`）存在 CUDA 开发头文件及 GL 开发头文件时
+编入可选 interop；运行时动态加载系统 `libcuda.so.1`，不新增 libcudart/libnvrtc 运行依赖。
+缺失头文件的构建仍可正常运行，指定 `cuda` 时会记录原因并回退。PTX 来自仓库内
+kernel 源码，可用 `bash scripts/build-gpu-kernel.sh` 重新生成；预生成 PTX 需要
+兼容的 NVIDIA 驱动。此版仅支持 RGBA8 SDR，同 GPU 限制由 CUDA GL 查询校验。
+
+`python tests/gpu_smoke.py --benchmark` 检查真实 GL/CUDA/NVENC、每像素/alpha 和
+编码错误恢复，并输出 Release CPU/CUDA 对照到 `build/diagnostics/gpu-input-benchmark.json`。
+本机 RTX 5070 Ti 上，颜色输入及编码阶段在 1080p 从约 6.65/9.20 ms（不透明/透明）
+降到 1.67/2.40 ms；1440p 从约 10.80/15.35 ms 降到 2.40/3.37 ms。这些是本机
+合成测试的阶段耗时，不是物理输入到屏幕延迟，也不代表其他设备性能。
 
 ## 直接运行
 
@@ -153,7 +179,7 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 
 ## 当前边界与后续工作
 
-- 改进 GPU 直接送入编码器与异步回读，减少 CPU 往返；增加 UDP/FEC 和拥塞控制。
+- 扩展可选 CUDA GL 输入的驱动/多 GPU 兼容性与异步同步；增加 UDP/FEC 和拥塞控制。
 - 视频路径为 8-bit 4:2:0 SDR，彩色文字可能不如 PNG 清晰；默认 H.264，可选 HEVC/AV1 的 Windows 硬解仍需实机验证。4:4:4、HDR 和高刷新率仍需扩展、验证。
 - 每个视频顶层窗口使用一个 NVENC 会话；会话数量受硬件/驱动限制，不能分配时回退 PNG。视频包尺寸范围为 48×48 至 4096×2304，各 codec 的实际最小尺寸另受驱动限制，不支持时走 PNG。
 - 完善模态协议、窗口状态和光标/输入区域映射。

@@ -88,6 +88,7 @@ use std::{
     },
     path::PathBuf,
     process::{Child, Command},
+    rc::Rc,
     sync::{mpsc::SyncSender, Arc},
     time::{Duration, Instant},
 };
@@ -116,6 +117,9 @@ struct Args {
     /// Media codec. Auto remains H.264; HEVC/AV1 require explicit selection and viewer support.
     #[arg(long,default_value="auto",value_parser=["auto","png","h264-nvenc","hevc-nvenc","av1-nvenc"])]
     codec: String,
+    /// Color input path; CUDA GL interop is optional and requires the same NVIDIA GPU.
+    #[arg(long,default_value="cpu",value_parser=["cpu","cuda"])]
+    gpu_input: String,
     /// Per-stream video bitrate in kilobits/s.
     #[arg(long,default_value_t=30000,value_parser=clap::value_parser!(u32).range(1000..=200000))]
     bitrate: u32,
@@ -134,6 +138,7 @@ struct RemoteWindow {
     announced: bool,
     last_info: Value,
     frame_sequence: u64,
+    gpu_source: Option<waybridge_codec::GpuSource>,
     target: Option<GlesRenderbuffer>,
     target_size: (i32, i32),
     output: Output,
@@ -151,6 +156,7 @@ struct RemotePopup {
     dirty: bool,
     last_info: Value,
     sequence: u64,
+    gpu_source: Option<waybridge_codec::GpuSource>,
     target: Option<GlesRenderbuffer>,
     target_size: (i32, i32),
 }
@@ -158,6 +164,8 @@ struct RemotePopup {
 type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 
 struct App {
+    gpu_device: Option<Rc<waybridge_codec::GpuDevice>>,
+    video_codec: Option<waybridge_codec::Codec>,
     dh: DisplayHandle,
     compositor: CompositorState,
     shell: XdgShellState,
@@ -197,7 +205,30 @@ struct App {
     encoder: video::Encoder,
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // Unregister every GL resource while the renderer/context still exists.
+        let windows = &mut self.windows;
+        let popups = &mut self.remote_popups;
+        let _ = self.renderer.with_context(|_| {
+            windows.clear();
+            popups.clear();
+        });
+        self.windows.clear();
+        self.remote_popups.clear();
+        self.gpu_device.take();
+    }
+}
+
 impl App {
+    fn release_gpu_sources(&mut self) {
+        let windows = &mut self.windows;
+        let _ = self.renderer.with_context(|_| {
+            for window in windows {
+                window.gpu_source.take();
+            }
+        });
+    }
     fn control(&self, message: Value) {
         if let Some(peer) = &self.peer {
             peer.control(message);
@@ -864,6 +895,7 @@ impl App {
                 }
                 remote.last_info = info;
                 remote.announced = true;
+                remote.dirty |= peer.take_gpu_refresh(remote.id);
                 if remote.dirty {
                     remote.frame_sequence += 1;
                     let mut frame = capture_surface(
@@ -876,6 +908,12 @@ impl App {
                         &mut remote.target,
                         &mut remote.target_size,
                         peer.clone(),
+                        self.gpu_device.as_ref().filter(|_| {
+                            self.video_codec
+                                .is_some_and(|codec| peer.supports(codec, remote.id))
+                                && peer.gpu_allowed(remote.id)
+                        }),
+                        &mut remote.gpu_source,
                     )?;
                     frame.video_eligible = true;
                     self.encoder.submit(frame);
@@ -919,6 +957,8 @@ impl App {
                         &mut popup.target,
                         &mut popup.target_size,
                         peer.clone(),
+                        None,
+                        &mut popup.gpu_source,
                     )?;
                     self.encoder.submit(frame);
                 }
@@ -952,6 +992,8 @@ fn capture_surface(
     target: &mut Option<GlesRenderbuffer>,
     target_size: &mut (i32, i32),
     peer: Arc<Peer>,
+    gpu_device: Option<&Rc<waybridge_codec::GpuDevice>>,
+    gpu_source: &mut Option<waybridge_codec::GpuSource>,
 ) -> Result<video::Frame> {
     let size = bbox.size;
     let pixels = size.to_physical_precise_round(scale);
@@ -963,7 +1005,11 @@ fn capture_surface(
     {
         bail!("surface {id} exceeds render allocation limit");
     }
+    if gpu_device.is_none() && gpu_source.is_some() {
+        renderer.with_context(|_| drop(gpu_source.take()))?;
+    }
     if *target_size != (pixels.w, pixels.h) {
+        renderer.with_context(|_| drop(gpu_source.take()))?;
         *target = Some(renderer.create_buffer(Fourcc::Abgr8888, (pixels.w, pixels.h).into())?);
         *target_size = (pixels.w, pixels.h);
     }
@@ -979,13 +1025,85 @@ fn capture_surface(
         );
     let mut bound = renderer.bind(target.as_mut().unwrap())?;
     let damage = Rectangle::from_size(pixels);
+    let mut source_object = (0i32, 0i32);
     {
         let mut frame = renderer.render(&mut bound, pixels, Transform::Flipped180)?;
         frame.clear(Color32F::new(0., 0., 0., 0.), &[damage])?;
         draw_render_elements(&mut frame, scale, &elements, &[damage])?;
+        if gpu_device.is_some() {
+            frame.with_context(|gl| unsafe {
+                use smithay::backend::renderer::gles::ffi;
+                gl.GetFramebufferAttachmentParameteriv(
+                    ffi::FRAMEBUFFER,
+                    ffi::COLOR_ATTACHMENT0,
+                    ffi::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                    &mut source_object.0,
+                );
+                gl.GetFramebufferAttachmentParameteriv(
+                    ffi::FRAMEBUFFER,
+                    ffi::COLOR_ATTACHMENT0,
+                    ffi::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                    &mut source_object.1,
+                );
+            })?;
+        }
         frame.finish()?.wait()?;
     }
     metrics::record("composite", started.elapsed());
+    if let Some(device) = gpu_device.filter(|_| {
+        pixels.w >= 48
+            && pixels.h >= 48
+            && pixels.w <= 4096
+            && pixels.h <= 2304
+            && peer.gpu_allowed(id)
+    }) {
+        let started = Instant::now();
+        let result = renderer.with_context(|_| -> std::result::Result<_, String> {
+            if source_object.0 != smithay::backend::renderer::gles::ffi::RENDERBUFFER as i32
+                || source_object.1 <= 0
+            {
+                return Err("expected a public GL renderbuffer framebuffer attachment".into());
+            }
+            if gpu_source.is_none() {
+                *gpu_source = Some(waybridge_codec::GpuSource::new(
+                    device.clone(),
+                    source_object.1 as u32,
+                    pixels.w as u32,
+                    pixels.h as u32,
+                )?);
+                tracing::info!(
+                    id,
+                    width = pixels.w,
+                    height = pixels.h,
+                    "CUDA GL color input registered; independent alpha may still read back"
+                );
+            }
+            gpu_source.as_mut().unwrap().capture(true)
+        })?;
+        match result {
+            Ok(gpu) => {
+                metrics::record("gpu_capture", started.elapsed());
+                return Ok(video::Frame {
+                    id,
+                    width: pixels.w as u32,
+                    height: pixels.h as u32,
+                    sequence,
+                    geometry: [size.w, size.h, bbox.loc.x, bbox.loc.y],
+                    rgba: vec![],
+                    gpu: Some(gpu),
+                    straight: true,
+                    peer,
+                    video_eligible: false,
+                    enqueued: Instant::now(),
+                });
+            }
+            Err(error) => {
+                peer.disable_gpu(id);
+                renderer.with_context(|_| drop(gpu_source.take()))?;
+                tracing::warn!(id,%error,"CUDA GL capture failed; using CPU color path for this viewer/window");
+            }
+        }
+    }
     let started = Instant::now();
     let mapping = renderer.copy_framebuffer(
         &bound,
@@ -1013,6 +1131,8 @@ fn capture_surface(
         sequence,
         geometry: [size.w, size.h, bbox.loc.x, bbox.loc.y],
         rgba,
+        gpu: None,
+        straight: false,
         peer,
         video_eligible: false,
         enqueued: Instant::now(),
@@ -1175,6 +1295,7 @@ impl XdgShellHandler for App {
             announced: false,
             last_info: Value::Null,
             frame_sequence: 0,
+            gpu_source: None,
             target: None,
             target_size: (0, 0),
             output,
@@ -1219,6 +1340,7 @@ impl XdgShellHandler for App {
             dirty: true,
             last_info: Value::Null,
             sequence: 0,
+            gpu_source: None,
             target: None,
             target_size: (0, 0),
         });
@@ -1496,7 +1618,27 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| PathBuf::from(&runtime).join("waybridge.token"));
     let auth = token(&token_path)?;
-    let (renderer, render_node) = make_renderer(args.render_node.as_ref())?;
+    let (mut renderer, render_node) = make_renderer(args.render_node.as_ref())?;
+    let video_codec = match args.codec.as_str() {
+        "png" => None,
+        "hevc-nvenc" => Some(waybridge_codec::Codec::Hevc),
+        "av1-nvenc" => Some(waybridge_codec::Codec::Av1),
+        _ => Some(waybridge_codec::Codec::H264),
+    };
+    let gpu_device = if args.gpu_input == "cuda" && video_codec.is_some() {
+        match renderer.with_context(|_| waybridge_codec::GpuDevice::new())? {
+            Ok(device) => {
+                tracing::info!("CUDA GL color input available (opt-in)");
+                Some(device)
+            }
+            Err(error) => {
+                tracing::warn!(%error,"CUDA GL input unavailable; retaining CPU input");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut display = Display::<App>::new()?;
     let dh = display.handle();
     let socket = ListeningSocket::bind(&args.socket)
@@ -1552,6 +1694,8 @@ fn main() -> Result<()> {
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
     let mut app = App {
+        gpu_device,
+        video_codec,
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1588,16 +1732,7 @@ fn main() -> Result<()> {
         default_scale: 1.0,
         focused_window: None,
         last_interaction: None,
-        encoder: video::Encoder::new(
-            match args.codec.as_str() {
-                "png" => None,
-                "hevc-nvenc" => Some(waybridge_codec::Codec::Hevc),
-                "av1-nvenc" => Some(waybridge_codec::Codec::Av1),
-                _ => Some(waybridge_codec::Codec::H264),
-            },
-            args.fps,
-            args.bitrate,
-        ),
+        encoder: video::Encoder::new(video_codec, args.fps, args.bitrate),
     };
     let mut children: Vec<Child> = Vec::new();
     if let Some(program) = args.command.first() {
@@ -1652,6 +1787,7 @@ fn main() -> Result<()> {
                 }
                 Event::Message(value) => app.message(value),
                 Event::Disconnected => {
+                    app.release_gpu_sources();
                     app.release_input();
                     app.encoder.reset();
                     app.focus(None);

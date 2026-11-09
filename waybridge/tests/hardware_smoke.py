@@ -8,7 +8,14 @@ from smoke import ROOT
 class Viewer:
     def __init__(self,port,token,codec="h264_alpha",kind=2):
         self.kind=kind
-        self.control=socket.create_connection(('127.0.0.1',port),timeout=10)
+        deadline=time.monotonic()+10
+        while True:
+            try:
+                self.control=socket.create_connection(('127.0.0.1',port),timeout=10)
+                break
+            except ConnectionRefusedError:
+                if time.monotonic()>=deadline: raise
+                time.sleep(.02)
         self.send(type='hello',version=3,token=token,split_media=True,frame_ack=True,codecs=['png_rgba']+([codec] if isinstance(codec,str) else list(codec)))
         kind,hello=self.packet(self.control)
         assert kind==0 and hello['codec']=='mixed'
@@ -46,7 +53,8 @@ class Viewer:
             if check(kind,value):return value
         raise AssertionError('missing NVENC packet; see hardware-host.log')
     def video(self,ack=True):
-        body=self.until(lambda k,v:k==self.kind)
+        return self.parse_video(self.until(lambda k,v:k==self.kind),ack)
+    def parse_video(self,body,ack=True):
         id,w,h,seq,lw,lh,x,y,epoch,cw,ch,key,color,alpha=struct.unpack('>IIIQiiiiIIIIII',body[:60])
         assert len(body)==60+color+alpha
         if ack:self.send(type='frame_ack',id=id,sequence=seq)
@@ -55,7 +63,7 @@ class Viewer:
 
 def decoded(frames):
     w,h=frames[0]['cw'],frames[0]['ch']
-    data=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f',{2:'h264',4:'hevc',5:'obu'}[frames[0].get('kind',2)],'-i','pipe:0','-f','rawvideo','-pix_fmt','rgba','pipe:1'],input=b''.join(f['color'] for f in frames),capture_output=True,check=True,timeout=15).stdout
+    data=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-xerror','-f',{2:'h264',4:'hevc',5:'obu'}[frames[0].get('kind',2)],'-i','pipe:0','-f','rawvideo','-pix_fmt','rgba','-fps_mode','passthrough','pipe:1'],input=b''.join(f['color'] for f in frames),capture_output=True,check=True,timeout=15).stdout
     assert len(data)==len(frames)*w*h*4,(len(data),len(frames),w,h)
     image=Image.frombytes('RGBA',(w,h),data[-w*h*4:]).crop((0,0,frames[-1]['w'],frames[-1]['h']))
     image.putalpha(frames[-1]['alpha']);return image
@@ -66,7 +74,7 @@ def main():
         env={**os.environ,'XDG_RUNTIME_DIR':runtime,'WAYLAND_DISPLAY':'hw-0','WAYBRIDGE_FIXTURE_ALPHA':'1'}
         with socket.socket() as free:free.bind(('127.0.0.1',0));port=free.getsockname()[1]
         token='hardware-test-'+40*'4';token_path=Path(runtime)/'token';token_path.write_text(token);token_path.chmod(0o600)
-        host=subprocess.Popen([os.environ.get('WAYBRIDGE_HOST_BINARY',str(ROOT/'target/debug/waybridge')),'--listen',f'127.0.0.1:{port}','--socket','hw-0','--token-file',str(token_path),'--codec','h264-nvenc','--stats'],env=env,stdout=log,stderr=log)
+        host=subprocess.Popen([os.environ.get('WAYBRIDGE_HOST_BINARY',str(ROOT/'target/debug/waybridge')),'--listen',f'127.0.0.1:{port}','--socket','hw-0','--token-file',str(token_path),'--codec','h264-nvenc','--stats']+(['--gpu-input',os.environ['WAYBRIDGE_GPU_INPUT']] if os.getenv('WAYBRIDGE_GPU_INPUT') else []),env=env,stdout=log,stderr=log)
         app=None
         try:
             end=time.monotonic()+10
