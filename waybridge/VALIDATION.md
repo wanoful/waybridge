@@ -1,5 +1,13 @@
 # Validation — 2026-11-09
 
+Native cursor extension checks:
+
+- `tests/cursor_smoke.py` exercises a real wl_pointer fixture and the cursor-shape protocol: text/resize shapes, null and detached-surface hiding, premultiplied RGBA/alpha, 175%/125% DPI, nonzero and outside hotspots, animated surface commits without main-window damage, oversized output/source fallback, surface destruction, pointer/keyboard-focus independence, two-window switching, leave, reconnect and v3 opt-out.
+- `tests/windows_cursor_smoke.py` runs the real x64 viewer in a private Wine/Xvfb desktop. XFixes reads the displayed cursor image, verifying named system cursors, hidden state, custom RGBA dimensions/hotspots, animation, oversized fallback, outside-hotspot padding and non-client `WM_SETCURSOR` dispatch (native sizing cursor). The companion native probe exercises malformed/stale rejection, DPI scaling, and 500 cursor replacements without growth in GDI/USER resources.
+- Wine's X11 cursor conversion additionally premultiplies half-alpha cursor RGB (green 128 becomes 64). The Windows path retains the premultiplied bitmap required by [Microsoft's alpha-cursor example](https://learn.microsoft.com/windows/win32/menurc/using-cursors#creating-an-alpha-blended-cursor); actual Windows translucent-cursor appearance and multi-monitor DPI transitions still need physical-device validation. Wine also cannot use another process's HCURSOR with GetIconInfo, so cross-process visual checks use the private X server rather than assuming handles are transferable.
+- Cursor queues retain one latest update at each side, source/output bitmaps and custom handles are bounded, and animation is capped at 30 FPS. The Windows ARM64 LLVM-MinGW and x64 GNU clients build; Rust formatting, strict Clippy, unit tests, protocol/clipboard/file smoke, decoration checks and Qt DPI/input regression pass. The extension is optional within v3; older endpoints continue using the native default cursor.
+
+
 Maximize/restore resize checks:
 
 - The actual native FFmpeg/NVENC adapter measured roughly 101 ms to create a session and 70 ms to destroy one when alternating 960×640 / 2240×1400. Keeping both sizes and forcing independent SPS/PPS+IDR on reuse reduced warm first-frame encoding to about 3.1 ms. These adapter timings exclude capture, alpha and network processing.

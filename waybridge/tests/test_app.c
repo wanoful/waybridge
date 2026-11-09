@@ -120,6 +120,7 @@ static void released(void *data, struct wl_buffer *buffer) {
   free(p);
 }
 static const struct wl_buffer_listener buffer_listener = {.release = released};
+#include "cursor_fixture.h"
 static void draw(struct window *w) {
   int shadow = client_decorated ? 12 : 0;
   int width = w->width + shadow * 2, height = w->height + shadow * 2;
@@ -202,6 +203,8 @@ static void pointer_enter(void *data, struct wl_pointer *p, uint32_t s, struct w
   for (int i = 0; i < 2; i++)
     if (windows[i].surface == surface)
       pointer_window = &windows[i];
+  cursor_pointer = p; cursor_serial = s; cursor_mode = -1;
+  cursor_select(wl_fixed_to_double(x));
   pointer_x = wl_fixed_to_double(x);
   pointer_y = wl_fixed_to_double(y);
   printf("ENTER %.1f %.1f\n", wl_fixed_to_double(x), wl_fixed_to_double(y));
@@ -213,6 +216,7 @@ static void pointer_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_s
   (void)s;
   (void)surface;
   pointer_window = NULL;
+  cursor_mode = -1;
 }
 static void motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, wl_fixed_t y) {
   (void)d;
@@ -220,6 +224,7 @@ static void motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, wl_f
   (void)t;
   pointer_x = wl_fixed_to_double(x);
   pointer_y = wl_fixed_to_double(y);
+  cursor_select(wl_fixed_to_double(x));
   printf("MOTION %.1f %.1f\n", wl_fixed_to_double(x), wl_fixed_to_double(y));
   fflush(stdout);
 }
@@ -354,6 +359,8 @@ static const struct wl_seat_listener seat_listener = {.capabilities = capabiliti
 static void global(void *data, struct wl_registry *r, uint32_t name, const char *interface,
                    uint32_t version) {
   (void)data;
+  if (!strcmp(interface, "wp_cursor_shape_manager_v1"))
+    cursor_manager = wl_registry_bind(r, name, &wp_cursor_shape_manager_v1_interface, 1);
   if (!strcmp(interface, "wl_compositor"))
     compositor = wl_registry_bind(r, name, &wl_compositor_interface, version < 4 ? version : 4);
   if (!strcmp(interface, "wl_shm"))
