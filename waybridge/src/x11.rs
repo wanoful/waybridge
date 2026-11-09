@@ -293,19 +293,7 @@ impl App {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let output = Output::new(
-            format!("Waybridge-X11-{id}"),
-            self.output.physical_properties(),
-        );
-        let global = output.create_global::<App>(&self.dh);
-        let mode = self.output.current_mode().unwrap();
-        output.change_current_state(
-            Some(mode),
-            None,
-            Some(Scale::Fractional(self.default_scale)),
-            Some((0, 0).into()),
-        );
-        output.set_preferred(mode);
+        let output = self.output.clone();
         if let Some(surface) = surface.wl_surface() {
             set_surface_scale(&surface, &output, self.default_scale);
         }
@@ -327,7 +315,7 @@ impl App {
             target: None,
             target_size: (0, 0),
             output,
-            output_global: global,
+            output_global: None,
             scale: self.default_scale,
             mapped,
             work_area: Rectangle::from_size((3840, 2160).into()),
@@ -389,7 +377,9 @@ impl App {
             self.focus(None);
         }
         let remote = self.windows.remove(index);
-        self.dh.remove_global::<App>(remote.output_global);
+        if let Some(global) = remote.output_global {
+            self.dh.remove_global::<App>(global);
+        }
         self.encoder.forget(id);
         if let Some(peer) = &self.peer {
             peer.forget_window(id);

@@ -247,6 +247,7 @@ impl App {
         };
         let Some(top) = window.toplevel() else { return };
         let surface = top.wl_surface().clone();
+        self.window_drag.unmap(&surface);
         self.reparent_children(&surface, top.parent());
         with_states(&surface, |states| {
             let mut role = states
@@ -269,7 +270,7 @@ impl App {
         if self.focused_window == Some(id) {
             self.focus(None);
         }
-        if self.pointer_window == Some(id) {
+        if self.pointer_window == Some(id) && !self.window_drag.active() {
             self.pointer_window = None;
             let pointer = self.seat.get_pointer().unwrap();
             pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), self.time());

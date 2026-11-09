@@ -94,6 +94,7 @@ pub struct Session {
     bus: Option<Child>,
     address: Option<String>,
     saved: Option<(PathBuf, u64, u64)>,
+    keyring: Option<crate::keyring::Bridge>,
 }
 impl Session {
     pub fn new(socket: &str, display: Option<u32>, audio: Option<&audio::Session>) -> Result<Self> {
@@ -103,6 +104,7 @@ impl Session {
             bus: None,
             address: None,
             saved: None,
+            keyring: None,
         };
         if available("dbus-daemon") {
             let mut command = Command::new("dbus-daemon");
@@ -121,6 +123,10 @@ impl Session {
                 bail!("private D-Bus daemon returned no Unix address");
             }
             session.address = Some(address.trim().into());
+            match crate::keyring::Bridge::new(session.address.as_deref().unwrap()) {
+                Ok(bridge) => session.keyring = bridge,
+                Err(error) => tracing::warn!(%error, "host keyring bridge unavailable"),
+            }
         } else {
             tracing::warn!(
                 "dbus-daemon unavailable; applications cannot share a private session bus"
@@ -155,9 +161,15 @@ impl Session {
         command
             .env("WAYLAND_DISPLAY", &self.socket)
             .env("XDG_SESSION_TYPE", "wayland")
-            .env("XDG_CURRENT_DESKTOP", "Waybridge")
+            .env(
+                "XDG_CURRENT_DESKTOP",
+                self.keyring.as_ref().map_or("Waybridge", |b| b.desktop()),
+            )
             .env("QT_QPA_PLATFORM", "wayland;xcb")
             .env("GDK_BACKEND", "wayland,x11");
+        if let Some(version) = self.keyring.as_ref().and_then(|b| b.kde_version()) {
+            command.env("KDE_SESSION_VERSION", version);
+        }
         for name in [
             "XDG_RUNTIME_DIR",
             "XDG_CONFIG_HOME",
@@ -200,6 +212,7 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
+        self.keyring.take();
         if let Some((path, dev, ino)) = &self.saved {
             if fs::symlink_metadata(path).is_ok_and(|m| m.dev() == *dev && m.ino() == *ino) {
                 let _ = fs::remove_file(path);

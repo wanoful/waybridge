@@ -15,6 +15,12 @@ python tests/drag_out_smoke.py
 python tests/tree_smoke.py
 python tests/decorations_smoke.py
 python tests/window_semantics_smoke.py
+if command -v Xwayland >/dev/null && command -v xrandr >/dev/null && pkg-config --atleast-version=3.4 glfw3 && pkg-config --exists gl; then
+  python tests/x11_pointer_smoke.py
+fi
+if command -v google-chrome-stable >/dev/null; then
+  python tests/chrome_drag_smoke.py
+fi
 
 python tests/qt_smoke.py
 python tests/ime_smoke.py

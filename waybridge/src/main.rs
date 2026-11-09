@@ -7,12 +7,14 @@ mod cursor;
 mod drag;
 mod file_tree;
 mod ime;
+mod keyring;
 mod launch;
 mod metrics;
 mod network;
 mod protocol;
 mod relative_input;
 mod shutdown;
+mod toplevel_drag;
 mod transfer;
 mod udp;
 mod video;
@@ -194,7 +196,7 @@ struct RemoteWindow {
     target: Option<GlesRenderbuffer>,
     target_size: (i32, i32),
     output: Output,
-    output_global: GlobalId,
+    output_global: Option<GlobalId>,
     scale: f64,
     mapped: bool,
     work_area: Rectangle<i32, Logical>,
@@ -246,6 +248,7 @@ struct App {
     drag_enabled: bool,
     next_drag: u64,
     outbound: Option<OutboundDrag>,
+    window_drag: toplevel_drag::State,
     dh: DisplayHandle,
     compositor: CompositorState,
     x11: x11::State,
@@ -333,6 +336,9 @@ impl App {
     }
 
     fn focus(&mut self, id: Option<u32>) {
+        if self.window_drag.defer_focus(id) {
+            return;
+        }
         // Native OLE capture/focus changes must not cancel the Wayland source.
         if self.external_drag_input() {
             if let Some(drag) = &mut self.outbound {
@@ -445,6 +451,11 @@ impl App {
         for popup in self.remote_popups.iter_mut().filter(|p| p.root == id) {
             popup.dirty = true;
         }
+        if remote.window.is_x11() {
+            // X11 shares a RandR desktop. Resample this stream without changing
+            // the shared output or its DPI when one native window changes size.
+            return;
+        }
         remote
             .output
             .change_current_state(mode, None, Some(Scale::Fractional(scale)), None);
@@ -473,6 +484,21 @@ impl App {
     fn pointer_motion(&mut self, id: u32, x: f64, y: f64) {
         self.sync_pointer_lock();
         if self.pointer_locked() {
+            return;
+        }
+        if id == 0 && self.window_drag.active() {
+            self.pointer_window = None;
+            let pointer = self.seat.get_pointer().unwrap();
+            pointer.motion(
+                self,
+                None,
+                &MotionEvent {
+                    location: (x, y).into(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: self.time(),
+                },
+            );
+            pointer.frame(self);
             return;
         }
         if !self.input_allowed(id) || !x.is_finite() || !y.is_finite() {
@@ -527,6 +553,7 @@ impl App {
         if self.pointer_window != Some(id) {
             self.cursor.dirty = true;
         }
+        hit = hit.filter(|(surface, _)| !self.window_drag.excludes(surface));
         self.relative_hit(hit.clone());
         self.pointer_window = Some(id);
         let pointer = self.seat.get_pointer().unwrap();
@@ -908,6 +935,7 @@ impl App {
             }
             "ping" => self.control(json!({"type":"pong","nonce":value["nonce"]})),
             "hello" => {
+                self.window_drag.available = value["toplevel_drag_v1"].as_bool().unwrap_or(false);
                 self.relative_available(value["pointer_lock"].as_bool().unwrap_or(false));
                 self.drag_enabled = value["file_drop_out"].as_bool().unwrap_or(false);
                 self.default_scale = dpi_scale(&value);
@@ -933,6 +961,7 @@ impl App {
             "pointer" if !self.external_drag_input() => self.pointer_message(id, &value),
             "relative_pointer" if !self.external_drag_input() => self.relative_motion(id, &value),
             "pointer_lock_ack" => self.pointer_lock_ack(id, &value),
+            "toplevel_drag_cancel" => self.cancel_window_drag(),
             "leave"
                 if self.pointer_window == Some(id)
                     && !self.pointer_locked()
@@ -953,7 +982,10 @@ impl App {
                 );
                 p.frame(self);
             }
-            "button" if self.input_allowed(id) && !self.external_drag_input() => {
+            "button"
+                if (self.input_allowed(id) || self.window_drag.active())
+                    && !self.external_drag_input() =>
+            {
                 if value["x"].is_number() && value["y"].is_number() {
                     self.pointer_message(id, &value);
                 }
@@ -1384,7 +1416,9 @@ impl App {
                 self.focus(parent);
             }
             if let Some(remote) = self.windows.iter().find(|w| w.id == id) {
-                self.dh.remove_global::<App>(remote.output_global.clone());
+                if let Some(global) = &remote.output_global {
+                    self.dh.remove_global::<App>(global.clone());
+                }
             }
             self.windows.retain(|w| w.id != id);
             self.icons.forget(id);
@@ -1912,9 +1946,10 @@ impl XdgDecorationHandler for App {
     fn new_decoration(&mut self, surface: ToplevelSurface) {
         self.request_mode(surface, DecorationMode::ServerSide);
     }
-    fn request_mode(&mut self, surface: ToplevelSurface, _: DecorationMode) {
-        // The actual server-side decoration is drawn by the native Windows client.
-        surface.with_pending_state(|s| s.decoration_mode = Some(DecorationMode::ServerSide));
+    fn request_mode(&mut self, surface: ToplevelSurface, mode: DecorationMode) {
+        // Chrome explicitly asks to keep its own tab-strip/window controls.
+        // Server decoration remains the default for applications requesting it.
+        surface.with_pending_state(|s| s.decoration_mode = Some(mode));
         surface.send_pending_configure();
     }
     fn unset_mode(&mut self, surface: ToplevelSurface) {
@@ -2023,7 +2058,12 @@ impl CompositorHandler for App {
                     top.send_configure();
                 }
             }
-            set_surface_scale(surface, &remote.output, remote.scale);
+            let density = if remote.window.is_x11() {
+                self.default_scale
+            } else {
+                remote.scale
+            };
+            set_surface_scale(surface, &remote.output, density);
         }
         if let Some(id) = unmapped {
             self.unmap_toplevel(id);
@@ -2053,7 +2093,14 @@ impl DmabufHandler for App {
         }
     }
 }
-impl OutputHandler for App {}
+impl OutputHandler for App {
+    fn can_view_output(client: &Client, output: &Output) -> bool {
+        output.name() == "Waybridge"
+            || client
+                .get_data::<smithay::xwayland::XWaylandClientData>()
+                .is_none()
+    }
+}
 impl XdgShellHandler for App {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.shell
@@ -2106,7 +2153,7 @@ impl XdgShellHandler for App {
             target: None,
             target_size: (0, 0),
             output,
-            output_global,
+            output_global: Some(output_global),
             scale: window_scale,
             mapped: false,
             work_area: Rectangle::from_size((3840, 2160).into()),
@@ -2394,7 +2441,19 @@ impl DataControlHandler for App {
     }
 }
 impl ClientDndGrabHandler for App {
+    fn send_drop_performed(&mut self, source: &WlDataSource, validated: bool) -> bool {
+        validated || self.window_drag.completes_move(source)
+    }
     fn started(&mut self, source: Option<WlDataSource>, _: Option<WlSurface>, _: Seat<Self>) {
+        let internal = source.as_ref().is_some_and(|s| {
+            self.window_drag.is_toplevel_source(s)
+                || with_source_metadata(s, |m| !m.mime_types.iter().any(|s| s == "text/uri-list"))
+                    .unwrap_or(false)
+        });
+        if internal {
+            self.start_window_drag(source);
+            return;
+        }
         if !self.drag_enabled
             || self.outbound.is_some()
             || self.drag_surface.is_none()
@@ -2442,6 +2501,7 @@ impl ClientDndGrabHandler for App {
         });
     }
     fn dropped(&mut self, _: Option<WlSurface>, validated: bool, _: Seat<Self>) {
+        self.window_drag.ended();
         if let Some(drag) = &self.outbound {
             if !drag.dropped && (!drag.external || !validated) {
                 self.end_outbound(false);
@@ -2717,6 +2777,7 @@ fn main() -> Result<()> {
         drag_enabled: false,
         next_drag: 0,
         outbound: None,
+        window_drag: toplevel_drag::State::default(),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -2756,6 +2817,7 @@ fn main() -> Result<()> {
         last_interaction: None,
         encoder: video::Encoder::new(video_codec, args.fps, args.bitrate),
     };
+    toplevel_drag::State::register(&app.dh);
     let (sink_server, sink_client) = UnixStream::pair()?;
     app.dh.insert_client(
         sink_server,
@@ -2804,6 +2866,7 @@ fn main() -> Result<()> {
                 .insert_client(stream, Arc::new(ClientState::default()))?;
         }
         display.dispatch_clients(&mut app)?;
+        app.poll_window_drag();
         app.sync_pointer_lock();
         app.pump_outbound()?;
         app.finish_file_drop();
@@ -2885,6 +2948,9 @@ fn main() -> Result<()> {
                     }
                 }
                 Event::Disconnected => {
+                    app.cancel_window_drag();
+                    app.poll_window_drag();
+                    app.window_drag.available = false;
                     app.release_gpu_sources();
                     if let Some(audio) = &app.audio {
                         audio.set_peer(None);
@@ -3000,7 +3066,13 @@ impl FractionalScaleHandler for App {
             .windows
             .iter()
             .find(|w| w.window.wl_surface().as_deref() == Some(&root))
-            .map_or(self.default_scale, |w| w.scale);
+            .map_or(self.default_scale, |w| {
+                if w.window.is_x11() {
+                    self.default_scale
+                } else {
+                    w.scale
+                }
+            });
         with_states(&surface, |s| {
             with_fractional_scale(s, |f| f.set_preferred_scale(scale))
         });
@@ -3043,12 +3115,14 @@ impl App {
 impl App {
     fn update_viewport(&mut self, id: u32, value: &Value) {
         if let Some(remote) = self.windows.iter_mut().find(|w| w.id == id) {
-            remote.output.change_current_state(
-                monitor_mode(value, remote.output.current_mode().unwrap().refresh),
-                None,
-                None,
-                None,
-            );
+            if !remote.window.is_x11() {
+                remote.output.change_current_state(
+                    monitor_mode(value, remote.output.current_mode().unwrap().refresh),
+                    None,
+                    None,
+                    None,
+                );
+            }
             if let (Some(x), Some(y), Some(w), Some(h)) = (
                 value["work_x"].as_i64(),
                 value["work_y"].as_i64(),

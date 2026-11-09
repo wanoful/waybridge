@@ -124,6 +124,12 @@ pub trait DataDeviceHandler: Sized + SelectionHandler + ClientDndGrabHandler + S
 /// Events that are generated during client initiated drag'n'drop
 #[allow(unused_variables)]
 pub trait ClientDndGrabHandler: SeatHandler + Sized {
+    /// Whether to send drop_performed before cancellation for an unaccepted drop.
+    /// A toplevel drag can finish its window move without accepting a data offer.
+    fn send_drop_performed(&mut self, source: &WlDataSource, validated: bool) -> bool {
+        validated
+    }
+
     /// A client started a drag'n'drop as response to a user pointer action
     ///
     /// * `source` - The data source provided by the client.

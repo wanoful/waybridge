@@ -61,6 +61,8 @@ TCP 协议自身不加密，默认使用本地监听和 SSH 隧道；可选 UDP 
 
 自定义 socket 的会话同时指定 `--socket <名称>`。`--launch` 读取服务端写入的 0600 权限会话描述文件，自动带上私有 DISPLAY、Wayland、D-Bus 和音频环境，并清除宿主 fcitx/ibus 覆盖；不会修改宿主环境。过期描述会被拒绝，服务端正常退出时移除。不要仅设置 `WAYLAND_DISPLAY` 后直接在外部 SSH 启动应用，这会绕过会话的输入法、音频和 D-Bus 设置。已有 KWin 窗口不会迁移到这个会话。
 
+私有 D-Bus 会话自动桥接宿主可用的 KWallet/Secret Service 名称，应用可继续使用原有密钥存储；其他宿主 GUI 服务仍不共享。桥接保留每个应用的独立连接和加密会话，不记录消息正文，不修改 Chrome profile 或密码存储参数。Chrome 已有登录能否恢复还取决于原密钥是否可解锁、Cookie 是否有效；被锁的钱包仍可能在 Linux 宿主弹出解锁提示。宿主已经运行的同 profile Chrome 仍会接管启动命令，此时需关闭原进程或使用独立 profile。
+
 正常启动 `./target/release/waybridge -- ghostty` 会自动启用已安装的 Xwayland，以及可用的私有音频 sink。`--no-xwayland` / `--no-audio` 可分别关闭；`--xwayland` / `--audio` 则要求该功能初始化成功，失败时直接报错。可选功能不可用时默认保留原生 Wayland 窗口。
 
 可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc|hevc-nvenc|av1-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
@@ -70,6 +72,8 @@ TCP 协议自身不加密，默认使用本地监听和 SSH 隧道；可选 UDP 
 光标、XDG 应用图标和窗口语义按 v3 能力自动协商。支持系统形状、隐藏、自定义/动画光标及 DPI 热点；自定义动画独立于窗口画面，最多 30 FPS。应用 PNG/SVG 图标在后台解析为 Windows 大小图标，找不到时使用默认图标；不执行 desktop 文件中的 Exec。
 
 已实现真正的 xdg-dialog 模态提示、动态 owner、最小/最大尺寸、全屏恢复、unmap/remap 与隐藏/最小化后的 suspended/低频回调。仅有 parent 关系不代表模态。输入区域与视觉透明度分别映射；排除的客户区像素使用 `HTTRANSPARENT`，只保证同一 UI 线程中的 Waybridge 窗口间穿透，不能点穿到其他进程或桌面。未实现 KDE 毛玻璃。
+
+尊重 `xdg-decoration` 的客户端/服务端请求，Chrome 自绘标签栏时不再叠加 Windows 标题栏。原生 Wayland Chrome 支持 `xdg-toplevel-drag-v1`：标签可拖出成独立 Windows 窗口、拖回另一个窗口合并，Esc 取消。拖拽期间保持 Wayland data-device grab，按本地窗口遮挡和实际画面坐标选择目标；拖动中的窗口不参与目标命中。需要更新并重启两端，应用启动时发现新的 Wayland 接口；显式 X11 Chrome 的 XDND 路径尚未实现。
 
 ## 相对鼠标与指针锁定
 
@@ -99,7 +103,7 @@ Linux 安装 `pactl` 和 `parec` 并有可用 PulseAudio/PipeWire-Pulse 时，�
 
 ## 可选 X11 应用
 
-安装 `Xwayland` 后默认自动启用。Java/JavaFX、默认 X11 后端的 Chrome 等应用可直接从会话终端或 `--launch` 启动。例如在独立端口和 socket 强制要求 X11：
+安装 `Xwayland` 后默认自动启用。Java/JavaFX、选择 X11 后端的 Chrome 等应用可直接从会话终端或 `--launch` 启动。例如在独立端口和 socket 强制要求 X11：
 
 ```bash
 ./target/release/waybridge --xwayland \
@@ -119,6 +123,8 @@ WAYLAND_DISPLAY=waybridge-x11 QT_QPA_PLATFORM=wayland ./build/tests/qt-app
 已接入独立顶层窗口、transient owner、无边框 override-redirect 菜单/嵌套菜单、原生移动后的点击路由、resize/关闭、键盘焦点、文本/PNG/URI 剪贴板及大文本 INCR。X11 菜单在 Windows 捕获鼠标时仍能越出父窗口，Tooltip 不建立输入捕获。剪贴板按代际丢弃过时读取，缓存写出最多 16 worker、每次最多 10 秒。
 
 Xft/DPI 和 X11 客户端密度为这个 X 服务器共享，初始跟随 Windows 连接 DPI；各 Windows 窗口的呈现仍独立缩放。实测 Qt/XCB 在 175% 创建 1680×1120 画面，改成 125% 呈现为 1000×625，但应用共享 Xft 密度仍为 175%。忽略 Xft/DPI 的旧软件可能需要应用自己的字体设置。X11 resize 仍由应用自行布局，不能等同原生 Wayland 的逐窗口密度协议。
+
+所有 X11 窗口共用一个稳定的 RandR 输出，原生 Wayland 的逐窗口输出对 Xwayland 隐藏。调整 MC 等单个窗口的尺寸/呈现 DPI 或关闭游戏，不再创建、移除或缩放整个 X11 会话的显示器；真实 GLFW 回归覆盖缩放后菜单坐标，以及禁用光标的游戏窗口关闭后再次点击启动器。
 
 当前 X11 子集不含 PRIMARY、XDND 文件拖放桥、XIM/Windows IME、完整 EWMH fullscreen/尺寸提示及自动 Xwayland 崩溃重启。崩溃/关闭 X11 应用不会关闭其余 Wayland 窗口；正常退出/SIGINT/SIGTERM 回收私有 X socket 和锁。可以与本版的原生 Wayland、音频和媒体功能共用会话。
 
@@ -256,6 +262,8 @@ python tests/session_integration_smoke.py
 | 相对鼠标 | `relative_smoke`、`windows_relative_smoke` |
 | 原生拖出/目录/虚拟源 | `drag_out_smoke`、`tree_smoke`、`windows_drag_out_smoke`（可加 `--tree`）、`windows_virtual_smoke` |
 | X11/GLX/剪贴板 | `x11_smoke`、`x11_clipboard_smoke` |
+| 游戏式 X11 缩放/点击、稳定 RandR | `x11_pointer_smoke`（需要 GLFW ≥3.4、GL、xrandr） |
+| Chrome 标签拆分/合并/取消 | `chrome_drag_smoke`、`windows_chrome_smoke`（独立测试 profile） |
 | PCM/WASAPI | `audio_smoke`、`windows_audio_smoke` |
 | 真实 NVENC/缓存/回退 | `hardware_smoke`、`codecs_smoke`、`resize_smoke`、`windows_codecs_smoke` |
 | CUDA 与故障恢复 | `gpu_window_lifecycle_smoke`、`gpu_smoke --binary target/debug/waybridge`；Release 对照使用 `--benchmark` |

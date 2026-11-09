@@ -160,6 +160,12 @@ std::unique_ptr<ImageDecoder> iconDecoder;
 bool semanticsNegotiated = false;
 void reconcileWindows();
 RelativeInput relativeInput;
+struct WindowDrag {
+  bool active = false, released = false, cancelled = false;
+  uint32_t source = 0, attached = 0, target = 0;
+  int offsetX = 0, offsetY = 0;
+} windowDrag;
+constexpr UINT_PTR WindowDragTimer = 5;
 
 DWORD windowStyle(bool clientDecorated) {
   // Client-decorated applications already supply their own title bar and controls.
@@ -1215,6 +1221,88 @@ void pointer(RemoteWindow *w, LPARAM param) {
             {"origin_x", w->originX},
             {"origin_y", w->originY}});
 }
+RemoteWindow *windowDragTarget(POINT point) {
+  struct Search { POINT point; RemoteWindow *target = nullptr; } search{point};
+  EnumWindows([](HWND hwnd, LPARAM data) -> BOOL {
+    auto &s = *reinterpret_cast<Search *>(data);
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || hwnd == controller)
+      return TRUE;
+    auto dragged = windows.find(windowDrag.attached);
+    if (dragged != windows.end() && hwnd == dragged->second->hwnd)
+      return TRUE;
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect) || !PtInRect(&rect, s.point))
+      return TRUE;
+    for (auto &[id, window] : windows) {
+      if (window->hwnd != hwnd) continue;
+      POINT local = s.point;
+      ScreenToClient(hwnd, &local);
+      RECT image = imageRect(window.get());
+      if (PtInRect(&image, local)) s.target = window.get();
+      break;
+    }
+    return FALSE; // Another local application's window occludes the remote target.
+  }, reinterpret_cast<LPARAM>(&search));
+  return search.target;
+}
+void moveDraggedWindow() {
+  auto found = windows.find(windowDrag.attached);
+  if (!windowDrag.active || windowDrag.released || found == windows.end()) return;
+  auto *w = found->second.get();
+  POINT cursor{};
+  if (!GetCursorPos(&cursor)) return;
+  POINT client{0, 0};
+  ClientToScreen(w->hwnd, &client);
+  RECT outer{};
+  GetWindowRect(w->hwnd, &outer);
+  SetWindowPos(w->hwnd, nullptr,
+               cursor.x - MulDiv(windowDrag.offsetX, w->dpi, 96) - (client.x - outer.left),
+               cursor.y - MulDiv(windowDrag.offsetY, w->dpi, 96) - (client.y - outer.top),
+               0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+void sendWindowDragMotion(bool release = false) {
+  if (!windowDrag.active || windowDrag.released) return;
+  moveDraggedWindow();
+  POINT point{};
+  if (!GetCursorPos(&point)) return;
+  auto *target = windowDragTarget(point);
+  Json motion = {{"type", "pointer"}, {"id", 0}, {"x", 0}, {"y", 0}};
+  windowDrag.target = target ? target->id : 0;
+  if (target) {
+    ScreenToClient(target->hwnd, &point);
+    RECT r = imageRect(target);
+    motion["id"] = target->id;
+    motion["x"] = double(point.x - r.left) * target->width / (r.right - r.left);
+    motion["y"] = double(point.y - r.top) * target->height / (r.bottom - r.top);
+    motion["origin_x"] = target->originX;
+    motion["origin_y"] = target->originY;
+  }
+  sendJson(motion);
+  if (release) {
+    motion["type"] = "button";
+    motion["button"] = 0x110;
+    motion["down"] = false;
+    sendJson(motion);
+    windowDrag.released = true;
+  }
+}
+void cancelWindowDrag() {
+  if (!windowDrag.active || windowDrag.cancelled) return;
+  windowDrag.cancelled = true;
+  windowDrag.released = true;
+  sendJson({{"type", "toplevel_drag_cancel"}});
+}
+void endWindowDrag() {
+  if (!windowDrag.active) return;
+  auto target = windowDrag.attached ? windowDrag.attached : windowDrag.target;
+  bool cancelled = windowDrag.cancelled;
+  windowDrag = {};
+  KillTimer(controller, WindowDragTimer);
+  if (GetCapture() == controller) ReleaseCapture();
+  auto found = windows.find(target);
+  if (!cancelled && found != windows.end() && IsWindowVisible(found->second->hwnd))
+    SetForegroundWindow(found->second->hwnd);
+}
 uint32_t linuxKey(LPARAM param, UINT virtualKey = 0) {
   uint32_t code = (param >> 16) & 0xff;
   bool extended = (param & (1LL << 24)) != 0;
@@ -1894,6 +1982,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_MOUSEMOVE:
+    if (windowDrag.active) { sendWindowDragMotion(); return 0; }
     if (relativeInput.active(hwnd))
       return 0;
     FileDrag::maybeClaim();
@@ -1916,7 +2005,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     // A captured root may receive this after a motion has already entered an
     // overflowing popup. Captured motion supplies the real Wayland hit test;
     // forwarding the stale leave can clear the pressed menu item before up.
-    if (grabbedRoot) return 0;
+    if (grabbedRoot || windowDrag.active) return 0;
     sendJson({{"type", "leave"}, {"id", w->id}});
     return 0;
   case WM_DROPFILES: {
@@ -1953,6 +2042,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_LBUTTONUP:
   case WM_RBUTTONUP:
   case WM_MBUTTONUP: {
+    if (windowDrag.active) {
+      if (message == WM_LBUTTONUP) sendWindowDragMotion(true);
+      return 0;
+    }
     if (FileDrag::ownsInput()) {
       if (message == WM_LBUTTONUP) {
         FileDrag::releasedBeforeStart();
@@ -1989,6 +2082,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   }
   case WM_KEYDOWN:
+    if (windowDrag.active && wp == VK_ESCAPE) { cancelWindowDrag(); return 0; }
     if (wp == VK_ESCAPE && VirtualFiles::synchronousWaits) {
       VirtualFiles::cancelDrops();
       return 0;
@@ -2093,6 +2187,20 @@ void dispatchNetwork() {
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
+    } else if (type == "toplevel_drag") {
+      if (!m.value("active", false)) { endWindowDrag(); continue; }
+      if (!windowDrag.active) {
+        releasePointer();
+        windowDrag = {};
+        windowDrag.active = true;
+        SetCapture(controller);
+        SetTimer(controller, WindowDragTimer, 10, nullptr);
+      }
+      windowDrag.source = m.value("source", 0u);
+      windowDrag.attached = m.value("id", 0u);
+      windowDrag.offsetX = m.value("offset_x", 0);
+      windowDrag.offsetY = m.value("offset_y", 0);
+      sendWindowDragMotion(!(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
     } else if (type == "window_icon" && iconsNegotiated) {
       if (!m.contains("id") || !m.at("id").is_number_unsigned() || m.at("id").get<uint64_t>() > UINT32_MAX) continue;
       auto found = windows.find(m.at("id").get<uint32_t>());
@@ -2429,17 +2537,30 @@ void dispatchNetwork() {
     if (!w->shown) {
       w->shown = true;
       if (w->state.mapped)
-        ShowWindow(w->hwnd, w->popup ? SW_SHOWNOACTIVATE : SW_SHOW);
+        ShowWindow(w->hwnd, w->popup || windowDrag.active ? SW_SHOWNOACTIVATE : SW_SHOW);
       reconcileWindows();
       sendWindowState(w);
       if (!w->popup && grabbedRoot == w->id)
         SetCapture(w->hwnd);
     }
   }
+  moveDraggedWindow();
   updateIme();
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
+    if (windowDrag.active) {
+      if (message == WM_MOUSEMOVE) { sendWindowDragMotion(); return 0; }
+      if (message == WM_LBUTTONUP) { sendWindowDragMotion(true); return 0; }
+      if (message == WM_CANCELMODE || (message == WM_CAPTURECHANGED && reinterpret_cast<HWND>(lp) != hwnd)) {
+        cancelWindowDrag(); return 0;
+      }
+      if (message == WM_TIMER && wp == WindowDragTimer) {
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) cancelWindowDrag();
+        else sendWindowDragMotion(!(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
+        return 0;
+      }
+    }
     if (message == VirtualFiles::CompletedMessage) {
       VirtualFiles::drain();
       return 0;
@@ -2475,6 +2596,8 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_CLOSE) {
+      windowDrag.cancelled = true;
+      endWindowDrag();
       releasePointer(false);
       running = false;
       FileTree::cancelUploads();
@@ -2638,6 +2761,7 @@ int wmain(int argc, wchar_t **argv) {
             {"window_icon_v1", true},
             {"window_semantics_v1", true},
             {"pointer_lock", true},
+            {"toplevel_drag_v1", true},
             {"file_drop_out", true},
             {"file_tree", true},
             {"codecs", codecs},
@@ -2652,6 +2776,8 @@ int wmain(int argc, wchar_t **argv) {
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
+  windowDrag.cancelled = true;
+  endWindowDrag();
   releasePointer(false);
   running = false;
   FileTree::cancelUploads();

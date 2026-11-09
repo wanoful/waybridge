@@ -110,6 +110,10 @@ pub struct WlOutputData {
 
 /// Events initiated by the clients interacting with outputs
 pub trait OutputHandler {
+    /// Restrict output globals for clients with a shared display topology.
+    fn can_view_output(_client: &Client, _output: &Output) -> bool {
+        true
+    }
     /// A client bound a new `wl_output` instance.
     fn output_bound(&mut self, _output: Output, _wl_output: WlOutput) {}
 }

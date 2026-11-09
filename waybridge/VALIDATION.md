@@ -1,5 +1,23 @@
 # Validation — 2026-11-10
 
+## X11 game input, Chrome tabs and host keyrings
+
+X11 windows now share one stable RandR output; native Wayland per-window outputs are hidden from Xwayland. Individual stream resize/DPI changes no longer alter the shared monitor topology or application density. `x11_pointer_smoke.py` uses real X11 GLFW windows, checks actual cursor/framebuffer pixels at multiple points after resize and 175%/125% presentation changes, and asserts an identical single-monitor RandR layout while creating/closing the game and a native Wayland window. It negotiates and acknowledges a real pointer lock, closes the GLFW_CURSOR_DISABLED game, observes viewer unlock, and clicks the launcher again. This is a controlled MC-style regression; actual Minecraft menu/backpack and HMCL recovery still need device retesting.
+
+The installed unforced `google-chrome-stable` (156.0.8078.47) selects native Wayland and explicitly requests ClientSide decorations. That request is now honored. `chrome_drag_smoke.py` uses a temporary two-tab profile and real viewer input to detach a tab, release outside all targets, then reattach it to the other tab strip. The complete x64 PE viewer under private Wine/Xvfb passes `windows_chrome_smoke.py`: no native caption on CSD, real SendInput drag across HWNDs, outside drop preserving the new window, merging through the overlapping dragged window, and Escape reverting detachment. Immediately after Escape it navigates through Ctrl+L/Unicode/Return without clicking or refocusing, verifying keyboard-focus recovery. Explicit X11 Chrome/XDND remains unsupported.
+
+The private application D-Bus now relays only available host KWallet/Secret Service names. Each private caller gets a separate persistent host connection. The mock two-bus test verifies Unicode/raw bytes, FD round trips, 100 NoReply calls without consuming pending-reply slots, unique-owner calls, errors, sender-filtered unicast signals, and exclusion of an unrelated host GUI service. A separate test covers KDE4/5/6 backend hints for SSH shells missing KDE_SESSION_VERSION. No actual host wallet content, Chrome cookies or password records are read by these tests. Access to an existing unlocked keyring is implemented; restoration of the user's existing Chrome sign-in is not yet verified, and a locked wallet can still prompt on the Linux desktop.
+
+Validation for this change passed:
+
+- Full `scripts/test.sh`, including strict workspace Clippy, **19 Rust tests** (18 host + 1 codec), the new GLFW/Chrome tests, Qt/Dolphin/Ghostty focus/IME, desktop semantics, files and clipboard regressions.
+- `x11_smoke.py` and `x11_clipboard_smoke.py`: GLX, independent native Wayland windows, XCB input/focus, Unicode/PNG/INCR clipboard and cleanup.
+- `windows_chrome_smoke.py`, `windows_relative_smoke.py`, `windows_ime_keys_smoke.py --ole`: complete PE drag/cancel/focus, real native clipping/relative input and OLE/IME handoff regressions under private Wine desktops.
+- Linux Release, x64 Windows and ARM64 Windows builds. The ARM64 artifact is confirmed as ARM64 PE; physical WoA execution of this revision remains pending.
+- An isolated Release startup against the actual host bus exposes KWallet6/Secret Service owners on the private bus, restores KDE6 hints in the launch descriptor, excludes host GUI service owners, and exits/cleans up within five seconds. Only bus metadata was queried; no keyring API was called.
+
+Transcripts and fixture screenshots are `build/tests/compat-*.log`, `x11-pointer-*.log`, `chrome-drag-*` and `windows-chrome-*`. Tests use temporary profiles/listeners and do not restart the user's service or modify the default Chrome profile. The earlier integration and physical checks below describe their own source checkpoints.
+
 ## Application fixes after physical WoA testing
 
 The previous ordinary startup inherited the host's `QT_IM_MODULE=fcitx`/`GTK_IM_MODULE=fcitx`, omitted Xwayland/audio unless explicit flags were supplied, and routed only PulseAudio applications with `PULSE_SINK`. This prevented Dolphin's native text-input bridge, legacy GUI startup and mpv's default native PipeWire output. Startup now detects available Xwayland/private audio, isolates the application D-Bus session, removes host IM overrides and routes both PulseAudio and native PipeWire. `--launch -- <application>` restores that same environment for another SSH shell using a 0600 descriptor with process-identity checks and owned cleanup.

@@ -27,6 +27,9 @@ where
     D: CompositorHandler,
     D: 'static,
 {
+    fn can_view(client: Client, data: &WlOutputData) -> bool {
+        D::can_view_output(&client, &data.output)
+    }
     fn bind(
         state: &mut D,
         _dh: &DisplayHandle,
