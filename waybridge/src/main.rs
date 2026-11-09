@@ -4,6 +4,7 @@ mod app_icon;
 mod metrics;
 mod network;
 mod protocol;
+mod relative_input;
 mod transfer;
 mod video;
 mod x11;
@@ -62,6 +63,8 @@ use smithay::{
             with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState,
         },
         output::{OutputHandler, OutputManagerState},
+        pointer_constraints::PointerConstraintsState,
+        relative_pointer::RelativePointerManagerState,
         seat::WaylandFocus,
         selection::{
             data_device::{
@@ -170,6 +173,9 @@ struct App {
     cursor: cursor::Cursor,
     _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState,
     icons: app_icon::Icons,
+    relative: relative_input::RelativeInput,
+    _relative_manager: RelativePointerManagerState,
+    _constraints: PointerConstraintsState,
     dh: DisplayHandle,
     compositor: CompositorState,
     x11: x11::State,
@@ -287,6 +293,7 @@ impl App {
                     let _ = wm.raise_window(&x);
                 }
             }
+            self.relative_focus_changed();
         }
         let surface = id
             .and_then(|id| self.windows.iter().find(|w| w.id == id && w.mapped))
@@ -353,6 +360,8 @@ impl App {
     }
 
     fn pointer_motion(&mut self, id: u32, x: f64, y: f64) {
+        self.sync_pointer_lock();
+        if self.pointer_locked() { return; }
         if !self.input_allowed(id) || !x.is_finite() || !y.is_finite() {
             return;
         }
@@ -405,6 +414,7 @@ impl App {
         if self.pointer_window != Some(id) {
             self.cursor.dirty = true;
         }
+        self.relative_hit(hit.clone());
         self.pointer_window = Some(id);
         let pointer = self.seat.get_pointer().unwrap();
         pointer.motion(
@@ -417,6 +427,7 @@ impl App {
             },
         );
         pointer.frame(self);
+        self.sync_pointer_lock();
     }
 
     fn message_position(&self, id: u32, value: &Value) -> (f64, f64) {
@@ -561,6 +572,7 @@ impl App {
             );
         }
         pointer.frame(self);
+        self.unlock_pointer(true);
         self.pointer_window = None;
         self.cursor.dirty = true;
         self.drop_deadline = None;
@@ -581,6 +593,7 @@ impl App {
             }
             "ping" => self.control(json!({"type":"pong","nonce":value["nonce"]})),
             "hello" => {
+                self.relative_available(value["pointer_lock"].as_bool().unwrap_or(false));
                 self.default_scale = dpi_scale(&value);
                 self.x11_scale(self.default_scale);
                 let mode = monitor_mode(&value, self.output.current_mode().unwrap().refresh);
@@ -602,7 +615,10 @@ impl App {
                 }
             }
             "pointer" => self.pointer_message(id, &value),
-            "leave" if self.pointer_window == Some(id) => {
+            "relative_pointer" => self.relative_motion(id, &value),
+            "pointer_lock_ack" => self.pointer_lock_ack(id, &value),
+            "leave" if self.pointer_window == Some(id) && !self.pointer_locked() => {
+                self.relative_hit(None);
                 self.pointer_window = None;
                 self.cursor.dirty = true;
                 let p = self.seat.get_pointer().unwrap();
@@ -785,6 +801,9 @@ impl App {
                 self.release_input()
             }
             "close" => {
+                if self.focused_window == Some(id) {
+                    self.release_input();
+                }
                 if let Some(window) = self.window(id) {
                     if let Some(top) = window.toplevel() {
                         top.send_close();
@@ -1623,6 +1642,7 @@ impl XdgShellHandler for App {
                 self.popup_grab = Some((id, grab.clone()));
                 self.control(json!({"type":"popup_grab","root":id,"active":true}));
             }
+            self.unlock_pointer(true);
             keyboard.set_focus(self, grab.current_grab(), serial);
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
             pointer.set_grab(
@@ -1761,6 +1781,8 @@ impl ClientData for ClientState {
     fn initialized(&self, _: ClientId) {}
     fn disconnected(&self, _: ClientId, _: DisconnectReason) {}
 }
+smithay::delegate_pointer_constraints!(App);
+smithay::delegate_relative_pointer!(App);
 smithay::delegate_compositor!(App);
 smithay::delegate_shm!(App);
 smithay::delegate_dmabuf!(App);
@@ -1896,6 +1918,9 @@ fn main() -> Result<()> {
         _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<App>(&dh),
         icons: app_icon::Icons::new(tx.clone()),
         _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<App>(&dh),
+        relative: relative_input::RelativeInput::default(),
+        _relative_manager: RelativePointerManagerState::new::<App>(&dh),
+        _constraints: PointerConstraintsState::new::<App>(&dh),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1973,6 +1998,7 @@ fn main() -> Result<()> {
                 .insert_client(stream, Arc::new(ClientState::default()))?;
         }
         display.dispatch_clients(&mut app)?;
+        app.sync_pointer_lock();
         app.finish_file_drop();
         app.read_pending_clipboard();
         // Bound input work per cycle so a busy peer cannot starve Wayland or rendering.
@@ -2030,6 +2056,7 @@ fn main() -> Result<()> {
                         app.x11_cancel_popup(root);
                         app.x11.grab = None;
                     }
+                    app.relative_available(false);
                     app.release_input();
                     app.encoder.reset();
                     app.focus(None);
