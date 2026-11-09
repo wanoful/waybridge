@@ -25,7 +25,7 @@
 
 媒体与交互共用 v3 能力协商。PNG/H.264/HEVC/AV1/Main10 的原始 kind 为 1/2/4/5/7/8，UDP 补帧容器为 6，独立 PCM 音频为 3。UDP 全局 8 条/64 MiB 传输 credit、每窗口两帧呈现 credit 和独立音频 credit 分开计数；PNG→视频恢复和缓存复用均保留新 epoch/独立关键帧。
 
-光标更新在指针锁定期间不解除原生隐藏/裁剪，解锁取当前光标；IME/OLE/焦点切换保留 generation 和输入释放约束。共享退出处理统一回收私有 Xwayland 资源和音频 sink。文件工作线程不阻塞合成器或窗口控制，Linux 只向应用发布已完成的本地路径。
+光标更新在指针锁定期间不解除原生隐藏/裁剪，解锁取当前光标；IME/OLE/焦点切换保留 generation 和输入释放约束。共享退出处理先停止并等待视频编码线程，再回收 GPU、私有 Xwayland 资源和音频 sink。文件工作线程不阻塞合成器或窗口控制，Linux 只向应用发布已完成的本地路径。
 
 ## 构建和启用
 
@@ -49,6 +49,6 @@
 
 ## 验证范围
 
-真实 Wayland/Qt/GTK/X11、NVIDIA NVENC/CUDA 和私有 Wine/Xvfb 中的 Windows PE/API 已覆盖各功能检查点。媒体整合验证覆盖全部 UDP 媒体 kind、故障恢复、流控和音频；桌面+媒体组合已通过 X11/音频/UDP/GPU/HDR 同时启用、PNG-only 回退及共享退出清理测试。最终包含全部文件功能的组合复测以 [VALIDATION.md](waybridge/VALIDATION.md) 的状态为准。
+真实 Wayland/Qt/GTK/X11、NVIDIA NVENC/CUDA 和私有 Wine/Xvfb 中的 Windows PE/API 已覆盖完整合并后的回归。结果包括全部 UDP 媒体 kind、音频、流控、文件/目录/OLE/21 种虚拟源，以及 X11/音频/UDP/GPU/HDR 同时启用时的 PNG-only 回退和共享退出清理。GPU 隐藏/重映射、持有编码缓存时退出也已通过；分层结果见 [VALIDATION.md](waybridge/VALIDATION.md)。
 
 Wine 的 Unicode 注入不代表微软拼音引擎、候选面板或选词验收；软件 D3D11 数值检查不代表物理 HDR/MFT。Explorer、Outlook、压缩软件、真实 WoA 新 codec、多显示器 DPI 和输入到显示延迟仍需相应实机测试。完整 HDR、XIM/XDND/PRIMARY、跨进程透明点穿、FUSE、Opus、自适应拥塞控制与 Moonlight 线协议兼容未实现。

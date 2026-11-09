@@ -235,7 +235,7 @@ LLVM_MINGW_ROOT=/path/to/llvm-mingw ./scripts/build-windows-arm64.sh
 python tests/session_integration_smoke.py
 ```
 
-组合脚本同时启用 X11/音频/UDP/GPU/HDR，验证能力、独立音频认证、PNG-only 回退、Wayland+X11 共存、控制响应及共享退出清理；它不代表所有 14 项功能在一个真实 Windows 会话中完成验收。桌面+媒体检查点已通过，最终文件整合后的复测状态见 [VALIDATION.md](VALIDATION.md)。
+组合脚本同时启用 X11/音频/UDP/GPU/HDR，验证能力、独立音频认证、PNG-only 回退、Wayland+X11 共存、控制响应及共享退出清理；它不代表所有 14 项功能在一个真实 Windows 会话中完成验收。完整文件整合后的组合脚本、原生文件/IME 和媒体回归已通过，分层结果见 [VALIDATION.md](VALIDATION.md)。
 
 按所需功能选择额外测试；每条命令都需其对应依赖。
 
@@ -250,7 +250,7 @@ python tests/session_integration_smoke.py
 | X11/GLX/剪贴板 | `x11_smoke`、`x11_clipboard_smoke` |
 | PCM/WASAPI | `audio_smoke`、`windows_audio_smoke` |
 | 真实 NVENC/缓存/回退 | `hardware_smoke`、`codecs_smoke`、`resize_smoke`、`windows_codecs_smoke` |
-| CUDA 与故障恢复 | `gpu_smoke --binary target/debug/waybridge`；Release 对照使用 `--benchmark` |
+| CUDA 与故障恢复 | `gpu_window_lifecycle_smoke`、`gpu_smoke --binary target/debug/waybridge`；Release 对照使用 `--benchmark` |
 | UDP 故障/所有 codec/全局流控 | `windows_udp_smoke`、`udp_flow_smoke` |
 | HDR 数值/视频/Windows shader | `hdr_smoke`、`hdr_video_smoke`、`hdr_windows_smoke`、`hdr_preflight` |
 
