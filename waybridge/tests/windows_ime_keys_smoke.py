@@ -135,12 +135,35 @@ def main():
             assert not keys(changed), changed
             copied = run("copy-release")
             assert keys(copied) == [(29, True), (46, True), (46, False), (29, False)], copied
+            for drag, action in enumerate(("ole-start", "ole-composition"), 1):
+                start = len(snapshot())
+                driver = subprocess.Popen(["wine", str(probe), action], env=env, stdout=log, stderr=log)
+                processes.append(driver)
+                wait_for(lambda: any(m["type"] == "button" and m.get("down") for m in snapshot()[start:]))
+                send(type="drag_offer", drag=drag, id=1, files=[dict(id=0, name="copy.txt", size=0)])
+                wait_for(lambda: any(m["type"] == "drag_claim" and m.get("drag") == drag for m in snapshot()[start:]))
+                send(type="drag_ready", drag=drag)
+                assert driver.wait(timeout=5) == 0
+                wait_for(lambda: native("ole-suspended", check=False).returncode == 0)
+                native("ole-end")
+                wait_for(lambda: any(m["type"] == "drag_result" and m.get("drag") == drag for m in snapshot()[start:]))
+                handoff = snapshot()[start:]
+                assert keys(handoff) == [(29, True), (46, True), (46, False), (29, False)], handoff
+                assert not text(handoff), handoff
+                assert any(m["type"] == "drag_result" and m.get("success") is False for m in handoff), handoff
+                if action == "ole-composition":
+                    assert any(m["type"] == "ime" and m.get("preedit") == "" for m in handoff), handoff
+                wait_for(lambda: native("ready-new", check=False).returncode == 0)
+                restored = run("late-copy-character")
+                assert not keys(restored) and text(restored) == "c", restored
+                normal = run("select")
+                assert keys(normal) == [(29, True), (30, True), (30, False), (29, False)] and not text(normal), normal
             start = len(snapshot())
             lost = run("focus-lost-end")
             assert keys(lost) == [(29, True), (29, False)], lost
             assert any(m["type"] == "focus" and not m["focused"] for m in snapshot()[start:])
             assert client.poll() is None
-            print("PASS: actual SendInput Ctrl+Space/Ctrl+A route once; held Ctrl/Shift restored after controlled composition end/cancel; released modifiers stay released; generation cancellation/old END restore no stale keys; Unicode/emoji and English commit once (Wine; no Microsoft IME engine)")
+            print("PASS: actual SendInput Ctrl+Space/Ctrl+A route once; held Ctrl/Shift restored after controlled composition end/cancel; OLE handoff cancels preedit/releases raw keys, ignores stale END and restores fresh text/shortcuts; generation cancellation restores no stale keys; Unicode/emoji and English commit once (Wine; no Microsoft IME engine)")
         except BaseException:
             print(Path(log.name).read_text())
             raise

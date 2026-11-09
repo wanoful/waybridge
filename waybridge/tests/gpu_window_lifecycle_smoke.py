@@ -100,9 +100,14 @@ def main():
                 key(35)  # Real wl_surface.attach(NULL), rather than native minimize.
                 viewer.wait(lambda: not viewer.visibility.get(main_id, {}).get("mapped", True))
                 other_sequence = viewer.frames[other_id][-1]["seq"]
-                viewer.send(type="refresh")
+                other_width = viewer.frames[other_id][-1]["w"] + 1
+                other_height = viewer.frames[other_id][-1]["h"]
+                viewer.send(type="resize", id=other_id, width=other_width, height=other_height,
+                            dpi=96, fullscreen=False,
+                            fullscreen_epoch=viewer.infos[other_id]["fullscreen_epoch"])
                 # Rendering another surface drains GL cleanup while the first is detached.
-                viewer.wait(lambda: viewer.frames[other_id][-1]["seq"] > other_sequence)
+                viewer.wait(lambda: viewer.frames[other_id][-1]["seq"] > other_sequence and
+                            viewer.frames[other_id][-1]["w"] == other_width)
                 key(47)
                 viewer.wait(lambda: viewer.visibility.get(main_id, {}).get("mapped", False))
                 viewer.wait(fresh_pixels)
@@ -125,7 +130,11 @@ def main():
                 app.terminate()
                 app.wait(timeout=5)
             host.terminate()
-            host.wait(timeout=5)
+            try:
+                host.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                host.kill()
+                host.wait(timeout=5)
 
 
 if __name__ == "__main__":

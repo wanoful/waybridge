@@ -4,6 +4,8 @@ mod audio;
 mod color;
 mod color_management;
 mod cursor;
+mod drag;
+mod file_tree;
 mod ime;
 mod metrics;
 mod network;
@@ -53,7 +55,10 @@ use smithay::{
         },
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
-            protocol::{wl_buffer, wl_seat, wl_surface::WlSurface},
+            protocol::{
+                wl_buffer, wl_data_device_manager::DndAction, wl_data_source::WlDataSource,
+                wl_seat, wl_surface::WlSurface,
+            },
             Client, Display, DisplayHandle, ListeningSocket, Resource,
         },
     },
@@ -75,8 +80,8 @@ use smithay::{
         selection::{
             data_device::{
                 request_data_device_client_selection, set_data_device_focus,
-                set_data_device_selection, start_dnd, ClientDndGrabHandler, DataDeviceHandler,
-                DataDeviceState, ServerDndGrabHandler, SourceMetadata,
+                set_data_device_selection, start_dnd, with_source_metadata, ClientDndGrabHandler,
+                DataDeviceHandler, DataDeviceState, ServerDndGrabHandler, SourceMetadata,
             },
             wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler, SelectionSource, SelectionTarget,
@@ -96,13 +101,17 @@ use std::{
     io::{Read, Write},
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt},
-        io::OwnedFd,
+        io::{AsFd, OwnedFd},
         net::UnixStream,
     },
     path::PathBuf,
     process::{Child, Command},
     rc::Rc,
-    sync::{mpsc::SyncSender, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::SyncSender,
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -196,6 +205,19 @@ struct RemotePopup {
 
 type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 
+struct OutboundDrag {
+    id: u64,
+    window: u32,
+    source: WlDataSource,
+    cancelled: Arc<AtomicBool>,
+    files: Option<drag::Export>,
+    external: bool,
+    ready: bool,
+    dropped: bool,
+    deferred_focus: Option<Option<u32>>,
+    activity: Instant,
+}
+
 struct App {
     color_programs: Option<color::Programs>,
     _color_manager: Option<GlobalId>,
@@ -209,6 +231,11 @@ struct App {
     _relative_manager: RelativePointerManagerState,
     _constraints: PointerConstraintsState,
     ime: ime::Ime,
+    drag_sink: Option<drag::Sink>,
+    drag_surface: Option<WlSurface>,
+    drag_enabled: bool,
+    next_drag: u64,
+    outbound: Option<OutboundDrag>,
     dh: DisplayHandle,
     compositor: CompositorState,
     x11: x11::State,
@@ -295,6 +322,14 @@ impl App {
     }
 
     fn focus(&mut self, id: Option<u32>) {
+        // Native OLE capture/focus changes must not cancel the Wayland source.
+        if self.external_drag_input() {
+            if let Some(drag) = &mut self.outbound {
+                drag.deferred_focus = Some(id);
+            }
+            self.release_keys();
+            return;
+        }
         let id = id.map(|id| self.root_id(id));
         // Override-redirect menus keep their owning X11 window's keyboard focus.
         let id = id.and_then(|id| {
@@ -579,6 +614,170 @@ impl App {
         }
     }
 
+    fn external_drag_input(&self) -> bool {
+        self.outbound
+            .as_ref()
+            .is_some_and(|d| d.external && !d.dropped)
+    }
+
+    fn end_outbound(&mut self, success: bool) {
+        let Some(drag) = self.outbound.take() else {
+            return;
+        };
+        drag.cancelled.store(true, Ordering::Relaxed);
+        let success = success && drag.external && drag.dropped;
+        if drag.external && !drag.dropped {
+            let pointer = self.seat.get_pointer().unwrap();
+            pointer.motion(
+                self,
+                None,
+                &MotionEvent {
+                    location: pointer.current_location(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time: self.time(),
+                },
+            );
+            if self.pressed_buttons.remove(&0x110) {
+                pointer.button(
+                    self,
+                    &ButtonEvent {
+                        button: 0x110,
+                        state: ButtonState::Released,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: self.time(),
+                    },
+                );
+            }
+            pointer.frame(self);
+        }
+        if drag.external {
+            self.release_keys();
+            if let Some(focus) = drag.deferred_focus {
+                self.focus(focus);
+            }
+            if let Some(sink) = &mut self.drag_sink {
+                sink.finish(success);
+            }
+        }
+        self.control(json!({"type":"drag_end","drag":drag.id,"success":success}));
+        // Dropping Export cancels its bounded worker and closes source files.
+    }
+
+    fn drag_message(&mut self, message: &Value) {
+        let Some(id) = message["drag"].as_u64() else {
+            return;
+        };
+        let Some(drag) = self.outbound.as_mut().filter(|d| d.id == id) else {
+            return;
+        };
+        drag.activity = Instant::now();
+        match message["type"].as_str().unwrap_or("") {
+            "drag_claim"
+                if !drag.external
+                    && drag.files.is_some()
+                    && self.pressed_buttons.contains(&0x110) =>
+            {
+                let Some(surface) = self.drag_surface.clone() else {
+                    self.end_outbound(false);
+                    return;
+                };
+                if self.pressed_buttons.len() != 1 {
+                    self.end_outbound(false);
+                    return;
+                }
+                drag.external = true;
+                self.release_keys();
+                let serial = SERIAL_COUNTER.next_serial();
+                if let Some(sink) = &mut self.drag_sink {
+                    sink.arm(serial.into());
+                }
+                let pointer = self.seat.get_pointer().unwrap();
+                let location = pointer.current_location();
+                pointer.motion(
+                    self,
+                    Some((surface, location)),
+                    &MotionEvent {
+                        location,
+                        serial,
+                        time: self.time(),
+                    },
+                );
+                pointer.frame(self);
+            }
+            "drag_drop" if drag.external && drag.ready && !drag.dropped => {
+                drag.dropped = true;
+                let deferred_focus = drag.deferred_focus.take();
+                self.release_keys();
+                if self.pressed_buttons.remove(&0x110) {
+                    let pointer = self.seat.get_pointer().unwrap();
+                    pointer.button(
+                        self,
+                        &ButtonEvent {
+                            button: 0x110,
+                            state: ButtonState::Released,
+                            serial: SERIAL_COUNTER.next_serial(),
+                            time: self.time(),
+                        },
+                    );
+                    pointer.frame(self);
+                }
+                if let Some(focus) = deferred_focus {
+                    self.focus(focus);
+                }
+            }
+            "drag_claim" if !drag.external => self.end_outbound(false),
+            "drag_result" => self.end_outbound(message["success"].as_bool() == Some(true)),
+            "drag_read" if drag.external && drag.ready => {
+                let valid = (|| {
+                    let request = message["request"].as_u64()?;
+                    let file = usize::try_from(message["file"].as_u64()?).ok()?;
+                    let offset = message["offset"].as_u64()?;
+                    let length = usize::try_from(message["length"].as_u64()?).ok()?;
+                    if length == 0 || length > drag::MAX_READ {
+                        return None;
+                    }
+                    let files = drag.files.as_ref()?;
+                    Some(files.read(drag::ReadRequest {
+                        request,
+                        file,
+                        offset,
+                        length,
+                    }))
+                })()
+                .unwrap_or(false);
+                if !valid {
+                    self.control(json!({"type":"drag_data","drag":id,"request":message["request"],"error":"invalid read or busy transfer"}));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pump_outbound(&mut self) -> Result<()> {
+        if let Some(sink) = &mut self.drag_sink {
+            sink.pump()?;
+        }
+        let source_window_gone = self.outbound.as_ref().is_some_and(|drag| {
+            !drag.dropped && !self.windows.iter().any(|w| w.id == drag.window && w.mapped)
+        });
+        if let Some(drag) = &mut self.outbound {
+            if source_window_gone
+                || !drag.source.alive()
+                || drag.activity.elapsed() > Duration::from_secs(120)
+            {
+                self.end_outbound(false);
+            } else if drag.external
+                && !drag.ready
+                && self.drag_sink.as_ref().is_some_and(|s| s.accepted())
+            {
+                drag.ready = true;
+                let id = drag.id;
+                self.control(json!({"type":"drag_ready","drag":id}));
+            }
+        }
+        Ok(())
+    }
+
     fn read_pending_clipboard(&mut self) {
         // Smithay calls new_selection before installing the new provider on the seat.
         // Read only after dispatch_clients returns, otherwise we read the previous owner.
@@ -614,7 +813,7 @@ impl App {
         }
     }
 
-    fn release_input(&mut self) {
+    fn release_keys(&mut self) {
         let keyboard = self.seat.get_keyboard().unwrap();
         for key in std::mem::take(&mut self.pressed_keys) {
             keyboard.input::<(), _>(
@@ -626,6 +825,9 @@ impl App {
                 |_, _, _| FilterResult::Forward,
             );
         }
+    }
+    fn release_input(&mut self) {
+        self.release_keys();
         let pointer = self.seat.get_pointer().unwrap();
         for button in std::mem::take(&mut self.pressed_buttons) {
             pointer.button(
@@ -646,6 +848,37 @@ impl App {
         self.drop_accepted = false;
     }
 
+    fn publish_uploaded_files(&mut self, value: &Value, uris: Vec<u8>) {
+        let id = value["id"]
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .unwrap_or(0);
+        if value["drop"].as_bool() == Some(true) {
+            let (x, y) = self.message_position(id, value);
+            self.begin_file_drop(id, x, y, uris);
+        } else {
+            let contents = BTreeMap::from([("text/uri-list".to_string(), uris)]);
+            self.clipboard_generation += 1;
+            if let Some(peer) = &self.peer {
+                peer.begin_file_export(self.clipboard_generation);
+            }
+            self.clipboard = contents.clone();
+            self.x11.clipboard_generation = None;
+            if let Some(wm) = self.x11.wm.as_mut() {
+                let _ = wm.new_selection(
+                    SelectionTarget::Clipboard,
+                    Some(vec!["text/uri-list".into()]),
+                );
+            }
+            set_data_device_selection(
+                &self.dh,
+                &self.seat,
+                vec!["text/uri-list".into()],
+                Arc::new(contents),
+            );
+        }
+    }
+
     fn message(&mut self, value: Value) {
         let id = value["id"]
             .as_u64()
@@ -654,6 +887,9 @@ impl App {
         match value["type"].as_str().unwrap_or("") {
             "window_state" => self.native_window_state(id, &value),
             "ime" => self.ime_message(&value),
+            "drag_claim" | "drag_drop" | "drag_result" | "drag_read" => {
+                self.drag_message(&value);
+            }
             "frame_ack" => {
                 if let Some(peer) = &self.peer {
                     peer.acknowledge(id, value["sequence"].as_u64().unwrap_or(0));
@@ -662,6 +898,7 @@ impl App {
             "ping" => self.control(json!({"type":"pong","nonce":value["nonce"]})),
             "hello" => {
                 self.relative_available(value["pointer_lock"].as_bool().unwrap_or(false));
+                self.drag_enabled = value["file_drop_out"].as_bool().unwrap_or(false);
                 self.default_scale = dpi_scale(&value);
                 self.x11_scale(self.default_scale);
                 let mode = monitor_mode(&value, self.output.current_mode().unwrap().refresh);
@@ -682,10 +919,14 @@ impl App {
                     self.focus(None);
                 }
             }
-            "pointer" => self.pointer_message(id, &value),
-            "relative_pointer" => self.relative_motion(id, &value),
+            "pointer" if !self.external_drag_input() => self.pointer_message(id, &value),
+            "relative_pointer" if !self.external_drag_input() => self.relative_motion(id, &value),
             "pointer_lock_ack" => self.pointer_lock_ack(id, &value),
-            "leave" if self.pointer_window == Some(id) && !self.pointer_locked() => {
+            "leave"
+                if self.pointer_window == Some(id)
+                    && !self.pointer_locked()
+                    && !self.external_drag_input() =>
+            {
                 self.relative_hit(None);
                 self.pointer_window = None;
                 self.cursor.dirty = true;
@@ -701,7 +942,7 @@ impl App {
                 );
                 p.frame(self);
             }
-            "button" if self.input_allowed(id) => {
+            "button" if self.input_allowed(id) && !self.external_drag_input() => {
                 if value["x"].is_number() && value["y"].is_number() {
                     self.pointer_message(id, &value);
                 }
@@ -742,7 +983,11 @@ impl App {
                 );
                 pointer.frame(self);
             }
-            "key" if self.input_allowed(id) && self.focused_window == Some(self.root_id(id)) => {
+            "key"
+                if self.input_allowed(id)
+                    && !self.external_drag_input()
+                    && self.focused_window == Some(self.root_id(id)) =>
+            {
                 let key = value["key"].as_u64().unwrap_or(u64::MAX);
                 if key > 767 {
                     return;
@@ -930,6 +1175,9 @@ impl App {
                     }
                 }
                 self.clipboard_generation += 1; // discard reads from a superseded Linux selection
+                if let Some(peer) = &self.peer {
+                    peer.begin_file_export(self.clipboard_generation);
+                }
                 self.clipboard = contents.clone();
                 self.x11.clipboard_generation = None;
                 if let Some(wm) = self.x11.wm.as_mut() {
@@ -952,6 +1200,94 @@ impl App {
                     window.dirty = true;
                 }
             }
+            "file_tree_epoch" if self.peer.as_ref().is_some_and(|p| p.file_tree()) => {
+                if let (Some(peer), Some(epoch)) = (&self.peer, value["epoch"].as_u64()) {
+                    if epoch > peer.file_epoch() {
+                        peer.set_file_epoch(epoch);
+                        self.clipboard_generation += 1;
+                        peer.begin_file_export(self.clipboard_generation);
+                    }
+                }
+            }
+            "tree_upload_begin" | "tree_upload_chunk" | "tree_upload_end"
+            | "tree_upload_commit" | "tree_upload_cancel" => {
+                let batch = value["batch"].as_u64().unwrap_or(0);
+                // Once a batch has failed/finished, queued chunks are stale.
+                // Report the first failure without flooding the control queue.
+                if !matches!(
+                    value["type"].as_str(),
+                    Some("tree_upload_begin" | "tree_upload_cancel")
+                ) && !self.transfers.has_tree(batch)
+                {
+                    return;
+                }
+                let result = (|| -> Result<()> {
+                    if !self.peer.as_ref().is_some_and(|p| p.file_tree()) {
+                        bail!("file_tree capability required");
+                    }
+                    match value["type"].as_str().unwrap() {
+                        "tree_upload_begin" => {
+                            let metadata = value["entries"]
+                                .as_array()
+                                .context("missing tree entries")?;
+                            if metadata.is_empty() || metadata.len() > file_tree::MAX_ENTRIES {
+                                bail!("invalid tree entry count");
+                            }
+                            let entries: Vec<file_tree::Entry> =
+                                serde::Deserialize::deserialize(&value["entries"])?;
+                            let epoch =
+                                if value["drop"].as_bool() == Some(true) {
+                                    None
+                                } else {
+                                    Some(value["epoch"].as_u64().unwrap_or_else(|| {
+                                        self.peer.as_ref().unwrap().file_epoch()
+                                    }))
+                                };
+                            if epoch.is_some_and(|epoch| {
+                                epoch != self.peer.as_ref().unwrap().file_epoch()
+                            }) {
+                                bail!("clipboard upload superseded");
+                            }
+                            self.transfers.begin_tree(batch, entries, epoch)?;
+                            self.control(
+                                json!({"type":"tree_upload_ready","batch":batch,"stage":"begin"}),
+                            );
+                        }
+                        "tree_upload_chunk" => self.transfers.tree_chunk(
+                            batch,
+                            usize::try_from(value["file"].as_u64().context("missing file")?)?,
+                            value["data"].as_str().context("missing chunk")?,
+                        )?,
+                        "tree_upload_end" => self.transfers.tree_end(
+                            batch,
+                            usize::try_from(value["file"].as_u64().context("missing file")?)?,
+                        )?,
+                        "tree_upload_commit" => {
+                            if value["drop"].as_bool() == Some(true)
+                                && !self.windows.iter().any(|w| w.id == id && w.mapped)
+                            {
+                                bail!("drop target is gone");
+                            }
+                            let uris = self.transfers.finish_tree(
+                                batch,
+                                self.peer.as_ref().unwrap().file_epoch(),
+                                value["drop"].as_bool() == Some(true),
+                            )?;
+                            self.publish_uploaded_files(&value, uris);
+                            self.control(
+                                json!({"type":"tree_upload_ready","batch":batch,"stage":"commit"}),
+                            );
+                        }
+                        "tree_upload_cancel" => self.transfers.cancel_tree(batch),
+                        _ => {}
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    self.transfers.cancel_tree(batch);
+                    self.control(json!({"type":"tree_upload_error","batch":batch,"message":error.to_string()}));
+                }
+            }
             "upload_begin" | "upload_chunk" | "upload_end" | "upload_commit" => {
                 let transfer_id = value["transfer"].as_u64().unwrap_or(0);
                 let result = (|| -> Result<()> {
@@ -969,28 +1305,7 @@ impl App {
                         "upload_commit" => {
                             let ids: Vec<u64> = serde_json::from_value(value["transfers"].clone())?;
                             let uris = self.transfers.finish(&ids)?;
-                            if value["drop"].as_bool() == Some(true) {
-                                let (x, y) = self.message_position(id, &value);
-                                self.begin_file_drop(id, x, y, uris);
-                                self.control(json!({"type":"upload_ready","files":ids.len()}));
-                                return Ok(());
-                            }
-                            let contents = BTreeMap::from([("text/uri-list".to_string(), uris)]);
-                            self.clipboard_generation += 1;
-                            self.clipboard = contents.clone();
-                            self.x11.clipboard_generation = None;
-                            if let Some(wm) = self.x11.wm.as_mut() {
-                                let _ = wm.new_selection(
-                                    SelectionTarget::Clipboard,
-                                    Some(vec!["text/uri-list".into()]),
-                                );
-                            }
-                            set_data_device_selection(
-                                &self.dh,
-                                &self.seat,
-                                vec!["text/uri-list".into()],
-                                Arc::new(contents),
-                            );
+                            self.publish_uploaded_files(&value, uris);
                             self.control(json!({"type":"upload_ready","files":ids.len()}));
                         }
                         _ => {}
@@ -1597,6 +1912,14 @@ impl XdgDecorationHandler for App {
 }
 
 impl CompositorHandler for App {
+    fn new_surface(&mut self, surface: &WlSurface) {
+        if surface
+            .client()
+            .is_some_and(|c| c.get_data::<ClientState>().is_some_and(|s| s.drag_sink))
+        {
+            self.drag_surface = Some(surface.clone());
+        }
+    }
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor
     }
@@ -2005,8 +2328,11 @@ impl SelectionHandler for App {
         }
         self.clipboard_generation += 1;
         let generation = self.clipboard_generation;
+        if let Some(peer) = &self.peer {
+            peer.begin_file_export(generation);
+        }
         self.clipboard.clear();
-        self.control(json!({"type":"clipboard", "items":{}}));
+        self.control(json!({"type":"clipboard", "items":{}, "generation":generation}));
         self.x11.clipboard_generation = None;
         let Some(source) = source else {
             if let Some(wm) = self.x11.wm.as_mut() {
@@ -2056,7 +2382,62 @@ impl DataControlHandler for App {
         &self.data_control
     }
 }
-impl ClientDndGrabHandler for App {}
+impl ClientDndGrabHandler for App {
+    fn started(&mut self, source: Option<WlDataSource>, _: Option<WlSurface>, _: Seat<Self>) {
+        if !self.drag_enabled
+            || self.outbound.is_some()
+            || self.drag_surface.is_none()
+            || self.pressed_buttons.len() != 1
+            || !self.pressed_buttons.contains(&0x110)
+        {
+            return;
+        }
+        let Some(source) = source.filter(|s| s.version() >= 3) else {
+            return;
+        };
+        let supported = with_source_metadata(&source, |m| {
+            m.mime_types.iter().any(|s| s == "text/uri-list")
+                && m.dnd_action.contains(DndAction::Copy)
+        })
+        .unwrap_or(false);
+        if !supported {
+            return;
+        }
+        let Some(peer) = self.peer.clone() else {
+            return;
+        };
+        let Ok((read, write)) = UnixStream::pair() else {
+            return;
+        };
+        self.next_drag += 1;
+        let id = self.next_drag;
+        let window = self.focused_window.unwrap_or(0);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if !drag::prepare(id, read, peer, self.events.clone(), cancelled.clone()) {
+            return;
+        }
+        source.send("text/uri-list".into(), write.as_fd());
+        self.outbound = Some(OutboundDrag {
+            id,
+            window,
+            source,
+            cancelled,
+            files: None,
+            external: false,
+            ready: false,
+            dropped: false,
+            deferred_focus: None,
+            activity: Instant::now(),
+        });
+    }
+    fn dropped(&mut self, _: Option<WlSurface>, validated: bool, _: Seat<Self>) {
+        if let Some(drag) = &self.outbound {
+            if !drag.dropped && (!drag.external || !validated) {
+                self.end_outbound(false);
+            }
+        }
+    }
+}
 impl ServerDndGrabHandler for App {
     fn accept(&mut self, mime: Option<String>, _: Seat<Self>) {
         self.drop_accepted = mime.as_deref() == Some("text/uri-list");
@@ -2080,6 +2461,7 @@ impl ServerDndGrabHandler for App {
 
 #[derive(Default)]
 struct ClientState {
+    drag_sink: bool,
     compositor: CompositorClientState,
 }
 impl ClientData for ClientState {
@@ -2304,6 +2686,11 @@ fn main() -> Result<()> {
         _relative_manager: RelativePointerManagerState::new::<App>(&dh),
         _constraints: PointerConstraintsState::new::<App>(&dh),
         ime: ime::Ime::new(&dh),
+        drag_sink: None,
+        drag_surface: None,
+        drag_enabled: false,
+        next_drag: 0,
+        outbound: None,
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -2343,6 +2730,15 @@ fn main() -> Result<()> {
         last_interaction: None,
         encoder: video::Encoder::new(video_codec, args.fps, args.bitrate),
     };
+    let (sink_server, sink_client) = UnixStream::pair()?;
+    app.dh.insert_client(
+        sink_server,
+        Arc::new(ClientState {
+            drag_sink: true,
+            ..ClientState::default()
+        }),
+    )?;
+    app.drag_sink = Some(drag::Sink::new(sink_client)?);
     let mut children: Vec<Child> = Vec::new();
     if args.xwayland {
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -2385,6 +2781,7 @@ fn main() -> Result<()> {
         }
         display.dispatch_clients(&mut app)?;
         app.sync_pointer_lock();
+        app.pump_outbound()?;
         app.finish_file_drop();
         app.read_pending_clipboard();
         // Bound input work per cycle so a busy peer cannot starve Wayland or rendering.
@@ -2432,7 +2829,7 @@ fn main() -> Result<()> {
                         .map(|(mime, data)| (mime.clone(), B64.encode(data)))
                         .collect();
                     if !items.is_empty() {
-                        app.control(json!({"type":"clipboard", "items":items}));
+                        app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                     }
                 }
                 Event::Message(value) => app.message(value),
@@ -2446,6 +2843,23 @@ fn main() -> Result<()> {
                         window.icon.complete(revision, &app_id, png);
                     }
                 }
+                Event::DragFiles { id, result } => {
+                    if let Some(drag) = app.outbound.as_mut().filter(|d| d.id == id) {
+                        match result {
+                            Ok(files) => {
+                                let manifest = files.manifest.clone();
+                                let tree = files.tree;
+                                let window = drag.window;
+                                drag.files = Some(files);
+                                app.control(json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"tree":tree,"action":"copy"}));
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "outbound drag not supported");
+                                app.end_outbound(false);
+                            }
+                        }
+                    }
+                }
                 Event::Disconnected => {
                     app.release_gpu_sources();
                     if let Some(audio) = &app.audio {
@@ -2456,6 +2870,8 @@ fn main() -> Result<()> {
                         app.x11.grab = None;
                     }
                     app.relative_available(false);
+                    app.end_outbound(false);
+                    app.drag_enabled = false;
                     app.release_input();
                     app.encoder.reset();
                     app.focus(None);
@@ -2497,7 +2913,7 @@ fn main() -> Result<()> {
                         .iter()
                         .map(|(mime, data)| (mime.clone(), B64.encode(data)))
                         .collect();
-                    app.control(json!({"type":"clipboard", "items":items}));
+                    app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                 }
                 Event::Clipboard { .. } => {}
             }

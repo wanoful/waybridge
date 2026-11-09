@@ -11,6 +11,8 @@ if command -v rsvg-convert >/dev/null; then
   python tests/app_icon_smoke.py
 fi
 python tests/relative_smoke.py
+python tests/drag_out_smoke.py
+python tests/tree_smoke.py
 python tests/decorations_smoke.py
 python tests/window_semantics_smoke.py
 

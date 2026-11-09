@@ -121,6 +121,7 @@ struct IncomingFile {
 std::map<uint32_t, IncomingFile> incomingFiles;
 uint64_t incomingBatch = 0;
 DWORD incomingClipboardSequence = 0;
+std::wstring incomingDirectory;
 
 struct RemoteWindow {
   NativeIcon icon;
@@ -257,6 +258,12 @@ void sendJson(const Json &value) {
     shutdown(connection, SD_BOTH);
   }
 }
+HGLOBAL globalBytes(const void *data, size_t size);
+void cancelIncomingFiles();
+#include "file_tree.h"
+#include "file_drag.h"
+#include "virtual_files.h"
+
 bool readAll(SOCKET socket, void *bytes, size_t n) {
   auto p = static_cast<char *>(bytes);
   while (n && running) {
@@ -325,13 +332,19 @@ void receiveLoop(SOCKET socket) {
         }
       }
       bool control = packet[0] == 0;
+      Json incoming;
+      if (control) {
+        incoming = Json::parse(packet.begin() + 1, packet.end());
+        if (FileTree::uploadResponse(incoming) || FileDrag::receive(incoming)) continue;
+      }
       {
         std::unique_lock<std::mutex> guard(inboxMutex);
         if (control) {
-          inboxWake.wait(guard, [] { return controls.size() < 128 || !running; });
-          if (!running)
-            break;
-          auto message = Json::parse(packet.begin() + 1, packet.end());
+          // Never stop the receiver behind a UI queue: IStream may be waiting
+          // on this thread while the STA is inside an OLE data callback.
+          if (controls.size() >= 128) throw std::runtime_error("Control inbox full");
+          if (!running) break;
+          auto message = std::move(incoming);
           if (message.value("type", "") == "window_closed") {
             decoderGarbage.push_back(message.at("id").get<uint32_t>());
             frameWake.notify_all();
@@ -349,6 +362,8 @@ void receiveLoop(SOCKET socket) {
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
   }
+  FileTree::cancelUploads();
+  FileDrag::disconnect();
   PostMessageW(controller, WM_CLOSE, 0, 0);
 }
 
@@ -790,7 +805,18 @@ HGLOBAL globalBytes(const void *data, size_t size) {
   return mem;
 }
 
-void uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
+bool uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
+  if (paths.empty() || paths.size() > FileTree::MaxRoots) return false;
+  for (const auto &path : paths) {
+    WIN32_FILE_ATTRIBUTE_DATA metadata{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &metadata) || (metadata.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+      std::cerr << "File source is unavailable or is a reparse point\n"; return false;
+    }
+    if ((metadata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !FileTree::supported) {
+      std::cerr << "The server does not support file_tree; directories were not transferred\n"; return false;
+    }
+  }
+  if (FileTree::supported) return FileTree::upload(std::move(paths), std::move(drop));
   fileWorkers.emplace_back([paths = std::move(paths), drop = std::move(drop)] {
     Json transfers = Json::array();
     for (const auto &path : paths) {
@@ -835,6 +861,7 @@ void uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
       sendJson(commit);
     }
   });
+  return true;
 }
 
 RECT imageRect(RemoteWindow *w);
@@ -864,12 +891,13 @@ public:
   }
   HRESULT STDMETHODCALLTYPE DragEnter(IDataObject *data, DWORD, POINTL, DWORD *effect) override {
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    accepted = SUCCEEDED(data->QueryGetData(&format));
+    accepted = (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
+               (SUCCEEDED(data->QueryGetData(&format)) || VirtualFiles::supports(data));
     *effect = accepted ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD *effect) override {
-    *effect = accepted ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    *effect = accepted && (*effect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragLeave() override {
@@ -877,15 +905,36 @@ public:
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE Drop(IDataObject *data, DWORD, POINTL point, DWORD *effect) override {
+    bool copyAllowed = (*effect & DROPEFFECT_COPY) != 0;
     *effect = DROPEFFECT_NONE;
+    if (!copyAllowed || FileDrag::isOwn(data))
+      return S_OK;
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     STGMEDIUM storage{};
-    if (FAILED(data->GetData(&format, &storage)))
+    if (FAILED(data->GetData(&format, &storage))) {
+      POINT position{point.x, point.y};
+      ScreenToClient(window->hwnd, &position);
+      RECT r = imageRect(window);
+      if (r.right <= r.left || r.bottom <= r.top)
+        return S_OK;
+      Json drop{{"drop", true},
+                {"id", window->id},
+                {"origin_x", window->originX},
+                {"origin_y", window->originY},
+                {"x", double(position.x - r.left) * window->width / (r.right - r.left)},
+                {"y", double(position.y - r.top) * window->height / (r.bottom - r.top)}};
+      auto request = VirtualFiles::submit(data, std::move(drop), window->hwnd);
+      if (request && (request->asyncStarted || VirtualFiles::wait(request)))
+        *effect = DROPEFFECT_COPY;
       return S_OK;
+    }
     auto drop = static_cast<HDROP>(storage.hGlobal);
     std::vector<std::wstring> paths;
     UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
-    for (UINT i = 0; i < std::min(count, 128u); ++i) {
+    if (!count || count > FileTree::MaxRoots) {
+      ReleaseStgMedium(&storage); std::cerr << "Too many file roots; transfer rejected\n"; return S_OK;
+    }
+    for (UINT i = 0; i < count; ++i) {
       UINT n = DragQueryFileW(drop, i, nullptr, 0);
       std::wstring path(n + 1, L'\0');
       DragQueryFileW(drop, i, path.data(), n + 1);
@@ -897,26 +946,37 @@ public:
     ScreenToClient(window->hwnd, &position);
     RECT r = imageRect(window);
     if (!paths.empty() && r.right > r.left && r.bottom > r.top) {
-      uploadFiles(std::move(paths),
+      bool scheduled = uploadFiles(std::move(paths),
                   {{"drop", true},
                    {"id", window->id},
                    {"origin_x", window->originX},
                    {"origin_y", window->originY},
                    {"x", double(position.x - r.left) * window->width / (r.right - r.left)},
                    {"y", double(position.y - r.top) * window->height / (r.bottom - r.top)}});
-      *effect = DROPEFFECT_COPY;
+      *effect = scheduled ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     }
     return S_OK;
   }
 };
 
+void cancelIncomingFiles() {
+  for (auto &[id, file] : incomingFiles) if (file.handle != INVALID_HANDLE_VALUE) CloseHandle(file.handle);
+  incomingFiles.clear();
+  if (!incomingDirectory.empty()) FileTree::removeTree(incomingDirectory);
+  incomingDirectory.clear();
+  incomingBatch = 0;
+  incomingClipboardSequence = 0;
+}
+
 void receiveFiles(const Json &message) {
   const std::string type = message.at("type");
   if (type == "files_begin") {
-    for (auto &[id, file] : incomingFiles)
-      if (file.handle != INVALID_HANDLE_VALUE)
-        CloseHandle(file.handle);
-    incomingFiles.clear();
+    uint64_t batch = message.at("batch").get<uint64_t>();
+    if ((message.contains("epoch") && message["epoch"].get<uint64_t>() != FileTree::epoch) ||
+        batch <= FileTree::latestIncoming || batch < FileTree::serverGeneration || batch <= FileTree::blockedGeneration) return;
+    FileTree::latestIncoming = batch;
+    FileTree::cancelIncoming();
+    cancelIncomingFiles();
     incomingBatch = message.at("batch").get<uint64_t>();
     incomingClipboardSequence = GetClipboardSequenceNumber();
     wchar_t temp[MAX_PATH];
@@ -926,12 +986,12 @@ void receiveFiles(const Json &message) {
                              std::to_wstring(GetTickCount64());
     if (!CreateDirectoryW(directory.c_str(), nullptr))
       throw std::runtime_error("Cannot create incoming file directory");
-    if (message.at("files").size() > 128)
+    incomingDirectory = directory;
+    if (message.at("files").empty() || message.at("files").size() > 128)
       throw std::runtime_error("Too many incoming files");
     for (const auto &metadata : message.at("files")) {
       std::wstring name = wide(metadata.at("name").get<std::string>());
-      if (name.empty() || name == L"." || name == L".." ||
-          name.find_first_of(L"/\\:\0") != std::wstring::npos)
+      if (!FileTree::validName(name))
         throw std::runtime_error("Invalid incoming filename");
       IncomingFile file;
       file.path = directory + L"\\" + name;
@@ -968,6 +1028,7 @@ void receiveFiles(const Json &message) {
       paths.push_back(L'\0');
       // A newer local clipboard must win over a file download that finishes
       // late.
+      bool published = false;
       if (GetClipboardSequenceNumber() == incomingClipboardSequence && OpenClipboard(controller)) {
         EmptyClipboard();
         std::vector<uint8_t> data(sizeof(DROPFILES) + paths.size() * sizeof(wchar_t));
@@ -979,18 +1040,15 @@ void receiveFiles(const Json &message) {
         if (auto mem = globalBytes(data.data(), data.size())) {
           if (!SetClipboardData(CF_HDROP, mem))
             GlobalFree(mem);
+          else published = true;
         }
         CloseClipboard();
         ownClipboardSequence = GetClipboardSequenceNumber();
       }
-      incomingFiles.clear();
+      if (published) { FileTree::publishedGeneration = incomingBatch; incomingFiles.clear(); incomingDirectory.clear(); incomingBatch = 0; }
+      else cancelIncomingFiles();
     } else if (type == "files_error") {
-      for (auto &[id, file] : incomingFiles) {
-        if (file.handle != INVALID_HANDLE_VALUE)
-          CloseHandle(file.handle);
-        DeleteFileW(file.path.c_str());
-      }
-      incomingFiles.clear();
+      cancelIncomingFiles();
       std::cerr << message.value("message", "File transfer failed") << '\n';
     }
   }
@@ -1050,13 +1108,18 @@ void setClipboard(const Json &items) {
 }
 
 void publishClipboard() {
+  if (VirtualFiles::clipboard())
+    return;
   if (!OpenClipboard(controller))
     return;
   Json items = Json::object();
   std::vector<std::wstring> files;
   if (auto drop = static_cast<HDROP>(GetClipboardData(CF_HDROP))) {
     UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
-    for (UINT i = 0; i < std::min(count, 128u); ++i) {
+    if (!count || count > FileTree::MaxRoots) {
+      CloseClipboard(); std::cerr << "Too many file roots; clipboard transfer rejected\n"; return;
+    }
+    for (UINT i = 0; i < count; ++i) {
       UINT n = DragQueryFileW(drop, i, nullptr, 0);
       std::wstring name(n + 1, L'\0');
       DragQueryFileW(drop, i, name.data(), n + 1);
@@ -1380,7 +1443,13 @@ bool acceptsInput(RemoteWindow *w, LPARAM lp) {
          y = double(point.y - r.top) * w->height / (r.bottom - r.top);
   return w->state.accepts(x, y, w->originX, w->originY, w->width, w->height);
 }
+bool imeOleSuspending = false;
+void suspendImeForOle();
 void updateIme() {
+  if (FileDrag::ownsInput()) {
+    suspendImeForOle();
+    return;
+  }
   RemoteWindow *target = nullptr, *host = nullptr;
   if (imeStatus.is_object() && imeStatus.value("enabled", false)) {
     auto found = windows.find(imeStatus.value("id", 0u));
@@ -1432,7 +1501,7 @@ void sendIme(RemoteWindow *window, const std::optional<std::wstring> &commit,
 
 void synchronizeImeModifiers(RemoteWindow *window, uint32_t except = 0) {
   auto &ime = window->ime;
-  if (ime.composing || ime.cancelling || GetFocus() != window->hwnd) return;
+  if (FileDrag::ownsInput() || ime.composing || ime.cancelling || GetFocus() != window->hwnd) return;
   if (ime.enabled && (!imeStatus.value("enabled", false) ||
                       imeStatus.value("generation", uint64_t(0)) != ime.generation ||
                       imeStatus.value("id", 0u) != ime.target)) return;
@@ -1448,6 +1517,26 @@ void synchronizeImeModifiers(RemoteWindow *window, uint32_t except = 0) {
     else ime.forwardedKeys.erase(key);
     sendJson({{"type", "key"}, {"id", window->id}, {"key", key}, {"down", held}});
   }
+}
+
+// OLE owns keyboard processing while its native drag loop runs. Cancel the
+// remote preedit and forget raw routes before entering that nested pump.
+void suspendImeForOle() {
+  if (imeOleSuspending) return;
+  imeOleSuspending = true;
+  for (auto &[id, window] : windows) {
+    auto &ime = window->ime;
+    if (ime.composing) sendIme(window.get(), {}, std::wstring());
+    ime.cancel(window->hwnd);
+    for (auto key : ime.forwardedKeys)
+      sendJson({{"type", "key"}, {"id", id}, {"key", key}, {"down", false}});
+    ime.forwardedKeys.clear();
+    ime.rawCharacterKeys.clear();
+    ime.compositionGeneration = 0;
+    if (!window->popup) ime.associate(window->hwnd, false, 0, 0);
+  }
+  DestroyCaret();
+  imeOleSuspending = false;
 }
 
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
@@ -1665,6 +1754,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     break;
   case WM_IME_STARTCOMPOSITION:
+    if (FileDrag::ownsInput()) return 0;
     if (!w->ime.enabled) return DefWindowProcW(hwnd, message, wp, lp);
     w->ime.composing = true;
     w->ime.compositionGeneration = w->ime.generation;
@@ -1675,6 +1765,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     updateIme();
     return 0;
   case WM_IME_COMPOSITION:
+    if (FileDrag::ownsInput()) return 0;
     if (w->ime.enabled) {
       if (auto context = ImmGetContext(hwnd)) {
         std::optional<std::wstring> result, preedit;
@@ -1702,6 +1793,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_IME_CHAR:
     return 0; // Result strings are committed exactly once through WM_IME_COMPOSITION.
   case WM_CHAR:
+    if (FileDrag::ownsInput()) return 0;
     if (w->ime.enabled && !w->ime.composing && wp >= 32 && wp != 127) {
       if (w->ime.rawCharacterKeys.count(linuxKey(lp))) return 0;
       if (auto text = w->ime.character(wchar_t(wp))) sendIme(w, text, std::wstring());
@@ -1756,6 +1848,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_MOUSEMOVE:
     if (relativeInput.active(hwnd))
       return 0;
+    FileDrag::maybeClaim();
+    if (FileDrag::ownsInput()) {
+      suspendImeForOle();
+      return 0;
+    }
     pointer(w, lp);
     refreshCursor();
     if (!w->tracking) {
@@ -1765,9 +1862,13 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     return 0;
   case WM_MOUSELEAVE:
+    w->tracking = false;
     if (relativeInput.active(hwnd))
       return 0;
-    w->tracking = false;
+    // A captured root may receive this after a motion has already entered an
+    // overflowing popup. Captured motion supplies the real Wayland hit test;
+    // forwarding the stale leave can clear the pressed menu item before up.
+    if (grabbedRoot) return 0;
     sendJson({{"type", "leave"}, {"id", w->id}});
     return 0;
   case WM_DROPFILES: {
@@ -1776,7 +1877,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     DragQueryPoint(drop, &position);
     std::vector<std::wstring> paths;
     UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
-    for (UINT i = 0; i < std::min(count, 128u); ++i) {
+    if (!count || count > FileTree::MaxRoots) {
+      DragFinish(drop); std::cerr << "Too many file roots; transfer rejected\n"; return 0;
+    }
+    for (UINT i = 0; i < count; ++i) {
       UINT n = DragQueryFileW(drop, i, nullptr, 0);
       std::wstring path(n + 1, L'\0');
       DragQueryFileW(drop, i, path.data(), n + 1);
@@ -1801,6 +1905,13 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_LBUTTONUP:
   case WM_RBUTTONUP:
   case WM_MBUTTONUP: {
+    if (FileDrag::ownsInput()) {
+      if (message == WM_LBUTTONUP) {
+        FileDrag::releasedBeforeStart();
+        updateIme();
+      }
+      return 0;
+    }
     bool down = message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN;
     uint32_t button = (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)   ? 0x110
                       : (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) ? 0x111
@@ -1830,6 +1941,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   }
   case WM_KEYDOWN:
+    if (wp == VK_ESCAPE && VirtualFiles::synchronousWaits) {
+      VirtualFiles::cancelDrops();
+      return 0;
+    }
+    [[fallthrough]];
   case WM_KEYUP:
   case WM_SYSKEYDOWN:
   case WM_SYSKEYUP:
@@ -1839,6 +1955,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       releasePointer();
       return 0;
     }
+    if (FileDrag::ownsInput()) return 0;
     if (auto key = linuxKey(lp)) {
       bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
       if (down) {
@@ -1903,6 +2020,12 @@ void dispatchNetwork() {
   inboxWake.notify_all();
   for (auto &m : pending) {
     std::string type = m.value("type", "");
+    HWND sourceWindow = nullptr;
+    if (type == "drag_offer") {
+      auto found = windows.find(m.value("id", uint32_t(0)));
+      if (found != windows.end()) sourceWindow = found->second->hwnd;
+    }
+    if (FileTree::receive(m) || FileDrag::control(m, controller, sourceWindow)) continue;
     if (type == "hello") {
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
       if (m.value("version", 0) != 3 || m.value("codec", "") != "mixed") {
@@ -1917,6 +2040,8 @@ void dispatchNetwork() {
       semanticsNegotiated = m.value("window_semantics_v1", false);
       cursorNegotiated = m.value("cursor_v1", false);
       iconsNegotiated = m.value("window_icon_v1", false);
+      if (m.contains("features") && m["features"].is_array())
+        FileTree::supported = std::find(m["features"].begin(), m["features"].end(), "file_tree") != m["features"].end();
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
@@ -2185,8 +2310,14 @@ void dispatchNetwork() {
     } else if (type == "window_closed") {
       uint32_t id = m.at("id").get<uint32_t>();
       destroyRemote(id);
-    } else if (type == "clipboard")
-      setClipboard(m.at("items"));
+    } else if (type == "clipboard") {
+      auto generation = m.value("generation", uint64_t(0));
+      if (FileTree::serverClipboard(generation)) {
+        setClipboard(m.at("items"));
+        FileTree::clipboardApplied(generation, ownClipboardSequence);
+        if (incomingBatch == generation && !incomingFiles.empty()) incomingClipboardSequence = ownClipboardSequence;
+      }
+    }
     else if (type == "files_begin" || type == "file_chunk" || type == "files_done" ||
              type == "files_error")
       receiveFiles(m);
@@ -2260,25 +2391,45 @@ void dispatchNetwork() {
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
+    if (message == VirtualFiles::CompletedMessage) {
+      VirtualFiles::drain();
+      return 0;
+    }
+    if (message == FileDrag::StartMessage) {
+      if (FileDrag::ownsInput()) {
+        releasePointer();
+        suspendImeForOle();
+      }
+      FileDrag::start(hwnd);
+      updateIme();
+      return 0;
+    }
     if (message == NetworkReady) {
       dispatchNetwork();
       return 0;
     }
     if (message == WM_CLIPBOARDUPDATE) {
-      if (GetClipboardSequenceNumber() != ownClipboardSequence)
+      if (GetClipboardSequenceNumber() != ownClipboardSequence) {
+        FileTree::localClipboardChanged();
+        cancelIncomingFiles();
         publishClipboard();
+      }
       return 0;
     }
     if (message == WM_TIMER) {
       for (auto &entry : windows)
         if (!entry.second->popup)
           sendColorMode(entry.second.get());
+      VirtualFiles::tick();
       sendJson({{"type", "ping"}, {"nonce", GetTickCount64()}});
       clientStats.report();
       return 0;
     }
     if (message == WM_CLOSE) {
       releasePointer(false);
+      running = false;
+      FileTree::cancelUploads();
+      VirtualFiles::cancel();
       PostQuitMessage(0);
       return 0;
     }
@@ -2438,6 +2589,8 @@ int wmain(int argc, wchar_t **argv) {
             {"window_icon_v1", true},
             {"window_semantics_v1", true},
             {"pointer_lock", true},
+            {"file_drop_out", true},
+            {"file_tree", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},
@@ -2452,6 +2605,9 @@ int wmain(int argc, wchar_t **argv) {
   }
   releasePointer(false);
   running = false;
+  FileTree::cancelUploads();
+  FileTree::cancelIncoming();
+  FileDrag::disconnect();
   inboxWake.notify_all();
   frameWake.notify_all();
   shutdown(connection, SD_BOTH);
@@ -2469,13 +2625,13 @@ int wmain(int argc, wchar_t **argv) {
   if (mediaReceiver.joinable())
     mediaReceiver.join();
   decoder.join();
+  VirtualFiles::finishWorkers();
   for (auto &worker : fileWorkers) {
     worker.join();
   }
+  VirtualFiles::shutdown();
   closesocket(connection);
-  for (auto &[id, file] : incomingFiles)
-    if (file.handle != INVALID_HANDLE_VALUE)
-      CloseHandle(file.handle);
+  cancelIncomingFiles();
   for (auto &[id, w] : windows)
     DestroyWindow(w->hwnd);
   windows.clear();

@@ -113,6 +113,7 @@ impl App {
             let root = self.root_id(id);
             if !self.relative.available
                 || self.peer.is_none()
+                || self.outbound.is_some()
                 || id != root
                 || self.focused_window != Some(root)
                 || !surface.is_alive()
