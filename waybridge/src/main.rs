@@ -6,6 +6,7 @@ mod metrics;
 mod network;
 mod protocol;
 mod transfer;
+mod udp;
 mod video;
 
 use anyhow::{bail, Context, Result};
@@ -113,6 +114,12 @@ struct Args {
     listen: String,
     #[arg(long, default_value = "waybridge-0")]
     socket: String,
+    /// Optional encrypted UDP media endpoint; SSH forwards only TCP.
+    #[arg(long)]
+    udp_listen: Option<String>,
+    /// UDP pacing ceiling, including parity shards (not adaptive congestion control).
+    #[arg(long, default_value_t=200, value_parser=clap::value_parser!(u32).range(1..=1000))]
+    udp_mbps: u32,
     /// Authentication token file; created with mode 0600 if absent.
     #[arg(long)]
     token_file: Option<PathBuf>,
@@ -1785,13 +1792,21 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let udp = args
+        .udp_listen
+        .as_deref()
+        .map(|address| udp::Hub::new(address, args.udp_mbps))
+        .transpose()?;
     let (events, tx) = network::listen(
         &args.listen,
         auth,
-        color_programs.is_some()
-            && gpu_device.is_some()
-            && video_codec.is_some_and(|c| c.hdr_variant().is_some()),
-        audio.is_some(),
+        network::Options {
+            hdr_enabled: color_programs.is_some()
+                && gpu_device.is_some()
+                && video_codec.is_some_and(|c| c.hdr_variant().is_some()),
+            audio: audio.is_some(),
+            udp,
+        },
     )?;
     let compositor = CompositorState::new_v6::<App>(&dh);
     let shell = XdgShellState::new::<App>(&dh);

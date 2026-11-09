@@ -250,6 +250,27 @@ uint32_t u32(const uint8_t *p) {
   return ntohl(n);
 }
 
+void queueMedia(uint8_t kind, std::vector<uint8_t> bytes) {
+  if ((kind != 1 || bytes.size() < 36) && (!VideoDecoder::videoKind(kind) || bytes.size() < 60))
+    throw std::runtime_error("invalid media frame");
+  uint32_t id = u32(bytes.data());
+  std::unique_lock<std::mutex> guard(inboxMutex);
+  if (frames.size() >= 128 && !frames.count(id))
+    throw std::runtime_error("too many media windows");
+  if (VideoDecoder::videoKind(kind))
+    frameWake.wait(guard,
+                   [&] { return !running || !frames.count(id) || frames.at(id).size() < 4; });
+  if (!running)
+    return;
+  auto &queue = frames[id];
+  if (kind == 1)
+    queue.clear();
+  queue.push_back({kind, std::move(bytes), Clock::now()});
+  frameWake.notify_all();
+}
+#include "udp_media.h"
+UdpMedia udpMedia;
+
 void receiveLoop(SOCKET socket) {
   try {
     while (running) {
@@ -262,6 +283,23 @@ void receiveLoop(SOCKET socket) {
       std::vector<uint8_t> packet(size);
       if (!readAll(socket, packet.data(), size))
         break;
+      if (packet[0] == 6) {
+        udpMedia.repair(packet.data() + 1, packet.size() - 1);
+        continue;
+      }
+      if (packet[0] == 1 || VideoDecoder::videoKind(packet[0])) {
+        uint8_t kind = packet[0];
+        packet.erase(packet.begin());
+        queueMedia(kind, std::move(packet));
+        continue;
+      }
+      if (packet[0] == 0) {
+        auto message = Json::parse(packet.begin() + 1, packet.end());
+        if (message.value("type", "") == "udp_start") {
+          udpMedia.activate();
+          continue;
+        }
+      }
       bool control = packet[0] == 0;
       {
         std::unique_lock<std::mutex> guard(inboxMutex);
@@ -275,22 +313,6 @@ void receiveLoop(SOCKET socket) {
             frameWake.notify_all();
           }
           controls.push_back(std::move(message));
-        } else if ((packet[0] == 1 && size >= 37) || (VideoDecoder::videoKind(packet[0]) && size >= 61)) {
-          uint32_t id = u32(packet.data() + 1);
-          if (frames.size() >= 128 && !frames.count(id))
-            break;
-          if (VideoDecoder::videoKind(packet[0]))
-            frameWake.wait(
-                guard, [&] { return !running || !frames.count(id) || frames.at(id).size() < 4; });
-          if (!running)
-            break;
-          uint8_t kind = packet[0];
-          packet.erase(packet.begin());
-          auto &queue = frames[id];
-          if (kind == 1)
-            queue.clear();
-          queue.push_back({kind, std::move(packet), Clock::now()});
-          frameWake.notify_all();
         } else
           break;
       }
@@ -384,33 +406,43 @@ void receiveAudio(SOCKET socket) {
     uint8_t header[4];
     while (running && readAll(socket, header, 4)) {
       uint32_t size = u32(header);
-      if (!size || size > 19229) break;
+      if (!size || size > 19229)
+        break;
       std::vector<uint8_t> packet(size);
-      if (!readAll(socket, packet.data(), size)) break;
+      if (!readAll(socket, packet.data(), size))
+        break;
       if (!ready) {
-        if (packet[0] != 0 || Json::parse(packet.begin()+1,packet.end()).value("type", "") != "audio_ready") break;
+        if (packet[0] != 0 ||
+            Json::parse(packet.begin() + 1, packet.end()).value("type", "") != "audio_ready")
+          break;
         ready = true;
         audioPlayback.start();
         continue;
       }
-      if (packet[0] != 3 || size < 29) break;
-      const uint8_t *p = packet.data()+1;
-      uint32_t frames = u32(p+8);
-      if (u32(p) != 48000 || p[4] != 0 || p[5] != 2 || p[6] != 0 || p[7] != 16 ||
-          !frames || frames > 4800 || size != 29 + frames*4) break;
-      uint64_t sequence = (uint64_t(u32(p+12)) << 32) | u32(p+16);
-      if (sequence <= lastSequence) continue;
+      if (packet[0] != 3 || size < 29)
+        break;
+      const uint8_t *p = packet.data() + 1;
+      uint32_t frames = u32(p + 8);
+      if (u32(p) != 48000 || p[4] != 0 || p[5] != 2 || p[6] != 0 || p[7] != 16 || !frames ||
+          frames > 4800 || size != 29 + frames * 4)
+        break;
+      uint64_t sequence = (uint64_t(u32(p + 12)) << 32) | u32(p + 16);
+      if (sequence <= lastSequence)
+        continue;
       lastSequence = sequence;
-      audioPlayback.push(p+28, size_t(frames)*4);
+      audioPlayback.push(p + 28, size_t(frames) * 4);
       auto ack = Json({{"type", "audio_ack"}, {"sequence", sequence}}).dump();
-      uint32_t length = htonl(uint32_t(ack.size()+1));
-      std::vector<uint8_t> wire(5+ack.size());
-      memcpy(wire.data(), &length, 4); wire[4] = 0;
-      memcpy(wire.data()+5, ack.data(), ack.size());
+      uint32_t length = htonl(uint32_t(ack.size() + 1));
+      std::vector<uint8_t> wire(5 + ack.size());
+      memcpy(wire.data(), &length, 4);
+      wire[4] = 0;
+      memcpy(wire.data() + 5, ack.data(), ack.size());
       size_t sent = 0;
       while (running && sent < wire.size()) {
-        int n = send(socket, reinterpret_cast<const char *>(wire.data()+sent), int(wire.size()-sent), 0);
-        if (n <= 0) return;
+        int n = send(socket, reinterpret_cast<const char *>(wire.data() + sent),
+                     int(wire.size() - sent), 0);
+        if (n <= 0)
+          return;
         sent += size_t(n);
       }
     }
@@ -579,7 +611,8 @@ void decodeLoop() {
       auto kind = videoStates.at(window).kind;
       videoStates.erase(window);
       disabled.insert(window);
-      sendJson({{"type", "codec_fallback"}, {"id", window}, {"codec", VideoDecoder::capability(kind)}});
+      sendJson(
+          {{"type", "codec_fallback"}, {"id", window}, {"codec", VideoDecoder::capability(kind)}});
     }
     if (!id || closed.count(id))
       continue;
@@ -616,8 +649,8 @@ void decodeLoop() {
         uint32_t epoch = u32(bytes.data() + 36), cw = u32(bytes.data() + 40),
                  ch = u32(bytes.data() + 44), key = u32(bytes.data() + 48),
                  color = u32(bytes.data() + 52), alpha = u32(bytes.data() + 56);
-        if (cw < width || ch < height || cw > 4096 || ch > 2304 || (cw & 1) || (ch & 1) || key > 1 ||
-            uint64_t(color) + alpha + 60 != bytes.size() || !color)
+        if (cw < width || ch < height || cw > 4096 || ch > 2304 || (cw & 1) || (ch & 1) ||
+            key > 1 || uint64_t(color) + alpha + 60 != bytes.size() || !color)
           throw std::runtime_error("Invalid video dimensions/length");
         auto &state = videoStates[id];
         if (!state.decoder || state.epoch != epoch || state.kind != encoded.kind ||
@@ -633,7 +666,8 @@ void decodeLoop() {
                              millis(Clock::now() - initStarted));
           state.epoch = epoch;
           state.kind = encoded.kind;
-          std::cout << "D3D11 hardware " << VideoDecoder::name(encoded.kind) << " decoder active for window " << id << '\n';
+          std::cout << "D3D11 hardware " << VideoDecoder::name(encoded.kind)
+                    << " decoder active for window " << id << '\n';
         }
         if (alpha) {
           auto maskStarted = Clock::now();
@@ -668,11 +702,12 @@ void decodeLoop() {
           state.pending.erase(found);
         }
       } catch (const std::exception &e) {
-        std::cerr << VideoDecoder::name(encoded.kind) << " decode failed for window " << id << ": " << e.what()
-                  << "; requesting PNG fallback\n";
+        std::cerr << VideoDecoder::name(encoded.kind) << " decode failed for window " << id << ": "
+                  << e.what() << "; requesting PNG fallback\n";
         videoStates.erase(id);
         disabled.insert(id);
-        sendJson({{"type", "codec_fallback"}, {"id", id},
+        sendJson({{"type", "codec_fallback"},
+                  {"id", id},
                   {"codec", VideoDecoder::capability(encoded.kind)}});
         continue;
       }
@@ -1496,6 +1531,8 @@ void dispatchNetwork() {
       }
       if (m.value("audio_pcm", false))
         startAudio(m.at("media_key").get<std::string>());
+      if (m.contains("udp_fec_v1"))
+        udpMedia.start(m["udp_fec_v1"], queueMedia, sendJson);
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
@@ -1778,7 +1815,8 @@ int wmain(int argc, wchar_t **argv) {
     for (uint8_t kind : {2, 4, 5, 7, 8})
       std::cout << VideoDecoder::name(kind) << " capability="
                 << (started && VideoDecoder::available(kind) ? "available" : "unavailable") << '\n';
-    if (started) mf.Shutdown();
+    if (started)
+      mf.Shutdown();
     CoUninitialize();
     return 0;
   }
@@ -1894,6 +1932,7 @@ int wmain(int argc, wchar_t **argv) {
             {"version", 3},
             {"split_media", true},
             {"audio_pcm", audioSupported},
+            {"udp_fec_v1", UdpMedia::requested()},
             {"frame_ack", true},
             {"hdr", supportedVideoKinds.count(7) > 0 || supportedVideoKinds.count(8) > 0},
             {"color_spaces", Json::array({"bt709_sdr", "bt2020_pq"})},
@@ -1913,13 +1952,16 @@ int wmain(int argc, wchar_t **argv) {
   inboxWake.notify_all();
   frameWake.notify_all();
   shutdown(connection, SD_BOTH);
+  udpMedia.stop();
   SOCKET media = mediaConnection.load();
   if (media != INVALID_SOCKET)
     shutdown(media, SD_BOTH);
   SOCKET audio = audioConnection.load();
-  if (audio != INVALID_SOCKET) shutdown(audio, SD_BOTH);
+  if (audio != INVALID_SOCKET)
+    shutdown(audio, SD_BOTH);
   receiver.join();
-  if (audioReceiver.joinable()) audioReceiver.join();
+  if (audioReceiver.joinable())
+    audioReceiver.join();
   audioPlayback.stop();
   if (mediaReceiver.joinable())
     mediaReceiver.join();
