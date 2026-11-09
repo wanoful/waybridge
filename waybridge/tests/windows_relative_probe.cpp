@@ -32,6 +32,8 @@ int wmain(int argc, wchar_t **argv) {
     SendMessageW(target, WM_MOUSEMOVE, 0, MAKELPARAM(120, 80));
     SendMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(120, 80));
     SendMessageW(target, WM_LBUTTONUP, 0, MAKELPARAM(120, 80));
+  } else if (action == L"setcursor") {
+    SendMessageW(target, WM_SETCURSOR, reinterpret_cast<WPARAM>(target), MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
   } else if (action == L"motion") {
     INPUT input{}; input.type = INPUT_MOUSE; input.mi.dx = 17; input.mi.dy = -9;
     input.mi.dwFlags = MOUSEEVENTF_MOVE;
@@ -47,7 +49,8 @@ int wmain(int argc, wchar_t **argv) {
     RECT clip{}; GetClipCursor(&clip);
     CURSORINFO info{}; info.cbSize = sizeof(info); GetCursorInfo(&info);
     std::cout << "CLIP " << clip.left << ' ' << clip.top << ' ' << clip.right << ' ' << clip.bottom
-              << " SHOWING " << ((info.flags & CURSOR_SHOWING) ? 1 : 0) << '\n';
+              << " SHOWING " << ((info.flags & CURSOR_SHOWING) ? 1 : 0)
+              << " CURSOR " << (info.hCursor ? 1 : 0) << '\n';
   } else return 4;
   return 0;
 }

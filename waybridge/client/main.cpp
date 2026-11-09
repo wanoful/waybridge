@@ -1103,7 +1103,8 @@ uint32_t cursorRoot(RemoteWindow *w) { return w->popup ? w->root : w->id; }
 void refreshCursor() {
   if (relativeInput.active()) { SetCursor(nullptr); return; }
   POINT point{};
-  if (!cursorNegotiated || !GetCursorPos(&point)) return;
+  if (!cursorNegotiated) { SetCursor(LoadCursorW(nullptr, IDC_ARROW)); return; }
+  if (!GetCursorPos(&point)) return;
   HWND under = WindowFromPoint(point);
   for (auto &[id, w] : windows) {
     if (w->hwnd == under && SendMessageW(under, WM_NCHITTEST, 0, MAKELPARAM(point.x, point.y)) == HTCLIENT) {
@@ -1275,7 +1276,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, message, wp, lp);
   }
   case WM_SETCURSOR:
-    if (relativeInput.active(hwnd)) {
+    if (relativeInput.active()) {
       SetCursor(nullptr);
       return TRUE;
     }
@@ -1913,6 +1914,7 @@ void dispatchNetwork() {
         auto found = windows.find(id);
         bool locked = found != windows.end() && !found->second->popup && !grabbedRoot &&
                       relativeInput.lock(found->second->hwnd, id, generation);
+        if (!locked) refreshCursor();
         std::cout << "Pointer lock " << (locked ? "active" : "unavailable")
                   << " for window " << id << " generation " << generation << '\n';
         sendJson({{"type", "pointer_lock_ack"}, {"id", id},

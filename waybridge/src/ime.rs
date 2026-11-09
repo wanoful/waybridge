@@ -107,7 +107,14 @@ impl App {
         }
     }
     pub(crate) fn ime_message(&mut self, message: &Value) {
-        if self.seat.get_keyboard().unwrap().current_focus() != self.ime.focus {
+        if self
+            .seat
+            .get_keyboard()
+            .unwrap()
+            .current_focus()
+            .and_then(|s| s.wl_surface().map(|s| s.into_owned()))
+            != self.ime.focus
+        {
             return;
         }
         if message["generation"].as_u64() != Some(self.ime.generation)

@@ -257,7 +257,10 @@ impl Peer {
                 let frames_allowed = media || !self.split_media;
                 while !q.closed
                     && ((media
-                        || (q.controls.is_empty() && q.bulk.is_empty() && q.cursor.is_none() && q.icons.is_empty()))
+                        || (q.controls.is_empty()
+                            && q.bulk.is_empty()
+                            && q.cursor.is_none()
+                            && q.icons.is_empty()))
                         && (!frames_allowed || q.frames.is_empty()))
                 {
                     q = self.wake.wait(q).unwrap();

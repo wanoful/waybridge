@@ -83,7 +83,12 @@ int main(void) {
     if (fds[1].revents & POLLIN) {
       char command[128];
       if (!fgets(command, sizeof(command), stdin)) break;
-      if (!strncmp(command, "destroy_surface", 15)) {
+      if (!strncmp(command, "cursor_bitmap", 13) || !strncmp(command, "cursor_text", 11)) {
+        setenv("WAYBRIDGE_TEST_CURSOR", "1", 1);
+        cursor_mode = -1;
+        cursor_select(!strncmp(command, "cursor_bitmap", 13) ? 200 : 0);
+        unsetenv("WAYBRIDGE_TEST_CURSOR");
+      } else if (!strncmp(command, "destroy_surface", 15)) {
         closed(&windows[0], windows[0].top);
       } else if (!strncmp(command, "destroy", 7)) {
         clear_constraint(); puts("DESTROYED");

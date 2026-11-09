@@ -162,7 +162,7 @@ impl App {
             };
             let modal = self.windows.iter().rev().find(|w| {
                 w.mapped
-                    && w.window.toplevel().is_some_and(|t| {
+                    && (w.window.toplevel().is_some_and(|t| {
                         t.parent().as_ref() == Some(&parent)
                             && with_states(t.wl_surface(), |s| {
                                 s.data_map
@@ -172,7 +172,14 @@ impl App {
                                     .unwrap()
                                     .modal
                             })
-                    })
+                    }) || w.window.x11_surface().is_some_and(|x| {
+                        x.is_popup()
+                            && x.is_transient_for().is_some_and(|xid| {
+                                self.window(id)
+                                    .and_then(|p| p.x11_surface().map(|p| p.window_id()))
+                                    == Some(xid)
+                            })
+                    }))
             });
             let Some(modal) = modal else { break };
             id = modal.id;
@@ -219,7 +226,9 @@ impl App {
             })
         });
         for remote in &self.windows {
-            let top = remote.window.toplevel().unwrap();
+            let Some(top) = remote.window.toplevel() else {
+                continue;
+            };
             if top.parent().as_ref() == Some(surface) {
                 with_states(top.wl_surface(), |s| {
                     s.data_map
@@ -236,7 +245,7 @@ impl App {
         let Some(window) = self.window(id) else {
             return;
         };
-        let top = window.toplevel().unwrap();
+        let Some(top) = window.toplevel() else { return };
         let surface = top.wl_surface().clone();
         self.reparent_children(&surface, top.parent());
         with_states(&surface, |states| {
@@ -300,22 +309,26 @@ impl App {
         if !remote.mapped {
             return;
         }
-        let top = remote.window.toplevel().unwrap();
-        top.with_pending_state(|s| {
-            if visible {
-                s.states.unset(xdg_toplevel::State::Suspended);
-            } else {
-                s.states.set(xdg_toplevel::State::Suspended);
-            }
-        });
-        top.send_pending_configure();
+        if let Some(top) = remote.window.toplevel() {
+            top.with_pending_state(|s| {
+                if visible {
+                    s.states.unset(xdg_toplevel::State::Suspended);
+                } else {
+                    s.states.set(xdg_toplevel::State::Suspended);
+                }
+            });
+            top.send_pending_configure();
+        } else if let Some(x) = remote.window.x11_surface() {
+            let _ = x.set_suspended(!visible);
+        }
         if !visible && self.focused_window == Some(id) {
             self.focus(None);
         }
     }
     pub(crate) fn native_resize(&mut self, id: u32, value: &Value) -> Option<(i32, i32)> {
         let index = self.windows.iter().position(|w| w.id == id)?;
-        let top = self.windows[index].window.toplevel().unwrap().clone();
+        let top = self.windows[index].window.toplevel().cloned();
+        let x11 = self.windows[index].window.x11_surface().cloned();
         let mut size = (
             value["width"].as_i64().unwrap_or(960).clamp(1, 8192) as i32,
             value["height"].as_i64().unwrap_or(640).clamp(1, 8192) as i32,
@@ -328,19 +341,30 @@ impl App {
             remote.state.fullscreen(fullscreen);
         }
         if !fullscreen {
-            let (min, max) = limits(top.wl_surface());
+            let (min, max) = if let Some(top) = &top {
+                limits(top.wl_surface())
+            } else if let Some(x) = &x11 {
+                (
+                    x.min_size().map(|s| [s.w, s.h]).unwrap_or([0, 0]),
+                    x.max_size().map(|s| [s.w, s.h]).unwrap_or([0, 0]),
+                )
+            } else {
+                ([0, 0], [0, 0])
+            };
             size = (axis(size.0, min[0], max[0]), axis(size.1, min[1], max[1]));
         }
-        top.with_pending_state(|s| {
-            if valid_fullscreen {
-                if fullscreen {
-                    s.states.set(xdg_toplevel::State::Fullscreen);
-                    s.states.unset(xdg_toplevel::State::Maximized);
-                } else {
-                    s.states.unset(xdg_toplevel::State::Fullscreen);
+        if let Some(top) = top {
+            top.with_pending_state(|s| {
+                if valid_fullscreen {
+                    if fullscreen {
+                        s.states.set(xdg_toplevel::State::Fullscreen);
+                        s.states.unset(xdg_toplevel::State::Maximized);
+                    } else {
+                        s.states.unset(xdg_toplevel::State::Fullscreen);
+                    }
                 }
-            }
-        });
+            });
+        }
         Some(size)
     }
     pub(crate) fn configure_capabilities(&mut self) {
@@ -354,7 +378,9 @@ impl App {
         }
         self.shell.replace_capabilities(capabilities.clone());
         for window in &self.windows {
-            let top = window.window.toplevel().unwrap();
+            let Some(top) = window.window.toplevel() else {
+                continue;
+            };
             top.with_pending_state(|s| {
                 s.capabilities.replace(capabilities.clone());
             });

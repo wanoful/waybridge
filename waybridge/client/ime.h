@@ -29,6 +29,7 @@ struct NativeIme {
     }
     composing = false;
     surrogate = 0;
+    rawCharacterKeys.clear();
     cancelling = previous;
   }
   void associate(HWND hwnd, bool active, uint32_t id, uint64_t serial) {

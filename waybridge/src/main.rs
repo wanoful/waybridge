@@ -1,15 +1,16 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
-mod cursor;
 mod app_icon;
+mod cursor;
 mod ime;
 mod metrics;
 mod network;
 mod protocol;
 mod relative_input;
+mod shutdown;
 mod transfer;
 mod video;
-mod x11;
 mod window_semantics;
+mod x11;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -263,7 +264,9 @@ impl App {
             }
             Some(id)
         });
-        let id = id.map(|id| self.modal_target(id)).filter(|id| self.window(*id).is_some());
+        let id = id
+            .map(|id| self.modal_target(id))
+            .filter(|id| self.window(*id).is_some());
         let changed = self.focused_window != id;
         if changed {
             if let Some(root) = self.x11.grab.filter(|root| Some(*root) != id) {
@@ -317,7 +320,11 @@ impl App {
             keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
         }
         // Smithay 0.7 does not call SeatHandler::focus_changed when focus becomes None.
-        self.ime.focus(keyboard.current_focus());
+        self.ime.focus(
+            keyboard
+                .current_focus()
+                .and_then(|s| s.wl_surface().map(|s| s.into_owned())),
+        );
         self.publish_ime();
         for w in &self.windows {
             if w.window.set_activated(Some(w.id) == id) {
@@ -366,7 +373,9 @@ impl App {
 
     fn pointer_motion(&mut self, id: u32, x: f64, y: f64) {
         self.sync_pointer_lock();
-        if self.pointer_locked() { return; }
+        if self.pointer_locked() {
+            return;
+        }
         if !self.input_allowed(id) || !x.is_finite() || !y.is_finite() {
             return;
         }
@@ -752,6 +761,14 @@ impl App {
                         );
                     }
                     if let Some(x) = window.x11_surface() {
+                        if self.semantics_enabled() {
+                            let fullscreen = self
+                                .windows
+                                .iter()
+                                .find(|w| w.id == id)
+                                .is_some_and(|w| w.state.fullscreen);
+                            let _ = x.set_fullscreen(fullscreen);
+                        }
                         let mut geometry = x.geometry();
                         geometry.size = (width, height).into();
                         let _ = x.configure(geometry);
@@ -1046,23 +1063,35 @@ impl App {
                 })
             };
             if semantics {
-                remote.state.input = window_semantics::input_region(&surface,bbox);
-                if let Some(top)=remote.window.toplevel() {
-                    let (min,max)=window_semantics::limits(top.wl_surface());
-                    info["min_size"]=json!(min);info["max_size"]=json!(max);
-                    info["modal"]=with_states(top.wl_surface(),|s|json!(s.data_map.get::<XdgToplevelSurfaceData>().unwrap().lock().unwrap().modal));
-                } else if let Some(x)=remote.window.x11_surface() {
-                    info["min_size"]=json!(x.min_size().map(|s|[s.w,s.h]).unwrap_or([0,0]));
-                    info["max_size"]=json!(x.max_size().map(|s|[s.w,s.h]).unwrap_or([0,0]));
-                    info["modal"]=json!(x.is_popup());
+                remote.state.input = window_semantics::input_region(&surface, bbox);
+                if let Some(top) = remote.window.toplevel() {
+                    let (min, max) = window_semantics::limits(top.wl_surface());
+                    info["min_size"] = json!(min);
+                    info["max_size"] = json!(max);
+                    info["modal"] = with_states(top.wl_surface(), |s| {
+                        json!(
+                            s.data_map
+                                .get::<XdgToplevelSurfaceData>()
+                                .unwrap()
+                                .lock()
+                                .unwrap()
+                                .modal
+                        )
+                    });
+                } else if let Some(x) = remote.window.x11_surface() {
+                    info["min_size"] = json!(x.min_size().map(|s| [s.w, s.h]).unwrap_or([0, 0]));
+                    info["max_size"] = json!(x.max_size().map(|s| [s.w, s.h]).unwrap_or([0, 0]));
+                    info["modal"] = json!(x.is_popup());
                 }
-                info["fullscreen"]=json!(remote.state.fullscreen);
-                info["fullscreen_epoch"]=json!(remote.state.fullscreen_epoch);
-                info["mapping_epoch"]=json!(remote.state.mapping_epoch);
-                info["input_region"]=remote.state.input.clone();
+                info["fullscreen"] = json!(remote.state.fullscreen);
+                info["fullscreen_epoch"] = json!(remote.state.fullscreen_epoch);
+                info["mapping_epoch"] = json!(remote.state.mapping_epoch);
+                info["input_region"] = remote.state.input.clone();
             }
-            remote.icon.observe(info["app_id"].as_str().unwrap_or_default());
-            info["icon_revision"]=json!(remote.icon.revision);
+            remote
+                .icon
+                .observe(info["app_id"].as_str().unwrap_or_default());
+            info["icon_revision"] = json!(remote.icon.revision);
             if let Some(peer) = &self.peer {
                 if !remote.announced || remote.last_info != info {
                     peer.control(info.clone());
@@ -1376,25 +1405,22 @@ impl CompositorHandler for App {
                 }
                 if mapped {
                     remote.state.visible = true;
-                    let top = remote.window.toplevel().unwrap();
-                    top.with_pending_state(|s| {
-                        s.states.unset(xdg_toplevel::State::Suspended);
-                    });
-                    top.send_pending_configure();
+                    if let Some(top) = remote.window.toplevel() {
+                        top.with_pending_state(|s| {
+                            s.states.unset(xdg_toplevel::State::Suspended);
+                        });
+                        top.send_pending_configure();
+                    }
                 }
                 if semantics && remote.announced {
                     self.peer.as_ref().unwrap().control(json!({"type":"window_visibility","id":remote.id,"mapped":mapped,"mapping_epoch":remote.state.mapping_epoch,"fullscreen":remote.state.fullscreen,"fullscreen_epoch":remote.state.fullscreen_epoch}));
                 }
             }
             remote.mapped = mapped;
-            if unmapped != Some(remote.id)
-                && !remote
-                    .window
-                    .toplevel()
-                    .unwrap()
-                    .is_initial_configure_sent()
-            {
-                remote.window.toplevel().unwrap().send_configure();
+            if let Some(top) = remote.window.toplevel() {
+                if unmapped != Some(remote.id) && !top.is_initial_configure_sent() {
+                    top.send_configure();
+                }
             }
             set_surface_scale(surface, &remote.output, remote.scale);
         }
@@ -1677,7 +1703,8 @@ impl SeatHandler for App {
         &mut self.seats
     }
     fn cursor_image(&mut self, _: &Seat<Self>, image: smithay::input::pointer::CursorImageStatus) {
-        self.cursor.image=image; self.cursor.dirty=true;
+        self.cursor.image = image;
+        self.cursor.dirty = true;
     }
     fn focus_changed(&mut self, seat: &Seat<Self>, surface: Option<&Self::KeyboardFocus>) {
         use smithay::wayland::seat::WaylandFocus;
@@ -1688,7 +1715,8 @@ impl SeatHandler for App {
                 .and_then(|s| s.wl_surface())
                 .and_then(|s| s.client()),
         );
-        self.ime.focus(surface.and_then(|s| s.wl_surface()).map(|s| s.into_owned()));
+        self.ime
+            .focus(surface.and_then(|s| s.wl_surface()).map(|s| s.into_owned()));
         self.publish_ime();
     }
 }
@@ -2000,7 +2028,8 @@ fn main() -> Result<()> {
     tracing::info!(socket = %args.socket, token_file = %token_path.display(), "ready; launch apps with WAYLAND_DISPLAY set to this socket");
     let interval = Duration::from_secs_f64(1.0 / args.fps as f64);
     let mut next_frame = Instant::now();
-    while !x11::stopping() {
+    shutdown::install();
+    while !shutdown::requested() {
         xloop.dispatch(Some(Duration::ZERO), &mut app)?;
         while let Some(stream) = socket.accept()? {
             app.dh
@@ -2034,10 +2063,14 @@ fn main() -> Result<()> {
                     for w in &mut app.windows {
                         w.state.visible = true;
                         w.state.minimized = false;
-                        w.window.toplevel().unwrap().with_pending_state(|s| {
-                            s.states.unset(xdg_toplevel::State::Suspended);
-                        });
-                        w.window.toplevel().unwrap().send_pending_configure();
+                        if let Some(top) = w.window.toplevel() {
+                            top.with_pending_state(|s| {
+                                s.states.unset(xdg_toplevel::State::Suspended);
+                            });
+                            top.send_pending_configure();
+                        } else if let Some(x) = w.window.x11_surface() {
+                            let _ = x.set_suspended(false);
+                        }
                         w.announced = false;
                         w.icon.sent = false;
                         w.dirty = true;
@@ -2114,10 +2147,13 @@ fn main() -> Result<()> {
                 Event::Clipboard { .. } => {}
             }
         }
-        if app
-            .ime
-            .focus(app.seat.get_keyboard().unwrap().current_focus())
-        {
+        if app.ime.focus(
+            app.seat
+                .get_keyboard()
+                .unwrap()
+                .current_focus()
+                .and_then(|s| s.wl_surface().map(|s| s.into_owned())),
+        ) {
             app.publish_ime();
         }
         if Instant::now() >= next_frame {

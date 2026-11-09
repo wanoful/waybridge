@@ -10,9 +10,8 @@ use smithay::{
 };
 use std::{
     process::Stdio,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
-static STOP: AtomicBool = AtomicBool::new(false);
 static WRITERS: AtomicUsize = AtomicUsize::new(0);
 use smithay::input::keyboard::{KeyboardTarget, KeysymHandle, ModifiersState};
 use smithay::wayland::seat::WaylandFocus;
@@ -88,12 +87,6 @@ impl KeyboardTarget<App> for KeyboardFocus {
         }
     }
 }
-extern "C" fn stop(_: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
-}
-pub fn stopping() -> bool {
-    STOP.load(Ordering::Relaxed)
-}
 pub struct State {
     pub shell: XWaylandShellState,
     client: Option<Client>,
@@ -157,10 +150,6 @@ pub fn start(dh: &DisplayHandle, handle: LoopHandle<'static, App>, enabled: bool
     }
     let (source, client) = spawned.context("starting Xwayland")?;
     state.client = Some(client.clone());
-    unsafe {
-        libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
-    }
     let wm_handle = handle.clone();
     state.token = Some(
         handle
@@ -254,6 +243,23 @@ pub fn info(
     json!({"type":"window","id":id,"title":x.title(),"app_id":x.class(),"width":size.w,"height":size.h,"scale":scale,"parent":parent.map(|(_,id)|id),"decoration":if !x.is_decorated() && !x.is_override_redirect(){"server"}else{"client"},"x11":true})
 }
 impl App {
+    fn x11_fullscreen(&mut self, window: &X11Surface, value: bool) {
+        let _ = window.set_fullscreen(value);
+        if let Some(remote) = self
+            .windows
+            .iter_mut()
+            .find(|w| w.window.x11_surface() == Some(window))
+        {
+            remote.state.fullscreen(value);
+            remote.dirty = true;
+            let message = json!({"type":"window_action","id":remote.id,
+                "action":if value {"fullscreen"} else {"unfullscreen"},
+                "fullscreen_epoch":remote.state.fullscreen_epoch});
+            if self.semantics_enabled() {
+                self.control(message);
+            }
+        }
+    }
     pub(super) fn x11_scale(&mut self, scale: f64) {
         tracing::debug!(scale, "setting shared Xwayland DPI");
         if let Some(client) = &self.x11.client {
@@ -307,6 +313,11 @@ impl App {
         let mapped = surface.is_mapped() && surface.wl_surface().is_some();
         self.windows.push(RemoteWindow {
             id,
+            icon: app_icon::WindowIcon::default(),
+            state: window_semantics::State {
+                fullscreen: surface.is_fullscreen(),
+                ..Default::default()
+            },
             window: Window::new_x11_window(surface),
             dirty: true,
             announced: false,
@@ -503,6 +514,12 @@ impl XwmHandler for App {
         let _ = window.set_suspended(false);
         self.x11_action(&window, "restore", None);
     }
+    fn fullscreen_request(&mut self, _: XwmId, window: X11Surface) {
+        self.x11_fullscreen(&window, true);
+    }
+    fn unfullscreen_request(&mut self, _: XwmId, window: X11Surface) {
+        self.x11_fullscreen(&window, false);
+    }
     fn resize_request(&mut self, _: XwmId, window: X11Surface, _: u32, edge: ResizeEdge) {
         let edge = match edge {
             ResizeEdge::Top => 1,
@@ -554,7 +571,7 @@ impl XwmHandler for App {
                 let mut file = fs::File::from(fd);
                 let mut offset = 0;
                 let deadline = Instant::now() + Duration::from_secs(10);
-                while offset < bytes.len() && !stopping() && Instant::now() < deadline {
+                while offset < bytes.len() && !shutdown::requested() && Instant::now() < deadline {
                     match file.write(&bytes[offset..]) {
                         Ok(0) => break,
                         Ok(n) => offset += n,
