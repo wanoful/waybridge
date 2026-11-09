@@ -94,9 +94,9 @@ struct window {
   struct xdg_toplevel *top;
   struct zxdg_toplevel_decoration_v1 *decoration;
   int width, height, id;
-  int maximized;
+  int maximized, fullscreen, hidden, sem_invert;
 };
-static struct window windows[2];
+static struct window windows[3];
 static struct window *pointer_window;
 static double pointer_x, pointer_y;
 static void decoration_configured(void *data, struct zxdg_toplevel_decoration_v1 *decoration,
@@ -135,6 +135,8 @@ static void draw(struct window *w) {
     for (int x = 0; x < width; x++) {
       int cx = x - shadow, cy = y - shadow;
       uint32_t color = cy < w->height / 2 ? 0xffff0000 : 0xff0000ff;
+      if (w->sem_invert)
+        color = cy < w->height / 2 ? 0xff0000ff : 0xffff0000;
       if (client_decorated && cy < 32)
         color = 0xff282828;
       if (cx < 0 || cy < 0 || cx >= w->width || cy >= w->height)
@@ -156,7 +158,8 @@ static void draw(struct window *w) {
 }
 static void configured(void *data, struct xdg_surface *s, uint32_t serial) {
   xdg_surface_ack_configure(s, serial);
-  draw(data);
+  if (!((struct window *)data)->hidden)
+    draw(data);
 }
 static const struct xdg_surface_listener surface_listener = {.configure = configured};
 static void sized(void *data, struct xdg_toplevel *top, int32_t width, int32_t height,
@@ -164,10 +167,23 @@ static void sized(void *data, struct xdg_toplevel *top, int32_t width, int32_t h
   (void)top;
   struct window *w = data;
   w->maximized = 0;
+  w->fullscreen = 0;
+  int activated = 0, suspended = 0;
   uint32_t *state;
   wl_array_for_each(state, states) {
     if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED)
       w->maximized = 1;
+    if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN)
+      w->fullscreen = 1;
+    if (*state == XDG_TOPLEVEL_STATE_ACTIVATED)
+      activated = 1;
+    if (*state == XDG_TOPLEVEL_STATE_SUSPENDED)
+      suspended = 1;
+  }
+  if (getenv("WAYBRIDGE_TEST_SEMANTICS")) {
+    printf("SEM_CONFIGURE %d %d %d %d %d %d %d\n", w->id, width, height, w->fullscreen,
+           w->maximized, activated, suspended);
+    fflush(stdout);
   }
   if (width > 0)
     w->width = width;
@@ -184,10 +200,31 @@ static void closed(void *data, struct xdg_toplevel *top) {
   xdg_surface_destroy(w->xdg);
   wl_surface_destroy(w->surface);
   w->surface = NULL;
-  if (!windows[0].surface && !windows[1].surface)
+  if (!windows[0].surface && !windows[1].surface && !windows[2].surface)
     exit(0);
 }
-static const struct xdg_toplevel_listener top_listener = {.configure = sized, .close = closed};
+static void configure_bounds(void *d, struct xdg_toplevel *top, int32_t w, int32_t h) {
+  (void)d;
+  (void)top;
+  (void)w;
+  (void)h;
+}
+static void wm_capabilities(void *d, struct xdg_toplevel *top, struct wl_array *capabilities) {
+  (void)d;
+  (void)top;
+  if (getenv("WAYBRIDGE_TEST_SEMANTICS")) {
+    printf("SEM_CAPS");
+    uint32_t *cap;
+    wl_array_for_each(cap, capabilities) printf(" %u", *cap);
+    printf("\n");
+    fflush(stdout);
+  }
+}
+static const struct xdg_toplevel_listener top_listener = {.configure = sized,
+                                                          .close = closed,
+                                                          .configure_bounds = configure_bounds,
+                                                          .wm_capabilities = wm_capabilities};
+#include "semantics_fixture.h"
 static void ping(void *data, struct xdg_wm_base *base, uint32_t serial) {
   (void)data;
   xdg_wm_base_pong(base, serial);
@@ -199,7 +236,7 @@ static void pointer_enter(void *data, struct wl_pointer *p, uint32_t s, struct w
   (void)p;
   (void)s;
   (void)surface;
-  for (int i = 0; i < 2; i++)
+  for (int i = 0; i < 3; i++)
     if (windows[i].surface == surface)
       pointer_window = &windows[i];
   pointer_x = wl_fixed_to_double(x);
@@ -229,6 +266,10 @@ static void button(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32
   (void)p;
   (void)s;
   (void)t;
+  if (getenv("WAYBRIDGE_TEST_SEMANTICS")) {
+    printf("SEM_BUTTON %d %u %u\n", pointer_window ? pointer_window->id : 0, b, state);
+    fflush(stdout);
+  }
   printf("BUTTON %u %u\n", b, state);
   if (client_decorated && pointer_window && b == 272 && state == WL_POINTER_BUTTON_STATE_PRESSED &&
       pointer_y >= 12 && pointer_y < 44) {
@@ -299,6 +340,10 @@ static void keyboard_enter(void *d, struct wl_keyboard *k, uint32_t s, struct wl
   (void)s;
   (void)surface;
   (void)keys;
+  keyboard_window = 0;
+  for (int i = 0; i < 3; i++)
+    if (windows[i].surface == surface)
+      keyboard_window = i + 1;
 }
 static void keyboard_leave(void *d, struct wl_keyboard *k, uint32_t s, struct wl_surface *surface) {
   (void)d;
@@ -312,6 +357,8 @@ static void key(void *d, struct wl_keyboard *k, uint32_t s, uint32_t t, uint32_t
   (void)k;
   (void)s;
   (void)t;
+  if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+    semantics_key(code);
   printf("KEY %u %u\n", code, state);
   fflush(stdout);
 }
@@ -354,12 +401,17 @@ static const struct wl_seat_listener seat_listener = {.capabilities = capabiliti
 static void global(void *data, struct wl_registry *r, uint32_t name, const char *interface,
                    uint32_t version) {
   (void)data;
+  if (!strcmp(interface, "xdg_wm_dialog_v1"))
+    dialog_manager = wl_registry_bind(r, name, &xdg_wm_dialog_v1_interface, 1);
+  if (!strcmp(interface, "wl_subcompositor"))
+    subcompositor = wl_registry_bind(r, name, &wl_subcompositor_interface, 1);
   if (!strcmp(interface, "wl_compositor"))
     compositor = wl_registry_bind(r, name, &wl_compositor_interface, version < 4 ? version : 4);
   if (!strcmp(interface, "wl_shm"))
     shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
   if (!strcmp(interface, "xdg_wm_base")) {
-    shell = wl_registry_bind(r, name, &xdg_wm_base_interface, 1);
+    shell = wl_registry_bind(r, name, &xdg_wm_base_interface,
+                             getenv("WAYBRIDGE_TEST_SEMANTICS") ? (version < 6 ? version : 6) : 1);
     xdg_wm_base_add_listener(shell, &shell_listener, NULL);
   }
   if (!strcmp(interface, "wl_seat")) {
@@ -390,7 +442,7 @@ int main(int argc, char **argv) {
   wl_display_roundtrip(display);
   wl_data_device_add_listener(wl_data_device_manager_get_data_device(data_manager, seat),
                               &device_listener, NULL);
-  for (int i = 0; i < (argc > 1 ? 2 : 1); i++) {
+  for (int i = 0; i < (getenv("WAYBRIDGE_TEST_SEMANTICS") ? 3 : (argc > 1 ? 2 : 1)); i++) {
     struct window *w = &windows[i];
     w->id = i + 1;
     w->width = 400;
@@ -409,9 +461,16 @@ int main(int argc, char **argv) {
     }
     char title[64];
     snprintf(title, sizeof(title), "Waybridge fixture %d", w->id);
+    if (getenv("WAYBRIDGE_TEST_SEMANTICS"))
+      snprintf(title, sizeof(title), "Waybridge semantics %d", w->id);
     xdg_toplevel_set_title(w->top, title);
     xdg_toplevel_set_app_id(w->top, "waybridge.fixture");
     wl_surface_commit(w->surface);
+  }
+  if (getenv("WAYBRIDGE_TEST_SEMANTICS")) {
+    wl_display_roundtrip(display);
+    wl_display_roundtrip(display);
+    xdg_toplevel_set_parent(windows[2].top, windows[0].top);
   }
   while (wl_display_dispatch(display) >= 0) {
   }

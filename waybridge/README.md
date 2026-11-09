@@ -10,6 +10,10 @@ Windows 客户端会移除旧服务端码流中的填充 NAL，避免已实测�
 
 重复最大化/还原现在复用常用尺寸的编码器和解码器，切换后仍发送新 epoch 和完整 IDR。服务端闲置缓存全局最多两个、合计最多 4 Mi 像素；资源不足时清理缓存后重试。编码器冷启动期间出现更新尺寸时跳过已过时的原始帧。Windows 立即缩放现有画面，最大化/还原立即发送尺寸，交互拖动合并 resize。首次遇到新尺寸仍需初始化，不能据此保证完全无停顿。新服务端需要重新启动后才使用这些优化；新版客户端仍兼容之前的 v3 服务端。
 
+新增可协商的 `window_semantics_v1`：应用请求真正的显示器全屏，退出后恢复原来的普通/最大化位置；DPI 下执行应用最小/最大尺寸；动态更新 transient owner；通过真实 `xdg-dialog-v1` 提示禁用模态对话框的直接父窗口。最小化/隐藏反馈为 Wayland suspended，恢复后重新采集画面；应用 unmap/remap 清理旧角色状态并防止过时反馈影响新映射。旧 v3 查看端可继续连接。
+
+输入区域同步 root/subsurface 的 add/subtract 区域，不按图像透明度猜测。Windows 在客户区返回 `HTTRANSPARENT`，仅能穿到同一 UI 线程里的其他 Waybridge 窗口；不支持穿透到其他进程或 Windows 桌面。超过 64 个 surface/256 个矩形操作或与当前帧几何不一致时，保守接收输入。非客户区和 CSD 缩放边缘继续正常工作。
+
 **需要同时更新两端到 0.3.0。** 停止旧服务端，重新启动应用并复制新的 Windows `.exe`。协议已升级为 v3，连接端口和基本启动命令不变。客户端要求 Windows 10/11。已在 Snapdragon 8cx Gen 3 / Adreno 690 实机验证 ARM64 客户端硬解、纹理呈现及静止/动画不回退；实际输入到显示的端到端延迟尚未测量。Linux NVENC 比特流、透明度和参考帧连续性已在本机 NVIDIA 显卡上测试。
 
 Linux 仍存在同步 GPU 回读和 CPU→NVENC 输入拷贝；当前传输仍是 TCP/SSH，尚未接入 UDP/FEC 或 Sunshine/Moonlight 线协议。这是硬件媒体路径的第一版，不能据此承诺最终端到端延迟。
@@ -98,6 +102,8 @@ python tests/windows_smoke.py
 python tests/windows_smoke.py --csd
 python tests/windows_smoke.py --terminal
 python tests/windows_smoke.py --qt
+# 真正的 Win32 全屏/尺寸/owner/modal/输入区域/最小化恢复
+python tests/windows_semantics_smoke.py
 # 可选：需要 NVIDIA/NVENC；真实硬件编码、P 帧、alpha、奇数尺寸及回退
 python tests/hardware_smoke.py
 # 可选：真实 NVENC 尺寸切换、缓存淘汰、IDR/P 引用与回环耗时
@@ -107,6 +113,8 @@ python tests/ghostty_smoke.py
 ```
 
 `tests/smoke.py` 启动隔离的真实合成器和两个原生 Wayland 测试窗口，检查图像颜色/方向、尺寸、输入、断线、重连、双向文本/PNG/文件、文件拖放和路径校验。依赖 `python-pillow`、`wl-clipboard`、`wayland-scanner`、C 编译器。`tests/qt_smoke.py` 需要 Qt6Widgets 开发文件与 C++ 编译器，验证真实 Qt 的 175%/125% 动态缩放、精确透明度、文字输入、菜单和模态对话框；有 Dolphin 时还会在独立 D-Bus/配置目录中验证路径输入及导航。
+
+`tests/window_semantics_smoke.py` 使用真正的 Wayland fixture 验证状态 configure、模态、区域、映射 epoch 和旧 v3 兼容；`tests/windows_semantics_smoke.py` 在独立 Wine/Xvfb 中操作真实 HWND，另验证 100%/125%/175% 的尺寸换算。
 
 `tests/windows_smoke.py` 使用项目自己的 Wine prefix 与 Xvfb 显示，检查 `.exe` 的窗口像素、真实尺寸调整、原生剪贴板和文件拖放，不操作用户桌面。Wine 测试明确使用双缓冲 GDI 备用路径，不能代替在实际 Windows 机器上验证 DirectComposition 的透明合成和呈现效果。
 

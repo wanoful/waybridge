@@ -7,6 +7,7 @@ cargo test --workspace --locked
 cargo build --locked
 python tests/smoke.py
 python tests/decorations_smoke.py
+python tests/window_semantics_smoke.py
 
 python tests/qt_smoke.py
 if command -v dolphin >/dev/null; then
