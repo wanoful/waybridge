@@ -17,6 +17,7 @@
 #include "h264_decoder.h"
 #include "h264_decoder_cache.h"
 #include "image_decoder.h"
+#include "native_icon.h"
 #include "third_party/json.hpp"
 #include <algorithm>
 #include <atomic>
@@ -108,6 +109,9 @@ uint64_t incomingBatch = 0;
 DWORD incomingClipboardSequence = 0;
 
 struct RemoteWindow {
+  NativeIcon icon;
+  std::string appId;
+  uint64_t iconRevision = 0;
   uint32_t id;
   HWND hwnd = nullptr;
   int width = 960, height = 640;
@@ -131,6 +135,8 @@ struct RemoteWindow {
 };
 std::map<uint32_t, std::unique_ptr<RemoteWindow>> windows;
 uint32_t grabbedRoot = 0;
+bool iconsNegotiated = false;
+std::unique_ptr<ImageDecoder> iconDecoder;
 
 DWORD windowStyle(bool clientDecorated) {
   // Client-decorated applications already supply their own title bar and controls.
@@ -1192,6 +1198,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     w->dpi = effectiveDpi(hwnd);
+    w->icon.apply(hwnd, w->dpi);
     auto r = reinterpret_cast<const RECT *>(lp);
     SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                  SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1332,9 +1339,23 @@ void dispatchNetwork() {
         PostQuitMessage(1);
         return;
       }
+      iconsNegotiated = m.value("window_icon_v1", false);
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
+    } else if (type == "window_icon" && iconsNegotiated) {
+      if (!m.contains("id") || !m.at("id").is_number_unsigned() || m.at("id").get<uint64_t>() > UINT32_MAX) continue;
+      auto found = windows.find(m.at("id").get<uint32_t>());
+      if (found == windows.end() || found->second->popup) continue;
+      auto *w = found->second.get();
+      if (!NativeIcon::matches(m, w->id, w->appId, w->iconRevision)) continue;
+      if (m.at("png").is_null()) w->icon.clear();
+      else {
+        auto png = unbase64(m.at("png").get_ref<const std::string &>());
+        if (!iconDecoder) iconDecoder = std::make_unique<ImageDecoder>();
+        if (!w->icon.update(png, *iconDecoder)) continue;
+      }
+      w->icon.apply(w->hwnd, w->dpi);
     } else if (type == "pong") {
       clientStats.record("control_rtt", double(GetTickCount64() - m.at("nonce").get<uint64_t>()));
     } else if (type == "window") {
@@ -1404,6 +1425,14 @@ void dispatchNetwork() {
         setDecoration(windows.at(id).get(), m.value("decoration", "server") == "client");
         SetWindowTextW(windows.at(id)->hwnd, wide(m.value("title", "Linux application")).c_str());
       }
+      auto *iconWindow = windows.at(id).get();
+      auto appId = NativeIcon::appId(m.value("app_id", ""));
+      uint64_t revision = m.value("icon_revision", uint64_t(0));
+      if (iconWindow->appId != appId || iconWindow->iconRevision != revision) {
+        iconWindow->appId = std::move(appId); iconWindow->iconRevision = revision;
+        iconWindow->icon.clear();
+      }
+      iconWindow->icon.apply(iconWindow->hwnd, iconWindow->dpi);
       auto parent = m.find("parent");
       if (parent != m.end() && parent->is_number_unsigned() &&
           windows.count(parent->get<uint32_t>()))
@@ -1680,6 +1709,7 @@ int wmain(int argc, wchar_t **argv) {
             {"version", 3},
             {"split_media", true},
             {"frame_ack", true},
+            {"window_icon_v1", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},
@@ -1713,6 +1743,7 @@ int wmain(int argc, wchar_t **argv) {
   for (auto &[id, w] : windows)
     DestroyWindow(w->hwnd);
   windows.clear();
+  iconDecoder.reset();
   decodedFrames.clear();
   frames.clear();
   controls.clear();

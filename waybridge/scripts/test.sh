@@ -6,6 +6,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build --locked
 python tests/smoke.py
+if command -v rsvg-convert >/dev/null; then
+  python tests/app_icon_smoke.py
+fi
 python tests/decorations_smoke.py
 
 python tests/qt_smoke.py

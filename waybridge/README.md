@@ -2,6 +2,8 @@
 
 这一版修复越界菜单引起父窗口缩小：每个 `xdg_popup` 映射为独立的 Windows 无边框 owned window，不进入任务栏、不抢激活。父窗口的尺寸和画面范围保持不变；嵌套菜单、父窗口移动、DPI、鼠标抓取、Esc 和关闭均单独处理，弹出位置按 Windows 工作区约束。
 
+原生窗口现在显示 Linux 应用图标：后台按 `app_id` 查找 XDG `.desktop` 与主题 PNG/SVG，设置 Windows 大小图标并跟随 DPI。SVG 需要 PATH 中的 `rsvg-convert`；缺失、未知或超限图标回退系统默认图标。此能力在 v3 中单独协商，兼容已有两端。
+
 默认 60 FPS，采用固定截止时间调度；完全不透明的帧跳过反预乘颜色计算。媒体与窗口控制/文件使用分开的认证 TCP 连接，并用呈现确认限制每窗口最多两个在途帧，防止旧帧堆进 socket 缓冲区，两条连接都经过原来的 SSH 转发端口，不需要新增端口。
 
 `--codec auto` 在查看端支持时为顶层窗口启用 **NVENC H.264 超低延迟编码**。Windows 通过系统 Media Foundation/D3D11 解码为 GPU 纹理，再用 shader 结合无损 alpha 遮罩交给 DirectComposition。菜单继续使用无损 PNG。硬件不可用或硬解失败时按窗口回退 PNG；`--codec png` 可以强制使用无损图像。
@@ -98,6 +100,9 @@ python tests/windows_smoke.py
 python tests/windows_smoke.py --csd
 python tests/windows_smoke.py --terminal
 python tests/windows_smoke.py --qt
+# 可选：真实 XDG PNG/SVG 图标与 Windows 原生 HICON
+python tests/app_icon_smoke.py
+python tests/windows_app_icon_smoke.py
 # 可选：需要 NVIDIA/NVENC；真实硬件编码、P 帧、alpha、奇数尺寸及回退
 python tests/hardware_smoke.py
 # 可选：真实 NVENC 尺寸切换、缓存淘汰、IDR/P 引用与回环耗时
@@ -135,6 +140,8 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 
 尺寸切换另记录服务端 `encoder_init`、`encoder_reuse`（命中次数）、`resize_first_encoded`、`resize_first_sent`。后两项从开始处理 resize 到首个匹配目标像素尺寸的帧完成编码/写入 socket，跨越了应用重新布局、Wayland 提交、捕获及编码；不包含 Windows 解码与显示。Windows 的 `decoder_create`、`decoder_reuse` 和 `resize_to_present` 用于对照，其中 `resize_to_present` 从发送 resize 到匹配逻辑尺寸的帧提交呈现，也不包含最终屏幕扫描输出。
 
+图标诊断可设置 `WAYBRIDGE_ICON_TRACE=1`，记录本进程设置和读回的原生图标句柄；正常运行无需设置。
+
 开发诊断环境变量：`WAYBRIDGE_DPI=168` 强制 175%，`WAYBRIDGE_GDI=1` 强制备用绘制，`WAYBRIDGE_PNG=1` 禁用查看端 H.264 协商。正常使用跟随 Windows 的实际 DPI。清除环境变量恢复自动选择。
 
 ## 当前边界与后续工作
@@ -143,6 +150,7 @@ Linux 每两秒记录合成、回读、编码排队、颜色转换、NVENC/PNG�
 - 首版硬件路径为 H.264 4:2:0 SDR，彩色文字可能不如 PNG 清晰；4:4:4、HEVC/AV1、HDR 和高刷新率仍需扩展、验证。
 - 每个视频顶层窗口使用一个 NVENC 会话；会话数量受硬件/驱动限制，不能分配时回退 PNG。视频支持范围为 48×48 至 4096×2304，其他尺寸走 PNG。
 - 完善模态协议、窗口状态和光标/输入区域映射。
+- 图标首版支持 PNG 和系统 librsvg 转换的 SVG；归一化为 128×128，来源 PNG 最大 1024×1024/2 MiB，SVG 转换最多 2 秒。可用 `WAYBRIDGE_ICON_THEME` 指定主题；运行中的主题和图标文件不热更新。暂不支持 XPM、应用直接提供的 xdg-toplevel-icon 或按 Linux app_id 分开的 Windows 任务栏分组。
 - 透明区域的视觉 alpha 与鼠标穿透分别处理；尚未向 Windows 完整映射 Wayland 输入区域，也未实现 KDE 毛玻璃。
 - 接入 Xwayland，完善输入法、相对鼠标、指针形状和显式同步。
 - 实现 Linux → Windows 原生拖出、目录和按需文件访问。

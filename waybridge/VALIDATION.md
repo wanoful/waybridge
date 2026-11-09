@@ -1,5 +1,14 @@
 # Validation — 2026-11-09
 
+Application icon extension checks:
+
+- `tests/app_icon_smoke.py` uses a real Wayland fixture with changing app IDs and temporary isolated XDG roots. It verifies PNG size preference, actual non-square SVG rendering and transparent padding, escaped absolute paths, inherited themes, hicolor, pixmaps, nested desktop-file IDs and user Hidden overrides; malformed/oversized/unknown images fall back. Cache reuse, reconnect and v3 opt-out pass.
+- A deliberately stalled SVG converter is killed after its 2-second limit; newer app-ID results win and control ping remains responsive (observed maximum 5.5 ms in the isolated host run). Queues and positive/negative cache are bounded. Desktop/icon-theme lookup follows the [Freedesktop desktop entry](https://specifications.freedesktop.org/desktop-entry/latest/) and [icon theme](https://specifications.freedesktop.org/icon-theme/latest/) structures, with the documented format/resource limits.
+- `tests/windows_app_icon_smoke.py` runs the actual x64 viewer in private Wine/Xvfb: PNG red, SVG blue/transparent margins and inherited green pixels reach Wine's native X11 icon metadata; unknown, Hidden and oversized images restore the same generic icon. Optional trace verifies the viewer's own `WM_GETICON` large/small readback matches its `WM_SETICON` handles. Wine cannot retrieve another process's private HICON through WM_GETICON, so this is checked in-process rather than assuming handle transferability.
+- The native probe directly verifies `WM_GETICON` and actual large/small bitmap geometry at 100%, 125%, 175% and 400%, rejects wrong window/app/revision/types and bad PNG/geometry, and performs 300 replacements with stable GDI/USER resource counts and verifies every replaced custom HICON is invalidated. Physical Windows shell/Alt+Tab appearance and monitor-to-monitor DPI changes remain unverified. Per-app taskbar grouping and xdg-toplevel-icon are outside this extension.
+- Rust formatting, strict Clippy, five unit tests, Linux protocol/clipboard/file smoke and real Qt DPI/input regression pass; x64 GNU and ARM64 LLVM-MinGW clients build.
+
+
 Maximize/restore resize checks:
 
 - The actual native FFmpeg/NVENC adapter measured roughly 101 ms to create a session and 70 ms to destroy one when alternating 960×640 / 2240×1400. Keeping both sizes and forcing independent SPS/PPS+IDR on reuse reduced warm first-frame encoding to about 3.1 ms. These adapter timings exclude capture, alpha and network processing.

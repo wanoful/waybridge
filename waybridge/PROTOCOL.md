@@ -10,7 +10,7 @@ A viewer requesting `split_media:true` opens a second TCP connection to the same
 
 ## Windows and input
 
-Server `window`: `id`, `title`, `app_id`, `width`, `height` (logical units), `scale`, optional `parent` window ID, `decoration`. The viewer uses `parent` as the native owner for transient dialogs. `decoration:"server"` selects a native Windows title bar after xdg-decoration negotiation; `"client"` keeps the app-rendered title bar and removes the Windows non-client frame. Repeated messages update metadata and can change decoration ownership without recreating the native window. `window_closed` removes the native window. IDs are stable for the lifetime of the host process and restored on reconnect.
+Server `window`: `id`, `title`, `app_id`, `width`, `height` (logical units), `scale`, optional `parent` window ID, `decoration`, optional `icon_revision`. The viewer uses `parent` as the native owner for transient dialogs. `decoration:"server"` selects a native Windows title bar after xdg-decoration negotiation; `"client"` keeps the app-rendered title bar and removes the Windows non-client frame. Repeated messages update metadata and can change decoration ownership without recreating the native window. `window_closed` removes the native window. IDs are stable for the lifetime of the host process and restored on reconnect.
 
 Frame body: u32 window ID, u32 pixel width, u32 pixel height, u64 frame sequence, i32 logical width, i32 logical height, i32 surface-local origin x, i32 surface-local origin y, then PNG bytes (36-byte header). All integers are big-endian. PNG contains **straight** RGBA; the GLES and Windows composition surfaces use premultiplied alpha. Dimensions are bounded to 8192 per axis and 16,777,216 total pixels before framebuffer allocation/Windows decode.
 
@@ -42,6 +42,16 @@ Client messages:
 | `refresh` | no fields |
 
 Focus loss and disconnection release held keys/buttons. Stale loss/leave events only affect the window that still owns that focus. Keyboard focus is sent after mapping; popup grabs use the originating input serial. Each toplevel has an output and preferred fractional scale; viewporter and xdg-output are advertised, with integer buffer-scale fallback for older clients. Keyboard repeat is supplied by the receiving Wayland application; repeated Win32 keydown messages do not generate stuck keys.
+
+## Application icon extension (`window_icon_v1`)
+
+The viewer opts in with `window_icon_v1:true` in its control `hello`; a supporting server lists `window_icon_v1` in `features` and echoes the negotiated boolean. This remains optional within v3: no icon messages are emitted for old/simple viewers, and a new viewer keeps generic native icons with an older server.
+
+`window` metadata carries `icon_revision` (monotonically increasing for this window's application identity). The server asynchronously resolves the application's desktop file and icon, then sends control JSON `window_icon`: `id`, `app_id`, `revision`, `width:128`, `height:128`, and `png` (base64 PNG or `null` for generic application icons). The extension uses bounded ASCII desktop-file IDs; missing/unusable IDs normalize to an empty identity. On metadata identity/revision changes, the viewer clears the old icon immediately. It applies a result only when the window is still alive and both normalized application identity and revision match. Pending old results and messages for unknown/closed IDs are ignored. Reconnection reannounces metadata before the current icon.
+
+PNG is straight RGBA, normalized with aspect ratio and transparent padding to 128×128, at most 96 KiB decoded PNG / 128 KiB base64. The viewer validates exact PNG dimensions before copying pixels, constructs per-DPI large/small native `HICON`s and sets both with `WM_SETICON`. Replaced/closed-window custom icons are destroyed; system fallback handles are shared. Windows DPI changes rescale from the bounded master without a round trip.
+
+Resolution runs off the compositor thread: XDG applications lookup, desktop-file `Icon`, selected GTK/KDE theme (or `WAYBRIDGE_ICON_THEME`), theme size ranking/inheritance, hicolor and unthemed/pixmaps fallbacks. Desktop `Exec` is never executed. Source files are bounded to 2 MiB; PNG dimensions to 1024×1024 / decoder allocation to 16 MiB. SVG support uses optional `rsvg-convert`, limited to 2 seconds wall/CPU, 512 MiB virtual memory and 96 KiB output, and killed if its parent exits. Failure returns generic icons. At most the first 128 live toplevels load/retain icon data, matching the viewer window limit. Worker and transport queues replace pending work per window (maximum 128); the worker has a 64-entry positive/negative LRU cache with 60-second lookup TTL. Themes/configuration are sampled at server startup; existing windows do not hot-reload icon files. XPM and client-supplied xdg-toplevel-icon hints are not supported by this first extension.
 
 ## Clipboard
 

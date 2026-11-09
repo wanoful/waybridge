@@ -7,6 +7,7 @@ Linux 应用在 Windows 上显示为独立原生窗口的开发原型。服务�
 已实现：
 
 - 多个 Wayland 顶层窗口对应多个 Win32 窗口。
+- XDG 应用 PNG/SVG 图标映射到 Windows 大小图标，跟随 DPI。
 - 鼠标、键盘、滚轮、焦点、关闭及真实应用尺寸调整。
 - 跟随 Windows 显示器 DPI 的应用绘制，Qt 分数缩放、菜单抓取与对话框父子关系。
 - Windows D3D11/DirectComposition 保留帧呈现和透明度合成；编码、解码在后台线程。

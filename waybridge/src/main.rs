@@ -1,4 +1,5 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
+mod app_icon;
 mod metrics;
 mod network;
 mod protocol;
@@ -129,6 +130,7 @@ struct Args {
 
 struct RemoteWindow {
     id: u32,
+    icon: app_icon::WindowIcon,
     window: Window,
     dirty: bool,
     announced: bool,
@@ -158,6 +160,7 @@ struct RemotePopup {
 type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 
 struct App {
+    icons: app_icon::Icons,
     dh: DisplayHandle,
     compositor: CompositorState,
     shell: XdgShellState,
@@ -793,6 +796,7 @@ impl App {
                 self.dh.remove_global::<App>(remote.output_global.clone());
             }
             self.windows.retain(|w| w.id != id);
+            self.icons.forget(id);
             self.encoder.forget(id);
             if let Some(peer) = &self.peer {
                 peer.forget_window(id);
@@ -804,7 +808,8 @@ impl App {
             .iter()
             .filter_map(|w| w.window.wl_surface().map(|s| (s.into_owned(), w.id)))
             .collect();
-        for remote in &mut self.windows {
+        // Match the viewer's bounded native-window capacity for retained icon resources.
+        for (index, remote) in self.windows.iter_mut().enumerate() {
             let top = remote.window.toplevel().unwrap();
             let bbox = stream_geometry(&remote.window);
             let size = bbox.size;
@@ -833,7 +838,7 @@ impl App {
             let parent_id = top
                 .parent()
                 .and_then(|p| parent_ids.iter().find(|(s, _)| s == &p).map(|(_, id)| *id));
-            let info = with_states(top.wl_surface(), |states| {
+            let mut info = with_states(top.wl_surface(), |states| {
                 let s = states
                     .data_map
                     .get::<XdgToplevelSurfaceData>()
@@ -845,12 +850,29 @@ impl App {
                     "parent": parent_id,
                     "decoration":if native_decoration {"server"}else{"client"}})
             });
+            remote
+                .icon
+                .observe(info["app_id"].as_str().unwrap_or_default());
+            info["icon_revision"] = json!(remote.icon.revision);
             if let Some(peer) = &self.peer {
                 if !remote.announced || remote.last_info != info {
                     peer.control(info.clone());
                 }
                 remote.last_info = info;
                 remote.announced = true;
+                if peer.icons_enabled() && index < 128 {
+                    if !remote.icon.requested && !remote.icon.ready {
+                        remote.icon.requested = self.icons.request(
+                            remote.id,
+                            remote.icon.revision,
+                            &remote.icon.app_id,
+                        );
+                    }
+                    if remote.icon.ready && !remote.icon.sent {
+                        remote.icon.sent =
+                            peer.window_icon(remote.id, remote.icon.message(remote.id));
+                    }
+                }
                 if remote.dirty {
                     remote.frame_sequence += 1;
                     let mut frame = capture_surface(
@@ -1157,6 +1179,7 @@ impl XdgShellHandler for App {
         set_surface_scale(surface.wl_surface(), &output, window_scale);
         self.windows.push(RemoteWindow {
             id,
+            icon: app_icon::WindowIcon::default(),
             window: Window::new_wayland_window(surface),
             dirty: true,
             announced: false,
@@ -1539,6 +1562,7 @@ fn main() -> Result<()> {
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
     let mut app = App {
+        icons: app_icon::Icons::new(tx.clone()),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1617,6 +1641,7 @@ fn main() -> Result<()> {
                     }
                     for w in &mut app.windows {
                         w.announced = false;
+                        w.icon.sent = false;
                         w.dirty = true;
                     }
                     let items: BTreeMap<_, _> = app
@@ -1629,6 +1654,16 @@ fn main() -> Result<()> {
                     }
                 }
                 Event::Message(value) => app.message(value),
+                Event::Icon {
+                    id,
+                    revision,
+                    app_id,
+                    png,
+                } => {
+                    if let Some(window) = app.windows.iter_mut().find(|w| w.id == id) {
+                        window.icon.complete(revision, &app_id, png);
+                    }
+                }
                 Event::Disconnected => {
                     app.release_input();
                     app.encoder.reset();
