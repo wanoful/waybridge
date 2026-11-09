@@ -17,6 +17,7 @@
 #include "h264_decoder.h"
 #include "h264_decoder_cache.h"
 #include "image_decoder.h"
+#include "ime.h"
 #include "third_party/json.hpp"
 #include <algorithm>
 #include <atomic>
@@ -108,6 +109,7 @@ uint64_t incomingBatch = 0;
 DWORD incomingClipboardSequence = 0;
 
 struct RemoteWindow {
+  NativeIme ime;
   uint32_t id;
   HWND hwnd = nullptr;
   int width = 960, height = 640;
@@ -130,6 +132,8 @@ struct RemoteWindow {
   int lastWorkWidth = 0, lastWorkHeight = 0, lastWorkX = INT_MIN, lastWorkY = INT_MIN;
 };
 std::map<uint32_t, std::unique_ptr<RemoteWindow>> windows;
+Json imeStatus;
+void updateIme();
 uint32_t grabbedRoot = 0;
 
 DWORD windowStyle(bool clientDecorated) {
@@ -1050,6 +1054,56 @@ void acknowledge(RemoteWindow *w) {
   }
 }
 
+void updateIme() {
+  RemoteWindow *target = nullptr, *host = nullptr;
+  if (imeStatus.is_object() && imeStatus.value("enabled", false)) {
+    auto found = windows.find(imeStatus.value("id", 0u));
+    if (found != windows.end()) {
+      target = found->second.get();
+      host = target;
+      if (target->popup) {
+        auto root = windows.find(target->root);
+        host = root == windows.end() ? nullptr : root->second.get();
+      }
+    }
+  }
+  uint64_t generation = imeStatus.is_object() ? imeStatus.value("generation", uint64_t(0)) : 0;
+  for (auto &[id, window] : windows) {
+    if (!window->popup)
+      window->ime.associate(window->hwnd, window.get() == host && GetFocus() == window->hwnd,
+                            target ? target->id : 0, generation);
+  }
+  if (!host || !target || !host->ime.enabled || !imeStatus.contains("rectangle")) return;
+  const auto &caret = imeStatus.at("rectangle");
+  if (!caret.is_array() || caret.size() != 4) return;
+  RECT image = imageRect(target);
+  double sx = double(image.right - image.left) / std::max(1, target->width);
+  double sy = double(image.bottom - image.top) / std::max(1, target->height);
+  RECT rect{LONG(image.left + (caret[0].get<int>() - target->originX) * sx),
+            LONG(image.top + (caret[1].get<int>() - target->originY) * sy), 0, 0};
+  rect.right = rect.left + std::max(1L, LONG(caret[2].get<int>() * sx));
+  rect.bottom = rect.top + std::max(1L, LONG(caret[3].get<int>() * sy));
+  if (target != host) MapWindowPoints(target->hwnd, host->hwnd, reinterpret_cast<POINT *>(&rect), 2);
+  host->ime.caret(host->hwnd, rect);
+}
+
+void sendIme(RemoteWindow *window, const std::optional<std::wstring> &commit,
+             const std::optional<std::wstring> &preedit, LONG cursor = 0) {
+  auto &ime = window->ime;
+  if (!ime.enabled) return;
+  Json packet{{"type", "ime"}, {"id", ime.target},
+              {"generation", ime.composing ? ime.compositionGeneration : ime.generation}};
+  if (commit) packet["commit"] = utf8(*commit);
+  if (preedit) {
+    size_t pos = size_t(std::clamp<LONG>(cursor, 0, LONG(preedit->size())));
+    if (pos && pos < preedit->size() && (*preedit)[pos] >= 0xdc00 && (*preedit)[pos] <= 0xdfff &&
+        (*preedit)[pos-1] >= 0xd800 && (*preedit)[pos-1] <= 0xdbff) --pos;
+    packet["preedit"] = utf8(*preedit);
+    packet["cursor_begin"] = packet["cursor_end"] = utf8(preedit->substr(0, pos)).size();
+  }
+  sendJson(packet);
+}
+
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   auto w = reinterpret_cast<RemoteWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
   if (message == WM_NCCREATE) {
@@ -1176,11 +1230,70 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     if (w->popup)
       return 0;
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", true}});
+    updateIme();
     return 0;
   case WM_KILLFOCUS:
     if (w->popup)
       return 0;
+    if (w->ime.composing) sendIme(w, {}, std::wstring());
+    w->ime.cancel(hwnd);
+    w->ime.forwardedKeys.clear();
+    DestroyCaret();
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", false}});
+    return 0;
+  case WM_IME_SETCONTEXT:
+    return DefWindowProcW(hwnd, message, wp,
+                         w->ime.enabled ? lp & ~ISC_SHOWUICOMPOSITIONWINDOW : lp);
+  case WM_IME_REQUEST:
+    if (w->ime.enabled && wp == IMR_QUERYCHARPOSITION && lp) {
+      auto position = reinterpret_cast<IMECHARPOSITION *>(lp);
+      if (position->dwSize < sizeof(*position)) return 0;
+      RECT caret = w->ime.lastCaret;
+      POINT point{caret.left, caret.top};
+      ClientToScreen(hwnd, &point);
+      position->pt = point;
+      position->cLineHeight = UINT(std::max(1L, caret.bottom - caret.top));
+      GetWindowRect(hwnd, &position->rcDocument);
+      return TRUE;
+    }
+    break;
+  case WM_IME_STARTCOMPOSITION:
+    if (!w->ime.enabled) return DefWindowProcW(hwnd, message, wp, lp);
+    w->ime.composing = true;
+    w->ime.compositionGeneration = w->ime.generation;
+    for (auto key : w->ime.forwardedKeys)
+      sendJson({{"type", "key"}, {"id", w->id}, {"key", key}, {"down", false}});
+    w->ime.forwardedKeys.clear();
+    updateIme();
+    return 0;
+  case WM_IME_COMPOSITION:
+    if (w->ime.enabled) {
+      if (auto context = ImmGetContext(hwnd)) {
+        std::optional<std::wstring> result, preedit;
+        LONG cursor = 0;
+        if (lp & GCS_RESULTSTR) { result = NativeIme::string(context, GCS_RESULTSTR); preedit = L""; }
+        if (lp & GCS_COMPSTR) {
+          preedit = NativeIme::string(context, GCS_COMPSTR);
+          cursor = ImmGetCompositionStringW(context, GCS_CURSORPOS, nullptr, 0);
+          if (cursor < 0 && preedit) cursor = LONG(preedit->size());
+        }
+        if (!lp) preedit = L"";
+        ImmReleaseContext(hwnd, context);
+        sendIme(w, result, preedit, cursor);
+      }
+      return 0;
+    }
+    return DefWindowProcW(hwnd, message, wp, lp);
+  case WM_IME_ENDCOMPOSITION:
+    sendIme(w, {}, std::wstring());
+    w->ime.composing = false;
+    return 0;
+  case WM_IME_CHAR:
+    return 0; // Result strings are committed exactly once through WM_IME_COMPOSITION.
+  case WM_CHAR:
+    if (w->ime.enabled && !w->ime.composing && wp >= 32 && wp != 127) {
+      if (auto text = w->ime.character(wchar_t(wp))) sendIme(w, text, std::wstring());
+    }
     return 0;
   case WM_DISPLAYCHANGE:
   case WM_SETTINGCHANGE:
@@ -1209,6 +1322,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         sendResize(w);
       }
     }
+    updateIme();
     return 0;
   case WM_TIMER:
     KillTimer(hwnd, 1);
@@ -1262,6 +1376,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
                       : (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) ? 0x111
                                                                                : 0x112;
     if (down) {
+      if (w->ime.composing) {
+        sendIme(w, {}, std::wstring());
+        w->ime.cancel(hwnd);
+      }
       if (!w->popup)
         SetFocus(hwnd);
       if (!grabbedRoot)
@@ -1285,11 +1403,19 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_KEYUP:
   case WM_SYSKEYDOWN:
   case WM_SYSKEYUP:
-    if (auto key = linuxKey(lp))
-      sendJson({{"type", "key"},
-                {"id", w->id},
-                {"key", key},
-                {"down", message == WM_KEYDOWN || message == WM_SYSKEYDOWN}});
+    if (auto key = linuxKey(lp)) {
+      bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+      bool shortcut = (GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000) ||
+                      (GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000);
+      for (auto modifier : {29u, 97u, 56u, 100u, 125u, 126u})
+        shortcut = shortcut || w->ime.forwardedKeys.count(modifier);
+      if (down) {
+        if (wp == VK_PROCESSKEY || wp == VK_PACKET || w->ime.composing ||
+            (w->ime.enabled && NativeIme::printable(wp) && !shortcut)) return 0;
+        w->ime.forwardedKeys.insert(key);
+      } else if (!w->ime.forwardedKeys.erase(key)) return 0;
+      sendJson({{"type", "key"}, {"id", w->id}, {"key", key}, {"down", down}});
+    }
     return 0;
   case WM_CLOSE:
     sendJson({{"type", "close"}, {"id", w->id}});
@@ -1335,6 +1461,8 @@ void dispatchNetwork() {
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
+    } else if (type == "ime_state") {
+      imeStatus = m;
     } else if (type == "pong") {
       clientStats.record("control_rtt", double(GetTickCount64() - m.at("nonce").get<uint64_t>()));
     } else if (type == "window") {
@@ -1557,6 +1685,7 @@ void dispatchNetwork() {
         SetCapture(w->hwnd);
     }
   }
+  updateIme();
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {

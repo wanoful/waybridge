@@ -43,6 +43,14 @@ Client messages:
 
 Focus loss and disconnection release held keys/buttons. Stale loss/leave events only affect the window that still owns that focus. Keyboard focus is sent after mapping; popup grabs use the originating input serial. Each toplevel has an output and preferred fractional scale; viewporter and xdg-output are advertised, with integer buffer-scale fallback for older clients. Keyboard repeat is supplied by the receiving Wayland application; repeated Win32 keydown messages do not generate stuck keys.
 
+## Local Windows IME (optional `ime_v3` feature)
+
+The compositor exposes `zwp_text_input_manager_v3`. Only the enabled text-input belonging to the actual keyboard-focused surface receives composition. `ime_state` control messages contain `enabled`, an opaque `generation`, and, when enabled, target window/popup `id`, `rectangle:[x,y,width,height]` in surface-local logical coordinates and numeric content `purpose`. Neither surrounding application text nor document contents are forwarded.
+
+The viewer returns `{"type":"ime","id":N,"generation":G,"preedit":"nihao","cursor_begin":5,"cursor_end":5}` and/or `commit:"你好"`. Preedit cursor offsets are UTF-8 byte boundaries (or -1), not UTF-16 units. Strings are bounded to 60 KiB each, below the Wayland event size limit. Updates are sent in one text-input done batch with the application's current commit serial. An empty preedit cancels it. Focus/enable generation and actual focused target must match; stale updates are ignored. Enable state and pending client fields take effect only on the application's text-input `commit` request.
+
+Windows keeps the native candidate UI, sends IMM result/preedit strings, and positions its local caret/candidate window from the remote rectangle, image origin and current client scaling. Normal text uses this channel when enabled; modifiers, shortcuts and navigation retain the physical-key channel. Unsupported applications keep physical-key input. The wire version stays v3; older endpoints ignore the optional state/messages. XIM and surrounding-text reconversion are not implemented.
+
 ## Clipboard
 
 Both directions send `{"type":"clipboard","items":{"<MIME>":"<base64>"}}`. Supported formats are `text/plain;charset=utf-8`, `text/plain`, and `image/png`. Maximum decoded size is 12 MiB per format. Linux clipboard reads are asynchronous and tagged with an ownership generation to discard stale responses. Windows tracks the clipboard sequence number to avoid echo loops.

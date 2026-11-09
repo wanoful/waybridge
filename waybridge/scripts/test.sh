@@ -9,10 +9,12 @@ python tests/smoke.py
 python tests/decorations_smoke.py
 
 python tests/qt_smoke.py
+python tests/ime_smoke.py
 if command -v dolphin >/dev/null; then
   python tests/dolphin_smoke.py
 fi
 
 if command -v ghostty >/dev/null; then
   python tests/ghostty_smoke.py
+  python tests/ghostty_smoke.py --ime
 fi

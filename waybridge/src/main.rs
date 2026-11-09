@@ -1,4 +1,5 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
+mod ime;
 mod metrics;
 mod network;
 mod protocol;
@@ -158,6 +159,7 @@ struct RemotePopup {
 type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 
 struct App {
+    ime: ime::Ime,
     dh: DisplayHandle,
     compositor: CompositorState,
     shell: XdgShellState,
@@ -251,6 +253,9 @@ impl App {
         if !keyboard.is_grabbed() {
             keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
         }
+        // Smithay 0.7 does not call SeatHandler::focus_changed when focus becomes None.
+        self.ime.focus(keyboard.current_focus());
+        self.publish_ime();
         for w in &self.windows {
             if w.window.set_activated(Some(w.id) == id) {
                 w.window.toplevel().unwrap().send_pending_configure();
@@ -473,6 +478,7 @@ impl App {
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0);
         match value["type"].as_str().unwrap_or("") {
+            "ime" => self.ime_message(&value),
             "frame_ack" => {
                 if let Some(peer) = &self.peer {
                     peer.acknowledge(id, value["sequence"].as_u64().unwrap_or(0));
@@ -1330,6 +1336,8 @@ impl SeatHandler for App {
     fn cursor_image(&mut self, _: &Seat<Self>, _: smithay::input::pointer::CursorImageStatus) {}
     fn focus_changed(&mut self, seat: &Seat<Self>, surface: Option<&WlSurface>) {
         set_data_device_focus(&self.dh, seat, surface.and_then(|s| s.client()));
+        self.ime.focus(surface.cloned());
+        self.publish_ime();
     }
 }
 impl SelectionHandler for App {
@@ -1539,6 +1547,7 @@ fn main() -> Result<()> {
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
     let mut app = App {
+        ime: ime::Ime::new(&dh),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1606,6 +1615,8 @@ fn main() -> Result<()> {
                 Event::Connected(peer) => {
                     app.release_input();
                     app.peer = Some(peer);
+                    app.ime.republish();
+                    app.publish_ime();
                     for p in &mut app.remote_popups {
                         p.last_info = Value::Null;
                         p.dirty = true;
@@ -1657,6 +1668,12 @@ fn main() -> Result<()> {
                 }
                 Event::Clipboard { .. } => {}
             }
+        }
+        if app
+            .ime
+            .focus(app.seat.get_keyboard().unwrap().current_focus())
+        {
+            app.publish_ime();
         }
         if Instant::now() >= next_frame {
             app.render()?;

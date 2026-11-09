@@ -61,6 +61,16 @@ Qt、Electron、浏览器等应选择 Wayland 后端。单实例应用可能通�
 
 可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
 
+## Windows 本地输入法
+
+`codex/windows-ime` 分支增加 Windows 本地 IME → Wayland `text-input-v3` 通道。需要更新并重新启动服务端及客户端，让应用发现新的 Wayland 全局接口；连接命令和协议版本仍为 v3。
+
+在远端应用输入框获得焦点后，可用 Windows 的 `Win+Space` 切换到微软拼音。候选窗口显示在 Windows；预编辑文字由远端应用绘制，确认后才提交文本。候选位置跟随应用报告的光标矩形，并考虑 Windows DPI、画面缩放及裁剪原点。切换窗口会取消旧预编辑，迟到的提交由焦点 generation 拒绝。英文文本走同一文本通道，Ctrl/Alt/Win 快捷键与导航按键继续转发。
+
+已验证真实 Qt 和 Ghostty/GTK 在 175% 下的中文、emoji、预编辑/取消及焦点保护，也验证了 Wine 中原生 Win32 Unicode 输入到 Qt 的完整链路。**微软拼音实际候选面板、选词和快捷键切换还需在 WoA 实机验收**；Wine Unicode 注入不代表真实微软 IME 引擎测试。
+
+仅支持实现 `text-input-v3` 的 Wayland 应用；X11/XIM、文档重转换和周边文本查询暂未支持。应用周边文本不传到 Windows。如果程序被宿主环境强制使用 fcitx/ibus 模块，可在启动该远端实例时清除 `GTK_IM_MODULE` / `QT_IM_MODULE`，让它选择 Wayland 文本输入后端。
+
 ## 使用数据交换
 
 - 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
@@ -102,6 +112,10 @@ python tests/windows_smoke.py --qt
 python tests/hardware_smoke.py
 # 可选：真实 NVENC 尺寸切换、缓存淘汰、IDR/P 引用与回环耗时
 python tests/resize_smoke.py
+# 可选：真实 Qt、Ghostty 和 Win32 → Wayland 文本输入
+python tests/ime_smoke.py
+python tests/ghostty_smoke.py --ime
+python tests/windows_smoke.py --ime
 # 可选：安装了 Ghostty 时，验证真实 GTK 越界菜单
 python tests/ghostty_smoke.py
 ```

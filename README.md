@@ -12,11 +12,12 @@ Linux 应用在 Windows 上显示为独立原生窗口的开发原型。服务�
 - Windows D3D11/DirectComposition 保留帧呈现和透明度合成；编码、解码在后台线程。
 - NVENC H.264 低延迟编码、Windows GPU 解码、独立越界菜单和有界尺寸缓存。
 - Windows x64 和原生 ARM64 客户端构建。
+- Windows 本地 IME 的 Wayland text-input-v3 桥接：预编辑、中文/emoji 提交及光标定位。
 - 双向文本、PNG 图片剪贴板。
 - 双向文件复制粘贴，64 KiB 分块传输。
 - Windows 文件拖入远端窗口，在 Wayland 侧完成文件拖放。
 - 会话断线保留应用，重连恢复窗口，断线释放按键。
 
-这是开发原型，已在 Snapdragon 8cx Gen 3 / Adreno 690 实机验证原生 ARM64 硬解和尺寸切换；仍缺少 AV1、音频、X11 接入、完整输入法及 Linux → Windows 直接拖出文件。更广泛的设备兼容性和输入到显示的端到端延迟仍需验证。
+这是开发原型，已在 Snapdragon 8cx Gen 3 / Adreno 690 实机验证原生 ARM64 硬解和尺寸切换；仍缺少 AV1、音频、X11/XIM 接入、输入法重转换及 Linux → Windows 直接拖出文件。微软拼音实际候选面板、更广泛的设备兼容性和输入到显示的端到端延迟仍需验证。
 
 详见 [运行说明与当前边界](waybridge/README.md)、[协议](waybridge/PROTOCOL.md)。

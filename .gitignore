@@ -5,3 +5,4 @@
 /waybridge/.runtime/
 *.log
 __pycache__/
+/.worktrees/

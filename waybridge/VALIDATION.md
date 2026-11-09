@@ -1,5 +1,14 @@
 # Validation — 2026-11-09
 
+Windows local IME bridge:
+
+- Native Windows IMM composition/result strings are bridged to a compositor-owned Wayland text-input-v3 implementation. Candidate/caret coordinates account for current image scaling, crop origin and DPI; application surrounding text is not transmitted. Focus/enable generations reject stale composition, and UTF-8 preedit cursor positions are validated.
+- `tests/ime_smoke.py`: actual Qt at 175% receives preedit without committing it, Chinese/emoji commits exactly once, clears canceled preedit, and rejects stale-focus messages and offsets splitting UTF-8 characters. Caret rectangles and focus reactivation are checked.
+- `tests/ghostty_smoke.py --ime`: actual Ghostty/GTK at 175% delivers Chinese/emoji to a raw PTY exactly once; preedit and cancellation never reach the PTY.
+- `tests/windows_smoke.py --ime`: actual PE executable in isolated Wine/Xvfb receives native Win32 Unicode/emoji and physical English keyboard input, commits to actual Qt through Wayland, uses Ctrl+A replacement, and publishes a local native caret at the expected scaled position.
+- Rust strict Clippy and five unit tests pass, alongside existing protocol/clipboard/file and real Qt DPI/focus/menu checks. ARM64 LLVM-MinGW and x64 GNU client builds succeed.
+- Actual Microsoft Pinyin candidate UI, selection and input-language shortcuts still require the WoA device. Wine keyboard injection validates the message/Unicode/control chain, not the Microsoft IME engine. X11/XIM, reconversion and surrounding-text retrieval are not implemented.
+
 Maximize/restore resize checks:
 
 - The actual native FFmpeg/NVENC adapter measured roughly 101 ms to create a session and 70 ms to destroy one when alternating 960×640 / 2240×1400. Keeping both sizes and forcing independent SPS/PPS+IDR on reuse reduced warm first-frame encoding to about 3.1 ms. These adapter timings exclude capture, alpha and network processing.

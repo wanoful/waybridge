@@ -2,6 +2,7 @@
 #include <QApplication>
 #include <QDialog>
 #include <QLineEdit>
+#include <QInputMethodEvent>
 #include <QKeySequence>
 #include <QMenu>
 #include <QPainter>
@@ -9,6 +10,15 @@
 #include <QTimer>
 #include <QWindow>
 #include <cstdio>
+
+class ImeEdit : public QLineEdit {
+public:
+  using QLineEdit::QLineEdit;
+  void inputMethodEvent(QInputMethodEvent *event) override {
+    std::printf("PREEDIT %s\n", event->preeditString().toUtf8().constData());
+    QLineEdit::inputMethodEvent(event);
+  }
+};
 
 class AlphaWindow : public QWidget {
 public:
@@ -33,7 +43,7 @@ int main(int argc, char **argv) {
   QWidget window;
   window.setWindowTitle("Waybridge Qt fixture");
   window.resize(960, 640);
-  QLineEdit edit(&window);
+  ImeEdit edit(&window);
   edit.setGeometry(20, 20, 300, 40);
   QObject::connect(&edit, &QLineEdit::textChanged, [](const QString &text) {
     std::printf("TEXT %s\n", text.toUtf8().constData());
