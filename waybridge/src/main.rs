@@ -1,5 +1,6 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
 mod cursor;
+mod app_icon;
 mod metrics;
 mod network;
 mod protocol;
@@ -134,6 +135,7 @@ struct Args {
 
 struct RemoteWindow {
     id: u32,
+    icon: app_icon::WindowIcon,
     window: Window,
     dirty: bool,
     announced: bool,
@@ -165,6 +167,7 @@ type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
 struct App {
     cursor: cursor::Cursor,
     _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState,
+    icons: app_icon::Icons,
     dh: DisplayHandle,
     compositor: CompositorState,
     x11: x11::State,
@@ -915,6 +918,7 @@ impl App {
                 self.dh.remove_global::<App>(remote.output_global.clone());
             }
             self.windows.retain(|w| w.id != id);
+            self.icons.forget(id);
             self.encoder.forget(id);
             if let Some(peer) = &self.peer {
                 peer.forget_window(id);
@@ -932,7 +936,7 @@ impl App {
             .filter_map(|w| w.window.x11_surface().map(|x| (x.clone(), w.id)))
             .collect();
         let focused = self.focused_window;
-        for remote in &mut self.windows {
+        for (index, remote) in self.windows.iter_mut().enumerate() {
             let Some(surface) = remote.window.wl_surface().map(|s| s.into_owned()) else {
                 continue;
             };
@@ -1006,6 +1010,19 @@ impl App {
                 }
                 remote.last_info = info;
                 remote.announced = true;
+                if peer.icons_enabled() && index < 128 {
+                    if !remote.icon.requested && !remote.icon.ready {
+                        remote.icon.requested = self.icons.request(
+                            remote.id,
+                            remote.icon.revision,
+                            &remote.icon.app_id,
+                        );
+                    }
+                    if remote.icon.ready && !remote.icon.sent {
+                        remote.icon.sent =
+                            peer.window_icon(remote.id, remote.icon.message(remote.id));
+                    }
+                }
                 if remote.dirty {
                     remote.frame_sequence += 1;
                     let mut frame = capture_surface(
@@ -1332,6 +1349,7 @@ impl XdgShellHandler for App {
         set_surface_scale(surface.wl_surface(), &output, window_scale);
         self.windows.push(RemoteWindow {
             id,
+            icon: app_icon::WindowIcon::default(),
             window: Window::new_wayland_window(surface),
             dirty: true,
             announced: false,
@@ -1740,6 +1758,7 @@ fn main() -> Result<()> {
     let mut app = App {
         cursor: cursor::Cursor::default(),
         _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<App>(&dh),
+        icons: app_icon::Icons::new(tx.clone()),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
         dh,
@@ -1839,6 +1858,7 @@ fn main() -> Result<()> {
                     }
                     for w in &mut app.windows {
                         w.announced = false;
+                        w.icon.sent = false;
                         w.dirty = true;
                     }
                     let items: BTreeMap<_, _> = app
@@ -1851,6 +1871,16 @@ fn main() -> Result<()> {
                     }
                 }
                 Event::Message(value) => app.message(value),
+                Event::Icon {
+                    id,
+                    revision,
+                    app_id,
+                    png,
+                } => {
+                    if let Some(window) = app.windows.iter_mut().find(|w| w.id == id) {
+                        window.icon.complete(revision, &app_id, png);
+                    }
+                }
                 Event::Disconnected => {
                     if let Some(root) = app.x11.grab {
                         app.x11_cancel_popup(root);

@@ -317,6 +317,15 @@ static void key(void *d, struct wl_keyboard *k, uint32_t s, uint32_t t, uint32_t
   (void)k;
   (void)s;
   (void)t;
+  if (getenv("WAYBRIDGE_TEST_ICON") && state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+    const char *id = code == 30 ? "org.waybridge.Png" : code == 48 ? "org.waybridge.Svg" :
+        code == 46 ? "org.waybridge.Missing" : code == 32 ? "org.waybridge.Absolute" :
+        code == 18 ? "org.waybridge.Inherited" : code == 33 ? "org.waybridge.Hicolor" :
+        code == 34 ? "org.waybridge.Pixmap" : code == 35 ? "org.waybridge.Hidden" :
+        code == 23 ? "org.waybridge.Malformed" : code == 24 ? "org.waybridge.Huge" :
+        code == 25 ? "org.waybridge.Slow" : code == 49 ? "nested-app" : NULL;
+    if (id) { xdg_toplevel_set_app_id(windows[0].top, id); wl_surface_commit(windows[0].surface); }
+  }
   printf("KEY %u %u\n", code, state);
   fflush(stdout);
 }
@@ -417,7 +426,8 @@ int main(int argc, char **argv) {
     char title[64];
     snprintf(title, sizeof(title), "Waybridge fixture %d", w->id);
     xdg_toplevel_set_title(w->top, title);
-    xdg_toplevel_set_app_id(w->top, "waybridge.fixture");
+    const char *app_id = getenv("WAYBRIDGE_TEST_APP_ID");
+    xdg_toplevel_set_app_id(w->top, app_id ? app_id : "waybridge.fixture");
     wl_surface_commit(w->surface);
   }
   while (wl_display_dispatch(display) >= 0) {
