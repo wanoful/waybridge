@@ -5,7 +5,7 @@ Source: the published crates.io smithay 0.7.0 crate, copied without modifying th
 Modified files are `src/xwayland/xwm/mod.rs`, `src/xwayland/x11_sockets.rs` and `src/backend/renderer/gles/mod.rs`:
 
 1. CreateNotify converts client coordinates through f64 rather than truncating a fractional client scale to i32. This avoids double scaling initial 175% X11 windows.
-2. Reparenting frames use the original client depth/visual and an associated colormap, transparent background and border. A 24-bit frame irreversibly flattens an ARGB32 child onto black before its Wayland buffer reaches the compositor. Matching the visual preserves alpha and the existing GPU capture path. Colormap XID is freed after the frame takes its reference.
+2. Reparenting frames use the original client depth/visual and the original client colormap, transparent background and border. A 24-bit frame irreversibly flattens an ARGB32 child onto black before its Wayland buffer reaches the compositor. Matching the visual preserves alpha and the existing GPU capture path. The frame borrows the client colormap without allocating/freeing one: XFreeColormap would set referring windows to None, so immediate freeing is incorrect.
 
 3. `new_selection` and `set_xsettings` flush their output immediately. Otherwise a newly attached application can observe old clipboard ownership or DPI until an unrelated XWM request happens to flush the connection.
 

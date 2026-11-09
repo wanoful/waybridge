@@ -1462,9 +1462,9 @@ where
                     let win = r.window;
                     let frame_win = conn.generate_id()?;
                     // Match the client's visual/depth so ARGB alpha survives reparenting.
-                    let visual = conn.get_window_attributes(win)?.reply()?.visual;
-                    let colormap = conn.generate_id()?;
-                    conn.create_colormap(x11rb::protocol::xproto::ColormapAlloc::NONE, colormap, xwm.screen.root, visual)?;
+                    let attributes = conn.get_window_attributes(win)?.reply()?;
+                    let visual = attributes.visual;
+                    let colormap = attributes.colormap;
                     let win_aux = CreateWindowAux::new().colormap(colormap).background_pixel(0).border_pixel(0).event_mask(
                         EventMask::SUBSTRUCTURE_NOTIFY
                             | EventMask::SUBSTRUCTURE_REDIRECT
@@ -1490,7 +1490,6 @@ where
                             visual,
                             &win_aux,
                         )?;
-                        conn.free_colormap(colormap)?;
                         let cookie2 = conn.reparent_window(win, frame_win, 0, 0)?;
                         conn.map_window(win)?;
 
