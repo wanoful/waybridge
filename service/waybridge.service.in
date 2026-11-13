@@ -1,0 +1,16 @@
+[Unit]
+Description=Waybridge encrypted remote application entry point
+After=network.target
+
+[Service]
+Type=simple
+ExecStart="@SERVICE_BINARY@" serve --compositor "@COMPOSITOR_BINARY@"
+Restart=on-failure
+RestartSec=2
+UMask=0077
+# Session children are explicitly managed by Waybridge and survive entry-point
+# restarts. Ending a session is a separate authenticated operation.
+KillMode=process
+
+[Install]
+WantedBy=default.target

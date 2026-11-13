@@ -32,7 +32,7 @@ public sealed record ClientSettings
         if (Hdr && Codec is "h264" or "png") throw new ArgumentException("HDR 需要自动、HEVC 或 AV1 编码");
     }
     [JsonIgnore]
-    public string ServerCodec => Codec switch { "auto" when Hdr => "hevc-nvenc", "h264" => "h264-nvenc", "hevc" => "hevc-nvenc", "av1" => "av1-nvenc", _ => Codec };
+    public string ServerCodec => Codec switch { "h264" => "h264-nvenc", "hevc" => "hevc-nvenc", "av1" => "av1-nvenc", _ => Codec };
 }
 
 public sealed record ConnectionProfile
@@ -44,6 +44,8 @@ public sealed record ConnectionProfile
     public int SshPort { get; set; } = 22;
     public string User { get; set; } = "";
     public string IdentityFile { get; set; } = "";
+    public string CertificateSha256 { get; set; } = "";
+    public string ClientId { get; set; } = "";
     public string ServerBinary { get; set; } = "waybridge";
     public string Session { get; set; } = "waybridge-0";
     public string SessionMode { get; set; } = "auto";
@@ -53,10 +55,12 @@ public sealed record ConnectionProfile
     public void Validate()
     {
         if (Id == Guid.Empty || string.IsNullOrWhiteSpace(Name) || Name.Length > 100) throw new ArgumentException("请输入连接名称");
-        if (Mode is not ("ssh" or "tunnel")) throw new ArgumentException("无效的连接方式");
+        if (Mode is not ("ssh" or "tunnel" or "direct")) throw new ArgumentException("无效的连接方式");
         if (!Regex.IsMatch(Host, @"^[a-zA-Z0-9\[\]][a-zA-Z0-9_.:\[\]-]{0,252}$")) throw new ArgumentException("请输入主机名、SSH config 别名或 IP 地址");
         if (User.Length > 64 || (User.Length > 0 && !Regex.IsMatch(User, @"^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$"))) throw new ArgumentException("无效的 SSH 用户名");
-        if (SshPort is < 1 or > 65535 || Port is < 0 or > 65535 || (Mode == "tunnel" && Port == 0)) throw new ArgumentException("无效的端口");
+        if (SshPort is < 1 or > 65535 || Port is < 0 or > 65535 || (Mode != "ssh" && Port == 0)) throw new ArgumentException("无效的端口");
+        if (CertificateSha256.Length > 0 && (CertificateSha256.Length != 64 || !CertificateSha256.All(Uri.IsHexDigit))) throw new ArgumentException("无效的 SHA-256 证书指纹");
+        if (ClientId.Length > 256 || ClientId.Any(char.IsWhiteSpace)) throw new ArgumentException("无效的客户端标识");
         if (!Regex.IsMatch(Session, @"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")) throw new ArgumentException("会话名称仅允许字母、数字、下划线与连字符");
         if (SessionMode is not ("auto" or "attach" or "new")) throw new ArgumentException("无效的会话策略");
         if (string.IsNullOrWhiteSpace(ServerBinary) || ServerBinary.Length > 4096 || ServerBinary.Contains('\0')) throw new ArgumentException("请输入 Linux 服务端路径");

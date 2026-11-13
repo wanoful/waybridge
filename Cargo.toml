@@ -28,7 +28,7 @@ zbus = "5.19"
 lto = "thin"
 
 [workspace]
-members = ["native"]
+members = ["native", "service"]
 exclude = ["vendor/smithay"]
 resolver = "2"
 

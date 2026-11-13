@@ -26,9 +26,12 @@ internal sealed class MainWindow : Window
     private readonly ObservableCollection<ConnectionProfile> profiles = [];
     private readonly ComboBox profilePicker = new() { DisplayMemberPath = "Name", MinWidth = 220, HorizontalAlignment = HorizontalAlignment.Stretch };
     private readonly TextBox name = new(), host = new(), user = new(), identity = new(), binary = new(), session = new(), udpHost = new();
+    private readonly TextBox fingerprint = new(), clientId = new() { IsReadOnly = true };
+    private readonly PasswordBox pairCode = new();
+    private readonly Button pair = Button("配对此设备"), revoke = Button("撤销此设备配对");
     private readonly PasswordBox token = new();
     private readonly CheckBox remember = new() { Content = "使用 Windows 凭据管理器保存令牌" };
-    private readonly ComboBox connectionMode = Combo(["内置 SSH", "已有 SSH 隧道"]);
+    private readonly ComboBox connectionMode = Combo(["认证加密直连", "内置 SSH", "已有 SSH 隧道"]);
     private readonly ComboBox sessionMode = Combo(["已有会话优先，未运行时启动", "仅接入已有会话", "创建独立会话"]);
     private readonly NumberBox sshPort = Number(22, 1, 65535), remotePort = Number(49090, 0, 65535);
     private readonly ToggleSwitch reconnect = Toggle(true), audio = Toggle(true), files = Toggle(true), images = Toggle(true), readOnly = Toggle(false), ime = Toggle(true), udp = Toggle(false), hdr = Toggle(false);
@@ -49,7 +52,7 @@ internal sealed class MainWindow : Window
     private readonly TextBox logs = new() { IsReadOnly = true, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 180, MaxHeight = 320 };
     private readonly Dictionary<string, TextBlock> metrics = new();
     private IReadOnlyList<RemoteApplication> applications = [];
-    private ConnectionProfile selected = new();
+    private ConnectionProfile selected = NewProfile();
     private ContentDialog? activeDialog;
     private bool loading, quitting, busy;
     private ulong lastBytes, lastUpdates, lastTick;
@@ -74,7 +77,7 @@ internal sealed class MainWindow : Window
         controller.ConnectionChanged += connected => UI(() =>
         {
             connect.Content = connected ? "断开连接" : (busy || controller.IsRunning) ? "取消连接" : "连接";
-            end.IsEnabled = connected && selected.Mode == "ssh";
+            end.IsEnabled = connected && selected.Mode is "ssh" or "direct";
             tray?.Update(connected);
             UpdateMode();
             if (!connected) { actual.Text = "实际编码／解码／呈现：等待连接"; lastTick = lastBytes = lastUpdates = 0; }
@@ -127,6 +130,7 @@ internal sealed class MainWindow : Window
     private static NumberBox Number(double value, double min, double max) => new()
     { Value = value, Minimum = min, Maximum = max, SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact, MinWidth = 150 };
     private static ToggleSwitch Toggle(bool value) => new() { IsOn = value, OnContent = "开启", OffContent = "关闭" };
+    private static ConnectionProfile NewProfile() => new() { Mode = "direct", Port = 49092 };
     private static Button Button(string label, bool primary = false)
     {
         var result = new Button { Content = label, MinHeight = 36 };
@@ -185,20 +189,60 @@ internal sealed class MainWindow : Window
     {
         profilePicker.ItemsSource = profiles;
         profilePicker.SelectionChanged += (_, _) => { if (!loading && profilePicker.SelectedItem is ConnectionProfile profile) Load(profile); };
-        addProfile.Click += (_, _) => { var profile = new ConnectionProfile(); profiles.Add(profile); profilePicker.SelectedItem = profile; };
+        addProfile.Click += (_, _) => { var profile = NewProfile(); profiles.Add(profile); profilePicker.SelectedItem = profile; };
         deleteProfile.Click += async (_, _) => await GuardAsync(async () =>
         {
             if (controller.Connected) throw new InvalidOperationException("删除连接前请先断开");
             secrets.Delete(selected.Id); profiles.Remove(selected);
-            if (profiles.Count == 0) profiles.Add(new());
+            if (profiles.Count == 0) profiles.Add(NewProfile());
             profilePicker.SelectedIndex = 0; await store.SaveAsync(profiles);
         });
-        connectionMode.SelectionChanged += (_, _) => { if (!loading) UpdateMode(); };
+        connectionMode.SelectionChanged += (_, _) =>
+        {
+            if (!loading)
+            {
+                if (connectionMode.SelectedIndex == 0 && remotePort.Value == 49090) remotePort.Value = 49092;
+                UpdateMode();
+            }
+        };
         name.PlaceholderText = "连接名称"; host.PlaceholderText = "Linux 主机名或 IP";
         user.PlaceholderText = "留空使用 SSH 配置中的用户"; identity.PlaceholderText = "留空使用 ssh-agent / OpenSSH 默认身份";
         binary.PlaceholderText = "waybridge 或 Linux 可执行文件完整路径";
-        session.PlaceholderText = "waybridge-0"; token.PlaceholderText = "已有隧道模式需要令牌";
-        var help = Text("SSH 使用 Windows OpenSSH 与 ssh-agent。首次连接确认主机指纹；加密私钥请先通过 ssh-add 加入 agent。", 12);
+        session.PlaceholderText = "waybridge-0"; token.PlaceholderText = "配对后自动填入；已有隧道模式填写会话令牌";
+        fingerprint.PlaceholderText = "Linux 配对命令显示的 SHA-256 证书指纹";
+        pairCode.PlaceholderText = "Linux 服务生成的一次性配对码";
+        var help = Text("直连模式先核对 Linux 服务的证书指纹并配对，之后直接连接局域网或 VPN 地址。SSH 模式继续使用 Windows OpenSSH 与 ssh-agent。", 12);
+        pair.Click += async (_, _) => await GuardAsync(async () =>
+        {
+            var profile = ReadEditor();
+            if (profile.Mode != "direct" || controller.IsRunning) throw new InvalidOperationException("请先断开连接并选择直连模式");
+            busy = true; connect.IsEnabled = false; UpdateMode();
+            try
+            {
+                var credentials = await DirectAgent.PairAsync(profile, pairCode.Password, Environment.MachineName);
+                clientId.Text = credentials.ClientId;
+                token.Password = credentials.ClientToken;
+                pairCode.Password = "";
+                remember.IsChecked = true;
+                await SaveAsync();
+                Inform("配对成功，可以连接。客户端凭据已保存到 Windows 凭据管理器。");
+            }
+            finally { busy = false; connect.IsEnabled = true; UpdateMode(); }
+        });
+        revoke.Click += async (_, _) => await GuardAsync(async () =>
+        {
+            var profile = ReadEditor();
+            if (profile.Mode != "direct" || controller.IsRunning) throw new InvalidOperationException("请先断开连接再撤销配对");
+            busy = true; connect.IsEnabled = false; UpdateMode();
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                await new DirectAgent(profile, token.Password).CallAsync(new { op = "revoke", revoke_client_id = profile.ClientId }, timeout.Token);
+                secrets.Delete(profile.Id); clientId.Text = ""; token.Password = ""; remember.IsChecked = false;
+                await SaveAsync(); Inform("此设备的配对已撤销。");
+            }
+            finally { busy = false; connect.IsEnabled = true; UpdateMode(); }
+        });
         connect.Click += async (_, _) => await GuardAsync(ConnectOrDisconnectAsync);
         save.Click += async (_, _) => await GuardAsync(SaveAsync);
         end.IsEnabled = false;
@@ -210,9 +254,10 @@ internal sealed class MainWindow : Window
             Field("主机地址", host), Row("SSH 端口", "内置 SSH 使用此端口", sshPort),
             Field("SSH 用户名", user), Field("私钥文件（可选）", identity), help,
             Field("Linux 服务端程序", binary), Field("会话名称", session),
-            Row("会话策略", "内置 SSH 自动管理隧道与会话", sessionMode),
-            Row("远端串流端口", "新建会话可填 0 自动分配；已有隧道填本地转发端口", remotePort),
-            Field("会话令牌", token), remember, Row("自动重连", "连接恢复后重新接入原会话，保留 Linux 应用", reconnect),
+            Row("会话策略", "直连与内置 SSH 都可创建或接入会话", sessionMode),
+            Row("服务端口", "直连默认 49092；SSH 新建会话可填 0；已有隧道填本地转发端口", remotePort),
+            Field("服务端证书指纹", fingerprint), Field("一次性配对码", pairCode), Actions(pair, revoke), Field("客户端标识", clientId),
+            Field("客户端凭据／会话令牌", token), remember, Row("自动重连", "连接恢复后重新接入原会话，保留 Linux 应用", reconnect),
             Actions(connect, save, end));
     }
     private UIElement DisplayPage()
@@ -310,7 +355,7 @@ internal sealed class MainWindow : Window
         var saved = await store.LoadAsync();
         loading = true;
         foreach (var profile in saved) profiles.Add(profile);
-        if (profiles.Count == 0) profiles.Add(new());
+        if (profiles.Count == 0) profiles.Add(NewProfile());
         loading = false; profilePicker.SelectedIndex = 0;
         try
         {
@@ -322,12 +367,14 @@ internal sealed class MainWindow : Window
     }
     private void UpdateMode()
     {
-        bool ssh = connectionMode.SelectedIndex == 0;
+        bool direct = connectionMode.SelectedIndex == 0, ssh = connectionMode.SelectedIndex == 1;
         bool editable = !busy && !controller.IsRunning;
         addProfile.IsEnabled = deleteProfile.IsEnabled = editable;
         reconnect.IsEnabled = editable;
         profilePicker.IsEnabled = name.IsEnabled = host.IsEnabled = connectionMode.IsEnabled = remotePort.IsEnabled = editable;
-        user.IsEnabled = identity.IsEnabled = binary.IsEnabled = session.IsEnabled = sessionMode.IsEnabled = sshPort.IsEnabled = ssh && editable;
+        user.IsEnabled = identity.IsEnabled = binary.IsEnabled = sshPort.IsEnabled = ssh && editable;
+        session.IsEnabled = sessionMode.IsEnabled = (ssh || direct) && editable;
+        fingerprint.IsEnabled = pairCode.IsEnabled = pair.IsEnabled = revoke.IsEnabled = clientId.IsEnabled = direct && editable;
         token.IsEnabled = remember.IsEnabled = !ssh && editable;
     }
     private void Load(ConnectionProfile profile)
@@ -335,7 +382,8 @@ internal sealed class MainWindow : Window
         loading = true; selected = profile;
         name.Text = profile.Name; host.Text = profile.Host; user.Text = profile.User; identity.Text = profile.IdentityFile;
         binary.Text = profile.ServerBinary; session.Text = profile.Session; sshPort.Value = profile.SshPort; remotePort.Value = profile.Port;
-        connectionMode.SelectedIndex = profile.Mode == "ssh" ? 0 : 1;
+        connectionMode.SelectedIndex = profile.Mode switch { "direct" => 0, "ssh" => 1, _ => 2 };
+        fingerprint.Text = profile.CertificateSha256; clientId.Text = profile.ClientId; pairCode.Password = "";
         sessionMode.SelectedIndex = Array.IndexOf(new[] { "auto", "attach", "new" }, profile.SessionMode);
         reconnect.IsOn = profile.AutoReconnect;
         token.Password = secrets.Read(profile.Id) ?? ""; remember.IsChecked = token.Password.Length > 0;
@@ -368,7 +416,8 @@ internal sealed class MainWindow : Window
         {
             Name = name.Text.Trim(), Host = host.Text.Trim(), User = user.Text.Trim(), IdentityFile = identity.Text.Trim(),
             ServerBinary = binary.Text.Trim(), Session = session.Text.Trim(), SshPort = checked((int)sshPort.Value), Port = checked((int)remotePort.Value),
-            Mode = connectionMode.SelectedIndex == 0 ? "ssh" : "tunnel",
+            Mode = connectionMode.SelectedIndex switch { 0 => "direct", 1 => "ssh", _ => "tunnel" },
+            CertificateSha256 = fingerprint.Text.Trim().ToLowerInvariant(), ClientId = clientId.Text.Trim(),
             SessionMode = new[] { "auto", "attach", "new" }[Math.Max(0, sessionMode.SelectedIndex)],
             AutoReconnect = reconnect.IsOn, Settings = settings
         };
@@ -377,7 +426,7 @@ internal sealed class MainWindow : Window
     private async Task SaveAsync()
     {
         var profile = ReadEditor();
-        if (profile.Mode == "tunnel" && remember.IsChecked == true) secrets.Write(profile.Id, token.Password);
+        if (profile.Mode is "tunnel" or "direct" && remember.IsChecked == true && token.Password.Length > 0) secrets.Write(profile.Id, token.Password);
         else secrets.Delete(profile.Id);
         int index = profiles.IndexOf(selected);
         loading = true; profiles[index] = profile; profilePicker.SelectedIndex = index; loading = false;
@@ -394,7 +443,7 @@ internal sealed class MainWindow : Window
         try
         {
             await controller.ConnectAsync(profile, token.Password); connect.Content = "断开连接";
-            if (profile.Mode == "ssh" && controller.CurrentSession is { } actualSession)
+            if (profile.Mode is "ssh" or "direct" && controller.CurrentSession is { } actualSession)
             {
                 session.Text = actualSession; sessionMode.SelectedIndex = 0;
                 await SaveAsync();
@@ -412,7 +461,7 @@ internal sealed class MainWindow : Window
     private async Task RefreshApplicationsAsync()
     {
         applications = await controller.ApplicationsAsync(); FilterApplications();
-        if (applications.Count == 0) Inform("应用目录需要内置 SSH 连接；已有隧道模式仍可在远端终端启动应用。");
+        if (applications.Count == 0) Inform("应用目录需要直连或内置 SSH 会话；已有隧道模式仍可在远端终端启动应用。");
     }
     private void FilterApplications()
     {
@@ -432,7 +481,11 @@ internal sealed class MainWindow : Window
         else if (type == "stream_config")
         {
             if (message.GetProperty("ok").GetBoolean())
-                Inform($"服务端已应用：{message.GetProperty("fps")} FPS，{message.GetProperty("bitrate").GetInt32()/1000.0:g} Mbps/窗口，{message.GetProperty("codec")}。实际画面路径见诊断。");
+            {
+                string reason = message.TryGetProperty("fallback_reason", out var fallback) && fallback.GetString() == "session_video_disabled"
+                    ? " 当前会话启动时限定 PNG；请新建使用视频编码的会话。" : "";
+                Inform($"服务端已应用：{message.GetProperty("fps")} FPS，{message.GetProperty("bitrate").GetInt32()/1000.0:g} Mbps/窗口，{message.GetProperty("codec")}。实际画面路径见诊断。" + reason);
+            }
             else Inform("服务端未接受设置：" + message.GetProperty("message").GetString());
         }
         else if (type is "error" or "settings_warning") Inform(message.GetProperty("message").GetString() ?? "操作失败");

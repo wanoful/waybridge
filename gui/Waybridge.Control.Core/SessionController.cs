@@ -8,10 +8,12 @@ public sealed class SessionController(string directory, string enginePath, Func<
     private Task? loop;
     private SshAgent? agent;
     private SshTunnel? tunnel;
+    private DirectAgent? direct;
     private EngineChannel? engine;
     private ConnectionProfile? active;
     private string? currentSession;
     private string currentToken = "";
+    private string currentCredential = "";
     private volatile bool running;
     public bool Connected { get; private set; }
     public bool IsRunning => running;
@@ -26,6 +28,7 @@ public sealed class SessionController(string directory, string enginePath, Func<
     private void WriteLog(string text)
     {
         if (currentToken.Length > 0) text = text.Replace(currentToken, "[令牌已隐藏]", StringComparison.Ordinal);
+        if (currentCredential.Length > 0) text = text.Replace(currentCredential, "[客户端凭据已隐藏]", StringComparison.Ordinal);
         if (text.Length > 2048) text = text[..2048];
         lock (diagnostics) { diagnostics.Enqueue(text); while (diagnostics.Count > 200) diagnostics.Dequeue(); }
         Log?.Invoke(text);
@@ -74,10 +77,29 @@ public sealed class SessionController(string directory, string enginePath, Func<
                         host = "127.0.0.1"; port = tunnel.Port;
                         if (profile.Settings.Udp && string.IsNullOrWhiteSpace(profile.Settings.UdpHost)) profile.Settings.UdpHost = profile.Host;
                     }
+                    else if (profile.Mode == "direct")
+                    {
+                        currentCredential = manualToken;
+                        direct = new DirectAgent(profile, manualToken);
+                        Status?.Invoke("正在验证 Linux 服务并接入会话…");
+                        var result = await direct.CallAsync(new
+                        {
+                            op = "ensure", session = currentSession ?? profile.Session,
+                            mode = currentSession is null ? profile.SessionMode : "attach",
+                            port = 0, fps = profile.Settings.Fps, bitrate = profile.Settings.Bitrate,
+                            codec = profile.Settings.ServerCodec, udp = profile.Settings.Udp,
+                            hdr = profile.Settings.Hdr, gpu_input = profile.Settings.GpuInput
+                        }, token);
+                        currentSession = result.GetProperty("name").GetString()!;
+                        currentToken = result.GetProperty("token").GetString()!;
+                        host = profile.Host; port = profile.Port;
+                        if (profile.Settings.Udp && string.IsNullOrWhiteSpace(profile.Settings.UdpHost)) profile.Settings.UdpHost = profile.Host;
+                        WriteLog($"加密服务已验证，会话 {currentSession} 已就绪");
+                    }
                     else { host = profile.Host; port = profile.Port; currentToken = manualToken; }
                     Status?.Invoke("正在连接串流内核…");
                     engine = await EngineChannel.StartAsync(enginePath, host, port, currentToken, profile.Settings,
-                        message => Message?.Invoke(message), WriteLog, token);
+                        message => Message?.Invoke(message), WriteLog, token, transport: direct?.Transport(currentSession!));
                     Connected = true; ConnectionChanged?.Invoke(true); Status?.Invoke("已连接");
                     hadConnection = true; attempt = 0; ready.TrySetResult();
                     Task cancelled = Task.Delay(Timeout.Infinite, token);
@@ -92,7 +114,7 @@ public sealed class SessionController(string directory, string enginePath, Func<
                 catch (Exception error)
                 {
                     WriteLog(error.Message);
-                    if (!hadConnection || !profile.AutoReconnect)
+                    if (!hadConnection || !profile.AutoReconnect || error is System.Security.Authentication.AuthenticationException or ArgumentException)
                     {
                         ready.TrySetException(error); Status?.Invoke(error.Message); break;
                     }
@@ -112,7 +134,9 @@ public sealed class SessionController(string directory, string enginePath, Func<
         if (engine is { } e) { engine = null; await e.DisposeAsync(); }
         if (tunnel is { } t) { tunnel = null; await t.DisposeAsync(); }
         if (agent is { } a) { agent = null; await a.DisposeAsync(); }
+        direct = null;
         currentToken = "";
+        currentCredential = "";
     }
     public async Task DisconnectAsync()
     {
@@ -134,26 +158,33 @@ public sealed class SessionController(string directory, string enginePath, Func<
     }
     public async Task<IReadOnlyList<RemoteApplication>> ApplicationsAsync()
     {
-        if (agent is null) return [];
+        if (agent is null && direct is null) return [];
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        var result = await agent.CallAsync(new { op = "applications" }, timeout.Token);
+        var result = await ManagementAsync(new { op = "applications" }, timeout.Token);
         return result.Deserialize<List<RemoteApplication>>(Wire.Json) ?? [];
     }
     public async Task LaunchAsync(string? app = null, string[]? argv = null)
     {
-        if (agent is null || active is null || currentSession is null) throw new InvalidOperationException("应用启动需要内置 SSH 会话");
+        if ((agent is null && direct is null) || active is null || currentSession is null) throw new InvalidOperationException("请先连接可管理的远端会话");
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        await agent.CallAsync(new { op = "launch", session = currentSession, binary = active.ServerBinary, app, argv }, timeout.Token);
+        await ManagementAsync(new { op = "launch", session = currentSession, binary = active.ServerBinary, app, argv }, timeout.Token);
     }
     public async Task EndSessionAsync()
     {
-        if (agent is null || currentSession is null) throw new InvalidOperationException("结束会话需要内置 SSH");
+        if ((agent is null && direct is null) || currentSession is null) throw new InvalidOperationException("请先连接可管理的远端会话");
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         // Cancel reconnect before the expected remote shutdown.
         if (active is not null) active.AutoReconnect = false;
-        await agent.CallAsync(new { op = "end", session = currentSession }, timeout.Token);
+        await ManagementAsync(new { op = "end", session = currentSession }, timeout.Token);
         await DisconnectAsync();
     }
     public Task SendEngineAsync(object request) => engine?.SendAsync(request) ?? throw new InvalidOperationException("请先连接");
+    private Task<JsonElement> ManagementAsync(object request, CancellationToken token)
+    {
+        var directAgent = direct;
+        if (directAgent is not null) return directAgent.CallAsync(request, token);
+        var sshAgent = agent;
+        return sshAgent?.CallAsync(request, token) ?? throw new InvalidOperationException("远端会话管理不可用");
+    }
     public async ValueTask DisposeAsync() => await DisconnectAsync();
 }

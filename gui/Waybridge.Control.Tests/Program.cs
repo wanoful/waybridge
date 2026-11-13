@@ -2,6 +2,7 @@ using System.IO.Pipes;
 using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Security.Authentication;
 using System.Text;
 using System.Text.Json;
 using Waybridge.Control.Core;
@@ -22,6 +23,18 @@ if (args is ["--control-pipe", var pipeName])
     Check(start.GetProperty("type").GetString() == "start", "missing start");
     string secret = start.GetProperty("token").GetString()!;
     Check(secret.Length >= 16 && !Environment.GetCommandLineArgs().Any(a => a.Contains(secret, StringComparison.Ordinal)), "secret leaked to argv");
+    if (start.TryGetProperty("transport", out var transport) && transport.ValueKind == JsonValueKind.Object)
+    {
+        string clientSecret = transport.GetProperty("client_token").GetString()!;
+        Check(clientSecret.Length >= 32, "missing direct client credential");
+        Check(!Environment.GetCommandLineArgs().Any(argument => argument.Contains(clientSecret, StringComparison.Ordinal)), "direct credential leaked to argv");
+        Check(!Environment.GetEnvironmentVariables().Values.Cast<string>().Any(value => value.Contains(clientSecret, StringComparison.Ordinal) || value.Contains(secret, StringComparison.Ordinal)), "credential leaked to environment");
+        Check(transport.GetProperty("type").GetString() == "tls", "direct transport type changed");
+        string fingerprint = transport.GetProperty("fingerprint").GetString()!;
+        Check(fingerprint.Length == 64 && fingerprint.All(Uri.IsHexDigit), "direct transport omitted certificate pin");
+        Check(!string.IsNullOrWhiteSpace(transport.GetProperty("client_id").GetString()), "direct transport omitted client identity");
+        await pipe.WriteAsync(Wire.Encode(new { type = "bootstrap_verified", transport_type = "tls", session = transport.GetProperty("session").GetString() }));
+    }
     await pipe.WriteAsync(Wire.Encode(new { type = "connected", version = 3 }));
     while (await input.ReadAsync(default) is { } request)
     {
@@ -29,6 +42,104 @@ if (args is ["--control-pipe", var pipeName])
         if (request.GetProperty("type").GetString() == "crash") Environment.Exit(3);
         await pipe.WriteAsync(Wire.Encode(new { type = "observed", request }));
     }
+    return;
+}
+if (args is ["--direct-smoke"])
+{
+    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+    var bootstrap = (await new JsonLines(Console.OpenStandardInput(), 65536).ReadAsync(deadline.Token))
+        ?? throw new IOException("missing private direct-test bootstrap");
+    string pairingCode = bootstrap.GetProperty("pair_code").GetString()!;
+    string directRuntime = bootstrap.GetProperty("runtime").GetString()!;
+    string sessionName = bootstrap.GetProperty("session").GetString()!;
+    var unpaired = new ConnectionProfile { Mode = "direct", Host = bootstrap.GetProperty("host").GetString()!,
+        Port = bootstrap.GetProperty("port").GetInt32(), CertificateSha256 = bootstrap.GetProperty("certificate_sha256").GetString()!,
+        Session = sessionName, Settings = new ClientSettings {Codec = "png", Audio = false} };
+    Check(!Environment.GetCommandLineArgs().Any(argument => argument.Contains(pairingCode, StringComparison.Ordinal)), "pair code leaked to argv");
+    Check(!Environment.GetEnvironmentVariables().Values.Cast<string>().Any(value => value.Contains(pairingCode, StringComparison.Ordinal)), "pair code leaked to environment");
+    string changedPin = (unpaired.CertificateSha256[0] == '0' ? "1" : "0") + unpaired.CertificateSha256[1..];
+    await Reject<AuthenticationException>(() => DirectAgent.PairAsync(unpaired with {CertificateSha256 = changedPin}, pairingCode, "test", deadline.Token));
+    await Reject<AuthenticationException>(() => DirectAgent.PairAsync(unpaired, new string('x', 43), "test", deadline.Token));
+    var credentials = await DirectAgent.PairAsync(unpaired, pairingCode, "Windows 测试设备", deadline.Token);
+    await Reject<AuthenticationException>(() => DirectAgent.PairAsync(unpaired, pairingCode, "replay", deadline.Token));
+    var directProfile = unpaired with {ClientId = credentials.ClientId};
+    directProfile.Validate();
+    var direct = new DirectAgent(directProfile, credentials.ClientToken);
+    await Reject<AuthenticationException>(() => new DirectAgent(directProfile, new string('x', 43)).CallAsync(new {op="list"}, deadline.Token));
+    var initialSessions = await direct.CallAsync(new {op="list"}, deadline.Token);
+    Check(initialSessions.ValueKind == JsonValueKind.Array && initialSessions.GetArrayLength() == 0, "private direct service did not start empty");
+    Console.WriteLine("PASS: .NET pinned TLS rejects changed identity, invalid/replayed pairing codes and incorrect credentials");
+
+    var actualSession = await direct.CallAsync(new {op="ensure",session=sessionName,mode="auto",codec="png",audio=false,xwayland=false}, deadline.Token);
+    int pid = actualSession.GetProperty("pid").GetInt32();
+    string sessionSecret = actualSession.GetProperty("token").GetString()!;
+    Check(actualSession.GetProperty("created").GetBoolean(), "actual session was not created");
+    var listed = await direct.CallAsync(new {op="list"}, deadline.Token);
+    Check(listed.EnumerateArray().Any(item => item.GetProperty("pid").GetInt32() == pid), "created session missing from list");
+    Check(listed.EnumerateArray().All(item => !item.TryGetProperty("token", out _)), "list leaked session credentials");
+    var information = await direct.CallAsync(new {op="info",session=sessionName}, deadline.Token);
+    Check(information.GetProperty("pid").GetInt32() == pid && !information.TryGetProperty("token",out _), "invalid session info");
+    var directApplications = await direct.CallAsync(new {op="applications"}, deadline.Token);
+    Check(directApplications.ValueKind == JsonValueKind.Array && directApplications.EnumerateArray().Any(item => item.GetProperty("id").GetString() == "waybridge-direct-smoke.desktop"), "private application fixture missing from direct catalog");
+    string marker = Path.Combine(directRuntime,"direct-marker");
+    await direct.CallAsync(new {op="launch",session=sessionName,argv=new[]{"python3","-I","-c","import pathlib,sys;pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",marker,"你好 ; $(literal)"}}, deadline.Token);
+    for (int i=0;i<100 && !File.Exists(marker);i++) await Task.Delay(25, deadline.Token);
+    Check(File.ReadAllText(marker) == "你好 ; $(literal)", "direct literal Unicode application launch failed");
+    Console.WriteLine("PASS: .NET direct RPC creates real compositor, lists sessions/applications and launches Unicode argv without shell evaluation");
+
+    string settingsDirectory = Path.Combine(directRuntime,"direct settings 你好");
+    var profileStore = new ProfileStore(settingsDirectory);
+    await profileStore.SaveAsync([directProfile]);
+    string stored = File.ReadAllText(Path.Combine(settingsDirectory,"profiles.json"));
+    Check(!stored.Contains(credentials.ClientToken,StringComparison.Ordinal) && !stored.Contains(sessionSecret,StringComparison.Ordinal), "direct credential persisted in profile JSON");
+    var firstTransport = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var restored = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    int connections = 0, bootstraps = 0;
+    string appHost = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!, "Waybridge.Control.Tests" + (OperatingSystem.IsWindows() ? ".exe" : ""));
+    await using (var controller = new SessionController(settingsDirectory,appHost,_ => throw new Exception("direct connection unexpectedly requested SSH trust")))
+    {
+        controller.Message += message => {
+            if (message.GetProperty("type").GetString() == "bootstrap_verified")
+            {
+                Check(message.GetProperty("transport_type").GetString() == "tls" && message.GetProperty("session").GetString() == sessionName, "native transport bootstrap changed");
+                Interlocked.Increment(ref bootstraps); firstTransport.TrySetResult();
+            }
+        };
+        controller.ConnectionChanged += value => {if (value && Interlocked.Increment(ref connections) == 2) restored.TrySetResult();};
+        await controller.ConnectAsync(directProfile with {SessionMode="attach"},credentials.ClientToken);
+        await firstTransport.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Check(controller.Connected && controller.CurrentSession == sessionName,"direct controller did not attach");
+        Check((await controller.ApplicationsAsync()).Any(app => app.Id == "waybridge-direct-smoke.desktop"),"direct controller application catalog failed");
+        string controllerMarker = Path.Combine(directRuntime,"controller-marker");
+        await controller.LaunchAsync(argv:["python3","-I","-c","import pathlib,sys;pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",controllerMarker,"controller 你好"]);
+        for (int i=0;i<100 && !File.Exists(controllerMarker);i++) await Task.Delay(25,deadline.Token);
+        Check(File.ReadAllText(controllerMarker)=="controller 你好","controller direct launch failed");
+        await controller.SendEngineAsync(new {type="crash"});
+        await restored.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        Check(bootstraps >= 2 && controller.Connected,"direct controller did not repeat private transport bootstrap on reconnect");
+        Check((await direct.CallAsync(new {op="info",session=sessionName},deadline.Token)).GetProperty("pid").GetInt32() == pid,"engine restart replaced remote session");
+        await controller.DisconnectAsync();
+        Check(!controller.IsRunning && !controller.Connected,"direct controller did not disconnect");
+        var attached = await direct.CallAsync(new {op="ensure",session=sessionName,mode="attach"},deadline.Token);
+        Check(!attached.GetProperty("created").GetBoolean() && attached.GetProperty("pid").GetInt32() == pid,"viewer disconnect killed direct session");
+        Check(controller.Logs.All(line => !line.Contains(credentials.ClientToken,StringComparison.Ordinal) && !line.Contains(sessionSecret,StringComparison.Ordinal)),"direct credentials leaked to diagnostics");
+        await controller.ConnectAsync(directProfile with {SessionMode="attach"},credentials.ClientToken);
+        await controller.EndSessionAsync();
+        Check(!controller.IsRunning,"explicit direct session end did not stop controller");
+    }
+    for(int i=0;i<100;i++)
+    {
+        var sessions=await direct.CallAsync(new{op="list"},deadline.Token);
+        if(sessions.GetArrayLength()==0) break;
+        await Task.Delay(25,deadline.Token);
+    }
+    Check((await direct.CallAsync(new{op="list"},deadline.Token)).GetArrayLength()==0,"explicit direct end did not remove session");
+    var clients=await direct.CallAsync(new{op="clients"},deadline.Token);
+    Check(clients.EnumerateArray().Any(item=>item.GetProperty("client_id").GetString()==credentials.ClientId),"paired client missing from trust list");
+    var revoked=await direct.CallAsync(new{op="revoke",revoke_client_id=credentials.ClientId},deadline.Token);
+    Check(revoked.GetProperty("revoked").GetBoolean(),"direct client was not revoked");
+    await Reject<AuthenticationException>(()=>direct.CallAsync(new{op="list"},deadline.Token));
+    Console.WriteLine("PASS: direct controller privately bootstraps native transport, reconnects retained session, ends explicitly, keeps credentials out of profiles/logs and enforces revocation");
     return;
 }
 if (args is ["--ssh-smoke", var sshPort, var identityFile, var serverBinary, var runtime])
@@ -92,6 +203,12 @@ try
     foreach (string session in new[] { "../other", "/tmp/session", "x;rm", "bad\nname" })
         await Reject<ArgumentException>(() => { (profile with { Session = session }).Validate(); return Task.CompletedTask; });
     await Reject<ArgumentException>(() => { new ClientSettings { Fps = 10000 }.Validate(); return Task.CompletedTask; });
+    Check(new ClientSettings { Codec = "auto", Hdr = true }.ServerCodec == "auto", "GUI must preserve auto/HDR policy for the shared server resolver");
+    var directProfile = profile with { Mode = "direct", Port = 49092, CertificateSha256 = new string('a', 64), ClientId = "paired-client" };
+    directProfile.Validate();
+    await Reject<ArgumentException>(() => { (directProfile with { CertificateSha256 = "bad-pin" }).Validate(); return Task.CompletedTask; });
+    await Reject<ArgumentException>(() => { (directProfile with { Port = 0 }).Validate(); return Task.CompletedTask; });
+    await Reject<ArgumentException>(() => { _ = new DirectAgent(directProfile with { CertificateSha256 = "" }, new string('b',64)); return Task.CompletedTask; });
     Console.WriteLine("PASS: profile validation rejects option, shell and session-path injection");
 
     var store = new ProfileStore(directory);
