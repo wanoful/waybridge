@@ -6,6 +6,7 @@ license = "MIT"
 description = "Authenticated TLS entry point for same-user Waybridge sessions"
 
 [dependencies]
+waybridge-config = { path = "../config" }
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }

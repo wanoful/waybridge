@@ -1,0 +1,15 @@
+# Copy under an explicit user-chosen unit name; replace @COMMAND@.
+# Enable explicitly; this file is never installed/enabled by Waybridge startup.
+[Unit]
+Description=User-selected Waybridge graphical session component
+PartOf=waybridge-session.target
+After=waybridge-session-pre.target
+Before=waybridge-session.target
+
+[Service]
+Type=simple
+ExecStart=@COMMAND@
+TimeoutStopSec=10
+
+[Install]
+WantedBy=waybridge-session.target

@@ -31,6 +31,16 @@ impl App {
         let bitrate = value["bitrate"].as_u64().unwrap_or(0);
         let requested = value["codec"].as_str().unwrap_or("");
         let hdr = value["hdr"].as_bool().unwrap_or(self.hdr_requested);
+        if let Err(error) = self
+            .stream_limits
+            .validate_stream(fps, bitrate, requested, hdr)
+        {
+            self.control(
+                json!({"type":"stream_config","request_id":request,"ok":false,
+                "message":error.to_string(),"limits":self.stream_limits}),
+            );
+            return;
+        }
         let codec = match resolve_codec(requested, hdr) {
             Ok(codec) => codec,
             Err(_) => {
@@ -38,10 +48,6 @@ impl App {
                 return;
             }
         };
-        if !(1..=120).contains(&fps) || !(1000..=200000).contains(&bitrate) {
-            self.control(json!({"type":"stream_config","request_id":request,"ok":false,"message":"invalid frame rate or bitrate"}));
-            return;
-        }
         let video_limited = !self.video_allowed && codec.is_some();
         let codec = if self.video_allowed { codec } else { None };
         let hdr_changed = self.hdr_requested != hdr;
@@ -73,6 +79,7 @@ impl App {
             "fps":self.stream_fps,"bitrate":self.stream_bitrate,"codec":codec_name(codec),
             "requested_codec":requested,"hdr_requested":hdr,
             "fallback_reason":video_limited.then_some("session_video_disabled"),
+            "source":"runtime_request","persisted":false,"limits":self.stream_limits,
             "read_only":self.read_only}),
         );
     }

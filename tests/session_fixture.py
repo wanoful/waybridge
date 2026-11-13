@@ -14,10 +14,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SessionFixture:
-    def __init__(self, directory):
+    def __init__(self, directory, real_manager=False):
+        self.real_manager = real_manager
         self.root = Path(directory)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.env = dict(os.environ)
+        # An isolated user bus must never activate clients against host displays.
+        for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'QT_QPA_PLATFORM',
+                    'GDK_BACKEND', 'SESSION_MANAGER', 'XDG_CURRENT_DESKTOP'):
+            self.env.pop(key, None)
         # Keep compiler/package caches while giving applications a disposable
         # HOME. Otherwise rustup would lose the user's selected toolchain.
         for key, leaf in [('RUSTUP_HOME', '.rustup'), ('CARGO_HOME', '.cargo'),
@@ -62,7 +67,7 @@ class SessionFixture:
         self.env.update(DBUS_SESSION_BUS_ADDRESS=address, DBUS_SYSTEM_BUS_ADDRESS=address,
                         WAYBRIDGE_TEST_SESSION_FIXTURE='1')
         self.server = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--server',
-                                        str(self.sessions), str(self.manager)], env=self.env,
+                                        str(self.sessions), str(self.manager), "real" if self.real_manager else "fake"], env=self.env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         assert self.server.stdout.readline().strip() == 'ready', self.server.stderr.read()
         return self
@@ -93,7 +98,7 @@ class SessionFixture:
         temporary.replace(self.sessions)
 
 
-def server(sessions_path, manager_path):
+def server(sessions_path, manager_path, mode="fake"):
     import gi
     gi.require_version('Gio', '2.0')
     from gi.repository import Gio, GLib
@@ -128,8 +133,9 @@ def server(sessions_path, manager_path):
         bus.register_object(f'/org/freedesktop/login1/session/s{i}', Gio.DBusNodeInfo.new_for_xml(session_xml).interfaces[0], None, prop, None)
     def environment(*unused):
         return GLib.Variant('as', [f'{k}={v}' for k, v in json.loads(manager_path.read_text()).items()])
-    bus.register_object('/org/freedesktop/systemd1', Gio.DBusNodeInfo.new_for_xml(systemd_xml).interfaces[0], method, environment, None)
-    for name in ('org.freedesktop.login1', 'org.freedesktop.systemd1'):
+    if mode != 'real':
+        bus.register_object('/org/freedesktop/systemd1', Gio.DBusNodeInfo.new_for_xml(systemd_xml).interfaces[0], method, environment, None)
+    for name in (('org.freedesktop.login1',) if mode == 'real' else ('org.freedesktop.login1', 'org.freedesktop.systemd1')):
         bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
                       'RequestName', GLib.Variant('(su)', (name, 0)), None, Gio.DBusCallFlags.NONE, 3000, None)
     print('ready', flush=True)

@@ -43,24 +43,33 @@ const HELPER: &str = include_str!("../../scripts/session-control.py");
     about = "Secure direct entry point for same-user Waybridge sessions"
 )]
 struct Args {
+    /// Replace the XDG user configuration file for serve and configuration checks.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Validate configuration without creating identity/state or starting listeners.
+    #[arg(long, global = true)]
+    check_config: bool,
+    /// Print effective configuration and sources as JSON, then exit.
+    #[arg(long, global = true)]
+    print_config: bool,
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
     #[arg(long, global = true)]
     runtime_dir: Option<PathBuf>,
     #[command(subcommand)]
-    command: Action,
+    command: Option<Action>,
 }
 
 #[derive(Subcommand)]
 enum Action {
     /// Start the TLS listener and owner-only local administration socket.
     Serve {
-        #[arg(long, default_value = "0.0.0.0:49092")]
-        listen: String,
-        #[arg(long, default_value = "waybridge")]
-        compositor: String,
-        #[arg(long, default_value = "python3")]
-        python: String,
+        #[arg(long)]
+        listen: Option<String>,
+        #[arg(long)]
+        compositor: Option<String>,
+        #[arg(long)]
+        python: Option<String>,
     },
     /// Create an expiring, one-use pairing code. Transfer its certificate pin independently.
     Pair {
@@ -80,6 +89,7 @@ struct Shared {
     listen: String,
     compositor: String,
     python: String,
+    config_path: Option<PathBuf>,
     changed: watch::Sender<u64>,
     rpc_slots: Semaphore,
 }
@@ -233,6 +243,11 @@ async fn helper(shared: &Shared, request: &Value) -> Result<Value> {
     let map = request.as_object_mut().context("invalid request")?;
     map.remove("client_id");
     map.remove("client_token");
+    // A remote peer cannot choose configuration, programs, or server limits.
+    map.remove("config");
+    if let Some(path) = &shared.config_path {
+        map.insert("config".into(), json!(path));
+    }
     map.insert("binary".into(), Value::String(shared.compositor.clone()));
     map.insert("id".into(), json!(1));
     let mut bytes = serde_json::to_vec(&request)?;
@@ -440,7 +455,7 @@ async fn remote(
     }
     if !matches!(
         op,
-        "list" | "ensure" | "info" | "applications" | "launch" | "end"
+        "list" | "ensure" | "info" | "applications" | "launch" | "launch-plan" | "end"
     ) {
         return write_response(
             &mut connection,
@@ -511,6 +526,7 @@ async fn serve(
     listen: String,
     compositor: String,
     python: String,
+    config_path: Option<PathBuf>,
 ) -> Result<()> {
     storage::private_directory(&state)?;
     storage::private_directory(&runtime)?;
@@ -556,6 +572,7 @@ async fn serve(
         listen,
         compositor,
         python,
+        config_path,
         changed,
         rpc_slots: Semaphore::new(4),
     });
@@ -603,16 +620,58 @@ async fn serve(
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
-    let (state, runtime) = locations(&args)?;
-    if let Action::Serve {
-        listen,
-        compositor,
-        python,
-    } = args.command
-    {
-        return serve(state, runtime, listen, compositor, python).await;
+    let is_serve = matches!(&args.command, Some(Action::Serve { .. }));
+    // Administrative commands address the running service, whose configuration
+    // may differ from a file being edited for its next restart.
+    if is_serve || args.check_config || args.print_config {
+        let mut configuration = waybridge_config::Loaded::load(args.config.as_deref())?;
+        if let Some(Action::Serve {
+            listen,
+            compositor,
+            python,
+        }) = &args.command
+        {
+            configuration.apply(waybridge_config::Overrides {
+                service_listen: listen.clone(),
+                compositor: compositor.clone(),
+                python: python.clone(),
+                ..Default::default()
+            })?;
+        }
+        if args.print_config {
+            println!("{}", serde_json::to_string_pretty(&configuration.report())?);
+            return Ok(());
+        }
+        if args.check_config {
+            println!(
+                "{}",
+                json!({"valid":true,"config_file":configuration.report()["config_file"]})
+            );
+            return Ok(());
+        }
+        let (state, runtime) = locations(&args)?;
+        let service = configuration.config.service;
+        // A selected explicit file remains mandatory. The default XDG file
+        // remains optional and is discovered identically by helper children.
+        let config_path = configuration
+            .explicit
+            .then_some(configuration.path)
+            .flatten();
+        return serve(
+            state,
+            runtime,
+            service.listen,
+            service.compositor,
+            service.python,
+            config_path,
+        )
+        .await;
     }
-    let request = match args.command {
+    let action = args.command.as_ref().context(
+        "specify serve, pair, status, clients or revoke (or --check-config/--print-config)",
+    )?;
+    let (_, runtime) = locations(&args)?;
+    let request = match action {
         Action::Pair { expires } => json!({"op":"pair","expires":expires}),
         Action::Status => json!({"op":"status"}),
         Action::Clients => json!({"op":"clients"}),

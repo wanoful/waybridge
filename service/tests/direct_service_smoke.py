@@ -30,6 +30,16 @@ def receive_json(connection):
     return json.loads(data)
 
 
+def receive_exact(connection, count):
+    data = bytearray()
+    while len(data) < count:
+        block = connection.recv(count - len(data))
+        if not block:
+            raise EOFError("connection closed before framed payload")
+        data += block
+    return data
+
+
 def process_identity(pid):
     return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
 
@@ -50,7 +60,12 @@ def main():
         env.update(XDG_RUNTIME_DIR=str(runtime), XDG_DATA_HOME=str(root / "data"),
                    XDG_STATE_HOME=str(root / "app-state"), XDG_CONFIG_HOME=str(root / "config"),
                    XDG_CACHE_HOME=str(root / "cache"))
-        command = [str(service), "--state-dir", str(state), "--runtime-dir", str(runtime / "entry")]
+        config = root / "explicit-server.toml"
+        config.write_text('[service]\nlisten = "127.0.0.1:1"\n'
+                          '[session]\nfps = 37\nbitrate = 17000\ncodec = "png"\n'
+                          '[limits]\nmax_fps = 75\nmax_bitrate = 55000\nallowed_codecs = ["png", "h264"]\n')
+        config_bytes = config.read_bytes()
+        command = [str(service), "--config", str(config), "--state-dir", str(state), "--runtime-dir", str(runtime / "entry")]
         daemon = subprocess.Popen([*command, "serve", "--listen", "127.0.0.1:0", "--compositor", str(compositor)],
                                   env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         actual = None
@@ -160,11 +175,30 @@ def main():
             assert not rpc({"op": "ensure", "session": "controlled", "mode": "attach", **credentials})["ok"]
 
             if args.compositor:
-                response = rpc({"op": "ensure", "session": "actual", "mode": "auto", "audio": False, "xwayland": False, **credentials})
+                for invalid in [{"fps": 76}, {"bitrate": 55001}, {"codec": "hevc-nvenc"}]:
+                    rejected = rpc({"op": "ensure", "session": "actual", "mode": "new", **invalid, **credentials})
+                    assert not rejected["ok"], rejected
+                    assert not list(runtime.glob("actual*.session.json"))
+                response = rpc({"op": "ensure", "session": "actual", "mode": "auto", "audio": False, "xwayland": False,
+                                "config": "/client-cannot-choose-config", "binary": "/bin/false", **credentials})
                 assert response["ok"], response
                 actual = response["result"]
+                effective = actual["configuration"]
+                assert effective["values"]["session"]["fps"] == 37, effective
+                assert effective["values"]["session"]["bitrate"] == 17000, effective
+                assert effective["sources"]["session.fps"]["kind"] == "file", effective
+                assert effective["values"]["limits"]["max_fps"] == 75, effective
+                config.write_text("temporarily invalid configuration")
+                reconnected = rpc({"op": "ensure", "session": actual["name"], "mode": "auto", "fps": 999, **credentials})
+                assert reconnected["ok"] and not reconnected["result"]["created"], reconnected
+                assert reconnected["result"]["pid"] == actual["pid"] and "configuration" not in reconnected["result"]
+                config.write_bytes(config_bytes)
                 marker = root / "launched.json"
                 launch_code = "import json,os,pathlib;pathlib.Path(" + repr(str(marker)) + ").write_text(json.dumps({k:os.environ.get(k) for k in ['WAYLAND_DISPLAY','DBUS_SESSION_BUS_ADDRESS']}))"
+                planned = rpc({"op": "launch-plan", "session": actual["name"], "argv": [sys.executable, "-I", "-c", launch_code], **credentials})
+                assert planned["ok"] and planned["result"]["kind"] == "argv", planned
+                assert not marker.exists(), "launch-plan must not execute the application"
+                assert "environment" not in planned["result"] and "token" not in planned["result"]
                 launched = rpc({"op": "launch", "session": actual["name"], "argv": [sys.executable, "-I", "-c", launch_code], **credentials})
                 assert launched["ok"], launched
                 deadline = time.monotonic() + 5
@@ -175,18 +209,61 @@ def main():
                 inherited = json.loads(marker.read_text())
                 assert inherited["WAYLAND_DISPLAY"] == actual["name"]
                 assert inherited["DBUS_SESSION_BUS_ADDRESS"]
+                applications = root / "data/applications"
+                applications.mkdir(parents=True, exist_ok=True)
+                desktop_id = "org.waybridge.Controlled.desktop"
+                desktop_marker, desktop_script = root / "desktop-result", root / "desktop-fixture"
+                desktop_script.write_text('#!/bin/sh\nprintf "%s\\n" "$PYTHONHOME" > "$1"\npwd >> "$1"\n')
+                desktop_script.chmod(0o700)
+                (applications / desktop_id).write_text(
+                    f"[Desktop Entry]\nType=Application\nName=Controlled launch\nExec={desktop_script} {desktop_marker}\n")
+                overrides = root / "config/waybridge/desktop-overrides"
+                overrides.mkdir(parents=True)
+                (overrides / (desktop_id + ".toml")).write_text(
+                    f'version = 1\n[default]\ncwd = "{root}"\n[default.env]\nPYTHONHOME = "/application-only-python-home"\n')
+                desktop_plan = rpc({"op": "launch-plan", "session": actual["name"], "app": desktop_id, **credentials})
+                assert desktop_plan["ok"] and desktop_plan["result"]["env_keys"] == ["PYTHONHOME"], desktop_plan
+                assert not desktop_marker.exists()
+                desktop_launch = rpc({"op": "launch", "session": actual["name"], "app": desktop_id, **credentials})
+                assert desktop_launch["ok"] and desktop_launch["result"]["status"] == "dispatched", desktop_launch
+                deadline = time.monotonic() + 5
+                expected_desktop_result = ["/application-only-python-home", str(root)]
+                while not desktop_marker.exists() or desktop_marker.read_text().splitlines() != expected_desktop_result:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("TLS desktop override did not launch the application")
+                    time.sleep(.02)
+                assert desktop_marker.read_text().splitlines() == expected_desktop_result
                 with connect() as connection:
                     connection.sendall(json.dumps({"op": "stream", "session": actual["name"], **credentials}).encode() + b"\n")
                     assert receive_json(connection)["result"]["stream_ready"]
                     hello = json.dumps({"type": "hello", "version": 3, "token": actual["token"], "dpi": 96}).encode()
                     connection.sendall(struct.pack(">I", len(hello) + 1) + b"\0" + hello)
-                    header = connection.recv(4)
-                    assert len(header) == 4
+                    header = receive_exact(connection, 4)
                     length = struct.unpack(">I", header)[0]
-                    message = bytearray()
-                    while len(message) < length:
-                        message += connection.recv(length - len(message))
+                    message = receive_exact(connection, length)
                     assert message[0] == 0 and json.loads(message[1:])["type"] == "hello"
+
+                    def stream_config(request_id, **settings):
+                        body = b"\0" + json.dumps({"type": "stream_config", "request_id": request_id, **settings}).encode()
+                        connection.sendall(struct.pack(">I", len(body)) + body)
+                        while True:
+                            header = receive_exact(connection, 4)
+                            size, = struct.unpack(">I", header)
+                            payload = receive_exact(connection, size)
+                            if payload[0] != 0:
+                                continue
+                            reply = json.loads(payload[1:])
+                            if reply["type"] == "stream_config" and reply["request_id"] == request_id:
+                                return reply
+
+                    denied = stream_config(501, fps=76, bitrate=17000, codec="png")
+                    assert not denied["ok"] and denied["limits"]["max_fps"] == 75, denied
+                    denied_codec = stream_config(502, fps=37, bitrate=17000, codec="hevc")
+                    assert not denied_codec["ok"], denied_codec
+                    accepted = stream_config(503, fps=39, bitrate=18000, codec="png")
+                    assert accepted["ok"] and accepted["fps"] == 39 and accepted["bitrate"] == 18000, accepted
+                    assert accepted["persisted"] is False and accepted["source"] == "runtime_request", accepted
+                assert config.read_bytes() == config_bytes, "client requests must not rewrite server configuration"
                 assert rpc({"op": "info", "session": actual["name"], **credentials})["ok"]
                 # A service restart keeps both the pinned identity/trust and the
                 # already detached real compositor alive.
@@ -208,7 +285,7 @@ def main():
                 assert rpc({"op": "info", "session": actual["name"], **credentials})["ok"]
                 assert rpc({"op": "end", "session": actual["name"], **credentials})["ok"]
                 actual = None
-            print("TLS pairing, pinning, authorization, single-use codes, session metadata, opaque duplex gateway, revocation and bounds passed" + ("; actual compositor handshake passed" if args.compositor else ""))
+            print("TLS pairing, pinning, authorization, single-use codes, session metadata, opaque duplex gateway, revocation and bounds passed" + ("; actual compositor handshake, config defaults/limits, nonexecuting launch-plan, live policy and retained-session config independence passed" if args.compositor else ""))
         finally:
             if actual:
                 try:

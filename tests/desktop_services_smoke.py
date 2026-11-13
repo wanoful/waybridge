@@ -108,6 +108,17 @@ def main():
         # Fixture-only preferences avoid the first-use wizard; real user config
         # is never edited by Waybridge.
         (config / 'kwalletrc').write_text('[Wallet]\nEnabled=true\nFirst Use=false\n[KSecretD]\nEnabled=true\n')
+        # Explicit fixture component selection, using the same static Portal
+        # configuration and standard D-Bus service format a user can install.
+        portal = config / 'xdg-desktop-portal'
+        portal.mkdir()
+        (portal / 'waybridge-portals.conf').write_bytes((ROOT / 'integration/xdg-desktop-portal/waybridge-portals.conf').read_bytes())
+        catalog = app_data / 'dbus-1/services'
+        catalog.mkdir(parents=True, exist_ok=True)
+        (catalog / 'org.freedesktop.secrets.service').write_text('[D-BUS Service]\nName=org.freedesktop.secrets\nExec=/usr/bin/ksecretd\n')
+        subprocess.run(['gdbus', 'call', '--address', user.env['DBUS_SESSION_BUS_ADDRESS'], '--dest',
+                        'org.freedesktop.DBus', '--object-path', '/org/freedesktop/DBus',
+                        '--method', 'org.freedesktop.DBus.ReloadConfig'], check=True, capture_output=True)
         env = {**user.env, 'KDE_SESSION_VERSION': '999'}
         token = 'desktop-test-' + '4' * 40
         token_path = fixture_root / 'token'
@@ -133,17 +144,11 @@ def main():
                 saved = json.loads(descriptor.read_text())
                 status_file = Path(saved['environment']['WAYBRIDGE_DESKTOP_SERVICES'])
 
-                def services_ready():
-                    status = json.loads(status_file.read_text())
-                    providers = {item['name']: item for item in status['services']}
-                    assert not any(providers[name]['status'] == 'unavailable' for name in
-                        ['secret-service', 'kwallet', 'gtk-portal', 'desktop-portal']), (status, (user.root / 'bus.log').read_text()[-5000:])
-                    return status if all(providers[name]['status'] == 'ready' for name in
-                        ['secret-service', 'kwallet', 'gtk-portal', 'desktop-portal']) else None
-
-                status = wait(services_ready)
+                status = json.loads(status_file.read_text())
+                assert status['version'] == 3 and status['activation_environment']['dbus_unset'] is False
                 assert all(item['status'] != 'ready' for item in status['services']
                            if item['name'] in ('screencast', 'flatpak-documents'))
+                assert saved['environment'].get('XDG_CONFIG_DIRS') is None, 'runtime must not inject Portal config search paths'
                 viewer = Viewer(port, token, dpi=168)
                 helper = subprocess.Popen([str(ROOT / 'target/debug/waybridge'), '--socket',
                     socket_name, '--launch', '--', sys.executable, str(Path(__file__).resolve()),
@@ -185,7 +190,7 @@ def main():
                 assert inherited['DBUS_SESSION_BUS_ADDRESS'] == env['DBUS_SESSION_BUS_ADDRESS']
                 request('names')
                 names = message('names')['names']
-                assert 'org.freedesktop.secrets' in names
+                assert 'org.freedesktop.secrets' not in names, 'core proactively activated a wallet'
                 assert 'org.kde.KWin' not in names and 'org.kde.plasmashell' not in names
 
                 request('file')
@@ -243,11 +248,7 @@ def main():
                                 capture_output=True)
                             return result.returncode != 0
                         wait(owner_gone)
-                        # KWallet's distro activation name; this machine does
-                        # not install an org.freedesktop.secrets .service alias.
-                        subprocess.check_output(['gdbus', 'call', '--address', address,
-                            '--dest', 'org.freedesktop.DBus', '--object-path', '/org/freedesktop/DBus',
-                            '--method', 'org.freedesktop.DBus.StartServiceByName', 'org.kde.secretservicecompat', '0'])
+                        # The next standard interface call activates the fixture's explicitly selected provider.
                     request('wallet')
                     wallet_request = message('wallet')['path']
                     wallet = viewer.until(lambda kind, value: kind == 'control' and
@@ -275,8 +276,8 @@ def main():
                 assert uncooperative.poll() is None, 'unrelated user process was terminated'
                 assert not descriptor.exists() and not status_file.exists()
                 assert not (app_data / 'waybridge/sessions').exists()
-                assert json.loads(user.manager.read_text()) == {'WAYLAND_DISPLAY': 'previous-display', 'KEEP_ME': 'unchanged'}
-                print('PASS: wallet uses normal user paths/bus, Portal selection renders remotely, user service environment restored, unrelated background process preserved')
+                assert json.loads(user.manager.read_text()) == {'KEEP_ME': 'unchanged'}
+                print('PASS: wallet uses normal user paths/bus, Portal selection renders remotely, stale display environment removed, unrelated background process preserved')
             finally:
                 if helper is not None and helper.poll() is None:
                     helper.terminate(); helper.wait(timeout=5)

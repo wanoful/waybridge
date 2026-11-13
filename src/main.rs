@@ -7,13 +7,13 @@ mod cursor;
 mod drag;
 mod file_tree;
 mod ime;
-mod keyring;
 mod launch;
 mod metrics;
 mod network;
 mod protocol;
 mod relative_input;
 mod session_guard;
+mod session_services;
 mod shutdown;
 mod stream_config;
 mod toplevel_drag;
@@ -26,7 +26,7 @@ mod x11;
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use clap::Parser;
+use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser};
 use network::{Event, Peer};
 use serde_json::{json, Value};
 use smithay::{
@@ -124,6 +124,15 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
+    /// Replace the standard XDG user configuration file.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Validate configuration without starting graphics, services, or listeners.
+    #[arg(long)]
+    check_config: bool,
+    /// Print effective configuration and per-field sources as JSON, then exit.
+    #[arg(long)]
+    print_config: bool,
     /// Inspect real render/codec precision without opening a viewer listener or changing a display.
     #[arg(long)]
     check_hdr: bool,
@@ -156,6 +165,9 @@ struct Args {
     /// Launch an application inside the running --socket session, including its audio and D-Bus.
     #[arg(long)]
     launch: bool,
+    /// Absolute working directory for an application (defaults to HOME).
+    #[arg(long)]
+    cwd: Option<PathBuf>,
     /// Check whether a new session is allowed, without starting graphics or services.
     #[arg(long, conflicts_with = "launch")]
     check_session: bool,
@@ -187,6 +199,56 @@ struct Args {
     /// Optional program to launch in the private Wayland session (after --).
     #[arg(last = true)]
     command: Vec<String>,
+}
+
+impl Args {
+    fn configured() -> Result<(Self, waybridge_config::Loaded)> {
+        let matches = Self::command().get_matches();
+        let mut args = Self::from_arg_matches(&matches)?;
+        let explicit_socket = matches.value_source("socket") == Some(ValueSource::CommandLine);
+        let mut loaded =
+            if args.launch && explicit_socket && !args.check_config && !args.print_config {
+                // Attaching to a named existing session does not create or change
+                // its stream configuration. A newly broken file cannot block it.
+                waybridge_config::Loaded::load_path(None, false)?
+            } else {
+                waybridge_config::Loaded::load(args.config.as_deref())?
+            };
+        // Clap defaults preserve --help compatibility, but only explicit command
+        // line values may replace the file's values.
+        macro_rules! explicit {
+            ($field:ident) => {
+                (matches.value_source(stringify!($field)) == Some(ValueSource::CommandLine))
+                    .then(|| args.$field.clone())
+            };
+        }
+        loaded.apply(waybridge_config::Overrides {
+            listen: explicit!(listen),
+            socket: explicit!(socket),
+            fps: explicit!(fps),
+            bitrate: explicit!(bitrate),
+            codec: explicit!(codec),
+            gpu_input: explicit!(gpu_input),
+            hdr: explicit!(hdr),
+            layout: explicit!(layout),
+            ..Default::default()
+        })?;
+        let session = &loaded.config.session;
+        args.listen = session.listen.clone();
+        args.socket = session.socket.clone();
+        args.fps = session.fps;
+        args.bitrate = session.bitrate;
+        args.codec = session.codec.clone();
+        args.gpu_input = session.gpu_input.clone();
+        args.hdr = session.hdr.clone();
+        args.layout = session.layout.clone();
+        if let Some(cwd) = &args.cwd {
+            if !cwd.is_absolute() || !cwd.is_dir() {
+                bail!("--cwd must name an existing absolute directory");
+            }
+        }
+        Ok((args, loaded))
+    }
 }
 
 struct RemoteWindow {
@@ -245,6 +307,7 @@ struct App {
     hdr_requested: bool,
     stream_fps: u32,
     stream_bitrate: u32,
+    stream_limits: waybridge_config::Limits,
     read_only: bool,
     audio: Option<audio::Session>,
     cursor: cursor::Cursor,
@@ -2540,9 +2603,20 @@ fn token(path: &PathBuf) -> Result<String> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let (args, configuration) = Args::configured()?;
+    if args.print_config {
+        println!("{}", serde_json::to_string_pretty(&configuration.report())?);
+        return Ok(());
+    }
+    if args.check_config {
+        println!(
+            "{}",
+            json!({"valid": true, "config_file": configuration.report()["config_file"]})
+        );
+        return Ok(());
+    }
     if args.launch {
-        return launch::attach(&args.socket, &args.command);
+        return launch::attach(&args.socket, &args.command, args.cwd.as_deref());
     }
     if args.check_hdr {
         let (mut renderer, node) = make_renderer(args.render_node.as_ref())?;
@@ -2724,6 +2798,7 @@ fn main() -> Result<()> {
         hdr_requested: args.hdr == "experimental-scrgb",
         stream_fps: args.fps,
         stream_bitrate: args.bitrate,
+        stream_limits: configuration.config.limits.clone(),
         read_only: false,
         audio,
         cursor: cursor::Cursor::default(),
@@ -2806,7 +2881,7 @@ fn main() -> Result<()> {
             );
         }
     }
-    let application_session = launch::Session::new(
+    let mut application_session = launch::Session::new(
         &args.socket,
         app.x11.display,
         app.audio.as_ref(),
@@ -2817,6 +2892,15 @@ fn main() -> Result<()> {
         let mut command = Command::new(program);
         command.args(&args.command[1..]);
         application_session.configure(&mut command, app.audio.as_ref());
+        let cwd = args
+            .cwd
+            .clone()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .context("HOME is required for application launch without --cwd")?;
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            bail!("application working directory must be an existing absolute directory");
+        }
+        command.current_dir(cwd);
         children.push(
             command
                 .spawn()
@@ -3037,6 +3121,16 @@ fn main() -> Result<()> {
         children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
         std::thread::sleep(Duration::from_millis(2));
     }
+    application_session.stop_services(|| {
+        xloop.dispatch(Some(Duration::ZERO), &mut app)?;
+        while let Some(stream) = socket.accept()? {
+            app.dh
+                .insert_client(stream, Arc::new(ClientState::default()))?;
+        }
+        display.dispatch_clients(&mut app)?;
+        display.flush_clients()?;
+        Ok(())
+    })?;
     if let Some(token) = app.x11.token.take() {
         xloop.handle().remove(token);
     }

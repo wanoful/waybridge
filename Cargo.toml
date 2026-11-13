@@ -7,6 +7,7 @@ description = "A headless Wayland compositor with native remote application wind
 
 [dependencies]
 waybridge-codec = { path = "native" }
+waybridge-config = { path = "config" }
 anyhow = "1"
 libc = "0.2"
 base64 = "0.22"
@@ -28,7 +29,7 @@ zbus = "5.19"
 lto = "thin"
 
 [workspace]
-members = ["native", "service"]
+members = ["native", "service", "config"]
 exclude = ["vendor/smithay"]
 resolver = "2"
 

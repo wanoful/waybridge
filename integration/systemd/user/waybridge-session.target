@@ -1,0 +1,6 @@
+[Unit]
+Description=Waybridge graphical session
+Wants=waybridge-session-pre.target
+After=waybridge-session-pre.target
+Conflicts=waybridge-session-shutdown.target
+Before=waybridge-session-shutdown.target

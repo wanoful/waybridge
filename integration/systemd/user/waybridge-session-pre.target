@@ -1,0 +1,5 @@
+[Unit]
+Description=Waybridge graphical session preparation
+Before=waybridge-session.target
+PartOf=waybridge-session.target
+StopWhenUnneeded=yes

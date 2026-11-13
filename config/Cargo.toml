@@ -1,0 +1,15 @@
+[package]
+name = "waybridge-config"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Shared validated Linux configuration for Waybridge"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

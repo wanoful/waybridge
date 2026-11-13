@@ -1,0 +1,5 @@
+[Unit]
+Description=Stop services belonging to the Waybridge graphical session
+DefaultDependencies=no
+Conflicts=waybridge-session.target waybridge-session-pre.target
+After=waybridge-session.target waybridge-session-pre.target

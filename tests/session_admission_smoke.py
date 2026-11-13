@@ -62,6 +62,9 @@ def main():
                 assert all(saved['environment'][key] == fixture.env[key] for key in ('XDG_DATA_HOME', 'XDG_CONFIG_HOME'))
                 before_manager = json.loads(fixture.manager.read_text())
                 assert before_manager['WAYLAND_DISPLAY'] == 'admission' and before_manager['KEEP_ME'] == 'unchanged'
+                assert 'DISPLAY' not in before_manager, 'unset DISPLAY must remain genuinely unset'
+                assert 'QT_QPA_PLATFORM' not in before_manager and 'GDK_BACKEND' not in before_manager
+                assert 'PULSE_SINK' not in before_manager and 'XDG_CONFIG_HOME' not in before_manager
                 assert not check()['available']
                 duplicate = subprocess.run([BINARY, '--socket', 'other', '--no-audio'], env=fixture.env, capture_output=True, text=True)
                 assert duplicate.returncode and 'already running or starting' in duplicate.stderr
@@ -86,7 +89,7 @@ def main():
                 host.terminate()
                 host.wait(timeout=10)
             restored = json.loads(fixture.manager.read_text())
-            assert restored == {'WAYLAND_DISPLAY': 'previous-display', 'KEEP_ME': 'unchanged'}, restored
+            assert restored == {'KEEP_ME': 'unchanged'}, restored
             assert not descriptor.exists()
             fixture.set_sessions([])
             assert check()['available'], 'lock was not released after exit'

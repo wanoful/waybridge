@@ -52,7 +52,7 @@ fn descriptor(socket: &str) -> Result<PathBuf> {
 }
 
 /// Join a running local session without shell evaluation or changing the host environment.
-pub fn attach(socket: &str, args: &[String]) -> Result<()> {
+pub fn attach(socket: &str, args: &[String], cwd: Option<&Path>) -> Result<()> {
     let program = args
         .first()
         .context("--launch requires a command after --")?;
@@ -76,6 +76,7 @@ pub fn attach(socket: &str, args: &[String]) -> Result<()> {
     }
     let mut command = Command::new(program);
     command.args(&args[1..]);
+    command.current_dir(launch_directory(cwd)?);
     for (key, value) in saved.environment {
         if let Some(value) = value {
             command.env(key, value);
@@ -84,6 +85,23 @@ pub fn attach(socket: &str, args: &[String]) -> Result<()> {
         }
     }
     Err(command.exec()).with_context(|| format!("launching {program}"))
+}
+
+/// Direct application entrypoints start in HOME unless the user chose a cwd.
+pub fn launch_directory(cwd: Option<&Path>) -> Result<PathBuf> {
+    let path = match cwd {
+        Some(path) => path.to_path_buf(),
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is required for application launch")?,
+    };
+    if !path.is_absolute() || !path.is_dir() {
+        bail!(
+            "application working directory must be an existing absolute directory: {}",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 pub fn available(program: &str) -> bool {
@@ -101,7 +119,7 @@ pub struct Session {
     display: Option<u32>,
     address: Option<String>,
     saved: Option<(PathBuf, u64, u64)>,
-    services: Option<crate::keyring::Services>,
+    services: Option<crate::session_services::Services>,
 }
 impl Session {
     pub fn new(
@@ -122,7 +140,7 @@ impl Session {
         let runtime = descriptor_path
             .parent()
             .context("session descriptor directory")?;
-        session.services = Some(crate::keyring::Services::prepare(runtime)?);
+        session.services = Some(crate::session_services::Services::prepare(runtime)?);
         session.address = Some(session.services.as_ref().unwrap().address().into());
         let mut environment = Command::new("env");
         session.configure(&mut environment, audio);
@@ -165,15 +183,20 @@ impl Session {
         tracing::info!(path=%path.display(), "application environment ready; use --launch -- <application> to join");
         Ok(session)
     }
+    /// Keep dispatching the compositor while declared services finish shutdown.
+    pub fn stop_services(&mut self, pump: impl FnMut() -> Result<()>) -> Result<()> {
+        if let Some(services) = self.services.as_mut() {
+            services.stop(pump)?;
+        }
+        Ok(())
+    }
     pub fn configure(&self, command: &mut Command, audio: Option<&audio::Session>) {
         command
             .env("WAYLAND_DISPLAY", &self.socket)
             .env("XDG_SESSION_TYPE", "wayland")
             .env("XDG_CURRENT_DESKTOP", "Waybridge")
             .env("XDG_SESSION_DESKTOP", "Waybridge")
-            .env("DESKTOP_SESSION", "Waybridge")
-            .env("QT_QPA_PLATFORM", "wayland;xcb")
-            .env("GDK_BACKEND", "wayland,x11");
+            .env("DESKTOP_SESSION", "Waybridge");
         if let Some(services) = &self.services {
             services.configure(command);
         }
