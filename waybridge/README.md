@@ -10,6 +10,12 @@
 
 **请同时更新并重启两端，再启动远端应用。** 协议保持独立 v3，不兼容普通 Moonlight。Windows 要求 Windows 10/11；历史 H.264/透明呈现的 WoA 实测不能替代新功能和整合版的实机验收。本版仍是开发原型，HDR 是明确标记的 scRGB 子集。
 
+## Windows GUI 控制中心
+
+新增 **C# / WinUI 3 控制中心**，提供原生 ARM64 和 x64 便携包。内置 SSH、连接配置、自动启动/接入会话、应用目录、实时画面设置、输入共享、文件传输活动、托盘与诊断；视频继续由独立 C++ worker 处理。
+
+WoA 解压 `build/Waybridge-Control-win-arm64.zip` 的整个目录后运行 `Waybridge.Control.exe`。Linux 先更新 `target/release/waybridge`；在 GUI 的「Linux 服务端程序」填写它的完整路径。使用密钥或 ssh-agent 登录，首次核对主机指纹，无需手动读取令牌或建立 TCP 隧道。完整说明与构建方法见 [GUI README](gui/README.md)。
+
 ## 直接运行
 
 构建产物：

@@ -421,3 +421,46 @@ longer need them. Copy/cancellation never deletes source files. Virtual director
 descriptors and all four directions are tested with real Wayland and native OLE
 probes under Wine/Xvfb; Windows Explorer/third-party compatibility still needs
 Windows 10/11 device validation.
+
+## Live stream settings and GUI worker control
+
+The v3 hello advertises `stream_config_v1`. A negotiated viewer may send
+`stream_config {request_id,fps,bitrate,codec,read_only}`; FPS is 1–120,
+bitrate is 1000–200000 kbps **per video window**, and codec is
+`auto|h264|hevc|av1|png`. The reply has the same type/request ID and `ok`;
+success includes accepted settings, failure includes `message` and changes nothing.
+The initial server `--codec png` remains a hard PNG policy. Auto selects H.264;
+viewer capability/fallback and HDR selection still govern actual frame encoding.
+Changing FPS/bitrate/codec clears cached encoder sessions on the encoder worker;
+new video starts with a fresh epoch and independent keyframe. Already in-flight
+frames remain valid and must still be acknowledged. Entering read-only releases
+held input and rejects pointer, relative motion, buttons, scroll, keys and IME.
+`file_drop_out_enabled {enabled}` changes outbound drag availability and cancels
+an active outbound operation when disabled.
+
+The optional Windows launch form `waybridge-client.exe --control-pipe NAME`
+connects to a randomly named, current-user-only pipe owned by the GUI. It accepts
+UTF-8 newline-delimited JSON, at most 64 KiB per request. The first request is
+`{type:"start",version:1,host,port,token,settings}`. Authentication stays inside
+the pipe; it is absent from the worker command line. Subsequent commands are
+`settings {settings}`, `status`, `send_files {paths}`, `focus_window {id}` and
+`disconnect`. Pipe EOF stops the local worker without terminating remote apps.
+
+Worker events include sanitized `connected` capabilities (never media keys),
+`stream_config` acknowledgements, `local_settings_applied`, `settings_warning`,
+`error`, `status` (actual per-window codec/GPU/presentation, TCP bytes and presented
+updates), `timings`, and `transfer` metadata. Local application and remote
+configuration acknowledgements are separate, asynchronous events. Telemetry has
+a bounded writer queue so a blocked GUI cannot stall video. The pipe contains no
+video, audio, clipboard payloads or file chunks. Settings for HDR, UDP and audio
+output devices require reconnect; GPU input/HDR/UDP server capabilities additionally
+depend on how the Linux session was created.
+
+The SSH helper uses its own bounded NDJSON RPC with request IDs. Supported
+operations are `hello`, `list`, `ensure`, `info`, `applications`, `launch` and
+`end`. Only `ensure` returns the token over the authenticated SSH channel;
+list/info/catalog never include it. Session descriptors remain version 1 and
+add optional `connection {listen,token_file}` for new GUI attachment, retaining
+old CLI launch compatibility. Descriptors and tokens must be same-user private
+regular files. A pidfd plus `/proc` start identity pins an explicit shutdown to
+the expected server. Detaching the SSH helper leaves daemonized sessions alive.
