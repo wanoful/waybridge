@@ -10,6 +10,7 @@ namespace FileTree {
 constexpr size_t MaxEntries = 512, MaxDepth = 16, MaxRoots = 128, MaxPath = 240;
 constexpr uint64_t MaxFile = 1024ULL * 1024 * 1024, MaxTotal = 8 * MaxFile;
 inline bool supported = false;
+inline std::function<void(const Json &)> activity;
 inline std::atomic<uint64_t> epoch{0};
 inline uint64_t latestIncoming = 0, serverGeneration = 0, blockedGeneration = 0,
                 publishedGeneration = 0;
@@ -238,6 +239,10 @@ inline bool uploadResponse(const Json &message) {
   auto type = message.value("type", "");
   if (type != "tree_upload_ready" && type != "tree_upload_error")
     return false;
+  if (activity) activity({{"type", "transfer"}, {"event", type},
+                         {"batch", message.value("batch", uint64_t(0))},
+                         {"stage", message.value("stage", "")},
+                         {"message", message.value("message", "")}});
   std::shared_ptr<Upload> job;
   {
     std::lock_guard<std::mutex> lock(uploadsMutex);
@@ -628,6 +633,8 @@ inline bool receive(const Json &message) {
         ownClipboardSequence = GetClipboardSequenceNumber();
         incoming->published = true;
         publishedGeneration = batch;
+        if (activity) activity({{"type", "transfer"}, {"event", "download_complete"},
+                               {"batch", batch}, {"directory", utf8(incoming->directory)}});
         incoming.reset();
       } else {
         std::cerr << "Tree download: " << message.value("message", "failed") << '\n';

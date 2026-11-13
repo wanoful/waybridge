@@ -25,6 +25,7 @@
 #include "relative_input.h"
 #include "ime.h"
 #include "third_party/json.hpp"
+#include "host_control.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -41,6 +42,15 @@
 #include <vector>
 
 using Json = nlohmann::json;
+HostControl hostControl;
+Json hostedSettings = Json::object();
+bool hostedReadOnly = false, hostedIme = true, hostedFiles = true, hostedImages = true;
+std::string hostedClipboard = "both";
+bool streamConfigNegotiated = false;
+std::atomic<uint64_t> networkBytes{0}, presentedFrames{0};
+uint64_t streamRequest = 0;
+void applyHostedSettings(const Json &settings, bool live);
+void sendStreamConfiguration();
 constexpr size_t MaxPacket = 72 * 1024 * 1024;
 constexpr UINT NetworkReady = WM_APP + 1;
 SOCKET connection = INVALID_SOCKET;
@@ -90,9 +100,14 @@ struct ClientStats {
       return;
     last = Clock::now();
     std::lock_guard<std::mutex> guard(mutex);
+    Json snapshot = Json::object();
     for (auto &[name, s] : stages)
+    {
+      snapshot[name] = {{"avg_ms", s.total / s.count}, {"max_ms", s.max}, {"samples", s.count}};
       std::cout << "Client timing " << name << " avg_ms=" << s.total / s.count
                 << " max_ms=" << s.max << " samples=" << s.count << '\n';
+    }
+    hostControl.emit({{"type","timings"},{"stages",snapshot}});
     stages.clear();
   }
 } clientStats;
@@ -276,6 +291,7 @@ bool readAll(SOCKET socket, void *bytes, size_t n) {
     int count = recv(socket, p, static_cast<int>(std::min(n, size_t(65536))), 0);
     if (count <= 0)
       return false;
+    networkBytes.fetch_add(uint64_t(count), std::memory_order_relaxed);
     p += count;
     n -= count;
   }
@@ -812,6 +828,7 @@ HGLOBAL globalBytes(const void *data, size_t size) {
 }
 
 bool uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
+  if (!hostedFiles) return false;
   if (paths.empty() || paths.size() > FileTree::MaxRoots) return false;
   for (const auto &path : paths) {
     WIN32_FILE_ATTRIBUTE_DATA metadata{};
@@ -897,7 +914,7 @@ public:
   }
   HRESULT STDMETHODCALLTYPE DragEnter(IDataObject *data, DWORD, POINTL, DWORD *effect) override {
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    accepted = (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
+    accepted = hostedFiles && (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
                (SUCCEEDED(data->QueryGetData(&format)) || VirtualFiles::supports(data));
     *effect = accepted ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
@@ -1051,7 +1068,11 @@ void receiveFiles(const Json &message) {
         CloseClipboard();
         ownClipboardSequence = GetClipboardSequenceNumber();
       }
-      if (published) { FileTree::publishedGeneration = incomingBatch; incomingFiles.clear(); incomingDirectory.clear(); incomingBatch = 0; }
+      if (published) {
+        hostControl.emit({{"type","transfer"},{"event","download_complete"},
+                          {"batch",incomingBatch},{"directory",utf8(incomingDirectory)}});
+        FileTree::publishedGeneration = incomingBatch; incomingFiles.clear(); incomingDirectory.clear(); incomingBatch = 0;
+      }
       else cancelIncomingFiles();
     } else if (type == "files_error") {
       cancelIncomingFiles();
@@ -1060,6 +1081,7 @@ void receiveFiles(const Json &message) {
   }
 }
 void setClipboard(const Json &items) {
+  if (hostedClipboard == "off" || hostedClipboard == "send") return;
   if (!items.is_object() || !OpenClipboard(controller))
     return;
   EmptyClipboard();
@@ -1074,7 +1096,7 @@ void setClipboard(const Json &items) {
     }
     break;
   }
-  if (items.contains("image/png") && items["image/png"].is_string()) {
+  if (hostedImages && items.contains("image/png") && items["image/png"].is_string()) {
     auto bytes = unbase64(items["image/png"].get<std::string>());
     if (!bytes.empty()) {
       if (auto mem = globalBytes(bytes.data(), bytes.size())) {
@@ -1114,13 +1136,14 @@ void setClipboard(const Json &items) {
 }
 
 void publishClipboard() {
-  if (VirtualFiles::clipboard())
+  if (hostedClipboard == "off" || hostedClipboard == "receive") return;
+  if (hostedFiles && VirtualFiles::clipboard())
     return;
   if (!OpenClipboard(controller))
     return;
   Json items = Json::object();
   std::vector<std::wstring> files;
-  if (auto drop = static_cast<HDROP>(GetClipboardData(CF_HDROP))) {
+  if (auto drop = static_cast<HDROP>(GetClipboardData(CF_HDROP)); hostedFiles && drop) {
     UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
     if (!count || count > FileTree::MaxRoots) {
       CloseClipboard(); std::cerr << "Too many file roots; clipboard transfer rejected\n"; return;
@@ -1146,7 +1169,7 @@ void publishClipboard() {
           base64(reinterpret_cast<const uint8_t *>(text.data()), text.size());
     }
   }
-  if (auto mem = GetClipboardData(pngFormat)) {
+  if (auto mem = GetClipboardData(pngFormat); hostedImages && mem) {
     auto p = static_cast<const uint8_t *>(GlobalLock(mem));
     if (p) {
       size_t n = GlobalSize(mem);
@@ -1154,7 +1177,7 @@ void publishClipboard() {
         items["image/png"] = base64(p, n);
       GlobalUnlock(mem);
     }
-  } else if (auto handle = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP))) {
+  } else if (auto handle = static_cast<HBITMAP>(GetClipboardData(CF_BITMAP)); hostedImages && handle) {
     Gdiplus::Bitmap bitmap(handle, nullptr);
     IStream *stream = nullptr;
     // Standard PNG encoder CLSID supplied by GDI+.
@@ -1545,7 +1568,7 @@ void updateIme() {
     return;
   }
   RemoteWindow *target = nullptr, *host = nullptr;
-  if (imeStatus.is_object() && imeStatus.value("enabled", false)) {
+  if (hostedIme && !hostedReadOnly && imeStatus.is_object() && imeStatus.value("enabled", false)) {
     auto found = windows.find(imeStatus.value("id", 0u));
     if (found != windows.end()) {
       target = found->second.get();
@@ -1634,6 +1657,10 @@ void suspendImeForOle() {
 }
 
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
+  if (hostedReadOnly && (message == WM_INPUT || (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) ||
+      (message >= WM_KEYFIRST && message <= WM_KEYLAST) ||
+      message == WM_IME_STARTCOMPOSITION || message == WM_IME_COMPOSITION ||
+      message == WM_IME_ENDCOMPOSITION)) return 0;
   auto w = reinterpret_cast<RemoteWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
   if (message == WM_NCCREATE) {
     w = static_cast<RemoteWindow *>(reinterpret_cast<CREATESTRUCTW *>(lp)->lpCreateParams);
@@ -2167,6 +2194,18 @@ void dispatchNetwork() {
       auto found = windows.find(m.value("id", uint32_t(0)));
       if (found != windows.end()) sourceWindow = found->second->hwnd;
     }
+    if ((type == "files_begin" || type == "tree_begin" || type == "files_done" || type == "files_error" ||
+         type == "upload_ready" || type == "upload_rejected" || type == "tree_done") && hostControl.active()) {
+      Json event = {{"type","transfer"},{"event",type}};
+      for (const auto *key : {"id","transfer","batch","name","size","total","message"})
+        if (m.contains(key)) event[key] = m[key];
+      hostControl.emit(event);
+    }
+    if ((type == "clipboard" && (hostedClipboard=="off" || hostedClipboard=="send")) ||
+        ((!hostedFiles || hostedClipboard=="off" || hostedClipboard=="send") &&
+                        (type == "files_begin" || type == "file_chunk" || type == "files_done" ||
+                         type == "tree_begin" || type == "tree_entry" || type == "tree_chunk" ||
+                         type == "tree_done")) || (!hostedFiles && type=="drag_offer")) continue;
     if (FileTree::receive(m) || FileDrag::control(m, controller, sourceWindow)) continue;
     if (type == "hello") {
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
@@ -2183,10 +2222,18 @@ void dispatchNetwork() {
       cursorNegotiated = m.value("cursor_v1", false);
       iconsNegotiated = m.value("window_icon_v1", false);
       if (m.contains("features") && m["features"].is_array())
+      {
         FileTree::supported = std::find(m["features"].begin(), m["features"].end(), "file_tree") != m["features"].end();
+        streamConfigNegotiated = std::find(m["features"].begin(),m["features"].end(),"stream_config_v1") != m["features"].end();
+      }
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
+      hostControl.emit({{"type","connected"},{"version",3},{"features",m.value("features",Json::array())},
+                        {"hardware_codecs",supportedVideoKinds},{"stream_config",streamConfigNegotiated}});
+      if (hostControl.active()) sendStreamConfiguration();
+    } else if (type == "stream_config") {
+      hostControl.emit(m);
     } else if (type == "toplevel_drag") {
       if (!m.value("active", false)) { endWindowDrag(); continue; }
       if (!windowDrag.active) {
@@ -2530,6 +2577,7 @@ void dispatchNetwork() {
     }
     clientStats.report();
     w->frame = frame;
+    presentedFrames.fetch_add(1, std::memory_order_relaxed);
     if (w->presentation)
       acknowledge(w);
     if (!w->presentation)
@@ -2547,8 +2595,98 @@ void dispatchNetwork() {
   moveDraggedWindow();
   updateIme();
 }
+void sendStreamConfiguration() {
+  if (!hostControl.active()) return;
+  if (!streamConfigNegotiated) {
+    hostControl.emit({{"type","settings_warning"},{"message","服务端不支持实时画面设置，请更新 Linux 服务端；本地设置仍可使用"}});
+    return;
+  }
+  sendJson({{"type","stream_config"},{"request_id",++streamRequest},
+            {"fps",hostedSettings.value("fps",60)},{"bitrate",hostedSettings.value("bitrate",30000)},
+            {"codec",hostedSettings.value("codec","auto")},{"read_only",hostedReadOnly}});
+}
+void applyHostedSettings(const Json &settings, bool live) {
+  if (!settings.is_object()) throw std::runtime_error("Settings must be an object");
+  int fps=settings.value("fps",60), bitrate=settings.value("bitrate",30000), dpi=settings.value("dpi",0);
+  int volume=settings.value("volume",100);
+  std::string codec=settings.value("codec","auto"), clipboard=settings.value("clipboard","both");
+  if (fps<1 || fps>120 || bitrate<1000 || bitrate>200000 || (dpi && (dpi<96 || dpi>384)) ||
+      volume<0 || volume>100 ||
+      (codec!="auto" && codec!="png" && codec!="h264" && codec!="hevc" && codec!="av1") ||
+      (clipboard!="both" && clipboard!="send" && clipboard!="receive" && clipboard!="off"))
+    throw std::runtime_error("Invalid settings range");
+  if (live) {
+    for (const char *key : {"hdr", "udp", "udp_host", "audio_device"})
+      if (hostedSettings.value(key, Json()) != settings.value(key, Json())) {
+        hostControl.emit({{"type","settings_warning"},{"message","HDR、UDP 或声音设备已保存；请断开并重新连接使其生效"}});
+        break;
+      }
+    releasePointer(); cancelWindowDrag(); suspendImeForOle();
+    for (auto &[id,window] : windows) sendJson({{"type","cancel_input"},{"id",id}});
+  }
+  hostedSettings=settings;
+  hostedReadOnly=settings.value("read_only",false); hostedIme=settings.value("ime",true);
+  hostedFiles=settings.value("files",true); hostedImages=settings.value("clipboard_images",true);
+  hostedClipboard=clipboard;
+  std::wstring scale=dpi?std::to_wstring(dpi):L"";
+  SetEnvironmentVariableW(L"WAYBRIDGE_DPI",dpi?scale.c_str():nullptr);
+  SetEnvironmentVariableW(L"WAYBRIDGE_HDR",settings.value("hdr",false)?L"1":nullptr);
+  SetEnvironmentVariableW(L"WAYBRIDGE_NO_AUDIO",settings.value("audio",true)?nullptr:L"1");
+  std::wstring device=wide(settings.value("audio_device",""));
+  SetEnvironmentVariableW(L"WAYBRIDGE_AUDIO_DEVICE",device.empty()?nullptr:device.c_str());
+  std::wstring udp=wide(settings.value("udp_host",""));
+  SetEnvironmentVariableW(L"WAYBRIDGE_UDP_HOST",settings.value("udp",false)&&!udp.empty()?udp.c_str():nullptr);
+  audioPlayback.setVolume(settings.value("audio",true)?float(volume)/100.0f:0.0f);
+  if (live) {
+    if (!hostedFiles) { FileDrag::disconnect(); FileTree::cancelUploads(); FileTree::cancelIncoming(); VirtualFiles::cancel(); }
+    if (hostedClipboard=="off" || hostedClipboard=="send") { FileTree::cancelIncoming(); VirtualFiles::cancel(); }
+    sendJson({{"type","file_drop_out_enabled"},{"enabled",hostedFiles}});
+    sendStreamConfiguration();
+    for (auto &[id,window] : windows) if (!window->popup) { window->dpi=effectiveDpi(window->hwnd); sendResize(window.get()); }
+    updateIme();
+    hostControl.emit({{"type","local_settings_applied"},{"settings",settings}});
+  }
+}
+void publishHostedStatus() {
+  if (!hostControl.active()) return;
+  Json list=Json::array();
+  for (auto &[id,w] : windows) if (!w->popup) {
+    wchar_t title[256]{}; GetWindowTextW(w->hwnd,title,256);
+    list.push_back({{"id",id},{"title",utf8(title)},{"width",w->width},{"height",w->height},
+      {"codec",w->frame?(VideoDecoder::videoKind(w->frame->codec)?VideoDecoder::name(w->frame->codec):"PNG"):"等待画面"},
+      {"hardware_decode",bool(w->frame&&w->frame->video.texture)},{"presentation",w->presentation?"D3D11 / DirectComposition":"GDI"}});
+  }
+  hostControl.emit({{"type","status"},{"uptime_ms",GetTickCount64()},{"tcp_bytes",networkBytes.load()},
+                    {"presented_updates",presentedFrames.load()},{"windows",list}});
+}
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
+    if (message == HostControl::Message) {
+      for (const auto &request : hostControl.take()) {
+        try {
+          std::string type=request.value("type","");
+          if (type=="disconnect") PostMessageW(hwnd,WM_CLOSE,0,0);
+          else if (type=="settings") applyHostedSettings(request.at("settings"),true);
+          else if (type=="send_files") {
+            if (!hostedFiles) throw std::runtime_error("File transfers disabled");
+            std::vector<std::wstring> paths;
+            for (const auto &path : request.at("paths")) {
+              if (!path.is_string() || paths.size()>=FileTree::MaxRoots) throw std::runtime_error("Invalid file roots");
+              paths.push_back(wide(path.get<std::string>()));
+            }
+            if (paths.empty() || !uploadFiles(std::move(paths))) throw std::runtime_error("Cannot start file transfer");
+            hostControl.emit({{"type","transfer"},{"event","upload_started"}});
+          } else if (type=="status") publishHostedStatus();
+          else if (type=="focus_window") {
+            auto found=windows.find(request.value("id",0u));
+            if (found!=windows.end()) {ShowWindow(found->second->hwnd,SW_RESTORE);SetForegroundWindow(found->second->hwnd);}
+          }
+        } catch (const std::exception &error) {
+          hostControl.emit({{"type","error"},{"message",error.what()}});
+        }
+      }
+      return 0;
+    }
     if (windowDrag.active) {
       if (message == WM_MOUSEMOVE) { sendWindowDragMotion(); return 0; }
       if (message == WM_LBUTTONUP) { sendWindowDragMotion(true); return 0; }
@@ -2593,6 +2731,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       VirtualFiles::tick();
       sendJson({{"type", "ping"}, {"nonce", GetTickCount64()}});
       clientStats.report();
+      publishHostedStatus();
       return 0;
     }
     if (message == WM_CLOSE) {
@@ -2620,6 +2759,25 @@ BOOL WINAPI consoleControl(DWORD) {
 }
 
 int wmain(int argc, wchar_t **argv) {
+  std::wstring hostedHost, hostedPort, hostedToken;
+  wchar_t *hostedArguments[4]{};
+  if (argc==3 && std::wstring(argv[1])==L"--control-pipe") {
+    try {
+      Json start=hostControl.connect(argv[2]);
+      std::string host=start.at("host").get<std::string>(), token=start.at("token").get<std::string>();
+      int port=start.at("port").get<int>();
+      if (host.empty() || host.size()>255 || port<1 || port>65535 || token.size()<16 || token.size()>4096 ||
+          token.find_first_of(" \r\n\t")!=std::string::npos) throw std::runtime_error("Invalid GUI connection parameters");
+      hostedHost=wide(host); hostedPort=std::to_wstring(port); hostedToken=wide(token);
+      hostedArguments[0]=argv[0]; hostedArguments[1]=hostedHost.data();
+      hostedArguments[2]=hostedPort.data(); hostedArguments[3]=hostedToken.data();
+      argv=hostedArguments; argc=4;
+      applyHostedSettings(start.value("settings",Json::object()),false);
+      clientStats.enabled=true;
+      SetEnvironmentVariableW(L"WAYBRIDGE_IME_TRACE",nullptr);
+      SetEnvironmentVariableW(L"WAYBRIDGE_ICON_TRACE",nullptr);
+    } catch (const std::exception &error) { std::cerr<<error.what()<<'\n'; return 2; }
+  }
   if (argc == 2 && std::wstring(argv[1]) == L"--check-hdr-shaders") {
     auto report = Presentation::validateHdrPixels();
     std::cout << report.dump() << '\n';
@@ -2709,6 +2867,8 @@ int wmain(int argc, wchar_t **argv) {
   RegisterClassW(&wc);
   controller = CreateWindowExW(0, wc.lpszClassName, L"Waybridge", 0, 0, 0, 0, 0, HWND_MESSAGE,
                                nullptr, instance, nullptr);
+  hostControl.start(controller);
+  FileTree::activity = [](const Json &event) { hostControl.emit(event); };
   AddClipboardFormatListener(controller);
   SetTimer(controller, 1, 2000, nullptr);
   SetConsoleCtrlHandler(consoleControl, TRUE);
@@ -2732,6 +2892,7 @@ int wmain(int argc, wchar_t **argv) {
   freeaddrinfo(addresses);
   if (connection == INVALID_SOCKET) {
     std::cerr << "Connection failed; check your SSH tunnel\n";
+    hostControl.emit({{"type","error"},{"message","无法连接串流服务，请检查 SSH 隧道与服务端"}});
     return 1;
   }
   int one = 1;
@@ -2762,7 +2923,7 @@ int wmain(int argc, wchar_t **argv) {
             {"window_semantics_v1", true},
             {"pointer_lock", true},
             {"toplevel_drag_v1", true},
-            {"file_drop_out", true},
+            {"file_drop_out", hostedFiles},
             {"file_tree", true},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
@@ -2780,6 +2941,7 @@ int wmain(int argc, wchar_t **argv) {
   endWindowDrag();
   releasePointer(false);
   running = false;
+  hostControl.stop();
   FileTree::cancelUploads();
   FileTree::cancelIncoming();
   FileDrag::disconnect();

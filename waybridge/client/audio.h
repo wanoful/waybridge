@@ -6,6 +6,7 @@
 #include <mmreg.h>
 #include <wrl/client.h>
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -21,6 +22,7 @@ class AudioPlayback {
   HANDLE quit = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   std::atomic<bool> playing{false};
+  std::atomic<float> volume{1.0f};
   static HRESULT endpoint(IMMDeviceEnumerator *devices, IMMDevice **device) {
     DWORD count = GetEnvironmentVariableW(L"WAYBRIDGE_AUDIO_DEVICE", nullptr, 0);
     if (!count) return devices->GetDefaultAudioEndpoint(eRender, eConsole, device);
@@ -68,10 +70,11 @@ class AudioPlayback {
           if (FAILED(output->GetBuffer(frames, &bytes))) break;
           auto dest = reinterpret_cast<int16_t *>(bytes);
           size_t count = size_t(frames) * 2, copied = 0;
+          float gain = volume.load(std::memory_order_relaxed);
           {
             std::lock_guard<std::mutex> guard(mutex);
             while (copied < count && !samples.empty()) {
-              dest[copied++] = samples.front(); samples.pop_front();
+              dest[copied++] = int16_t(float(samples.front()) * gain); samples.pop_front();
             }
           }
           memset(dest + copied, 0, (count - copied) * sizeof(int16_t));
@@ -84,6 +87,7 @@ class AudioPlayback {
     CoUninitialize();
   }
 public:
+  void setVolume(float value) { volume.store(std::max(0.0f, std::min(1.0f, value))); }
   static bool supported() {
     if (GetEnvironmentVariableW(L"WAYBRIDGE_NO_AUDIO", nullptr, 0)) return false;
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> devices;
