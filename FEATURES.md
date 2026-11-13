@@ -62,7 +62,7 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 
 ## 当前已有的功能
 
-“已有”表示源码已具备相应实现。Linux 集成测试、Wine 下 Windows API 测试和真实 Windows/WoA 验收分别记录，不能互相替代。完整集成版的物理设备验收仍有缺口；WinUI 控制中心最新启动修正也待实机确认。详细证据见 [VALIDATION.md](VALIDATION.md)。
+“已有”表示源码已具备相应实现。Linux 集成测试、Wine 下 Windows API 测试和真实 Windows/WoA 验收分别记录，不能互相替代。WinUI 控制中心启动及所选连接、应用、文件与会话流程已在 Windows 11 x64 实机通过；更新版 WoA、物理 HDR、托盘菜单退出和完整应用/设备矩阵仍待补验收。详细证据见 [VALIDATION.md](VALIDATION.md)。
 
 | 功能 | 当前已有内容 | 当前边界 |
 |---|---|---|
@@ -82,7 +82,7 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | I/O 响应性 | 两端文件接收工作队列、连接/选择代次、Windows 有界有序发送 | 文件字节仍共用控制通道；旧式非 file_tree 上传元数据有同步预检，逐文件进度/限速/续传留到 M2 |
 | 控制与诊断 | 托盘、只读键鼠、共享开关、实时帧率和码率配置、实际画面路径及阶段计时、导出日志 | 没有游戏内状态浮层；阶段时间和 RTT 不等于物理输入到显示延迟 |
 | 桌面服务 | 私有 D-Bus 与激活环境、会话原生 KWallet/Secret Service、Desktop Portal/GTK 文件选择、服务状态及结束清理 | 钱包/Portal 使用服务专用持久目录；原钱包迁移、Flatpak 文档授权未验证；ScreenCast 属于 M4 |
-| 应用与平台 | 原生 Wayland、私有 Xwayland、部分宿主密钥服务桥接，Windows x64 与原生 ARM64 构建 | X11 无 PRIMARY、XDND、XIM 和完整 EWMH；构建成功不代表所有应用、设备组合可用 |
+| 应用与平台 | 原生 Wayland、私有 Xwayland，Windows x64 与原生 ARM64 构建；桌面密钥服务在本会话原生运行 | X11 无 PRIMARY、XDND、XIM 和完整 EWMH；构建成功不代表所有应用、设备组合可用 |
 
 文件目前单个文件最多 1 GiB，目录批次内容最多 8 GiB、512 个条目；Windows 路径、名称、符号链接及 reparse point 等还有兼容限制。详见 [文件说明](README.md#使用数据交换) 与 [协议](PROTOCOL.md)。
 
