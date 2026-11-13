@@ -1,5 +1,7 @@
 # Waybridge 0.3.0
 
+配置归属、桌面集成边界及 Waybridge 专用 `.desktop` 追加/覆写的已确认设计见 [配置决策](CONFIGURATION_POLICY.md)；这是后续实施方案，当前还不能使用其中规划的配置入口。
+
 这是 Linux → Windows 独立应用窗口原型。服务端是私有无头 Smithay Wayland 合成器，可选择启动 rootless Xwayland；不接入 KWin，不迁移已有桌面窗口。Windows 客户端为 Win32，提供 x64 和原生 ARM64 构建。功能来源见 [整合清单](PARALLEL_FEATURES.md)，实际验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 本目录是 Git 仓库根目录：`src/` 是 Linux 合成器，`native/` 是编解码与 GPU 适配，`client/` 是 Windows 原生内核，`gui/` 是控制中心，`scripts/` 和 `tests/` 分别提供构建与验证入口。构建产物写入已忽略的 `target/`、`build/` 和 .NET `bin/`、`obj/`。
