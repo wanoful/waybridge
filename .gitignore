@@ -1,10 +1,15 @@
-/sunshine/
-/moonlight/
-/waybridge/target/
-/waybridge/build/
-/waybridge/.runtime/
-*.log
-__pycache__/
+# Generated build outputs and local runtime state.
+/target/
+/build/
+/.runtime/
+/artifacts/
 **/bin/
 **/obj/
-/.worktrees/
+__pycache__/
+*.py[cod]
+*.log
+
+# Local Visual Studio state.
+/.vs/
+*.user
+*.suo

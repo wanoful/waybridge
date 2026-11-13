@@ -1,6 +1,6 @@
 # 功能整合清单
 
-14 项功能已整合到同一套服务端和 Windows 客户端源码。下表保留功能来源；分支和 worktree 用于追溯，不再需要分别选择不同功能客户端。统一说明见 [运行文档](waybridge/README.md)、[协议](waybridge/PROTOCOL.md) 和 [验证记录](waybridge/VALIDATION.md)。
+14 项功能已整合到同一套服务端和 Windows 客户端源码。下表保留功能来源；来源分支保留用于追溯，旧 worktree 已清理，不再需要分别选择不同功能客户端。统一说明见 [运行文档](README.md)、[协议](PROTOCOL.md) 和 [验证记录](VALIDATION.md)。
 
 | 功能 | 来源分支 | 来源提交 | 当前范围 |
 |---|---|---|---|
@@ -21,7 +21,7 @@
 
 ## 整合关系
 
-目录传输保留原生拖出实现，虚拟文件再扩展 Windows 导入；GPU 颜色输入保留 HEVC/AV1，HDR 在其上提供 scRGB 子集。合并保留原分支历史。Smithay 的 Xwayland、colormap 生命周期及 SHM 格式缓存补丁共用同一份 vendor，来源与许可证见 [PATCHES.md](waybridge/vendor/smithay/PATCHES.md)。
+目录传输保留原生拖出实现，虚拟文件再扩展 Windows 导入；GPU 颜色输入保留 HEVC/AV1，HDR 在其上提供 scRGB 子集。合并保留原分支历史。Smithay 的 Xwayland、colormap 生命周期及 SHM 格式缓存补丁共用同一份 vendor，来源与许可证见 [PATCHES.md](vendor/smithay/PATCHES.md)。
 
 媒体与交互共用 v3 能力协商。PNG/H.264/HEVC/AV1/Main10 的原始 kind 为 1/2/4/5/7/8，UDP 补帧容器为 6，独立 PCM 音频为 3。UDP 全局 8 条/64 MiB 传输 credit、每窗口两帧呈现 credit 和独立音频 credit 分开计数；PNG→视频恢复和缓存复用均保留新 epoch/独立关键帧。
 
@@ -29,7 +29,7 @@
 
 ## 构建和启用
 
-在仓库的 `waybridge` 目录构建：
+在仓库根目录构建：
 
 ```bash
 ./scripts/build.sh
@@ -49,6 +49,6 @@
 
 ## 验证范围
 
-真实 Wayland/Qt/GTK/X11、NVIDIA NVENC/CUDA 和私有 Wine/Xvfb 中的 Windows PE/API 已覆盖完整合并后的回归。结果包括全部 UDP 媒体 kind、音频、流控、文件/目录/OLE/21 种虚拟源，以及 X11/音频/UDP/GPU/HDR 同时启用时的 PNG-only 回退和共享退出清理。GPU 隐藏/重映射、持有编码缓存时退出也已通过；分层结果见 [VALIDATION.md](waybridge/VALIDATION.md)。
+真实 Wayland/Qt/GTK/X11、NVIDIA NVENC/CUDA 和私有 Wine/Xvfb 中的 Windows PE/API 已覆盖完整合并后的回归。结果包括全部 UDP 媒体 kind、音频、流控、文件/目录/OLE/21 种虚拟源，以及 X11/音频/UDP/GPU/HDR 同时启用时的 PNG-only 回退和共享退出清理。GPU 隐藏/重映射、持有编码缓存时退出也已通过；分层结果见 [VALIDATION.md](VALIDATION.md)。
 
 Wine 的 Unicode 注入不代表微软拼音引擎、候选面板或选词验收；软件 D3D11 数值检查不代表物理 HDR/MFT。Explorer、Outlook、压缩软件、真实 WoA 新 codec、多显示器 DPI 和输入到显示延迟仍需相应实机测试。完整 HDR、XIM/XDND/PRIMARY、跨进程透明点穿、FUSE、Opus、自适应拥塞控制与 Moonlight 线协议兼容未实现。
