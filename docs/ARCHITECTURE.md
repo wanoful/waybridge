@@ -121,7 +121,7 @@ flowchart LR
 
 目标路径由 Windows 客户端直接连接 Linux 服务在局域网或 VPN 地址上的端口。用户级入口提供初次配对、服务端身份验证、已信任客户端授权和撤销；运行通道绑定已认证的会话与查看连接，日常连接、应用启动与结束会话无需 SSH。首轮以明确配置的地址为入口，自动发现和公网中继另列扩展。
 
-M1 选用标准 TLS：Linux 使用 rustls TLS 1.2/1.3，Windows C# 使用 SslStream，C++ 使用 Schannel TLS 1.2。客户端先校验固定的服务端证书 SHA-256，再发送一次性配对码或客户端凭据；持久客户端令牌存 Windows 凭据管理器，服务端仅存 HMAC 校验值。每条控制、媒体和音频连接分别认证，撤销立即关闭该客户端的活动隧道。业务 v3 封装保持不变；具体握手与限制见 [服务协议](service/README.md)。QUIC、实时数据报与按流隔离作为 M2 测量项目。
+M1 选用标准 TLS：Linux 使用 rustls TLS 1.2/1.3，Windows C# 使用 SslStream，C++ 使用 Schannel TLS 1.2。客户端先校验固定的服务端证书 SHA-256，再发送一次性配对码或客户端凭据；持久客户端令牌存 Windows 凭据管理器，服务端仅存 HMAC 校验值。每条控制、媒体和音频连接分别认证，撤销立即关闭该客户端的活动隧道。业务 v3 封装保持不变；具体握手与限制见 [服务协议](SERVICE.md)。QUIC、实时数据报与按流隔离作为 M2 测量项目。
 
 迁移阶段复用现有 SSH 认证、启动及 TCP 隧道，保留为可选管理与兼容路径。先将文件字节从控制连接分离，保留媒体各自的逻辑通道，逐步改善按流调度、音频格式及共同带宽预算；实际底层路径通过能力协商选择。
 
@@ -178,7 +178,7 @@ C# 控制中心通过当前用户专用 named pipe 管理原生内核，通过 T
 
 TCP 控制、媒体和音频连接分别认证，窗口控制与文件数据目前共用控制连接。可选 UDP 使用认证加密、XOR FEC 和 TCP 补帧，并按全局消息顺序交付媒体。TLS 网关与现有 SSH 隧道均可承载这些 TCP 连接。
 
-实现入口：[TLS 用户入口](service/src/main.rs)、[合成器](src/main.rs)、[会话环境](src/launch.rs)、[桌面服务](src/session_services.rs)、[文件工作队列](src/transfer_worker.rs)、[网络](src/network.rs)、[编码调度](src/video.rs)、[Windows 内核](client/main.cpp)、[Windows 呈现](client/presentation.h)、[GUI 会话控制](gui/Waybridge.Control.Core/SessionController.cs)。当前线协议见 [PROTOCOL.md](PROTOCOL.md)，设备验证范围见 [VALIDATION.md](VALIDATION.md)。
+实现入口：[TLS 用户入口](../service/src/main.rs)、[合成器](../src/main.rs)、[会话环境](../src/launch.rs)、[桌面服务](../src/session_services.rs)、[文件工作队列](../src/transfer_worker.rs)、[网络](../src/network.rs)、[编码调度](../src/video.rs)、[Windows 内核](../client/main.cpp)、[Windows 呈现](../client/presentation.h)、[GUI 会话控制](../gui/Waybridge.Control.Core/SessionController.cs)。当前线协议见 [PROTOCOL.md](PROTOCOL.md)，设备验证范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 画面路径的研究方向
 

@@ -11,7 +11,9 @@ try {
     $Output = "build/control-center-$Architecture"
     dotnet publish gui/Waybridge.Control/Waybridge.Control.csproj -c Release -r "win-$Architecture" "-p:Platform=$Platform" --self-contained true -p:WindowsAppSDKSelfContained=true -o $Output
     if ($LASTEXITCODE) { throw 'WinUI publish failed' }
-    Copy-Item "$Native/Release/waybridge-client.exe", 'gui/README.md' $Output
+    Copy-Item "$Native/Release/waybridge-client.exe", 'README.md' $Output
+    New-Item -ItemType Directory -Force "$Output/docs" | Out-Null
+    Copy-Item 'docs/*.md' "$Output/docs/"
     Copy-Item 'scripts/Diagnose-Startup.ps1', 'scripts/Diagnose-Startup.cmd' $Output
     Copy-Item LICENSE "$Output/LICENSE-Waybridge.txt"
     Write-Host "Built $Output/Waybridge.Control.exe"

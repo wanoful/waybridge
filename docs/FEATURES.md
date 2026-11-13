@@ -188,7 +188,7 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | 权限认证 | 需要系统授权的已选应用，在当前会话显示认证或明确说明不支持；不改变宿主授权规则 | 注册与调用归属对应实际 Linux 登录会话或进程，认证可取消；系统设置类操作按需扩展 |
 | SSH / GPG 与开发工具 | 默认使用 Linux 侧现有身份与 agent；需要交互时提供本会话可见路径。Windows 密钥代理另列可选功能 | Git 操作、SSH 密钥口令及 GPG 签名按实际工具选择验收，不把 KWallet 通过视为 agent 集成通过 |
 
-实现见 [桌面服务](src/session_services.rs) 与 [验证记录](VALIDATION.md)。默认使用原有用户总线上的 Secret Service/KWallet，解锁和应用授权沿用原生交互；SSH 密钥登录本身不提供钱包密码。
+实现见 [桌面服务](../src/session_services.rs) 与 [验证记录](VALIDATION.md)。默认使用原有用户总线上的 Secret Service/KWallet，解锁和应用授权沿用原生交互；SSH 密钥登录本身不提供钱包密码。
 
 应用与用户服务共享用户数据和总线，Waybridge 配置当前显示和激活环境，不另做通用密码对话框。
 
@@ -259,4 +259,4 @@ Portal 的后端选择及服务激活环境需要随会话配置；仅给应用�
 
 后续主要工作是将推荐规格逐项标为采用、调整或延后，记录设备能力与游戏运行器，再通过受控基线校准数字目标。设备型号与应用特例补入兼容矩阵，避免重新把每个默认行为都交给用户逐项设计。
 
-功能来源追溯见 [PARALLEL_FEATURES.md](PARALLEL_FEATURES.md)，实际使用边界见 [README.md](README.md) 和 [GUI 说明](gui/README.md)。
+功能来源追溯见 [PARALLEL_FEATURES.md](PARALLEL_FEATURES.md)，实际使用边界见 [README.md](README.md) 和 [GUI 说明](GUI.md)。

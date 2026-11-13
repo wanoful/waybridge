@@ -2,7 +2,7 @@
 
 ## Authenticated TLS entry
 
-`waybridge-service` accepts TLS 1.2/1.3 on port 49092 by default. Management uses bounded LF-delimited JSON. Each native control/media/audio socket independently checks the leaf DER SHA-256 pin **before** sending `{id:1,op:"stream",client_id,client_token,session}\n`. On `{id:1,ok:true,result:{stream_ready:true,version:3}}\n`, that same TLS socket carries the unchanged binary v3 framing below, including the existing token/media-key handshake. The entry validates the target session and forwards only to its owned loopback listener. Client revocation closes its active streams. Pairing, trust persistence, authorization scope and limits are specified in [service/README.md](service/README.md).
+`waybridge-service` accepts TLS 1.2/1.3 on port 49092 by default. Management uses bounded LF-delimited JSON. Each native control/media/audio socket independently checks the leaf DER SHA-256 pin **before** sending `{id:1,op:"stream",client_id,client_token,session}\n`. On `{id:1,ok:true,result:{stream_ready:true,version:3}}\n`, that same TLS socket carries the unchanged binary v3 framing below, including the existing token/media-key handshake. The entry validates the target session and forwards only to its owned loopback listener. Client revocation closes its active streams. Pairing, trust persistence, authorization scope and limits are specified in [service/README.md](SERVICE.md).
 
 Raw v3 listeners remain local compatibility endpoints. The TLS gateway and SSH tunnel are protected transports for the same business protocol.
 

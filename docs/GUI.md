@@ -1,6 +1,6 @@
 # Waybridge Control Center
 
-Linux 会话默认共享原有应用与钱包数据。创建前须注销同一用户的本地桌面，锁屏不够；自动连接优先接回已有 Waybridge，会拒绝第二个新会话。启动后再从其他 DM 登录交给该 DM，见 [会话策略](../SESSION_POLICY.md)。TLS 使用服务端的新版启动助手；使用 SSH 模式时需重新构建控制中心，以更新内嵌的 `session-control.py`。
+Linux 会话默认共享原有应用与钱包数据。创建前须注销同一用户的本地桌面，锁屏不够；自动连接优先接回已有 Waybridge，会拒绝第二个新会话。启动后再从其他 DM 登录交给该 DM，见 [会话策略](SESSION_POLICY.md)。TLS 使用服务端的新版启动助手；使用 SSH 模式时需重新构建控制中心，以更新内嵌的 `session-control.py`。
 
 C# / .NET 10 + WinUI 3 控制中心，配套独立的 C++ 串流内核。提供 ARM64 与 x64 便携包。视频解码、DirectComposition、远端窗口、IME、音频和 OLE 仍由原生内核处理，GUI 只通过当前用户专用 named pipe 管理连接和设置。
 
@@ -11,7 +11,7 @@ C# / .NET 10 + WinUI 3 控制中心，配套独立的 C++ 串流内核。提供 
 3. Linux 构建 `cargo build --release --workspace --locked`，启动 `./target/release/waybridge-service serve --compositor "$PWD/target/release/waybridge"`。需要 Python 3 及合成器运行依赖；直连模式无需 Windows OpenSSH。
 4. 在 Linux 另一个可信终端运行 `./target/release/waybridge-service pair --expires 120`，取得一次性配对码与 `certificate_sha256` 指纹。不要把网络端自行报告的指纹当作信任依据。
 5. GUI 选择「认证加密直连」，填写 LAN/VPN 地址、服务端口 `49092`、核对过的证书指纹和一次性配对码，点击「配对此设备」。客户端令牌保存在 Windows 凭据管理器；证书变化会拒绝连接。Linux 可用 `waybridge-service clients` / `revoke CLIENT_ID` 撤销信任，GUI 也可在断开后撤销当前设备。
-6. 选择「已有会话优先」并连接。在「远端应用」刷新并启动应用；「启动终端」默认运行 `ghostty`。关闭查看端保留应用，重新连接可接回仍存活的会话。服务部署与授权范围见 [服务说明](../service/README.md)。
+6. 选择「已有会话优先」并连接。在「远端应用」刷新并启动应用；「启动终端」默认运行 `ghostty`。关闭查看端保留应用，重新连接可接回仍存活的会话。服务部署与授权范围见 [服务说明](SERVICE.md)。
 
 兼容 SSH 模式：Windows 安装系统可选功能 OpenSSH 客户端，Linux 提供 SSH 服务。选择「内置 SSH」，填写 SSH 用户、私钥（或使用 ssh-agent）和 Linux 服务端绝对路径。使用 OpenSSH 密钥认证，首次核对主机 SHA256 指纹；没有交互式密码和键盘认证。加密私钥先执行 `ssh-add <私钥路径>`。
 已有 SSH 隧道也可在 GUI 使用：选择「已有 SSH 隧道」、填写 `127.0.0.1`、本地转发端口和令牌。这一模式没有远端应用目录、启动或结束会话功能。可选保存令牌到 Windows 凭据管理器；JSON 配置不保存令牌。

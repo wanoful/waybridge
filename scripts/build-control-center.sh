@@ -28,7 +28,9 @@ for arch in "${architectures[@]}"; do
     -p:WindowsAppSDKSelfContained=true -p:MicrosoftWindowsAppSDKPackageDir= \
     "-p:ManifestTool=$PWD/scripts/merge-windows-manifest.py" -o "$output"
   cp "$native/waybridge-client.exe" "$output/"
-  cp gui/README.md "$output/README.md"
+  cp README.md "$output/README.md"
+  mkdir -p "$output/docs"
+  cp docs/*.md "$output/docs/"
   cp scripts/Diagnose-Startup.ps1 scripts/Diagnose-Startup.cmd "$output/"
   cp LICENSE "$output/LICENSE-Waybridge.txt"
   mkdir -p "$output/licenses"

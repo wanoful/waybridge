@@ -21,7 +21,7 @@
 
 ## 整合关系
 
-目录传输保留原生拖出实现，虚拟文件再扩展 Windows 导入；GPU 颜色输入保留 HEVC/AV1，HDR 在其上提供 scRGB 子集。合并保留原分支历史。Smithay 的 Xwayland、colormap 生命周期及 SHM 格式缓存补丁共用同一份 vendor，来源与许可证见 [PATCHES.md](vendor/smithay/PATCHES.md)。
+目录传输保留原生拖出实现，虚拟文件再扩展 Windows 导入；GPU 颜色输入保留 HEVC/AV1，HDR 在其上提供 scRGB 子集。合并保留原分支历史。Smithay 的 Xwayland、colormap 生命周期及 SHM 格式缓存补丁共用同一份 vendor，来源与许可证见 [PATCHES.md](../vendor/smithay/PATCHES.md)。
 
 媒体与交互共用 v3 能力协商。PNG/H.264/HEVC/AV1/Main10 的原始 kind 为 1/2/4/5/7/8，UDP 补帧容器为 6，独立 PCM 音频为 3。UDP 全局 8 条/64 MiB 传输 credit、每窗口两帧呈现 credit 和独立音频 credit 分开计数；PNG→视频恢复和缓存复用均保留新 epoch/独立关键帧。
 
