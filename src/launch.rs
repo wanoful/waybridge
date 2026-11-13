@@ -1,17 +1,17 @@
-//! Keep remote applications off the host desktop's input-method and D-Bus session.
+//! Route applications to Waybridge graphics/audio while sharing user data and services.
 use crate::audio;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Read},
+    io::Read,
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         process::CommandExt,
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Command,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -99,7 +99,6 @@ pub fn available(program: &str) -> bool {
 pub struct Session {
     socket: String,
     display: Option<u32>,
-    bus: Option<Child>,
     address: Option<String>,
     saved: Option<(PathBuf, u64, u64)>,
     services: Option<crate::keyring::Services>,
@@ -115,70 +114,28 @@ impl Session {
         let mut session = Self {
             socket: socket.into(),
             display,
-            bus: None,
             address: None,
             saved: None,
             services: None,
         };
-        if available("dbus-daemon") {
-            let descriptor = descriptor(socket)?;
-            let runtime = descriptor
-                .parent()
-                .context("session descriptor directory")?;
-            session.services = Some(crate::keyring::Services::prepare(socket, runtime)?);
-            let mut command = Command::new("dbus-daemon");
-            session.configure(&mut command, audio);
-            let mut child = command
-                .arg("--config-file")
-                .arg(session.services.as_ref().unwrap().bus_config())
-                .args(["--nofork", "--print-address=1"])
-                .process_group(0)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .spawn()
-                .context("starting private application D-Bus session")?;
-            let stdout = child.stdout.take().unwrap();
-            session.bus = Some(child);
-            let mut address = String::new();
-            BufReader::new(stdout.take(4096)).read_line(&mut address)?;
-            if !address.starts_with("unix:") {
-                bail!("private D-Bus daemon returned no Unix address");
-            }
-            session.address = Some(address.trim().into());
-            let mut environment = Command::new("env");
-            session.configure(&mut environment, audio);
-            let environment: BTreeMap<String, Option<String>> = environment
-                .get_envs()
-                .map(|(key, value)| {
-                    (
-                        key.to_string_lossy().into_owned(),
-                        value.map(|v| v.to_string_lossy().into_owned()),
-                    )
-                })
-                .collect();
-            let address = session.address.as_deref().unwrap();
-            let bus =
-                crate::keyring::connect_private_bus(address, std::time::Duration::from_secs(2))?;
-            let activation: BTreeMap<&str, &str> = environment
-                .iter()
-                .filter_map(|(key, value)| value.as_deref().map(|value| (key.as_str(), value)))
-                .collect();
-            bus.call_method(
-                Some("org.freedesktop.DBus"),
-                "/org/freedesktop/DBus",
-                Some("org.freedesktop.DBus"),
-                "UpdateActivationEnvironment",
-                &activation,
-            )
-            .context("configuring private D-Bus activation environment")?;
-            session.services.as_mut().unwrap().start(
-                &environment,
-                session.bus.as_ref().unwrap().id(),
-                address,
-            )?;
-        } else {
-            bail!("dbus-daemon is required for an independent Waybridge application session");
-        }
+        let descriptor_path = descriptor(socket)?;
+        let runtime = descriptor_path
+            .parent()
+            .context("session descriptor directory")?;
+        session.services = Some(crate::keyring::Services::prepare(runtime)?);
+        session.address = Some(session.services.as_ref().unwrap().address().into());
+        let mut environment = Command::new("env");
+        session.configure(&mut environment, audio);
+        let environment = environment
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        session.services.as_mut().unwrap().start(&environment)?;
         let path = descriptor(socket)?;
         let mut command = Command::new("env");
         session.configure(&mut command, audio);
@@ -218,7 +175,7 @@ impl Session {
             .env("QT_QPA_PLATFORM", "wayland;xcb")
             .env("GDK_BACKEND", "wayland,x11");
         if let Some(services) = &self.services {
-            command.env("WAYBRIDGE_DESKTOP_SERVICES", services.status_file());
+            services.configure(command);
         }
         for name in [
             "XDG_RUNTIME_DIR",
@@ -273,20 +230,6 @@ impl Drop for Session {
                 let _ = fs::remove_file(path);
             }
         }
-        if let Some(child) = self.bus.as_mut() {
-            // The unreaped bus PID reserves this process-group ID. Providers
-            // and D-Bus-activated children inherit this owned group; terminating
-            // it cannot target a host user's unrelated desktop service.
-            let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
-        }
         self.services.take();
-        if let Some(child) = self.bus.as_mut() {
-            // D-Bus-activated replacements are not necessarily direct children
-            // of our service manager. After graceful teardown, terminate any
-            // remaining members before reaping the PID that reserves this PGID.
-            let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }

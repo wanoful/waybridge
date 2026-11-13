@@ -2,6 +2,9 @@
 # M0/M1 verification on the Linux NVIDIA development host; Windows hardware is separate.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+if [[ "${WAYBRIDGE_TEST_SESSION_FIXTURE:-}" != 1 ]]; then
+  exec python3 tests/session_fixture.py bash "$0" "$@"
+fi
 case "${1:-}" in
   ""|--with-wine) ;;
   *) echo "Usage: $0 [--with-wine]" >&2; exit 2 ;;
@@ -11,6 +14,7 @@ trap 'rm -rf -- "$verification_data"' EXIT
 export XDG_DATA_HOME="$verification_data"
 ./scripts/test.sh
 cargo build --workspace --locked
+python3 tests/session_admission_smoke.py
 python3 tests/transfer_worker_smoke.py
 python3 tests/desktop_services_smoke.py
 python3 tests/desktop_services_smoke.py --special-runtime

@@ -1,5 +1,20 @@
 # Validation
 
+## Shared user data and one-way session admission — 2026-11-14
+
+This supersedes the earlier private-bus/per-session wallet and browser-profile policy; the historical device results below retain their original scope. See [SESSION_POLICY.md](SESSION_POLICY.md).
+
+`./scripts/test-m0-m1.sh` passed in full, including formatting, workspace Clippy/unit tests, real Linux graphics/input/file regressions, native wallet/Portal tests, authenticated TLS and real OpenSSH management, .NET control tests, live NVENC codec changes and HDR policy/numerical regressions. The separate actual-Chrome default-profile test also passed. Debug and Release workspace builds passed. Existing vendored Smithay warnings remain unchanged. Windows x64 and ARM64 self-contained control-center packages were rebuilt successfully, including the updated embedded SSH helper.
+
+- `session_admission_smoke.py` uses a real compositor with disposable D-Bus/logind/systemd fixtures. It checks active/background Wayland and X11 rejection, ignored greeter/TTY/user-manager/other-UID/closing sessions, fail-closed logind errors, duplicate compositor exclusion, attachment and auto-reconnect despite later desktop login, lock release, shared application paths/bus, canonical user-bus fallback with an absolute Wayland socket, and restoration that preserves a later desktop's environment.
+- `desktop_services_smoke.py` exercises installed KWallet 6.31.0 and GTK Portal with temporary user data, including a runtime path with spaces, percent signs and quotes. Actual remote pixels/input select a Unicode file and cancel wallet prompts; explicit user-service reactivation after terminating the fixture wallet uses the current display. Service data paths match application paths, user activation variables restore, and an unrelated background process survives session end.
+- `session_launch_policy_smoke.py --actual-chrome` opens installed Chrome in its ordinary user profile under temporary XDG directories; no profile or password backend is injected. Command and GIO/desktop-entry launches reuse that browser instance. Explicit flags, Unicode and literal argv survive. This does not test access to the user's real saved passwords or wallet.
+- The Release compositor's read-only `--check-session` on the real desktop reports the existing graphical session and asks the user to log out; no real wallet, DM/PAM configuration or live service activation environment was changed.
+
+The test fixture provides private user/system buses and a simulated login manager rather than bypassing the production check. Shared document-portal mounts stay inside the fixture lifetime and are detached during fixture cleanup. The OpenSSH fixture explicitly passes these test bus addresses because SSH does not inherit them automatically.
+
+Windows hardware has not been retested for this policy change. TLS uses the updated server helper; SSH control-center distributions must carry the updated embedded Python helper. Chromium password-backend selection remains application policy; KDE users may need to retain `--password-store=kwallet6` explicitly when reusing their original encrypted data.
+
 ## Windows 11 x64 laptop — 2026-11-14
 
 Completed a first physical Windows x64 pass over the existing Tailscale VPN. The `laptop` host runs Windows 11 Pro 10.0.26200.9974, with Intel Iris Xe and NVIDIA RTX 4060 Laptop graphics. The portable x64 package was copied to `%LOCALAPPDATA%\Waybridge-Test\m0-m1-20261114`; private interactive scheduled tasks exercised the existing logged-in desktop using UI Automation and Win32 APIs. No VM, RDP desktop or Wine rendering was used for these device results.

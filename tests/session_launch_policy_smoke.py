@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Managed app launch profiles/Steam policy with controlled executable fixtures.
+"""Shared app data/Steam policy with controlled executable fixtures.
 
 Optional --actual-chrome opens only about:blank in a new temporary private
-profile and real Waybridge session; no host browser profile or wallet is read.
+user configuration and real Waybridge session; no host browser profile or wallet is read.
 """
 import argparse
 import importlib.util
@@ -86,30 +86,20 @@ def main():
 
         literal = "literal ; $(not-a-shell) 你好"
         first = launch([str(chrome), literal])
-        profile = next(value.split("=", 1)[1] for value in first["argv"] if value.startswith("--user-data-dir="))
-        assert str(data / "waybridge/sessions") in profile
-        assert Path(profile).is_dir() and Path(profile).stat().st_mode & 0o077 == 0
-        assert "--password-store=gnome-libsecret" in first["argv"] and first["argv"][-1] == literal
+        assert first["argv"] == [str(chrome), literal]
         assert first["desktop"] == "Waybridge" and first["display"] == "policy-0"
-        assert "--user-data-dir=" + profile in launch([str(chrome), "about:blank"])["argv"]
-        assert "--user-data-dir=" + profile not in launch([str(chrome)], session="policy-1")["argv"]
         explicit = str(root / "explicit profile")
-        chosen = launch([str(chrome), "--user-data-dir=" + explicit, "--profile-directory=Work profile", "--password-store=kwallet6"])["argv"]
-        assert chosen == [str(chrome), "--user-data-dir=" + explicit, "--profile-directory=Work profile", "--password-store=kwallet6"]
-        scoped = launch([str(chrome), "--profile-directory=Work profile"])["argv"]
-        assert "--profile-directory=Work profile" in scoped and "--user-data-dir=" + profile in scoped
-        for invalid in [[str(chrome), "--user-data-dir", explicit], [str(chrome), "--user-data-dir="],
-                        [str(chrome), "--user-data-dir=/valid", "-user-data-dir="], [str(chrome), "--password-store"]]:
-            reject(lambda: helper.launch_policy(invalid, "policy-0", saved), "requires")
-        reject(lambda: helper.launch_policy(["flatpak", "run", "com.google.Chrome"], "policy-0", saved), "sandbox wrapper")
-        reject(lambda: helper.launch_policy(["flatpak", "run", "com.valvesoftware.Steam"], "policy-0", saved), "sandbox wrapper")
-        assert helper.launch_policy(["flatpak", "info", "com.google.Chrome"], "policy-0", saved) == ["flatpak", "info", "com.google.Chrome"]
-        print("PASS: native browser argv receives persistent session-specific profile/backend, explicit choices survive, malformed value flags fail safely")
+        chosen = [str(chrome), "--user-data-dir=" + explicit, "--profile-directory=Work profile", "--password-store=kwallet6"]
+        assert launch(chosen)["argv"] == chosen
+        assert launch([str(chrome), "--profile-directory=Work profile"])["argv"] == [str(chrome), "--profile-directory=Work profile"]
+        assert helper.launch_policy(["flatpak", "run", "com.google.Chrome"], "policy-0", saved) == ["flatpak", "run", "com.google.Chrome"]
+        assert not (data / "waybridge/sessions").exists()
+        print("PASS: browser default data/backend unchanged, explicit profile choices survive, no isolated profile created")
 
         browser_entry = data / "applications/google-chrome.desktop"
         browser_entry.write_text("[Desktop Entry]\nType=Application\nName=Browser fixture 你好\nIcon=fixture-icon\nDBusActivatable=true\nExec=" + str(chrome) + " \"--profile-directory=Work profile\" \"literal ; $(not-a-shell)\" %c %k %i %%\n")
         catalog = launch(app="google-chrome.desktop")
-        assert "--user-data-dir=" + profile in catalog["argv"] and "--password-store=gnome-libsecret" in catalog["argv"]
+        assert not any(value.startswith(("--user-data-dir=", "--password-store=")) for value in catalog["argv"])
         assert "--profile-directory=Work profile" in catalog["argv"]
         assert literal.split(" 你好")[0] in catalog["argv"]
         assert "Browser fixture 你好" in catalog["argv"] and "--icon" in catalog["argv"] and "fixture-icon" in catalog["argv"]
@@ -119,7 +109,7 @@ def main():
         chosen_catalog = launch(app="google-chrome.desktop")["argv"]
         assert chosen_catalog == [str(chrome), "--user-data-dir=" + explicit, "--password-store=kwallet6"]
         browser_entry.write_text("[Desktop Entry]\nType=Application\nName=Browser wrapper\nExec=/usr/bin/env " + str(chrome) + " %U\n")
-        reject(lambda: helper.dispatch(dict(op="launch", session="policy-0", binary=str(compositor), app="google-chrome.desktop")), "unsupported wrapper")
+        assert launch(app="google-chrome.desktop")["argv"] == [str(chrome)]
         generic_entry = data / "applications/generic.desktop"
         generic_entry.write_text("[Desktop Entry]\nType=Application\nName=Generic fixture\nExec=" + str(generic) + " \"literal ; $(not-a-shell)\" %c %k %%\n")
         normal = launch(app="generic.desktop")["argv"]
@@ -153,50 +143,57 @@ def main():
 
         if args.actual_chrome:
             from smoke import Viewer
-            # Keep the escaped runtime/data paths for the real compositor and
-            # installed Chrome as well as the controlled GIO cases above.
-            try:
-                actual = helper.ensure(dict(session="actual-browser", binary=str(ROOT / "target/debug/waybridge"), codec="png", audio=False, xwayland=False))
-            except ValueError as error:
-                diagnostic = runtime / "waybridge-control-center/actual-browser.log"
-                raise AssertionError(diagnostic.read_text()[-3000:]) from error
-            child = None
-            viewer = None
-            try:
-                viewer = Viewer(actual["port"], actual["token"])
-                child = helper.dispatch(dict(op="launch", session="actual-browser", binary=str(ROOT / "target/debug/waybridge"),
-                                             argv=["/usr/bin/google-chrome-stable", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "about:blank"]))["pid"]
-                metadata = viewer.until(lambda kind, message: kind == "control" and message.get("type") == "window" and "chrome" in message.get("app_id", "").lower())
-                assert metadata["id"] > 0
-                actual_saved = helper.descriptor("actual-browser")
-                actual_profile = helper.browser_profile("actual-browser", actual_saved, "google-chrome")
-                lock = actual_profile / "SingletonLock"
-                wait(lock.is_symlink)
-                browser_pid = int(os.readlink(lock).rsplit("-", 1)[1])
-                assert Path(f"/proc/{browser_pid}").stat().st_uid == os.getuid()
-                time.sleep(.15)
-                state = Path(f"/proc/{browser_pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-                assert state != "Z", "browser exited after announcing its window"
-                actual_applications = Path(os.environ["XDG_DATA_HOME"]) / "applications"
-                actual_applications.mkdir(exist_ok=True)
-                installed_entry = Path("/usr/share/applications/google-chrome.desktop").read_text()
-                installed_entry = installed_entry.replace("Exec=/usr/bin/google-chrome-stable %U", "Exec=/usr/bin/google-chrome-stable --new-window about:blank %U", 1)
-                (actual_applications / "google-chrome.desktop").write_text(installed_entry)
-                helper.dispatch(dict(op="launch", session="actual-browser", binary=str(ROOT / "target/debug/waybridge"), app="google-chrome.desktop"))
-                second = viewer.until(lambda kind, message: kind == "control" and message.get("type") == "window" and message.get("id") != metadata["id"] and "chrome" in message.get("app_id", "").lower())
-                assert second["id"] != metadata["id"]
-                assert int(os.readlink(lock).rsplit("-", 1)[1]) == browser_pid
-                print("PASS: installed Chrome opens an actual Waybridge window using temporary session profile and Waybridge desktop identity")
-            finally:
-                if child:
-                    try:
-                        os.killpg(child, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                if viewer:
-                    viewer.sock.close()
-                helper.dispatch(dict(op="end", session="actual-browser"))
-                wait(lambda: not (runtime / "actual-browser.session.json").exists())
+            from session_fixture import SessionFixture
+            with SessionFixture(runtime / 'actual user') as user:
+                os.environ.update(user.env)
+                runtime = Path(user.env['XDG_RUNTIME_DIR'])
+                helper.RUNTIME = runtime
+                for path in runtime.glob("*.session.json"):
+                    path.unlink()
+                # Keep the escaped runtime/data paths for the real compositor and
+                # installed Chrome as well as the controlled GIO cases above.
+                try:
+                    actual = helper.ensure(dict(session="actual-browser", binary=str(ROOT / "target/debug/waybridge"), codec="png", audio=False, xwayland=False))
+                except ValueError as error:
+                    diagnostic = runtime / "waybridge-control-center/actual-browser.log"
+                    raise AssertionError(diagnostic.read_text()[-3000:]) from error
+                child = None
+                viewer = None
+                try:
+                    viewer = Viewer(actual["port"], actual["token"])
+                    child = helper.dispatch(dict(op="launch", session="actual-browser", binary=str(ROOT / "target/debug/waybridge"),
+                                                 argv=["/usr/bin/google-chrome-stable", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "about:blank"]))["pid"]
+                    metadata = viewer.until(lambda kind, message: kind == "control" and message.get("type") == "window" and "chrome" in message.get("app_id", "").lower())
+                    assert metadata["id"] > 0
+                    actual_profile = Path(os.environ["XDG_CONFIG_HOME"]) / "google-chrome"
+                    lock = actual_profile / "SingletonLock"
+                    wait(lock.is_symlink)
+                    browser_pid = int(os.readlink(lock).rsplit("-", 1)[1])
+                    assert Path(f"/proc/{browser_pid}").stat().st_uid == os.getuid()
+                    time.sleep(.15)
+                    state = Path(f"/proc/{browser_pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+                    assert state != "Z", "browser exited after announcing its window"
+                    actual_applications = Path(os.environ["XDG_DATA_HOME"]) / "applications"
+                    actual_applications.mkdir(exist_ok=True)
+                    installed_entry = Path("/usr/share/applications/google-chrome.desktop").read_text()
+                    installed_entry = installed_entry.replace("Exec=/usr/bin/google-chrome-stable %U", "Exec=/usr/bin/google-chrome-stable --new-window about:blank %U", 1)
+                    (actual_applications / "google-chrome.desktop").write_text(installed_entry)
+                    helper.dispatch(dict(op="launch", session="actual-browser", binary=str(ROOT / "target/debug/waybridge"), app="google-chrome.desktop"))
+                    second = viewer.until(lambda kind, message: kind == "control" and message.get("type") == "window" and message.get("id") != metadata["id"] and "chrome" in message.get("app_id", "").lower())
+                    assert second["id"] != metadata["id"]
+                    assert int(os.readlink(lock).rsplit("-", 1)[1]) == browser_pid
+                    print("PASS: installed Chrome opens an actual Waybridge window using its normal user profile inside temporary test XDG directories and Waybridge desktop identity")
+                finally:
+                    if child:
+                        try:
+                            os.killpg(child, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                    if viewer:
+                        viewer.sock.close()
+                    helper.dispatch(dict(op="end", session="actual-browser"))
+                    wait(lambda: not (runtime / "actual-browser.session.json").exists())
+
 
 
 if __name__ == "__main__":

@@ -93,7 +93,7 @@ def main():
             inherited = json.loads((runtime / 'environment.json').read_text())
             assert inherited['DISPLAY'].startswith(':')
             assert inherited['PULSE_SINK'] == inherited['PIPEWIRE_NODE'] == f'waybridge-{host.pid}'
-            assert inherited['DBUS_SESSION_BUS_ADDRESS'] != env.get('DBUS_SESSION_BUS_ADDRESS')
+            assert inherited['DBUS_SESSION_BUS_ADDRESS'] == env.get('DBUS_SESSION_BUS_ADDRESS')
             assert all(inherited[name] is None for name in ('QT_IM_MODULE', 'GTK_IM_MODULE', 'SDL_IM_MODULE', 'GLFW_IM_MODULE'))
             snapshot = 'import json,os,sys;print(json.dumps({k:os.environ.get(k) for k in sys.argv[1:]}))'
             joined = json.loads(subprocess.check_output([str(ROOT / 'target/debug/waybridge'), '--socket', 'launch-0', '--launch', '--',

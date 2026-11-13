@@ -13,6 +13,7 @@ mod metrics;
 mod network;
 mod protocol;
 mod relative_input;
+mod session_guard;
 mod shutdown;
 mod stream_config;
 mod toplevel_drag;
@@ -155,6 +156,9 @@ struct Args {
     /// Launch an application inside the running --socket session, including its audio and D-Bus.
     #[arg(long)]
     launch: bool,
+    /// Check whether a new session is allowed, without starting graphics or services.
+    #[arg(long, conflicts_with = "launch")]
+    check_session: bool,
     /// Authentication token file; created with mode 0600 if absent.
     #[arg(long)]
     token_file: Option<PathBuf>,
@@ -2547,6 +2551,19 @@ fn main() -> Result<()> {
         println!("{}", report);
         return Ok(());
     }
+    if args.check_session {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .context("XDG_RUNTIME_DIR must name a private runtime directory")?;
+        let result = session_guard::Guard::acquire(std::path::Path::new(&runtime));
+        println!(
+            "{}",
+            match result {
+                Ok(_) => json!({"available": true}),
+                Err(error) => json!({"available": false, "error": format!("{error:#}")}),
+            }
+        );
+        return Ok(());
+    }
     // One signal flag drives capture workers and both Wayland/X11 session cleanup.
     shutdown::install();
     tracing_subscriber::fmt()
@@ -2558,6 +2575,7 @@ fn main() -> Result<()> {
     metrics::init(args.stats);
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .context("XDG_RUNTIME_DIR must name a private runtime directory")?;
+    let _session_guard = session_guard::Guard::acquire(std::path::Path::new(&runtime))?;
     let token_path = args
         .token_file
         .clone()

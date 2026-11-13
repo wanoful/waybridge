@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real private wallet/portal services, rendered and operated through Waybridge.
+"""Real shared user wallet/portal services, rendered and operated through Waybridge.
 
 Only temporary XDG directories and a fixture wallet request are used. No host
 wallet APIs, credentials, desktop activation environment or profiles are read.
@@ -20,6 +20,7 @@ import time
 from urllib.parse import unquote, urlparse
 
 from smoke import ROOT, Viewer
+from session_fixture import SessionFixture
 
 
 def client():
@@ -98,25 +99,16 @@ def main():
         client()
         return
     (ROOT / 'build/tests').mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='wb-desktop-') as directory:
+    with tempfile.TemporaryDirectory(prefix='wb-desktop-') as directory, SessionFixture(Path(directory) / ("user % quote's $" if '--special-runtime' in sys.argv else 'user')) as user:
         fixture_root = Path(directory)
-        runtime = Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')) if '--host-runtime' in sys.argv else fixture_root
-        if '--special-runtime' in sys.argv:
-            runtime = fixture_root / "runtime % quote's $"
-            runtime.mkdir(mode=0o700)
+        runtime = Path(user.env['XDG_RUNTIME_DIR'])
         socket_name = f'desktop-fixture-{os.getpid()}'
-        def host_doc_mounts():
-            target = str(Path(os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')) / 'doc')
-            return [line for line in Path('/proc/self/mountinfo').read_text().splitlines()
-                    if len(line.split()) > 4 and line.split()[4] == target]
-        before_doc_mounts = host_doc_mounts()
-        app_data = fixture_root / "app data '测试' &"
-        config = fixture_root / 'app-config'
-        env = {**os.environ, 'XDG_RUNTIME_DIR': str(runtime),
-               'XDG_CONFIG_HOME': str(config), 'XDG_DATA_HOME': str(app_data),
-               'XDG_CACHE_HOME': str(fixture_root / 'cache'),
-               'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/nonexistent-host-desktop-bus',
-               'KDE_SESSION_VERSION': '999'}
+        app_data = Path(user.env['XDG_DATA_HOME'])
+        config = Path(user.env['XDG_CONFIG_HOME'])
+        # Fixture-only preferences avoid the first-use wizard; real user config
+        # is never edited by Waybridge.
+        (config / 'kwalletrc').write_text('[Wallet]\nEnabled=true\nFirst Use=false\n[KSecretD]\nEnabled=true\n')
+        env = {**user.env, 'KDE_SESSION_VERSION': '999'}
         token = 'desktop-test-' + '4' * 40
         token_path = fixture_root / 'token'
         token_path.write_text(token)
@@ -144,6 +136,8 @@ def main():
                 def services_ready():
                     status = json.loads(status_file.read_text())
                     providers = {item['name']: item for item in status['services']}
+                    assert not any(providers[name]['status'] == 'unavailable' for name in
+                        ['secret-service', 'kwallet', 'gtk-portal', 'desktop-portal']), (status, (user.root / 'bus.log').read_text()[-5000:])
                     return status if all(providers[name]['status'] == 'ready' for name in
                         ['secret-service', 'kwallet', 'gtk-portal', 'desktop-portal']) else None
 
@@ -188,32 +182,11 @@ def main():
                 assert inherited['KDE_SESSION_VERSION'] is None
                 assert inherited['XDG_CONFIG_HOME'] == str(config)
                 assert inherited['XDG_DATA_HOME'] == str(app_data)
-                assert inherited['DBUS_SESSION_BUS_ADDRESS'] != env['DBUS_SESSION_BUS_ADDRESS']
+                assert inherited['DBUS_SESSION_BUS_ADDRESS'] == env['DBUS_SESSION_BUS_ADDRESS']
                 request('names')
                 names = message('names')['names']
                 assert 'org.freedesktop.secrets' in names
                 assert 'org.kde.KWin' not in names and 'org.kde.plasmashell' not in names
-
-                second_name = socket_name + '-second'
-                second = subprocess.Popen([str(ROOT / 'target/debug/waybridge'), '--socket', second_name,
-                    '--listen', '127.0.0.1:0', '--token-file', str(token_path), '--codec', 'png',
-                    '--no-audio', '--no-xwayland'], env=env, stdout=log, stderr=log)
-                second_descriptor = runtime / f'{second_name}.session.json'
-                wait(lambda: second_descriptor.exists() or second.poll() is not None)
-                assert second.poll() is None
-                other = json.loads(second_descriptor.read_text())['environment']
-                second_status = Path(other['WAYBRIDGE_DESKTOP_SERVICES'])
-                def second_ready():
-                    result = json.loads(second_status.read_text())
-                    states = {item['name']: item['status'] for item in result['services']}
-                    return result if all(states[name] == 'ready' for name in
-                        ['secret-service', 'kwallet', 'gtk-portal', 'desktop-portal']) else None
-                other_status = wait(second_ready)
-                assert other['DBUS_SESSION_BUS_ADDRESS'] != inherited['DBUS_SESSION_BUS_ADDRESS']
-                assert other_status['persistent'] != status['persistent']
-                second.terminate(); second.wait(timeout=8)
-                assert not second_status.exists() and status_file.exists()
-                print('PASS: two same-user Waybridge sessions own independent native service sets; ending one preserves the other')
 
                 request('file')
                 picker_request = message('file')['path']
@@ -270,6 +243,11 @@ def main():
                                 capture_output=True)
                             return result.returncode != 0
                         wait(owner_gone)
+                        # KWallet's distro activation name; this machine does
+                        # not install an org.freedesktop.secrets .service alias.
+                        subprocess.check_output(['gdbus', 'call', '--address', address,
+                            '--dest', 'org.freedesktop.DBus', '--object-path', '/org/freedesktop/DBus',
+                            '--method', 'org.freedesktop.DBus.StartServiceByName', 'org.kde.secretservicecompat', '0'])
                     request('wallet')
                     wallet_request = message('wallet')['path']
                     wallet = viewer.until(lambda kind, value: kind == 'control' and
@@ -281,30 +259,24 @@ def main():
                     viewer.send(type='close', id=wallet['id'])
                     cancelled = message('Completed')
                     assert cancelled['path'] == wallet_request and cancelled['value'][0], cancelled
-                print('PASS: native fixture-wallet prompts paint and cancel remotely; private activation restarts the wallet after provider termination')
+                print('PASS: native fixture-wallet prompts paint and cancel remotely; standard user activation restarts the wallet after provider termination')
                 owner = subprocess.check_output(['gdbus', 'call', '--address', inherited['DBUS_SESSION_BUS_ADDRESS'],
                     '--dest', 'org.freedesktop.DBus', '--object-path', '/org/freedesktop/DBus',
                     '--method', 'org.freedesktop.DBus.GetConnectionUnixProcessID', 'org.freedesktop.secrets'], text=True)
                 wallet_pid = int(owner.strip().removeprefix('(uint32 ').removesuffix(',)'))
-                private_group = os.getpgid(wallet_pid)
-                assert private_group != os.getpgrp()
-                marker = fixture_root / 'ignoring-term'
-                uncooperative = subprocess.Popen([sys.executable, '-c',
-                    'import signal,time,sys;from pathlib import Path;signal.signal(signal.SIGTERM,signal.SIG_IGN);Path(sys.argv[1]).touch();time.sleep(60)',
-                    str(marker)], process_group=private_group)
-                wait(marker.exists)
+                wallet_environment = dict(item.split(b'=', 1) for item in Path(f'/proc/{wallet_pid}/environ').read_bytes().split(b'\0') if b'=' in item)
+                assert wallet_environment[b'XDG_DATA_HOME'].decode() == str(app_data)
+                assert wallet_environment[b'XDG_CONFIG_HOME'].decode() == str(config)
+                uncooperative = subprocess.Popen(['sleep', '60'], start_new_session=True)
                 request('quit')
                 helper.wait(timeout=5)
                 assert helper.returncode == 0
-                persistent = Path(status['persistent'])
                 host.terminate(); host.wait(timeout=8)
-                uncooperative.wait(timeout=3)
-                assert uncooperative.returncode == -signal.SIGKILL, 'private group survivor was not cleaned up'
+                assert uncooperative.poll() is None, 'unrelated user process was terminated'
                 assert not descriptor.exists() and not status_file.exists()
-                assert (persistent / 'wallet/config/kwalletrc').exists()
-                assert not (app_data / 'kwalletd').exists(), 'normal application wallet path was modified'
-                assert host_doc_mounts() == before_doc_mounts, 'host document portal mount changed'
-                print('PASS: service-only persistent storage, Waybridge identity, no host bus, explicit unsupported capabilities, and owned service cleanup')
+                assert not (app_data / 'waybridge/sessions').exists()
+                assert json.loads(user.manager.read_text()) == {'WAYLAND_DISPLAY': 'previous-display', 'KEEP_ME': 'unchanged'}
+                print('PASS: wallet uses normal user paths/bus, Portal selection renders remotely, user service environment restored, unrelated background process preserved')
             finally:
                 if helper is not None and helper.poll() is None:
                     helper.terminate(); helper.wait(timeout=5)
