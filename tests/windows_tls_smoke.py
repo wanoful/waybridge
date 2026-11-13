@@ -19,6 +19,9 @@ def main():
     binary = out / "windows-tls-probe.exe"
     subprocess.run(["x86_64-w64-mingw32-g++", "-std=c++17", "-static", "-O2", "-Wall", "-Wextra",
                     "tests/windows_tls_probe.cpp", "-o", str(binary), "-lws2_32", "-lsecur32", "-lcrypt32"], cwd=ROOT, check=True)
+    pipe_binary = out / "windows-host-control-probe.exe"
+    subprocess.run(["x86_64-w64-mingw32-g++", "-std=c++17", "-static", "-O2", "-Iclient",
+                    "tests/windows_host_control_probe.cpp", "-o", str(pipe_binary)], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="waybridge-tls-native-") as directory:
         temporary = Path(directory)
         cert, key = temporary / "cert.pem", temporary / "key.pem"
@@ -85,6 +88,11 @@ def main():
         config = dict(type="tls", fingerprint=hashlib.sha256(der).hexdigest(), client_id="native-probe",
                       client_token=credential, session="waybridge-0")
         try:
+            pipe_result = subprocess.run(["wine", str(pipe_binary)], env=env, text=True,
+                                         capture_output=True, timeout=60)
+            assert pipe_result.returncode == 0, pipe_result.stdout + pipe_result.stderr
+            print(pipe_result.stdout.strip())
+
             def run(settings):
                 result = subprocess.run(["wine", str(binary), str(listener.getsockname()[1])], env=env,
                                         input=json.dumps(settings) + "\n", text=True, capture_output=True, timeout=60)
