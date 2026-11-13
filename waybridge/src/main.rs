@@ -14,6 +14,7 @@ mod network;
 mod protocol;
 mod relative_input;
 mod shutdown;
+mod stream_config;
 mod toplevel_drag;
 mod transfer;
 mod udp;
@@ -235,6 +236,10 @@ struct App {
     _color_manager: Option<GlobalId>,
     gpu_device: Option<Rc<waybridge_codec::GpuDevice>>,
     video_codec: Option<waybridge_codec::Codec>,
+    video_allowed: bool,
+    stream_fps: u32,
+    stream_bitrate: u32,
+    read_only: bool,
     audio: Option<audio::Session>,
     cursor: cursor::Cursor,
     _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState,
@@ -918,11 +923,26 @@ impl App {
     }
 
     fn message(&mut self, value: Value) {
+        if self.read_only
+            && matches!(
+                value["type"].as_str(),
+                Some("pointer" | "relative_pointer" | "button" | "scroll" | "key" | "ime")
+            )
+        {
+            return;
+        }
         let id = value["id"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0);
         match value["type"].as_str().unwrap_or("") {
+            "stream_config" => self.stream_config(&value),
+            "file_drop_out_enabled" => {
+                self.drag_enabled = value["enabled"].as_bool().unwrap_or(false);
+                if !self.drag_enabled {
+                    self.end_outbound(false);
+                }
+            }
             "window_state" => self.native_window_state(id, &value),
             "ime" => self.ime_message(&value),
             "drag_claim" | "drag_drop" | "drag_result" | "drag_read" => {
@@ -2763,6 +2783,10 @@ fn main() -> Result<()> {
         color_programs,
         gpu_device,
         video_codec,
+        video_allowed: video_codec.is_some(),
+        stream_fps: args.fps,
+        stream_bitrate: args.bitrate,
+        read_only: false,
         audio,
         cursor: cursor::Cursor::default(),
         _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<App>(&dh),
@@ -2844,8 +2868,13 @@ fn main() -> Result<()> {
             );
         }
     }
-    let application_session =
-        launch::Session::new(&args.socket, app.x11.display, app.audio.as_ref())?;
+    let application_session = launch::Session::new(
+        &args.socket,
+        app.x11.display,
+        app.audio.as_ref(),
+        &args.listen,
+        &token_path,
+    )?;
     if let Some(program) = args.command.first() {
         let mut command = Command::new(program);
         command.args(&args.command[1..]);
@@ -2857,7 +2886,6 @@ fn main() -> Result<()> {
         );
     }
     tracing::info!(socket = %args.socket, token_file = %token_path.display(), "ready; launch apps with WAYLAND_DISPLAY set to this socket");
-    let interval = Duration::from_secs_f64(1.0 / args.fps as f64);
     let mut next_frame = Instant::now();
     while !shutdown::requested() {
         xloop.dispatch(Some(Duration::ZERO), &mut app)?;
@@ -2876,6 +2904,7 @@ fn main() -> Result<()> {
             let Ok(event) = events.try_recv() else { break };
             match event {
                 Event::Connected(peer) => {
+                    app.read_only = false;
                     if let Some(audio) = &app.audio {
                         audio.set_peer(Some(&peer));
                     }
@@ -3019,6 +3048,7 @@ fn main() -> Result<()> {
         }
         if Instant::now() >= next_frame {
             app.render()?;
+            let interval = Duration::from_secs_f64(1.0 / app.stream_fps as f64);
             next_frame += interval;
             if next_frame < Instant::now() {
                 next_frame = Instant::now() + interval;

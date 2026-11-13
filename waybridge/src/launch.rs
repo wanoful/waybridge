@@ -20,6 +20,14 @@ struct Saved {
     pid: u32,
     started: String,
     environment: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    connection: Option<ConnectionInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ConnectionInfo {
+    listen: String,
+    token_file: String,
 }
 fn started(pid: u32) -> Result<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
@@ -97,7 +105,13 @@ pub struct Session {
     keyring: Option<crate::keyring::Bridge>,
 }
 impl Session {
-    pub fn new(socket: &str, display: Option<u32>, audio: Option<&audio::Session>) -> Result<Self> {
+    pub fn new(
+        socket: &str,
+        display: Option<u32>,
+        audio: Option<&audio::Session>,
+        listen: &str,
+        token_file: &Path,
+    ) -> Result<Self> {
         let mut session = Self {
             socket: socket.into(),
             display,
@@ -148,6 +162,10 @@ impl Session {
                     )
                 })
                 .collect(),
+            connection: Some(ConnectionInfo {
+                listen: listen.into(),
+                token_file: token_file.to_string_lossy().into_owned(),
+            }),
         };
         let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
         serde_json::to_writer(file.as_file_mut(), &saved)?;
