@@ -62,20 +62,30 @@ public sealed class EngineChannel : IAsyncDisposable
             timeout.CancelAfter(TimeSpan.FromSeconds(30));
             var connected = pipe.WaitForConnectionAsync(timeout.Token);
             var exited = process.WaitForExitAsync(timeout.Token);
-            if (await Task.WhenAny(connected, exited) == exited) throw new IOException("串流内核在连接控制通道前退出");
+            if (await Task.WhenAny(connected, exited) == exited)
+            {
+                await exited; // A cancelled wait does not mean the process exited.
+                throw new IOException("串流内核在连接控制通道前退出");
+            }
             await connected;
             channel = new EngineChannel(pipe, process, token, transport?.ClientToken ?? "");
             channel.Message += message; channel.Log += log;
             await channel.SendAsync(new { type = "start", version = 1, host, port, token, settings, transport }, timeout.Token);
             var engineReady = channel.ready.Task;
-            if (await Task.WhenAny(engineReady, exited) == exited) throw new IOException("串流连接失败：" + await channel.errors);
+            if (await Task.WhenAny(engineReady, exited) == exited)
+            {
+                await exited;
+                throw new IOException("串流连接失败：" + await channel.errors.WaitAsync(timeout.Token));
+            }
             await engineReady.WaitAsync(timeout.Token);
             return channel;
         }
-        catch
+        catch (Exception error)
         {
             if (channel is not null) await channel.DisposeAsync();
             else { pipe.Dispose(); await Processes.StopAsync(process); }
+            if (error is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+                throw new TimeoutException("串流内核未在 30 秒内就绪，请查看诊断日志", error);
             throw;
         }
     }

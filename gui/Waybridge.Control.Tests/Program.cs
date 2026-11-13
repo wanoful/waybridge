@@ -14,6 +14,18 @@ static async Task Reject<T>(Func<Task> action) where T : Exception
     throw new Exception("Expected " + typeof(T).Name);
 }
 
+if (args is ["--silent-engine", var silentMarkerArgument, "--control-pipe", var silentPipe])
+{
+    using var pipe = new NamedPipeClientStream(".", silentPipe, PipeDirection.InOut, PipeOptions.Asynchronous);
+    await pipe.ConnectAsync(5000);
+    var start = await new JsonLines(pipe).ReadAsync(default);
+    Check(start?.GetProperty("type").GetString() == "start", "missing silent-worker bootstrap");
+    await File.WriteAllTextAsync(silentMarkerArgument, Environment.ProcessId.ToString());
+    // Reproduce an alive worker that never reports ready or closes stderr.
+    await Task.Delay(Timeout.Infinite);
+    return;
+}
+
 if (args is ["--control-pipe", var pipeName])
 {
     using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
@@ -247,6 +259,38 @@ try
         Check(reply.GetProperty("request").GetProperty("settings").GetProperty("clipboard").GetString() == "off", "IPC clipboard");
     }
     Console.WriteLine("PASS: separate-process named-pipe bootstrap, private credential transport, commands and graceful disconnect");
+
+    string silentMarker = Path.Combine(directory, "silent-worker.pid");
+    using (var cancellation = new CancellationTokenSource())
+    {
+        var startup = EngineChannel.StartAsync("dotnet", "127.0.0.1", 49090, "test-secret-" + new string('c', 40),
+            new(), _ => { }, _ => { }, cancellation.Token,
+            [Assembly.GetExecutingAssembly().Location, "--silent-engine", silentMarker]);
+        int silentProcessId = 0;
+        for (int i = 0; i < 250; i++)
+        {
+            try { if (File.Exists(silentMarker) && int.TryParse(File.ReadAllText(silentMarker), out silentProcessId)) break; }
+            catch (IOException) { }
+            await Task.Delay(20);
+        }
+        Check(silentProcessId > 0, "silent worker never received bootstrap");
+        using var silentWorker = System.Diagnostics.Process.GetProcessById(silentProcessId);
+        cancellation.Cancel();
+        try
+        {
+            await Reject<OperationCanceledException>(async () =>
+            {
+                await using var unexpected = await startup.WaitAsync(TimeSpan.FromSeconds(8));
+            });
+            Check(silentWorker.HasExited, "cancelled startup left its worker alive");
+        }
+        finally
+        {
+            if (!silentWorker.HasExited) silentWorker.Kill(true);
+            try { await startup.WaitAsync(TimeSpan.FromSeconds(4)); } catch (OperationCanceledException) { }
+        }
+    }
+    Console.WriteLine("PASS: cancellation of a silent connected worker is bounded and terminates it without waiting for live stderr EOF");
 
     string appHost = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!, "Waybridge.Control.Tests" + (OperatingSystem.IsWindows() ? ".exe" : ""));
     await using (var controller = new SessionController(directory, appHost, _ => Task.FromResult(false)))
