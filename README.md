@@ -4,7 +4,7 @@
 
 本目录是 Git 仓库根目录：`src/` 是 Linux 合成器，`native/` 是编解码与 GPU 适配，`client/` 是 Windows 原生内核，`gui/` 是控制中心，`scripts/` 和 `tests/` 分别提供构建与验证入口。构建产物写入已忽略的 `target/`、`build/` 和 .NET `bin/`、`obj/`。
 
-现有能力与目标范围见 [功能规格](FEATURES.md)，技术边界见 [v1 架构基线](ARCHITECTURE.md)，里程碑与完成条件见 [Roadmap](ROADMAP.md)。M0/M1 已实现认证加密直连、用户级会话入口及私有桌面服务；SSH 保留为兼容入口。Linux/Wine 验证和 Windows 交叉构建结果见验收记录，Windows 实机验收另行安排。
+现有能力与目标范围见 [功能规格](FEATURES.md)，技术边界见 [v1 架构基线](ARCHITECTURE.md)，里程碑与完成条件见 [Roadmap](ROADMAP.md)。M0/M1 已实现认证加密直连、用户级会话入口及私有桌面服务；SSH 保留为兼容入口。Linux/Wine 与 Windows 11 x64 首轮真机流程已通过，详见验收记录；更新版 ARM64、物理 HDR 及更多设备仍待验收。
 
 同级 `../sunshine/` 和 `../moonlight/` 是未修改的本地参考源码，不纳入本仓库；参考版本见 [upstreams.json](upstreams.json)。完整 Git 历史与功能来源分支保留，早期提交使用 `waybridge/` 路径前缀。协议为独立 v3，普通 Moonlight 不能直接连接。
 

@@ -1,8 +1,39 @@
 # Validation
 
+## Windows 11 x64 laptop — 2026-11-14
+
+Completed a first physical Windows x64 pass over the existing Tailscale VPN. The `laptop` host runs Windows 11 Pro 10.0.26200.9974, with Intel Iris Xe and NVIDIA RTX 4060 Laptop graphics. The portable x64 package was copied to `%LOCALAPPDATA%\Waybridge-Test\m0-m1-20261114`; private interactive scheduled tasks exercised the existing logged-in desktop using UI Automation and Win32 APIs. No VM, RDP desktop or Wine rendering was used for these device results.
+
+The pass found and fixed two issues that Linux/Wine had missed:
+
+- The native [HostControl pipe](client/host_control.h) used a synchronous handle for its concurrent reader and writer. On Windows, the pending read prevented ready/status output even while TLS streaming already displayed working windows. It now uses `FILE_FLAG_OVERLAPPED`, separate read/write events, cancellation with completion draining, and bounded bootstrap/write deadlines. See Microsoft's [overlapped pipe requirements](https://learn.microsoft.com/en-us/windows/win32/ipc/synchronous-and-overlapped-input-and-output). The standalone [Windows pipe probe](tests/windows_host_control_probe.cpp) passes on this physical host: pending read plus ordered ready/status writes, coalesced/fragmented commands, cancellation of pending read/write, invalid bootstrap cleanup and a 15-second incomplete-bootstrap deadline. The test-side [pipe fixture](tests/windows_pipe_fixture.h) is also duplex/overlapped.
+- [EngineChannel startup](gui/Waybridge.Control.Core/EngineChannel.cs) treated a cancelled process-exit wait as an actual exit, then awaited live stderr EOF before killing the worker. Startup could therefore remain pending indefinitely. It now propagates cancellation before reading exit diagnostics and reports its internal startup deadline as a timeout. The Core regression uses a separate process that accepts bootstrap but never reports ready or closes stderr. It fails against the old branch and passes after the fix, including bounded cancellation and child termination.
+
+Physical results after applying both fixes:
+
+| Area | Observed result |
+|---|---|
+| WinUI startup | Real controls, navigation, resources and application window load successfully; the previous bootstrap fix is confirmed on x64 |
+| Pairing and credentials | Real GUI pairing with a locally obtained pin/code; client credential exists in Windows Credential Manager and is absent from profile fields; GUI revocation removes the credential and Linux trust |
+| VPN connection | C# TLS management and independent Schannel control/media streams connect across Tailscale; GUI reaches connected state and receives live diagnostics |
+| Pixels and input | Two deterministic native windows rendered actual H.264 pixels; a 1200×800 capture has the expected red upper and blue lower regions; click and `abc` scan codes arrive in the Linux fixture log |
+| Hardware path | Actual worker logs report D3D11 hardware H.264 decoding and DirectComposition presentation; HEVC/AV1/Main10 capability probes also complete, but capability alone is not playback or HDR-display acceptance |
+| Applications | GUI catalog launches Blender 5.2.2 LTS to its initial viewport/setup screen; GUI terminal launch opens Ghostty. This is launch/display coverage, not a complete Blender project or game acceptance |
+| File picker/upload | Real owned Windows picker selects a Chinese-named test file; all 151,552 bytes arrive intact over TLS and match the expected UTF-8 contents |
+| Disconnect/reconnect | Normal GUI disconnect terminates the local worker while compositor, Blender and Ghostty retain exactly the same PIDs/start identities. Reconnect starts a new Windows worker and resumes those same instances |
+| Explicit end | GUI confirmation ends the test-owned compositor and both applications; the session descriptor is removed. A separate controlled check confirms ending a session leaves the detached TLS entry and its trust/identity running |
+| Tray/single instance | Closing hides the window and another launch reactivates the same GUI process. Tray-menu Exit was not reliably driven by the automation harness, so its result is not accepted; the test-owned GUI was stopped during cleanup |
+
+The existing native GUI IPC and full direct TLS/WASAPI Wine regressions pass after the fix, as do Core, .NET direct and SSH regressions. `windows_tls_smoke.py` now includes the standalone pipe probe. ARM64/x64 workers and both portable bundles have been rebuilt and each package's PE/resources/checksums verified. Test transcripts, UI results and test-window captures are under `build/tests/laptop/results/`, including `pipe-probe.log`, `core-after-fix.log`, `upload-verified.json` and `blender-windows11.png`; these generated artifacts are ignored by Git.
+
+Test pairing credentials, temporary scheduled tasks, Linux sessions and the isolated TLS entry were cleaned up. The portable package and diagnostics remain in the dedicated Windows test directory.
+
+Remaining device coverage includes tray-menu Exit, the updated ARM64/WoA package, physical Main10/HDR display behavior, real audio-device playback/recovery, IME/device variations, games and complete professional-software workflows. This pass covers the selected Tailscale path, not all LAN/VPN loss and performance conditions. Later milestone devices/features and Flatpak document authorization retain their previous pending status.
+
+
 ## M0/M1 — 2026-11-14
 
-Implemented core I/O cleanup and the independent-session/TLS connection baseline. Windows x64/ARM64 hardware verification is explicitly deferred by the user; Linux, cross-build and Wine results below do not substitute for it. Older entries describe their historical implementation: the host keyring bridge has now been replaced by native private-session services.
+Implemented core I/O cleanup and the independent-session/TLS connection baseline. At the initial delivery Windows hardware verification was deferred; the later physical x64 pass is recorded above. Linux, cross-build and Wine results below do not substitute for remaining hardware coverage. Older entries describe their historical implementation: the host keyring bridge has now been replaced by native private-session services.
 
 The complete `scripts/test-m0-m1.sh --with-wine` run passed on this NVIDIA Linux development host, including strict workspace Clippy, 26 Rust unit tests, real Linux application regressions, TLS/.NET integration, HDR NVENC and native Wine checks. It uses temporary application data for test sessions. `scripts/build.sh` (Linux Release workspace plus x64 native worker) and `scripts/build-control-center.sh all` also passed after source freeze. ARM64/x64 portable packages are `build/Waybridge-Control-win-{arm64,x64}.zip`; transcripts are `build/tests/m0-m1-validation.log`, `m0-m1-build.log` and `m0-m1-packaging.log`. Focused coverage:
 

@@ -1,6 +1,6 @@
 # Waybridge 计划与 Roadmap
 
-更新日期：2026 年 11 月 14 日。状态：M0/M1 代码与 Linux/Wine 验证已交付，Windows x64/ARM64 实机验收按用户决定另行安排。后续里程碑表示交付顺序与完成条件，不代表相关功能已实现；具体设备与性能数字按基线测量校准。
+更新日期：2026 年 11 月 14 日。状态：M0/M1 代码与 Linux/Wine 验证已交付，Windows 11 x64/Tailscale 首轮真机流程也已通过；更新版 ARM64 及剩余硬件/网络验收继续保留。后续里程碑表示交付顺序与完成条件，不代表相关功能已实现；具体设备与性能数字按基线测量校准。
 
 Waybridge 面向 Windows 端的专业软件办公与游戏，Linux 应用在自己的会话中运行，以独立原生窗口显示到 Windows。网络覆盖局域网及异地 VPN。目标是独立于宿主 DE、日常连接无需 SSH、断开后保留正常运行的 Linux 会话。
 
@@ -30,8 +30,8 @@ Waybridge 面向 Windows 端的专业软件办公与游戏，Linux 应用在自�
 
 | 阶段 | 已实现及验证 | 剩余验收或后续工作 |
 |---|---|---|
-| M0 | 两端文件接收移至有界工作队列；Windows 网络发送移出 UI；旧连接/选择结果失效；auto/HDR 解析一致、PNG 硬限制有明确回退；Linux 回归与原生 PE Wine 流程通过 | WinUI、凭据管理器、Windows x64/WoA 原生设备与真实网络性能基线待实机；入口继续渐进拆分，GPU 同步仍可能阻塞 |
-| M1 | 独立 TLS 用户入口、配对/撤销、会话及应用管理；C# 管理与 C++ 独立 TLS 流；私有 D-Bus、原生钱包/GTK Portal、激活与清理；Chrome 会话 profile 和 Steam 冲突检测；断开及服务入口重启后接回 | 实机与实际 VPN 待验收；原钱包迁移、Flatpak 沙箱文档授权、自定义应用 wrapper 需另测；ScreenCast 在 M4 实现 |
+| M0 | 两端文件接收移至有界工作队列；Windows 网络发送移出 UI；旧连接/选择结果失效；auto/HDR 解析一致、PNG 硬限制有明确回退；Linux 回归与原生 PE Wine 流程通过 | x64 WinUI、凭据管理器、文件选择及 VPN 流程已过；WoA、更多设备与网络性能基线待实机；入口继续拆分，GPU 同步仍可能阻塞 |
+| M1 | 独立 TLS 用户入口、配对/撤销、会话及应用管理；C# 管理与 C++ 独立 TLS 流；私有 D-Bus、原生钱包/GTK Portal、激活与清理；Chrome 会话 profile 和 Steam 冲突检测；断开及服务入口重启后接回 | x64/Tailscale 首轮已过，WoA 和更多网络待验收；原钱包迁移、Flatpak 文档授权及自定义 wrapper 需另测；ScreenCast 在 M4 实现 |
 | M2–M5 | 架构与支持范围已记录 | 尚未开始对应完整功能交付 |
 
 M0/M1 的自动验证入口为 `scripts/test-m0-m1.sh --with-wine`，覆盖范围与结果见 [VALIDATION.md](VALIDATION.md)。它验证真实 Linux 合成器、TLS 服务、.NET 管理链路与 Wine 原生 worker，不代表 WinUI 在 Windows 实机的交互验收。
