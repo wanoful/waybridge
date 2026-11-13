@@ -101,6 +101,12 @@ imports, controlled stdio, bounded responses and PID/ownership checks. `ensure`
 returns the session's v3 `token` only after client authentication; `info` and
 `list` omit it. `mode:"attach"` never starts or adopts a stale session.
 
+Only one Waybridge session per user is supported. `auto` reconnects an existing
+session even if its name differs; `new` rejects an existing session. Creation
+checks logind for this UID’s active/online X11 or Wayland user sessions.
+Attachment bypasses that check. Later display-manager logins are not intercepted.
+Application and wallet data are shared by default; see [session policy](../SESSION_POLICY.md).
+
 `clients` lists client identifiers, labels and creation times without verifiers.
 `revoke` requires `revoke_client_id` to identify the target; `client_id` still
 identifies the authenticated caller. These operations are also available through

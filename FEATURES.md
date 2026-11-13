@@ -81,7 +81,7 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | 网络 | 原生 TLS 直连、可选 SSH TCP、加密 UDP、丢包修复和 TCP 回退 | 需要手工配置可达 UDP 地址；固定节流，无自适应拥塞控制，媒体全局有序可能跨窗口阻塞 |
 | I/O 响应性 | 两端文件接收工作队列、连接/选择代次、Windows 有界有序发送 | 文件字节仍共用控制通道；旧式非 file_tree 上传元数据有同步预检，逐文件进度/限速/续传留到 M2 |
 | 控制与诊断 | 托盘、只读键鼠、共享开关、实时帧率和码率配置、实际画面路径及阶段计时、导出日志 | 没有游戏内状态浮层；阶段时间和 RTT 不等于物理输入到显示延迟 |
-| 桌面服务 | 私有 D-Bus 与激活环境、会话原生 KWallet/Secret Service、Desktop Portal/GTK 文件选择、服务状态及结束清理 | 钱包/Portal 使用服务专用持久目录；原钱包迁移、Flatpak 文档授权未验证；ScreenCast 属于 M4 |
+| 桌面服务 | 共享用户 D-Bus 与数据、KWallet/Secret Service、Desktop Portal/GTK 文件选择、激活环境及状态 | 默认共享用户数据；旧隔离钱包迁移、Flatpak 文档授权未验证；ScreenCast 属于 M4 |
 | 应用与平台 | 原生 Wayland、私有 Xwayland，Windows x64 与原生 ARM64 构建；桌面密钥服务在本会话原生运行 | X11 无 PRIMARY、XDND、XIM 和完整 EWMH；构建成功不代表所有应用、设备组合可用 |
 
 文件目前单个文件最多 1 GiB，目录批次内容最多 8 GiB、512 个条目；Windows 路径、名称、符号链接及 reparse point 等还有兼容限制。详见 [文件说明](README.md#使用数据交换) 与 [协议](PROTOCOL.md)。
@@ -142,7 +142,7 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 
 - Linux 服务端先以当前 NVIDIA 主机为基线。Windows 11 原生 ARM64 与 x64 作为首轮主验平台，Windows 10 保留现有兼容范围并单列测试结果。
 - 日常连接以客户端直接连接 LAN/VPN 内 Linux 服务为目标，内建认证加密与配对；SSH 作为可选部署、管理及隧道兼容入口。当前已实现 TLS 用户入口、配对与直连，Windows 11 x64/Tailscale 首轮流程已通过，WoA、更多网络及完整应用验收仍待完成，见 [Roadmap M1](ROADMAP.md#m1-独立会话与连接)。
-- 会话不要求宿主运行 KWin 或其他 DE；Waybridge 管理必要的服务组合，原生桌面组件按需复用。没有宿主图形桌面与多个桌面并行运行分别验收，边界见 [会话独立性原则](ARCHITECTURE.md#会话独立性原则)。
+- 会话不要求宿主运行 KWin 或其他 DE；Waybridge 管理必要的服务组合，原生桌面组件按需复用。没有本地图形桌面时验证启动，已有同用户桌面时验证拒绝创建，边界见 [会话独立性原则](ARCHITECTURE.md#会话独立性原则)。
 - 应用从 Waybridge 会话启动，每个会话一个活动查看端。通过 Steam、HMCL 等启动器继续启动的窗口同样进入该会话。
 - 首轮同时打开四个顶层窗口，覆盖一个持续更新的前台窗口和多个办公窗口。双显示器覆盖 100%、175%、200% 等混合 DPI；X11 共享应用密度的行为需要清楚呈现。
 - 动态画面的标准配置为 1080p60 和 1440p60。4K 静态办公清晰度单独验收，1080p120、持续 4K60、HDR 和广色域作为增强配置分别报告。
@@ -179,7 +179,7 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 
 | 场景 | 推荐默认行为 | 验收重点 |
 |---|---|---|
-| KWallet / Secret Service | 优先在 Waybridge 私有会话原生启动密钥服务，其解锁和授权窗口作为普通远程窗口显示；不将宿主钱包转发作为目标功能。M1 使用服务专用持久钱包与配置，普通应用数据路径保持 | 临时测试钱包覆盖已解锁、锁定、首次授权、取消、服务重启及无宿主桌面；同时运行宿主桌面时分别检查服务与数据归属 |
+| KWallet / Secret Service | 共享用户总线上的原生密钥服务与原有数据，解锁和授权窗口作为远程窗口显示；不做钱包转发 | 临时测试钱包覆盖已解锁、锁定、首次授权、取消、服务重启及无宿主桌面；本地与远程轮流使用，创建时检查已有桌面 |
 | 打开和保存文件 | 默认选择 Linux 文件；选择 Windows 文件时先传入 Linux，再交给应用。保存到 Windows 应明确包含回传步骤 | 普通 Qt/GTK 与 Flatpak 各走打开、保存、目录及取消流程；路径和文件生命周期正确 |
 | 打开链接和其他应用 | 普通操作默认留在本会话，提供“在 Windows 打开”。登录链接默认在远端浏览器处理；应用专用 URI 交给对应远端应用 | `https:`、`mailto:`、`steam:` 等分别验证；登录回调能返回发起应用，不被宿主已有进程接走 |
 | 通知与后台应用 | 会话通知在 Windows 可见，点击回到对应应用；关闭窗口后仍在后台运行的应用可从控制中心找到 | 飞书或 Telegram 等候选应用的通知、动作按钮及关闭窗口后再次打开；去重及免打扰规则明确 |
@@ -188,13 +188,13 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | 权限认证 | 需要系统授权的已选应用，在当前会话显示认证或明确说明不支持；不改变宿主授权规则 | 注册与调用归属对应实际 Linux 登录会话或进程，认证可取消；系统设置类操作按需扩展 |
 | SSH / GPG 与开发工具 | 默认使用 Linux 侧现有身份与 agent；需要交互时提供本会话可见路径。Windows 密钥代理另列可选功能 | Git 操作、SSH 密钥口令及 GPG 签名按实际工具选择验收，不把 KWallet 通过视为 agent 集成通过 |
 
-M1 已用本会话原生服务取代宿主调用桥接，见 [桌面服务实现](src/session_services.rs) 与 [验证记录](VALIDATION.md)。钱包打开可能同时要求应用授权和密码，见 [KWallet API](https://api.kde.org/kwallet-wallet.html)；Secret Service 也有独立的 [Prompt 流程](https://specifications.freedesktop.org/secret-service/latest/prompts.html)。把调用转发到宿主，并不会自动把宿主后端的窗口迁入 Waybridge。
+实现见 [桌面服务](src/session_services.rs) 与 [验证记录](VALIDATION.md)。默认使用原有用户总线上的 Secret Service/KWallet，解锁和应用授权沿用原生交互；SSH 密钥登录本身不提供钱包密码。
 
-采用普通桌面会话的方式：在 Waybridge 自己的 D-Bus 与显示环境启动原生桌面服务，直接复用 KWallet 本身的解锁和授权界面，不另做通用密码对话框。
+应用与用户服务共享用户数据和总线，Waybridge 配置当前显示和激活环境，不另做通用密码对话框。
 
-本机安装的是 KWallet 6.31.0，实际由 `kwalletd6` 兼容接口与 `ksecretd` 存储服务配合，见 [该版本说明](https://raw.githubusercontent.com/KDE/kwallet/v6.31.0/README.md)。2026 年 11 月 13 日使用同一 UID、两个私有 D-Bus、两套空的临时 XDG 目录及 Qt offscreen，已验证两组进程同时存活，各自拥有 KWallet、KSecretD 与 Secret Service 名称。后续 M1 验证已覆盖同用户两个真实 Waybridge 会话、Secret Service 提示在远程窗口显示/取消、服务重启激活、GTK Portal 选择 Unicode 文件及结束清理；测试使用专用数据，不访问宿主真实钱包。
+本机 KWallet 6.31.0 由 `kwalletd6` 兼容接口与 `ksecretd` 后端配合。历史双私有总线测试使用隔离数据，仅验证旧方案；当前策略见 [SESSION_POLICY.md](SESSION_POLICY.md)。
 
-原生启动需要区分两个层次：服务实例可随私有总线分开，钱包文件默认仍按用户数据目录定位。该版本后端把内存钱包写回文件，独立实例的并发合并不能由 D-Bus 隔离保证，见 [存储后端](https://raw.githubusercontent.com/KDE/kwallet/v6.31.0/src/runtime/kwalletbackend/kwalletbackend.cc)。当前使用会话专用的持久钱包与配置，断开查看端时保持，结束会话后数据仍保留；只对密钥服务设置相应目录，不把整个应用环境切换到空的数据目录。原有凭据共用、迁移及同一文件并发读写作为单独兼容项，未验证前不承诺支持。独立钱包需要重新登录或显式迁移；SSH 密钥登录本身不提供钱包密码。
+本地桌面与 Waybridge 轮流使用原有钱包、Chrome 等数据。创建时拒绝同用户已有图形桌面；启动后不拦截其他 DM。旧隔离数据保留，不自动合并或迁移。应用原有数据锁仍生效，不额外清理通用后台进程。
 
 Portal 的后端选择及服务激活环境需要随会话配置；仅给应用设置 `WAYLAND_DISPLAY` 不足以保证后续服务在同一会话启动，见 [Portal 系统集成](https://flatpak.github.io/xdg-desktop-portal/docs/system-integration.html) 与 [后端配置](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html)。文件选择还需保留 Flatpak 的文档访问授权。Windows 文件路径不能直接充当 Linux 应用可读路径。
 

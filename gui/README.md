@@ -1,5 +1,7 @@
 # Waybridge Control Center
 
+Linux 会话默认共享原有应用与钱包数据。创建前须注销同一用户的本地桌面，锁屏不够；自动连接优先接回已有 Waybridge，会拒绝第二个新会话。启动后再从其他 DM 登录交给该 DM，见 [会话策略](../SESSION_POLICY.md)。TLS 使用服务端的新版启动助手；使用 SSH 模式时需重新构建控制中心，以更新内嵌的 `session-control.py`。
+
 C# / .NET 10 + WinUI 3 控制中心，配套独立的 C++ 串流内核。提供 ARM64 与 x64 便携包。视频解码、DirectComposition、远端窗口、IME、音频和 OLE 仍由原生内核处理，GUI 只通过当前用户专用 named pipe 管理连接和设置。
 
 ## 开始使用

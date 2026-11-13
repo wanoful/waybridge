@@ -31,7 +31,7 @@ Waybridge 面向 Windows 端的专业软件办公与游戏，Linux 应用在自�
 | 阶段 | 已实现及验证 | 剩余验收或后续工作 |
 |---|---|---|
 | M0 | 两端文件接收移至有界工作队列；Windows 网络发送移出 UI；旧连接/选择结果失效；auto/HDR 解析一致、PNG 硬限制有明确回退；Linux 回归与原生 PE Wine 流程通过 | x64 WinUI、凭据管理器、文件选择及 VPN 流程已过；WoA、更多设备与网络性能基线待实机；入口继续拆分，GPU 同步仍可能阻塞 |
-| M1 | 独立 TLS 用户入口、配对/撤销、会话及应用管理；C# 管理与 C++ 独立 TLS 流；私有 D-Bus、原生钱包/GTK Portal、激活与清理；Chrome 会话 profile 和 Steam 冲突检测；断开及服务入口重启后接回 | x64/Tailscale 首轮已过，WoA 和更多网络待验收；原钱包迁移、Flatpak 文档授权及自定义 wrapper 需另测；ScreenCast 在 M4 实现 |
+| M1 | 独立 TLS 用户入口、配对/撤销、会话及应用管理；C# 管理与 C++ 独立 TLS 流；共享用户 D-Bus 与数据、原生钱包/GTK Portal、激活环境；单向创建检查与已有会话接回；断开及服务入口重启后接回 | x64/Tailscale 首轮已过，WoA 和更多网络待验收；原钱包迁移、Flatpak 文档授权及自定义 wrapper 需另测；ScreenCast 在 M4 实现 |
 | M2–M5 | 架构与支持范围已记录 | 尚未开始对应完整功能交付 |
 
 M0/M1 的自动验证入口为 `scripts/test-m0-m1.sh --with-wine`，覆盖范围与结果见 [VALIDATION.md](VALIDATION.md)。它验证真实 Linux 合成器、TLS 服务、.NET 管理链路与 Wine 原生 worker，不代表 WinUI 在 Windows 实机的交互验收。
@@ -62,10 +62,10 @@ M0/M1 的自动验证入口为 `scripts/test-m0-m1.sh --with-wine`，覆盖范�
 - 提供 Linux 用户级服务入口，支持配对、客户端信任及撤销、会话列举、创建、接入、启动应用与结束会话。
 - 已选用 rustls / SslStream / Schannel TLS，数据通道分别认证并绑定会话；业务 v3 保持兼容。QUIC、数据报与丢包调度比较留到 M2。
 - Windows 直接连接配置的 LAN/VPN 地址；SSH 继续用于迁移、可选管理及兼容隧道。
-- 统一 Waybridge 显示、私有 D-Bus、服务激活与配置环境，验证必要服务的启动、失败、恢复及结束清理。
+- 统一 Waybridge 显示、用户 D-Bus、服务激活与配置环境，验证必要服务的启动、失败、恢复及结束清理。
 - 在会话内启动钱包及合适的 Portal 后端，完成文件选择、链接和原生授权窗口流程；处理宿主单实例应用或 profile 冲突。
 
-退出条件：无宿主 DE、客户端无 OpenSSH 时完成配对、连接、启动、断开与接回；与现有桌面共存，窗口与服务不被宿主接管。原钱包并发共用单列兼容项，首轮采用服务专用的持久钱包与配置。
+退出条件：无宿主 DE、客户端无 OpenSSH 时完成配对、连接、启动、断开与接回；同一用户的本地桌面与 Waybridge 轮流使用，默认共享数据。创建时单向检查，启动后的 DM 登录不拦截，见 [会话策略](SESSION_POLICY.md)。
 
 ## M2 日常工作台预览
 

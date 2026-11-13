@@ -4,7 +4,7 @@
 
 本目录是 Git 仓库根目录：`src/` 是 Linux 合成器，`native/` 是编解码与 GPU 适配，`client/` 是 Windows 原生内核，`gui/` 是控制中心，`scripts/` 和 `tests/` 分别提供构建与验证入口。构建产物写入已忽略的 `target/`、`build/` 和 .NET `bin/`、`obj/`。
 
-现有能力与目标范围见 [功能规格](FEATURES.md)，技术边界见 [v1 架构基线](ARCHITECTURE.md)，里程碑与完成条件见 [Roadmap](ROADMAP.md)。M0/M1 已实现认证加密直连、用户级会话入口及私有桌面服务；SSH 保留为兼容入口。Linux/Wine 与 Windows 11 x64 首轮真机流程已通过，详见验收记录；更新版 ARM64、物理 HDR 及更多设备仍待验收。
+现有能力与目标范围见 [功能规格](FEATURES.md)，技术边界见 [架构](ARCHITECTURE.md)，里程碑见 [Roadmap](ROADMAP.md)。默认采用[共享用户数据与单向会话检查](SESSION_POLICY.md)：先注销同一用户的本地桌面，再创建 Waybridge；已有会话可以重连。M0/M1 设备验证与本次策略变更分开记录，见 [VALIDATION.md](VALIDATION.md)。
 
 同级 `../sunshine/` 和 `../moonlight/` 是未修改的本地参考源码，不纳入本仓库；参考版本见 [upstreams.json](upstreams.json)。完整 Git 历史与功能来源分支保留，早期提交使用 `waybridge/` 路径前缀。协议为独立 v3，普通 Moonlight 不能直接连接。
 
@@ -68,6 +68,8 @@ ssh -N -L 49090:127.0.0.1:49090 wano@<Linux-IP>
 
 以上是低层客户端的 SSH 兼容用法。原始 v3 TCP 协议自身不加密，需通过 TLS 入口或 SSH 等受保护传输；可选 UDP 媒体另有 AES-GCM 认证加密。认证握手和版本检查在任何窗口数据发送前完成；每个会话一次只允许一个查看端连接。
 
+升级后先结束旧版 Waybridge 会话，再创建新版会话。创建前请注销同一用户的本地桌面，锁屏不够。可先运行 `./target/release/waybridge --check-session` 查看结果；GUI/TLS/SSH 和直接启动均执行相同检查。已有 Waybridge 会话优先接回，第二个会话会被拒绝；启动后其他 DM 的登录交给该 DM。
+
 在 Waybridge 打开的终端内启动应用会继承正确的环境。从另一个 SSH 终端加入正在运行的会话，请使用：
 
 ```bash
@@ -75,16 +77,17 @@ ssh -N -L 49090:127.0.0.1:49090 wano@<Linux-IP>
 ./target/release/waybridge --launch -- hmcl-bin
 ./target/release/waybridge --launch -- vlc
 ./target/release/waybridge --launch -- mpv "/path/to/video.mkv"
-# Chrome 的独立 profile 避免把窗口交给宿主桌面已有的 Chrome 进程：
-./target/release/waybridge --launch -- google-chrome-stable \
-  --user-data-dir="$HOME/.local/share/waybridge-chrome"
+# 默认使用原有 Chrome 数据；显式 --user-data-dir 仍可选：
+./target/release/waybridge --launch -- google-chrome-stable
 ```
 
-自定义 socket 的会话同时指定 `--socket <名称>`。`--launch` 读取服务端写入的 0600 权限会话描述文件，自动带上私有 DISPLAY、Wayland、D-Bus 和音频环境，并清除宿主 fcitx/ibus 覆盖；不会修改宿主环境。过期描述会被拒绝，服务端正常退出时移除。不要仅设置 `WAYLAND_DISPLAY` 后直接在外部 SSH 启动应用，这会绕过会话的输入法、音频和 D-Bus 设置。已有 KWin 窗口不会迁移到这个会话。
+自定义 socket 的会话同时指定 `--socket <名称>`。`--launch` 读取 0600 权限描述文件，带上 Waybridge 的显示、用户 D-Bus、IME 和音频环境。过期描述会被拒绝，正常退出时移除。已有本地窗口不会迁入 Waybridge。
 
-私有 D-Bus 使用 Waybridge 桌面身份，原生启动已安装的 `ksecretd`、`kwalletd6`、Desktop Portal 及 GTK 后端；授权和文件选择对话框走普通远程窗口。钱包与 Portal 使用服务专用的持久配置，普通应用保留原有 XDG 数据路径；不转发宿主钱包、不改写宿主服务激活环境。服务状态路径由会话环境中的 `WAYBRIDGE_DESKTOP_SERVICES` 提供。原钱包迁移、已有浏览器登录及 Flatpak 文档授权另列兼容项；窗口共享尚未实现。
+会话使用标准用户 D-Bus、原有钱包及应用配置和数据。Waybridge 设置当前显示与服务激活环境，退出时恢复；钱包解锁和 Portal 文件选择使用现成原生界面。服务状态见 `WAYBRIDGE_DESKTOP_SERVICES`。不要求运行 KWin 或其他 DE；Flatpak 文档授权待逐项验证，窗口共享尚未实现。
 
-经控制中心应用目录或管理 API 启动的已识别原生 Chrome/Chromium 默认使用会话专用持久 profile 与 Secret Service 后端；显式指定的 profile/密码后端会保留。低层 `waybridge --launch` 仍按原 argv 启动，需要自行处理 profile。Steam 检测到同用户宿主实例时会提示先处理冲突，不会终止宿主进程。自定义 wrapper 与 Flatpak 启动器需逐项验证。
+控制中心、管理 API 和 `--launch` 均不自动添加 Chrome 的 `--user-data-dir` 或密码后端参数，默认使用原有数据，显式参数原样保留。旧 `~/.local/share/waybridge/sessions/` 隔离数据保留，不自动迁移或覆盖。数据目录占用沿用应用原有机制；现有 Steam 跨会话启动检查保留，不终止冲突进程。
+
+Chrome 会按桌面身份选择密码后端。原来使用 KDE/KWallet 6 的用户可运行 `waybridge --launch -- google-chrome-stable --password-store=kwallet6`，或将该选项保存在浏览器自身的用户 flags 中；这仍使用原有 profile。Waybridge 不自动转换密码存储后端，见 [Chromium 说明](https://chromium.googlesource.com/chromium/src/+/HEAD/docs/linux/password_storage.md)。
 
 正常启动 `./target/release/waybridge -- ghostty` 会自动启用已安装的 Xwayland，以及可用的私有音频 sink。`--no-xwayland` / `--no-audio` 可分别关闭；`--xwayland` / `--audio` 则要求该功能初始化成功，失败时直接报错。可选功能不可用时默认保留原生 Wayland 窗口。
 
@@ -260,14 +263,13 @@ LLVM_MINGW_ROOT=/path/to/llvm-mingw ./scripts/build-windows-arm64.sh
 
 也可在 Windows 上使用 MSVC/CMake 构建 `client/`。客户端使用 Win32、D3D11、DXGI、DirectComposition、GDI+、系统 Media Foundation 和系统剪贴板 API，无 WSL 或 Qt 运行时依赖。
 
-
-独立会话运行必需 `dbus-daemon`；管理入口需要 Python 3，应用目录启动需要 GIO。原生钱包和文件选择需要安装 `ksecretd`、`kwalletd6`、`xdg-desktop-portal`、GTK Portal 后端及 permission/document portal；缺少可选 provider 时状态文件明确报告不可用，本机验证组合为 KWallet 6.31.0。
+运行需要 systemd-logind 和可用的用户 D-Bus（dbus-daemon 或 dbus-broker），可用 `systemctl --user start dbus.service` 启动用户总线。管理入口需要 Python 3，应用目录需要 GIO。钱包与文件选择需安装所选 Secret Service/KWallet、`xdg-desktop-portal` 与 GTK 后端；缺少可选 provider 时状态文件报告不可用。
 
 按需功能依赖：X11 需要 `Xwayland`，音频需要 `pactl`/`parec` 和可用的 PulseAudio 或 PipeWire-Pulse；SVG 图标需要 `rsvg-convert`。CUDA/HDR 需要兼容 NVIDIA GPU/驱动及构建时 CUDA/GL 开发头；缺少 CUDA 头时仍可构建 CPU/PNG 路径。测试另需 Pillow、wl-clipboard、Wayland scanner、Qt6Widgets、Wine/Xvfb/MinGW；HDR 数值测试需要 NumPy。
 
 ## 构建后的测试
 
-以下命令均在 `waybridge` 目录执行。测试使用私有 Wayland socket、端口、Wine prefix/Xvfb 和音频 null sink；组合测试不会替换已有 49090 服务或修改默认音频输出。
+以下命令均在 `waybridge` 目录执行。组合脚本自动使用临时用户总线、模拟 logind 和临时用户数据，避免操作当前桌面的钱包或激活环境。单独运行旧图形回归时使用 `python tests/session_fixture.py python tests/<脚本>.py`；新的 admission 和 desktop-services 测试自带测试环境。
 
 ```bash
 ./scripts/test.sh
