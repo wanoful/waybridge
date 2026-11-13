@@ -17,6 +17,7 @@ mod shutdown;
 mod stream_config;
 mod toplevel_drag;
 mod transfer;
+mod transfer_worker;
 mod udp;
 mod video;
 mod window_semantics;
@@ -237,6 +238,7 @@ struct App {
     gpu_device: Option<Rc<waybridge_codec::GpuDevice>>,
     video_codec: Option<waybridge_codec::Codec>,
     video_allowed: bool,
+    hdr_requested: bool,
     stream_fps: u32,
     stream_bitrate: u32,
     read_only: bool,
@@ -281,7 +283,7 @@ struct App {
     clipboard_generation: u64,
     clipboard: BTreeMap<String, Vec<u8>>,
     clipboard_reads: Vec<(u64, String)>,
-    transfers: transfer::Transfers,
+    transfers: transfer_worker::Worker,
     drop_data: Option<Arc<Vec<u8>>>,
     drop_deadline: Option<Instant>,
     drop_accepted: bool,
@@ -1273,113 +1275,31 @@ impl App {
                 }
             }
             "tree_upload_begin" | "tree_upload_chunk" | "tree_upload_end"
-            | "tree_upload_commit" | "tree_upload_cancel" => {
-                let batch = value["batch"].as_u64().unwrap_or(0);
-                // Once a batch has failed/finished, queued chunks are stale.
-                // Report the first failure without flooding the control queue.
-                if !matches!(
+            | "tree_upload_commit" | "tree_upload_cancel" | "upload_begin" | "upload_chunk"
+            | "upload_end" | "upload_commit" => {
+                let Some(peer) = self.peer.clone() else {
+                    return;
+                };
+                if matches!(
                     value["type"].as_str(),
-                    Some("tree_upload_begin" | "tree_upload_cancel")
-                ) && !self.transfers.has_tree(batch)
+                    Some("tree_upload_commit" | "upload_commit")
+                ) && value["drop"].as_bool() == Some(true)
+                    && !self.windows.iter().any(|w| w.id == id && w.mapped)
                 {
+                    peer.control(if value["type"] == "tree_upload_commit" {
+                        json!({"type":"tree_upload_error","batch":value["batch"],"message":"File drop target is gone"})
+                    } else {
+                        json!({"type":"error","message":"File drop target is gone"})
+                    });
                     return;
                 }
-                let result = (|| -> Result<()> {
-                    if !self.peer.as_ref().is_some_and(|p| p.file_tree()) {
-                        bail!("file_tree capability required");
-                    }
-                    match value["type"].as_str().unwrap() {
-                        "tree_upload_begin" => {
-                            let metadata = value["entries"]
-                                .as_array()
-                                .context("missing tree entries")?;
-                            if metadata.is_empty() || metadata.len() > file_tree::MAX_ENTRIES {
-                                bail!("invalid tree entry count");
-                            }
-                            let entries: Vec<file_tree::Entry> =
-                                serde::Deserialize::deserialize(&value["entries"])?;
-                            let epoch =
-                                if value["drop"].as_bool() == Some(true) {
-                                    None
-                                } else {
-                                    Some(value["epoch"].as_u64().unwrap_or_else(|| {
-                                        self.peer.as_ref().unwrap().file_epoch()
-                                    }))
-                                };
-                            if epoch.is_some_and(|epoch| {
-                                epoch != self.peer.as_ref().unwrap().file_epoch()
-                            }) {
-                                bail!("clipboard upload superseded");
-                            }
-                            self.transfers.begin_tree(batch, entries, epoch)?;
-                            self.control(
-                                json!({"type":"tree_upload_ready","batch":batch,"stage":"begin"}),
-                            );
-                        }
-                        "tree_upload_chunk" => self.transfers.tree_chunk(
-                            batch,
-                            usize::try_from(value["file"].as_u64().context("missing file")?)?,
-                            value["data"].as_str().context("missing chunk")?,
-                        )?,
-                        "tree_upload_end" => self.transfers.tree_end(
-                            batch,
-                            usize::try_from(value["file"].as_u64().context("missing file")?)?,
-                        )?,
-                        "tree_upload_commit" => {
-                            if value["drop"].as_bool() == Some(true)
-                                && !self.windows.iter().any(|w| w.id == id && w.mapped)
-                            {
-                                bail!("drop target is gone");
-                            }
-                            let uris = self.transfers.finish_tree(
-                                batch,
-                                self.peer.as_ref().unwrap().file_epoch(),
-                                value["drop"].as_bool() == Some(true),
-                            )?;
-                            self.publish_uploaded_files(&value, uris);
-                            self.control(
-                                json!({"type":"tree_upload_ready","batch":batch,"stage":"commit"}),
-                            );
-                        }
-                        "tree_upload_cancel" => self.transfers.cancel_tree(batch),
-                        _ => {}
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = result {
-                    self.transfers.cancel_tree(batch);
-                    self.control(json!({"type":"tree_upload_error","batch":batch,"message":error.to_string()}));
-                }
-            }
-            "upload_begin" | "upload_chunk" | "upload_end" | "upload_commit" => {
-                let transfer_id = value["transfer"].as_u64().unwrap_or(0);
-                let result = (|| -> Result<()> {
-                    match value["type"].as_str().unwrap() {
-                        "upload_begin" => self.transfers.begin(
-                            transfer_id,
-                            value["name"].as_str().context("missing name")?,
-                            value["size"].as_u64().context("missing size")?,
-                        )?,
-                        "upload_chunk" => self.transfers.chunk(
-                            transfer_id,
-                            value["data"].as_str().context("missing chunk")?,
-                        )?,
-                        "upload_end" => self.transfers.end(transfer_id)?,
-                        "upload_commit" => {
-                            let ids: Vec<u64> = serde_json::from_value(value["transfers"].clone())?;
-                            let uris = self.transfers.finish(&ids)?;
-                            self.publish_uploaded_files(&value, uris);
-                            self.control(json!({"type":"upload_ready","files":ids.len()}));
-                        }
-                        _ => {}
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = result {
+                if !self
+                    .transfers
+                    .submit(peer.clone(), value, self.clipboard_generation)
+                {
+                    peer.control(json!({"type":"error","message":"File receiver queue is full; reconnect and retry"}));
+                    peer.close();
                     self.transfers.cancel();
-                    self.control(
-                        json!({"type":"error","message":format!("File transfer: {error}")}),
-                    );
                 }
             }
             _ => {}
@@ -1593,7 +1513,8 @@ impl App {
                         self.gpu_device.as_ref().filter(|_| {
                             self.video_codec.is_some_and(|codec| {
                                 peer.supports(codec, remote.id)
-                                    || (peer.hdr_allowed(remote.id)
+                                    || (self.hdr_requested
+                                        && peer.hdr_allowed(remote.id)
                                         && codec
                                             .hdr_variant()
                                             .is_some_and(|c| peer.supports(c, remote.id)))
@@ -1601,7 +1522,9 @@ impl App {
                         }),
                         &mut remote.gpu_source,
                         self.color_programs.as_ref(),
-                        self.video_codec.and_then(|c| c.hdr_variant()),
+                        self.video_codec
+                            .filter(|_| self.hdr_requested)
+                            .and_then(|c| c.hdr_variant()),
                     )?;
                     frame.video_eligible = remote.last_info["type"] == "window";
                     self.encoder.submit(frame);
@@ -2641,12 +2564,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(&runtime).join("waybridge.token"));
     let auth = token(&token_path)?;
     let (mut renderer, render_node) = make_renderer(args.render_node.as_ref())?;
-    let video_codec = match args.codec.as_str() {
-        "png" => None,
-        "hevc-nvenc" => Some(waybridge_codec::Codec::Hevc),
-        "av1-nvenc" => Some(waybridge_codec::Codec::Av1),
-        _ => Some(waybridge_codec::Codec::H264),
-    };
+    let video_codec = stream_config::resolve_codec(&args.codec, args.hdr == "experimental-scrgb")?;
     let gpu_device = if (args.gpu_input == "cuda" || args.hdr == "experimental-scrgb")
         && video_codec.is_some()
     {
@@ -2772,7 +2690,8 @@ fn main() -> Result<()> {
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
-    let transfers = transfer::Transfers::new(PathBuf::from(&runtime).join("waybridge-inbox"))?;
+    let transfers =
+        transfer_worker::Worker::new(PathBuf::from(&runtime).join("waybridge-inbox"), tx.clone())?;
     let fractional_scale = FractionalScaleManagerState::new::<App>(&dh);
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
@@ -2784,6 +2703,7 @@ fn main() -> Result<()> {
         gpu_device,
         video_codec,
         video_allowed: video_codec.is_some(),
+        hdr_requested: args.hdr == "experimental-scrgb",
         stream_fps: args.fps,
         stream_bitrate: args.bitrate,
         read_only: false,
@@ -2949,6 +2869,46 @@ fn main() -> Result<()> {
                     }
                 }
                 Event::Message(value) => app.message(value),
+                Event::UploadedFiles(completed) => {
+                    if !app.transfers.current(completed.epoch)
+                        || !app
+                            .peer
+                            .as_ref()
+                            .is_some_and(|peer| Arc::ptr_eq(peer, &completed.peer))
+                    {
+                        continue;
+                    }
+                    let value = &completed.message;
+                    let tree = value["type"] == "tree_upload_commit";
+                    let dropped = value["drop"].as_bool() == Some(true);
+                    let valid = if dropped {
+                        value["id"].as_u64().is_some_and(|id| {
+                            app.windows
+                                .iter()
+                                .any(|w| u64::from(w.id) == id && w.mapped)
+                        })
+                    } else {
+                        completed.clipboard_generation == app.clipboard_generation
+                            && (!tree
+                                || value["epoch"]
+                                    .as_u64()
+                                    .is_none_or(|epoch| epoch == completed.peer.file_epoch()))
+                    };
+                    if !valid {
+                        completed.peer.control(if tree {
+                            json!({"type":"tree_upload_error","batch":value["batch"],"message":"Upload target or clipboard was superseded"})
+                        } else {
+                            json!({"type":"error","message":"Upload target or clipboard was superseded"})
+                        });
+                        continue;
+                    }
+                    app.publish_uploaded_files(value, completed.uris);
+                    completed.peer.control(if tree {
+                        json!({"type":"tree_upload_ready","batch":value["batch"],"stage":"commit"})
+                    } else {
+                        json!({"type":"upload_ready","files":value["transfers"].as_array().map_or(0, Vec::len)})
+                    });
+                }
                 Event::Icon {
                     id,
                     revision,

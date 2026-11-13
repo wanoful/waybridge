@@ -85,6 +85,20 @@ def run(codec,kind,mode="chain"):
                 assert 'TEST injected fourth CUDA-frame rejection' in log_path.read_text()
                 print('PASS: real HDR GPU NVENC rejection retains accurately tonemapped current PNG/color/alpha and refreshes CPU without application repaint')
                 return
+            if mode=='policy':
+                first=parse(viewer.next(kind),kind)
+                explicit='hevc' if kind==7 else 'av1'
+                viewer.send(type='stream_config',request_id=1,codec=explicit,hdr=False,fps=60,bitrate=50000)
+                png=viewer.next(1)
+                assert Image.open(io.BytesIO(png[36:])).convert('RGBA').getpixel((initial[0]//2,initial[1]//2))[3]==128
+                # A client monitor request cannot override the global preference.
+                viewer.send(type='color_mode',id=first['id'],hdr=True)
+                viewer.next(1)
+                viewer.send(type='stream_config',request_id=2,codec=explicit,hdr=True,fps=60,bitrate=50000)
+                resumed=parse(viewer.next(kind),kind)
+                assert resumed['key'] and resumed['epoch']!=first['epoch']
+                print('PASS: HDR-only live policy changes invalidate capture, enforce SDR despite color_mode=true, then resume HDR with a fresh keyframe epoch')
+                return
             frames=[]
             for i in range(12):
                 if i:app.stdin.write('frame\n');app.stdin.flush()
@@ -143,4 +157,5 @@ if __name__=='__main__':
     native()
     run('hevc-nvenc',7);run('av1-nvenc',8)
     run('hevc-nvenc',7,'unnegotiated')
+    run('hevc-nvenc',7,'policy')
     run('hevc-nvenc',7,'fault')

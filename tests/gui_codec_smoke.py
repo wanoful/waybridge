@@ -3,12 +3,11 @@
 import io
 import os
 from pathlib import Path
-import signal
 import struct
 import tempfile
 import time
 from PIL import Image
-from gui_session_smoke import Rpc
+from gui_session_smoke import Rpc, stop_process
 from hardware_smoke import Viewer, decoded, ROOT
 
 
@@ -67,8 +66,7 @@ def main():
             rpc.close()
             for pid in (app_pid, server_pid):
                 if pid:
-                    try: os.kill(pid, signal.SIGTERM)
-                    except ProcessLookupError: pass
+                    stop_process(pid)
 
 
 if __name__ == "__main__":

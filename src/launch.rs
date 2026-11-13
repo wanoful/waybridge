@@ -102,7 +102,7 @@ pub struct Session {
     bus: Option<Child>,
     address: Option<String>,
     saved: Option<(PathBuf, u64, u64)>,
-    keyring: Option<crate::keyring::Bridge>,
+    services: Option<crate::keyring::Services>,
 }
 impl Session {
     pub fn new(
@@ -118,13 +118,21 @@ impl Session {
             bus: None,
             address: None,
             saved: None,
-            keyring: None,
+            services: None,
         };
         if available("dbus-daemon") {
+            let descriptor = descriptor(socket)?;
+            let runtime = descriptor
+                .parent()
+                .context("session descriptor directory")?;
+            session.services = Some(crate::keyring::Services::prepare(socket, runtime)?);
             let mut command = Command::new("dbus-daemon");
             session.configure(&mut command, audio);
             let mut child = command
-                .args(["--session", "--nofork", "--print-address=1"])
+                .arg("--config-file")
+                .arg(session.services.as_ref().unwrap().bus_config())
+                .args(["--nofork", "--print-address=1"])
+                .process_group(0)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .spawn()
@@ -137,14 +145,39 @@ impl Session {
                 bail!("private D-Bus daemon returned no Unix address");
             }
             session.address = Some(address.trim().into());
-            match crate::keyring::Bridge::new(session.address.as_deref().unwrap()) {
-                Ok(bridge) => session.keyring = bridge,
-                Err(error) => tracing::warn!(%error, "host keyring bridge unavailable"),
-            }
+            let mut environment = Command::new("env");
+            session.configure(&mut environment, audio);
+            let environment: BTreeMap<String, Option<String>> = environment
+                .get_envs()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            let address = session.address.as_deref().unwrap();
+            let bus =
+                crate::keyring::connect_private_bus(address, std::time::Duration::from_secs(2))?;
+            let activation: BTreeMap<&str, &str> = environment
+                .iter()
+                .filter_map(|(key, value)| value.as_deref().map(|value| (key.as_str(), value)))
+                .collect();
+            bus.call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "UpdateActivationEnvironment",
+                &activation,
+            )
+            .context("configuring private D-Bus activation environment")?;
+            session.services.as_mut().unwrap().start(
+                &environment,
+                session.bus.as_ref().unwrap().id(),
+                address,
+            )?;
         } else {
-            tracing::warn!(
-                "dbus-daemon unavailable; applications cannot share a private session bus"
-            );
+            bail!("dbus-daemon is required for an independent Waybridge application session");
         }
         let path = descriptor(socket)?;
         let mut command = Command::new("env");
@@ -179,14 +212,13 @@ impl Session {
         command
             .env("WAYLAND_DISPLAY", &self.socket)
             .env("XDG_SESSION_TYPE", "wayland")
-            .env(
-                "XDG_CURRENT_DESKTOP",
-                self.keyring.as_ref().map_or("Waybridge", |b| b.desktop()),
-            )
+            .env("XDG_CURRENT_DESKTOP", "Waybridge")
+            .env("XDG_SESSION_DESKTOP", "Waybridge")
+            .env("DESKTOP_SESSION", "Waybridge")
             .env("QT_QPA_PLATFORM", "wayland;xcb")
             .env("GDK_BACKEND", "wayland,x11");
-        if let Some(version) = self.keyring.as_ref().and_then(|b| b.kde_version()) {
-            command.env("KDE_SESSION_VERSION", version);
+        if let Some(services) = &self.services {
+            command.env("WAYBRIDGE_DESKTOP_SERVICES", services.status_file());
         }
         for name in [
             "XDG_RUNTIME_DIR",
@@ -212,6 +244,12 @@ impl Session {
             "DBUS_SESSION_BUS_ADDRESS",
             "DBUS_STARTER_ADDRESS",
             "DBUS_STARTER_BUS_TYPE",
+            "KDE_SESSION_VERSION",
+            "GNOME_DESKTOP_SESSION_ID",
+            "SESSION_MANAGER",
+            "XDG_ACTIVATION_TOKEN",
+            "DESKTOP_STARTUP_ID",
+            "WAYLAND_SOCKET",
         ] {
             command.env_remove(name);
         }
@@ -230,13 +268,23 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        self.keyring.take();
         if let Some((path, dev, ino)) = &self.saved {
             if fs::symlink_metadata(path).is_ok_and(|m| m.dev() == *dev && m.ino() == *ino) {
                 let _ = fs::remove_file(path);
             }
         }
         if let Some(child) = self.bus.as_mut() {
+            // The unreaped bus PID reserves this process-group ID. Providers
+            // and D-Bus-activated children inherit this owned group; terminating
+            // it cannot target a host user's unrelated desktop service.
+            let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
+        }
+        self.services.take();
+        if let Some(child) = self.bus.as_mut() {
+            // D-Bus-activated replacements are not necessarily direct children
+            // of our service manager. After graceful teardown, terminate any
+            // remaining members before reaping the PID that reserves this PGID.
+            let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.kill();
             let _ = child.wait();
         }

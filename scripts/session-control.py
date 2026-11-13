@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Structured, same-user session control, transported over an authenticated SSH channel."""
+"""Structured same-user session control used by authenticated TLS and SSH entries."""
 import configparser
+import ctypes
+import ctypes.util
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -16,6 +20,39 @@ import uuid
 
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+BROWSERS = {
+    "chrome": "google-chrome", "google-chrome": "google-chrome", "google-chrome-stable": "google-chrome",
+    "google-chrome-beta": "google-chrome-beta", "google-chrome-unstable": "google-chrome-unstable",
+    "chromium": "chromium", "chromium-browser": "chromium",
+    "brave": "brave", "brave-browser": "brave", "brave-browser-stable": "brave",
+    "brave-browser-beta": "brave-beta", "brave-browser-nightly": "brave-nightly",
+    "microsoft-edge": "microsoft-edge", "microsoft-edge-stable": "microsoft-edge",
+    "microsoft-edge-beta": "microsoft-edge-beta", "microsoft-edge-dev": "microsoft-edge-dev",
+}
+# Chromium's documented --user-data-dir and --password-store=gnome-libsecret
+# provide per-application routing without changing the session's DE identity:
+# https://chromium.googlesource.com/chromium/src/+/HEAD/docs/user_data_dir.md
+# https://chromium.googlesource.com/chromium/src/+/HEAD/docs/linux/password_storage.md
+SANDBOX_BROWSERS = {"com.google.Chrome", "org.chromium.Chromium", "com.brave.Browser", "com.microsoft.Edge"}
+KNOWN_BROWSER_IDS = {executable + ".desktop" for executable in BROWSERS} | {app + ".desktop" for app in SANDBOX_BROWSERS}
+BROWSER_WRAPPER = '''import os,sys
+profile,argv=sys.argv[1],sys.argv[2:]
+def present(key):
+    found=False
+    names=(key,"-"+key.lstrip("-"))
+    for value in argv[1:]:
+        if value=="--": break
+        for option in names:
+            if value==option: raise SystemExit("Browser launch option requires =VALUE: "+key)
+            if value.startswith(option+"="):
+                if not value[len(option)+1:]: raise SystemExit("Browser launch option requires a value: "+key)
+                found=True
+    return found
+extra=[]
+if not present("--user-data-dir"): extra.append("--user-data-dir="+profile)
+if not present("--password-store"): extra.append("--password-store=gnome-libsecret")
+os.execvpe(argv[0],[argv[0],*extra,*argv[1:]],os.environ)
+'''
 
 
 def name(value):
@@ -49,7 +86,7 @@ def descriptor(session):
         raise ValueError("Update/restart the Linux server to publish connection information")
     address, port = connection["listen"].rsplit(":", 1)
     if address not in ("127.0.0.1", "localhost", "0.0.0.0", "[::1]", "[::]"):
-        raise ValueError("This session is not available through a loopback SSH tunnel")
+        raise ValueError("This session is not available through the loopback session gateway")
     if not 1 <= int(port) <= 65535:
         raise ValueError("Invalid session port")
     return saved
@@ -157,7 +194,7 @@ def ensure(request):
             args += ["--no-xwayland"]
         if request.get("udp", False):
             args += ["--udp-listen", f"0.0.0.0:{port}"]
-        # New session/process group and detached stdio survive SSH disconnect.
+        # Detached session/process group and stdio survive entry-point disconnect.
         # Do not adopt or restart any preexisting service.
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log,
                                    stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
@@ -217,6 +254,194 @@ def app_catalog():
     return sorted(apps, key=lambda item: item["name"].casefold())
 
 
+def private_directory(path):
+    path.mkdir(mode=0o700, exist_ok=True)
+    meta = path.lstat()
+    if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.getuid() or meta.st_mode & 0o077:
+        raise ValueError("Application launch directory must be private and owned by this user")
+    return path
+
+
+def private_write(path, contents):
+    if path.exists() or path.is_symlink():
+        secure_read(path, 65536)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def browser_profile(session, saved, family):
+    environment = saved.get("environment", {})
+    data = Path(environment.get("XDG_DATA_HOME") or os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    # The same stable socket identity used by native desktop services. No host
+    # browser data is copied, opened or renamed.
+    display = Path(environment.get("WAYLAND_DISPLAY") or session)
+    if not display.is_absolute():
+        display = RUNTIME / display
+    profile = hashlib.sha256(os.fsencode(display)).hexdigest()[:32]
+    if not data.exists():
+        data.mkdir(mode=0o700, parents=True)
+    current = data
+    for part in ("waybridge", "sessions", profile, "browser-profiles", family):
+        current = private_directory(current / part)
+    return current
+
+
+def option_present(argv, key):
+    found = False
+    names = (key, "-" + key.lstrip("-"))
+    for value in argv[1:]:
+        if value == "--":
+            break
+        for option in names:
+            if value == option:
+                raise ValueError("Browser launch option requires =VALUE: " + key)
+            if value.startswith(option + "="):
+                if not value[len(option) + 1:]:
+                    raise ValueError("Browser launch option requires a value: " + key)
+                found = True
+    return found
+
+
+def browser_arguments(argv, profile):
+    extra = []
+    if not option_present(argv, "--user-data-dir"):
+        extra.append("--user-data-dir=" + str(profile))
+    if not option_present(argv, "--password-store"):
+        extra.append("--password-store=gnome-libsecret")
+    return [argv[0], *extra, *argv[1:]]
+
+
+def desktop_executable(path):
+    # Let GIO interpret Desktop Entry escaping and the executable token. The
+    # eventual launch remains `gio launch`; field codes are never shell-evaluated.
+    gio = ctypes.CDLL(ctypes.util.find_library("gio-2.0") or "libgio-2.0.so.0")
+    gobject = ctypes.CDLL(ctypes.util.find_library("gobject-2.0") or "libgobject-2.0.so.0")
+    gio.g_desktop_app_info_new_from_filename.argtypes = [ctypes.c_char_p]
+    gio.g_desktop_app_info_new_from_filename.restype = ctypes.c_void_p
+    gio.g_app_info_get_executable.argtypes = [ctypes.c_void_p]
+    gio.g_app_info_get_executable.restype = ctypes.c_char_p
+    gobject.g_object_unref.argtypes = [ctypes.c_void_p]
+    app = gio.g_desktop_app_info_new_from_filename(os.fsencode(path))
+    if not app:
+        return ""
+    try:
+        executable = gio.g_app_info_get_executable(app)
+        return os.fsdecode(executable) if executable else ""
+    finally:
+        gobject.g_object_unref(app)
+
+
+def desktop_argument(value):
+    # Desktop Entry string escaping precedes its command quoting rules. Percent
+    # field codes in our literal paths must also be escaped for GIO expansion.
+    value = str(value).replace("%", "%%")
+    quoted = '"' + "".join("\\" + char if char in '\\"`$' else char for char in value) + '"'
+    return quoted.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def browser_desktop(app, profile):
+    config = configparser.ConfigParser(interpolation=None, strict=False)
+    config.optionxform = str
+    config.read(app["path"], encoding="utf-8")
+    entry = config["Desktop Entry"]
+    command = entry.get("Exec")
+    if not command:
+        raise ValueError("Browser desktop entry does not provide an Exec command")
+    directory = private_directory(RUNTIME / "waybridge-launch")
+    directory = private_directory(directory / name(app["session"]))
+    wrapper = directory / "browser-wrapper.py"
+    private_write(wrapper, BROWSER_WRAPPER)
+    entry["Exec"] = " ".join(desktop_argument(part) for part in (sys.executable, "-I", wrapper, profile)) + " " + command
+    # Only the derived browser entry bypasses D-Bus activation, so GIO executes
+    # the profile-aware wrapper instead of forwarding to a host singleton.
+    entry["DBusActivatable"] = "false"
+    path = directory / (hashlib.sha256(os.fsencode(app["path"])).hexdigest()[:24] + ".desktop")
+    output = io.StringIO()
+    config.write(output, space_around_delimiters=False)
+    private_write(path, output.getvalue())
+    return ["gio", "launch", str(path)]
+
+
+def selected_process_environment(path):
+    wanted = {b"DISPLAY", b"WAYLAND_DISPLAY", b"DBUS_SESSION_BUS_ADDRESS"}
+    result = {}
+    # Keep only these routing fields; never retain or print unrelated values.
+    key, value, reading_value, selected = bytearray(), bytearray(), False, False
+    with path.open("rb", buffering=0) as stream:
+        total = 0
+        while chunk := stream.read(4096):
+            total += len(chunk)
+            if total > 1024 * 1024:
+                raise ValueError("Steam process environment exceeds routing metadata limit")
+            for byte in chunk:
+                if byte == 0:
+                    if selected:
+                        result[bytes(key).decode()] = bytes(value).decode(errors="replace")
+                    key, value, reading_value, selected = bytearray(), bytearray(), False, False
+                elif not reading_value:
+                    if byte == ord("="):
+                        reading_value, selected = True, bytes(key) in wanted
+                    elif len(key) < 64:
+                        key.append(byte)
+                elif selected:
+                    if len(value) >= 8192:
+                        raise ValueError("Steam display routing metadata exceeds limit")
+                    value.append(byte)
+    return result
+
+
+def check_steam_instance(saved, processes=None):
+    expected = saved.get("environment", {})
+    for process in Path("/proc").iterdir() if processes is None else processes:
+        if not process.name.isdigit():
+            continue
+        known_steam = False
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            if (process / "comm").read_text().strip() != "steam":
+                continue
+            known_steam = True
+            executable = Path(os.readlink(process / "exe")).name.removesuffix(" (deleted)")
+            if executable != "steam":
+                continue
+            started = identity(int(process.name))
+            actual = selected_process_environment(process / "environ")
+            if identity(int(process.name)) != started:
+                continue
+            bus_matches = bool(expected.get("DBUS_SESSION_BUS_ADDRESS")) and actual.get("DBUS_SESSION_BUS_ADDRESS") == expected["DBUS_SESSION_BUS_ADDRESS"]
+            if expected.get("DISPLAY"):
+                display_matches = actual.get("DISPLAY") == expected["DISPLAY"]
+            else:
+                display_matches = bool(expected.get("WAYLAND_DISPLAY")) and actual.get("WAYLAND_DISPLAY") == expected["WAYLAND_DISPLAY"] and not actual.get("DISPLAY")
+            if not (bus_matches and display_matches):
+                raise ValueError("Steam is already running outside this Waybridge session. Close that Steam instance, then launch Steam here; Waybridge will not stop it automatically.")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            if known_steam:
+                raise ValueError("Cannot verify an existing Steam instance's session. Close Steam outside Waybridge, then retry.") from None
+
+
+def launch_policy(argv, session, saved):
+    executable = Path(argv[0]).name
+    if executable == "flatpak" and "run" in argv[1:] and any(value in SANDBOX_BROWSERS | {"com.valvesoftware.Steam"} for value in argv[1:]):
+        raise ValueError("Managed browser/Steam launch through this sandbox wrapper is not supported. Launch a native executable or configure and verify a dedicated sandbox profile explicitly.")
+    if executable in BROWSERS:
+        return browser_arguments(argv, browser_profile(session, saved, BROWSERS[executable]))
+    if executable in ("steam", "steam.sh"):
+        check_steam_instance(saved)
+    return argv
+
+
 def dispatch(request):
     operation = request.get("op")
     if operation == "hello":
@@ -239,12 +464,23 @@ def dispatch(request):
                 raise ValueError("Application is not in the installed desktop catalog")
             if not shutil.which("gio"):
                 raise ValueError("gio is required to launch desktop applications")
-            argv = ["gio", "launch", app["path"]]
+            executable = Path(desktop_executable(app["path"])).name
+            if executable in BROWSERS:
+                app["session"] = session
+                argv = browser_desktop(app, browser_profile(session, saved, BROWSERS[executable]))
+            elif executable in ("steam", "steam.sh"):
+                check_steam_instance(saved)
+                argv = ["gio", "launch", app["path"]]
+            elif app["id"] in KNOWN_BROWSER_IDS or app["id"] in ("steam.desktop", "com.valvesoftware.Steam.desktop"):
+                raise ValueError("This browser or Steam desktop entry uses an unsupported wrapper or sandbox. Launch its native executable explicitly in Waybridge, or configure a dedicated profile before using the wrapper.")
+            else:
+                argv = ["gio", "launch", app["path"]]
         else:
             argv = request.get("argv")
             if not isinstance(argv, list) or not 1 <= len(argv) <= 128 or not all(
                     isinstance(v, str) and "\0" not in v and len(v) <= 8192 for v in argv) or not argv[0]:
                 raise ValueError("Launch requires an argument array or installed desktop application")
+            argv = launch_policy(argv, session, saved)
         with owned_log(session) as log:
             process = subprocess.Popen([binary, "--socket", session, "--launch", "--", *argv],
                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,

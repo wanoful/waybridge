@@ -15,6 +15,7 @@ use std::{
 };
 
 pub enum Event {
+    UploadedFiles(crate::transfer_worker::Completed),
     DragFiles {
         id: u64,
         result: Result<crate::drag::Export, String>,
@@ -367,7 +368,7 @@ impl Peer {
         self.wake.notify_all();
         true
     }
-    fn close(&self) {
+    pub fn close(&self) {
         if let Some(udp) = &self.udp {
             udp.cancel();
         }

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import select
 import signal
 import subprocess
 import tempfile
@@ -20,6 +21,24 @@ def wait(check, timeout=15):
             return value
         time.sleep(.025)
     raise AssertionError("GUI session fixture timed out")
+
+
+def stop_process(pid, timeout=10):
+    """Wait for owned detached fixtures, including private portal/FUSE teardown."""
+    try:
+        descriptor = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        try:
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        if not select.select([descriptor], [], [], timeout)[0]:
+            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            assert select.select([descriptor], [], [], 3)[0], "fixture failed to stop"
+    finally:
+        os.close(descriptor)
 
 
 class Rpc:
