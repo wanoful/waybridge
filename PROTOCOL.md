@@ -1,5 +1,13 @@
 # Waybridge protocol v3
 
+## Authenticated TLS entry
+
+`waybridge-service` accepts TLS 1.2/1.3 on port 49092 by default. Management uses bounded LF-delimited JSON. Each native control/media/audio socket independently checks the leaf DER SHA-256 pin **before** sending `{id:1,op:"stream",client_id,client_token,session}\n`. On `{id:1,ok:true,result:{stream_ready:true,version:3}}\n`, that same TLS socket carries the unchanged binary v3 framing below, including the existing token/media-key handshake. The entry validates the target session and forwards only to its owned loopback listener. Client revocation closes its active streams. Pairing, trust persistence, authorization scope and limits are specified in [service/README.md](service/README.md).
+
+Raw v3 listeners remain local compatibility endpoints. The TLS gateway and SSH tunnel are protected transports for the same business protocol.
+
+## Packet framing
+
 All TCP packets begin with a big-endian u32 length counting the kind byte and body, in `1..=75497472`. Unsupported or malformed framing closes the connection. Binary channels are distinct:
 
 | Kind | Body |
@@ -12,19 +20,19 @@ All TCP packets begin with a big-endian u32 length counting the kind byte and bo
 | 6 | Ordered UDP TCP-repair container, wrapping original kinds 1/2/4/5/7/8 |
 | 7 / 8 | Experimental HEVC / AV1 Main10 PQ + optional raw-half alpha16 PNG |
 
-First client message: `{"type":"hello","version":3,"token":"...","dpi":168,"work_width":3840,"work_height":2080}`. Authentication and exclusive viewer ownership precede window/media announcements. The server replies with `codec:"mixed"`, `codecs`, `features` and a random per-session `media_key`. Both ends must use v3. DPI defaults to 96; work dimensions are physical monitor work-area pixels. This TCP protocol is not intrinsically encrypted; use the local listener through SSH or another trusted protected transport. UDP media has its own AEAD, whose keys travel on the authenticated control connection.
+First client message: `{"type":"hello","version":3,"token":"...","dpi":168,"work_width":3840,"work_height":2080}`. Authentication and exclusive viewer ownership precede window/media announcements. The server replies with `codec:"mixed"`, `codecs`, `features` and a random per-session `media_key`. Both ends must use v3. DPI defaults to 96; work dimensions are physical monitor work-area pixels. This TCP protocol is not intrinsically encrypted; use the local listener through the TLS entry, SSH or another trusted protected transport. UDP media has its own AEAD, whose keys travel on the authenticated control connection.
 
 Optional client hello fields are `split_media`, `frame_ack`, `cursor_v1`, `window_icon_v1`, `window_semantics_v1`, `pointer_lock`, `toplevel_drag_v1`, `file_drop_out`, `file_tree`, `audio_pcm`, `udp_fec_v1`, `codecs`, `hdr` and `color_spaces`. Enable extensions only as described in their sections; the server advertises `ime_v3` for local text input. Missing fields retain compatible v3 behavior. `features` lists implemented extensions, not proof that a GPU/decoder/device is usable.
 
-A viewer advertises `png_rgba` unconditionally. It adds `h264_alpha`, `hevc_alpha` or `av1_alpha` only after an actual synchronous D3D11-aware system MFT decodes a small access unit to a timestamp-matching NV12 GPU texture. HEVC/AV1 use dynamically loaded `MFTEnumEx`; missing enumeration/decoder/GPU support keeps PNG available. Main10 has additional checks below. The server advertises implemented formats; driver/size/resource failures may still select PNG. `auto` continues to choose H.264, not whichever codec appears newest.
+A viewer advertises `png_rgba` unconditionally. It adds `h264_alpha`, `hevc_alpha` or `av1_alpha` only after an actual synchronous D3D11-aware system MFT decodes a small access unit to a timestamp-matching NV12 GPU texture. HEVC/AV1 use dynamically loaded `MFTEnumEx`; missing enumeration/decoder/GPU support keeps PNG available. Main10 has additional checks below. The server advertises implemented formats; driver/size/resource failures may still select PNG. `auto` chooses H.264 for SDR and HEVC when HDR is requested; actual output still requires the relevant negotiated capability.
 
 ## Media connection
 
-A viewer requesting `split_media:true` opens a second TCP connection to the same address and port. Authenticate it with `{"type":"hello","version":3,"token":"...","channel":"media","media_key":"..."}`. Only the current viewer's random key is accepted, and only one media socket attaches. The server replies `media_ready`, then sends frame kinds 1/2/4/5/7/8 over this socket. Input, window control, clipboard and file messages stay on the control socket. Socket failure closes the session; reconnect restores live windows. Existing SSH forwarding carries both connections. Test/simple viewers may omit `split_media` to multiplex on one socket.
+A viewer requesting `split_media:true` opens a second TCP connection to the same address and port. Authenticate it with `{"type":"hello","version":3,"token":"...","channel":"media","media_key":"..."}`. Only the current viewer's random key is accepted, and only one media socket attaches. The server replies `media_ready`, then sends frame kinds 1/2/4/5/7/8 over this socket. Input, window control, clipboard and file messages stay on the control socket. Socket failure closes the session; reconnect restores live windows. The TLS entry and existing SSH forwarding carry both connections. Test/simple viewers may omit `split_media` to multiplex on one socket.
 
 ## Optional UDP/FEC v1
 
-Server `--udp-listen` plus client hello `udp_fec_v1:true`, `split_media:true`, `frame_ack:true` are all required. The server hello contains `udp_fec_v1:{version:1,session:"<u64 decimal>",port,tx_key:"<base64 32 bytes>",rx_key:"<base64 32 bytes>",chunk:1024,group:8}` or null. Keys are named from the server's perspective and **must travel over SSH** with the control connection; the default TCP protocol is not intrinsically encrypted. Client uses an explicitly configured directly reachable UDP endpoint, independently of its tunneled TCP address. Fresh keys/session are generated on reconnect. No audio negotiation is changed.
+Server `--udp-listen` plus client hello `udp_fec_v1:true`, `split_media:true`, `frame_ack:true` are all required. The server hello contains `udp_fec_v1:{version:1,session:"<u64 decimal>",port,tx_key:"<base64 32 bytes>",rx_key:"<base64 32 bytes>",chunk:1024,group:8}` or null. Keys are named from the server's perspective and **must travel over an authenticated encrypted control connection**, such as the TLS entry or SSH; raw v3 TCP is not intrinsically encrypted. Client uses an explicitly configured directly reachable UDP endpoint, independently of its tunneled TCP address. Fresh keys/session are generated on reconnect. No audio negotiation is changed.
 
 Datagrams are at most 1080 bytes: clear header `"WBU1" + u64 session + u64 counter` (big-endian), AES-256-GCM ciphertext, 16-byte GCM tag. The whole 20-byte clear header is AAD. The 12-byte nonce is four zero bytes followed by that direction's nonzero u64 counter; every sealed datagram consumes a new counter, including parity and keepalives. Keys are distinct per direction; counter overflow fails rather than reuses a nonce. Client rejects authenticated duplicates and counters older than a 4096-packet replay window. Client keepalives are a single encrypted zero byte; server accepts increasing counters from the first authenticated endpoint only. No unauthenticated amplification or automatic NAT rebinding.
 
@@ -40,7 +48,7 @@ Implementation API references: [ring AEAD nonce requirements](https://docs.rs/ri
 
 ## Optional audio connection
 
-Both hellos negotiate `audio_pcm:true`; the server only offers it with `--audio`. The viewer authenticates a separate TCP connection on the same listener using `{"type":"hello","version":3,"token":"...","channel":"audio","media_key":"..."}`. Only one audio channel attaches to the current viewer; it receives `audio_ready`. Failure of this optional channel leaves control/video running. It can use the existing SSH forward. Legacy v3 peers without the capability receive no audio.
+Both hellos negotiate `audio_pcm:true`; the server only offers it with `--audio`. The viewer authenticates a separate TCP connection on the same listener using `{"type":"hello","version":3,"token":"...","channel":"audio","media_key":"..."}`. Only one audio channel attaches to the current viewer; it receives `audio_ready`. Failure of this optional channel leaves control/video running. It can use the TLS entry or existing SSH forward. Legacy v3 peers without the capability receive no audio.
 
 Audio packet kind **3** has a 28-byte big-endian header: `u32 rate`, `u16 channels`, `u16 bits`, `u32 frames`, `u64 sequence`, `u64 source_elapsed_us`, followed by interleaved signed **little-endian** PCM. This version emits 480 frames at 48000 Hz, stereo 16-bit (1920 PCM bytes, 10 ms). Timestamps are source-local and do not imply a synchronized viewer clock. Capture spans only the server's private session sink; no microphone or default monitor capture.
 
@@ -69,8 +77,8 @@ H.264 kind 2 uses the same 36-byte geometry header, followed by six u32 fields: 
 HEVC kind **4** and AV1 kind **5** are optional v3 extensions. They reuse the exact
 60-byte geometry/epoch/coded-size/key/color-length/alpha-length header above. The
 kind identifies the codec; it must match an explicitly advertised client capability.
-The server's default `--codec auto` continues to select H.264, including when a
-viewer supports all codecs. `--codec hevc-nvenc` or `--codec av1-nvenc` explicitly
+The server's default `--codec auto` selects H.264 for SDR and HEVC when
+HDR is requested, subject to viewer capabilities. `--codec hevc-nvenc` or `--codec av1-nvenc` explicitly
 selects the new codec; a viewer omitting that capability receives PNG. No new codec
 is sent speculatively to an old viewer.
 
@@ -128,9 +136,9 @@ Focus loss and disconnection release held keys/buttons. Stale loss/leave events 
 
 ## Experimental scRGB / Main10 HDR
 
-Default is 8-bit BT.709 SDR. Linux must enable `--hdr experimental-scrgb` with `--codec hevc-nvenc` or `av1-nvenc`; Windows must opt in with `WAYBRIDGE_HDR=1`. The server hello reports `hdr`, `color_spaces` (`bt709_sdr`, optionally `bt2020_pq`) and `color_depths` (8, optionally 10). The viewer must explicitly send `hdr:true`, include `bt2020_pq` and advertise `hevc_main10_pq_alpha16` and/or `av1_main10_pq_alpha16`. A codec string alone never enables HDR. Client runtime probes must actually decode a Main10 sample into P010, create usable P010 plane views and verify FP16/scRGB composition support; an active-HDR monitor is also required for that window.
+Default is 8-bit BT.709 SDR. Linux must enable `--hdr experimental-scrgb` with `--codec auto`, `hevc-nvenc` or `av1-nvenc`; Windows must opt in with `WAYBRIDGE_HDR=1`. The server hello reports `hdr`, `color_spaces` (`bt709_sdr`, optionally `bt2020_pq`) and `color_depths` (8, optionally 10). The viewer must explicitly send `hdr:true`, include `bt2020_pq` and advertise `hevc_main10_pq_alpha16` and/or `av1_main10_pq_alpha16`. A codec string alone never enables HDR. Client runtime probes must actually decode a Main10 sample into P010, create usable P010 plane views and verify FP16/scRGB composition support; an active-HDR monitor is also required for that window.
 
-`color_mode {id,hdr:true|false}` selects the monitor policy for a live toplevel. It is subject to negotiated HDR/codecs, never a bypass. Display/move/settings changes re-evaluate the native monitor. No system display setting is changed. An SDR monitor or unsupported path produces SDR; decoding/presentation failures request codec-bound PNG fallback for the rest of the viewer session.
+`color_mode {id,hdr:true|false}` selects the monitor policy for a live toplevel. It is subject to the current global HDR preference and negotiated HDR/codecs, never a bypass. Display/move/settings changes re-evaluate the native monitor. No system display setting is changed. An SDR monitor or unsupported path produces SDR; decoding/presentation failures request codec-bound PNG fallback for the rest of the viewer session.
 
 Only Wayland surfaces explicitly tagged through `wp_color_manager_v1.create_windows_scrgb` enter this HDR subset. Linear Rec.709 scRGB uses 80 nits per unit. A true RGBA16F target composites the surface tree; untagged SDR subsurfaces are converted from sRGB to linear before blending. Same-GPU CUDA unpremultiplies and converts to BT.2020 non-constant-luminance/PQ limited-range P010. HEVC kind7 and AV1 kind8 carry 10-bit 4:2:0 Main10 access units with PQ/BT.2020 metadata. Their fixed 60-byte video header is identical to kinds 2/4/5; stream epoch, independent key frame, coded padding, exact sequence pairing and two presentation credits retain the same meaning.
 
@@ -425,12 +433,11 @@ Windows 10/11 device validation.
 ## Live stream settings and GUI worker control
 
 The v3 hello advertises `stream_config_v1`. A negotiated viewer may send
-`stream_config {request_id,fps,bitrate,codec,read_only}`; FPS is 1–120,
+`stream_config {request_id,fps,bitrate,codec,hdr,read_only}`; FPS is 1–120,
 bitrate is 1000–200000 kbps **per video window**, and codec is
 `auto|h264|hevc|av1|png`. The reply has the same type/request ID and `ok`;
-success includes accepted settings, failure includes `message` and changes nothing.
-The initial server `--codec png` remains a hard PNG policy. Auto selects H.264;
-viewer capability/fallback and HDR selection still govern actual frame encoding.
+success includes accepted settings, `requested_codec`, `hdr_requested`, and the resolved `codec`; failure includes `message` and changes nothing. Optional `hdr` preserves the prior preference when absent.
+The initial server `--codec png` remains a hard PNG policy: a later video request returns PNG with `fallback_reason:"session_video_disabled"`. Auto selects H.264 for SDR and HEVC when HDR is requested; viewer capability/fallback and per-window HDR selection still govern actual frame encoding. HDR-only preference changes also invalidate capture and reconfigure encoding.
 Changing FPS/bitrate/codec clears cached encoder sessions on the encoder worker;
 new video starts with a fresh epoch and independent keyframe. Already in-flight
 frames remain valid and must still be acknowledged. Entering read-only releases
@@ -441,7 +448,7 @@ an active outbound operation when disabled.
 The optional Windows launch form `waybridge-client.exe --control-pipe NAME`
 connects to a randomly named, current-user-only pipe owned by the GUI. It accepts
 UTF-8 newline-delimited JSON, at most 64 KiB per request. The first request is
-`{type:"start",version:1,host,port,token,settings}`. Authentication stays inside
+`{type:"start",version:1,host,port,token,settings,transport?}`. Optional `transport` is `{type:"tls",fingerprint,client_id,client_token,session}`; `host`/`port` then identify the TLS entry and `token` remains the backend v3 credential. Without it the worker uses the legacy socket transport. Authentication stays inside
 the pipe; it is absent from the worker command line. Subsequent commands are
 `settings {settings}`, `status`, `send_files {paths}`, `focus_window {id}` and
 `disconnect`. Pipe EOF stops the local worker without terminating remote apps.
@@ -464,3 +471,5 @@ add optional `connection {listen,token_file}` for new GUI attachment, retaining
 old CLI launch compatibility. Descriptors and tokens must be same-user private
 regular files. A pidfd plus `/proc` start identity pins an explicit shutdown to
 the expected server. Detaching the SSH helper leaves daemonized sessions alive.
+
+Managed application launch in both TLS and SSH modes uses the same helper. Recognized native Chrome/Chromium launches receive a persistent session-specific user-data directory and scoped Secret Service backend unless explicitly configured. Derived browser desktop entries preserve GIO field expansion; other desktop entries retain normal GIO behavior. Detected host Steam instances fail with an actionable conflict rather than forwarding silently. Low-level compositor `--launch` retains literal argv behavior.

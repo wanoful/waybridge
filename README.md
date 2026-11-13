@@ -1,30 +1,41 @@
 # Waybridge 0.3.0
 
-这是整合了 14 项并行功能的 Linux → Windows 独立应用窗口原型。服务端是私有无头 Smithay Wayland 合成器，可选择启动 rootless Xwayland；不接入 KWin，不迁移已有桌面窗口。Windows 客户端为 Win32，提供 x64 和原生 ARM64 构建。功能来源见 [整合清单](PARALLEL_FEATURES.md)，实际验收范围见 [VALIDATION.md](VALIDATION.md)。
+这是 Linux → Windows 独立应用窗口原型。服务端是私有无头 Smithay Wayland 合成器，可选择启动 rootless Xwayland；不接入 KWin，不迁移已有桌面窗口。Windows 客户端为 Win32，提供 x64 和原生 ARM64 构建。功能来源见 [整合清单](PARALLEL_FEATURES.md)，实际验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 本目录是 Git 仓库根目录：`src/` 是 Linux 合成器，`native/` 是编解码与 GPU 适配，`client/` 是 Windows 原生内核，`gui/` 是控制中心，`scripts/` 和 `tests/` 分别提供构建与验证入口。构建产物写入已忽略的 `target/`、`build/` 和 .NET `bin/`、`obj/`。
+
+现有能力与目标范围见 [功能规格](FEATURES.md)，技术边界见 [v1 架构基线](ARCHITECTURE.md)，里程碑与完成条件见 [Roadmap](ROADMAP.md)。M0/M1 已实现认证加密直连、用户级会话入口及私有桌面服务；SSH 保留为兼容入口。Linux/Wine 验证和 Windows 交叉构建结果见验收记录，Windows 实机验收另行安排。
 
 同级 `../sunshine/` 和 `../moonlight/` 是未修改的本地参考源码，不纳入本仓库；参考版本见 [upstreams.json](upstreams.json)。完整 Git 历史与功能来源分支保留，早期提交使用 `waybridge/` 路径前缀。协议为独立 v3，普通 Moonlight 不能直接连接。
 
 每个顶层窗口对应一个 Windows 窗口，标题栏只由一端拥有；越界/嵌套菜单映射为独立 owned popup，不改变父窗口尺寸。绘制跟随 Windows DPI，Qt 分数缩放、透明 alpha、父子对话框与原生输入分别处理。断线保留应用，重连恢复窗口；旧焦点的按键、组合和指针锁定不会继续作用于新目标。
 
-默认 `--codec auto` 在查看端支持时选择 NVENC H.264 超低延迟编码，菜单使用 PNG。可选 HEVC/AV1 保留独立无损 alpha。Windows 使用实际能力探测后的系统 Media Foundation/D3D11 解码和 DirectComposition；不可用或运行失败按窗口回退 PNG。`--codec png` 强制无损图像。默认 60 FPS，原始更新合并，编码引用帧有序，每窗口最多两个呈现确认在途帧。
+默认 `--codec auto` 在 SDR 下选择 NVENC H.264，启用 HDR 偏好时选择 HEVC，菜单使用 PNG；实际路径仍取决于能力协商。可选 HEVC/AV1 保留独立无损 alpha。Windows 使用实际能力探测后的系统 Media Foundation/D3D11 解码和 DirectComposition；不可用或运行失败按窗口回退 PNG。`--codec png` 强制无损图像。默认 60 FPS，原始更新合并，编码引用帧有序，每窗口最多两个呈现确认在途帧。
 
-控制/文件、媒体与可选音频使用独立认证 TCP 连接，同一个 SSH 转发端口即可承载。UDP 是额外可直达端口，保留原 TCP 控制/补帧。编码、解码和文件 I/O 不在合成器/UI 事件循环执行。常见尺寸有界缓存，复用后仍强制新 epoch/独立关键帧；首次遇到新尺寸、资源限制和同步回读仍可能产生停顿。
+控制/文件、媒体与可选音频使用独立认证连接，可经同一 TLS 入口或 SSH 转发端口承载。UDP 是额外可直达端口，保留原 TCP 控制/补帧。编码、解码和两端文件接收落盘在工作线程执行，Windows 输入发送使用有界有序队列。文件字节仍与控制共用通道，网络调度优化留到 M2。常见尺寸有界缓存，复用后仍强制新 epoch/独立关键帧；首次遇到新尺寸、资源限制和同步回读仍可能产生停顿。
 
 **请同时更新并重启两端，再启动远端应用。** 协议保持独立 v3，不兼容普通 Moonlight。Windows 要求 Windows 10/11；历史 H.264/透明呈现的 WoA 实测不能替代新功能和整合版的实机验收。本版仍是开发原型，HDR 是明确标记的 scRGB 子集。
 
 ## Windows GUI 控制中心
 
-新增 **C# / WinUI 3 控制中心**，提供原生 ARM64 和 x64 便携包。内置 SSH、连接配置、自动启动/接入会话、应用目录、实时画面设置、输入共享、文件传输活动、托盘与诊断；视频继续由独立 C++ worker 处理。
+**C# / WinUI 3 控制中心**提供原生 ARM64 和 x64 便携包。支持 TLS 直连配对、客户端撤销、可选 SSH、连接配置、自动启动/接入会话、应用目录、实时画面设置、输入共享、文件传输活动、托盘与诊断；视频继续由独立 C++ worker 处理。
 
-WoA 解压 `build/Waybridge-Control-win-arm64.zip` 的整个目录后运行 `Waybridge.Control.exe`。Linux 先更新 `target/release/waybridge`；在 GUI 的「Linux 服务端程序」填写它的完整路径。使用密钥或 ssh-agent 登录，首次核对主机指纹，无需手动读取令牌或建立 TCP 隧道。完整说明与构建方法见 [GUI README](gui/README.md)。
+解压 `build/Waybridge-Control-win-{arm64,x64}.zip` 的整个目录后运行 `Waybridge.Control.exe`。Linux 先构建并启动用户级入口，在另一个本机终端生成一次性配对码：
+
+```bash
+cargo build --release --workspace --locked
+./target/release/waybridge-service serve --compositor "$PWD/target/release/waybridge"
+# 另一个 Linux 终端：
+./target/release/waybridge-service pair --expires 120
+```
+
+GUI 选择「认证加密直连」，填写 Linux LAN/VPN 地址及端口 `49092`，从可信 Linux 终端核对并填写 `certificate_sha256` 指纹和一次性配对码，再配对、连接。客户端令牌保存到 Windows 凭据管理器，指纹变化会拒绝连接。默认服务监听 `0.0.0.0:49092`，可用 `--listen` 绑定具体 LAN/VPN 地址。安装可选用户单元、信任撤销及协议细节见 [service README](service/README.md)，GUI 与 SSH 兼容模式见 [GUI README](gui/README.md)。
 
 ## 直接运行
 
 构建产物：
 
-- Linux：`target/release/waybridge`
+- Linux：`target/release/waybridge`、`target/release/waybridge-service`
 - Windows x64：`build/windows/waybridge-client.exe`。
 - Windows on ARM 原生 ARM64：`build/windows-arm64/waybridge-client.exe`。
 
@@ -55,7 +66,7 @@ ssh -N -L 49090:127.0.0.1:49090 wano@<Linux-IP>
 .\waybridge-client.exe 127.0.0.1 49090 "<token>"
 ```
 
-TCP 协议自身不加密，默认使用本地监听和 SSH 隧道；可选 UDP 媒体另有 AES-GCM 认证加密。认证握手和版本检查在任何窗口数据发送前完成；一次只允许一个查看端连接。
+以上是低层客户端的 SSH 兼容用法。原始 v3 TCP 协议自身不加密，需通过 TLS 入口或 SSH 等受保护传输；可选 UDP 媒体另有 AES-GCM 认证加密。认证握手和版本检查在任何窗口数据发送前完成；每个会话一次只允许一个查看端连接。
 
 在 Waybridge 打开的终端内启动应用会继承正确的环境。从另一个 SSH 终端加入正在运行的会话，请使用：
 
@@ -71,7 +82,9 @@ TCP 协议自身不加密，默认使用本地监听和 SSH 隧道；可选 UDP 
 
 自定义 socket 的会话同时指定 `--socket <名称>`。`--launch` 读取服务端写入的 0600 权限会话描述文件，自动带上私有 DISPLAY、Wayland、D-Bus 和音频环境，并清除宿主 fcitx/ibus 覆盖；不会修改宿主环境。过期描述会被拒绝，服务端正常退出时移除。不要仅设置 `WAYLAND_DISPLAY` 后直接在外部 SSH 启动应用，这会绕过会话的输入法、音频和 D-Bus 设置。已有 KWin 窗口不会迁移到这个会话。
 
-私有 D-Bus 会话自动桥接宿主可用的 KWallet/Secret Service 名称，应用可继续使用原有密钥存储；其他宿主 GUI 服务仍不共享。桥接保留每个应用的独立连接和加密会话，不记录消息正文，不修改 Chrome profile 或密码存储参数。Chrome 已有登录能否恢复还取决于原密钥是否可解锁、Cookie 是否有效；被锁的钱包仍可能在 Linux 宿主弹出解锁提示。宿主已经运行的同 profile Chrome 仍会接管启动命令，此时需关闭原进程或使用独立 profile。
+私有 D-Bus 使用 Waybridge 桌面身份，原生启动已安装的 `ksecretd`、`kwalletd6`、Desktop Portal 及 GTK 后端；授权和文件选择对话框走普通远程窗口。钱包与 Portal 使用服务专用的持久配置，普通应用保留原有 XDG 数据路径；不转发宿主钱包、不改写宿主服务激活环境。服务状态路径由会话环境中的 `WAYBRIDGE_DESKTOP_SERVICES` 提供。原钱包迁移、已有浏览器登录及 Flatpak 文档授权另列兼容项；窗口共享尚未实现。
+
+经控制中心应用目录或管理 API 启动的已识别原生 Chrome/Chromium 默认使用会话专用持久 profile 与 Secret Service 后端；显式指定的 profile/密码后端会保留。低层 `waybridge --launch` 仍按原 argv 启动，需要自行处理 profile。Steam 检测到同用户宿主实例时会提示先处理冲突，不会终止宿主进程。自定义 wrapper 与 Flatpak 启动器需逐项验证。
 
 正常启动 `./target/release/waybridge -- ghostty` 会自动启用已安装的 Xwayland，以及可用的私有音频 sink。`--no-xwayland` / `--no-audio` 可分别关闭；`--xwayland` / `--audio` 则要求该功能初始化成功，失败时直接报错。可选功能不可用时默认保留原生 Wayland 窗口。
 
@@ -107,7 +120,7 @@ TCP 协议自身不加密，默认使用本地监听和 SSH 隧道；可选 UDP 
 
 Linux 安装 `pactl` 和 `parec` 并有可用 PulseAudio/PipeWire-Pulse 时，音频默认自动启用。服务端创建私有 sink，通过 `PULSE_SINK` 路由 PulseAudio 应用，并通过 `PIPEWIRE_NODE`/流属性路由 mpv 等原生 PipeWire 应用；不修改系统默认输出。后续应用使用 `--launch` 自动加入同一 sink，无需手工抄 PID。原生 PipeWire 流禁止在目标消失时回退到宿主输出；直接使用硬件 ALSA 的应用仍需选择兼容后端。
 
-新版 Windows 客户端自动协商独立音频 TCP 连接，仍经过原来的 SSH 端口，使用 WASAPI 播放到默认输出设备。出现 `WASAPI 48 kHz stereo audio playback active` 表示音频设备已启动；设置 `WAYBRIDGE_NO_AUDIO=1` 可关闭客户端音频，`WAYBRIDGE_AUDIO_DEVICE` 可指定 WASAPI endpoint ID。无声卡或音频连接失败不影响画面。
+新版 Windows 客户端自动协商独立音频连接，经 TLS 入口或原来的 SSH 端口，使用 WASAPI 播放到默认输出设备。出现 `WASAPI 48 kHz stereo audio playback active` 表示音频设备已启动；设置 `WAYBRIDGE_NO_AUDIO=1` 可关闭客户端音频，`WAYBRIDGE_AUDIO_DEVICE` 可指定 WASAPI endpoint ID。无声卡或音频连接失败不影响画面。
 
 首版为 48 kHz、16-bit 双声道 PCM，每秒约 1.536 Mbit，不含协议开销；每包 10 ms，服务端待发队列最多 40 ms、在途最多 40 ms，客户端待播放队列最多 100 ms，另有系统缓冲。拥堵时丢弃旧 PCM，优先恢复实时播放。尚未接入 Opus、跨设备时钟同步、严格音画同步、麦克风或输出设备热切换。正常退出/SIGINT/SIGTERM 清理自身 sink；强制 SIGKILL 无法清理，遗留模块可按日志确认后手动卸载。音频应用应随会话退出。
 
@@ -153,7 +166,7 @@ Xft/DPI 和 X11 客户端密度为这个 X 服务器共享，初始跟随 Window
 
 ## 可选 UDP/FEC 媒体通道
 
-默认继续使用 TCP/SSH。显式启用 UDP 时，在 Linux 增加 `--udp-listen <可达监听地址>:49091`；`--udp-mbps 200` 控制含校验片的发送速率上限，范围 1–1000 Mbit/s。它是固定速率节流，尚无自适应拥塞控制；应低于可用带宽。Windows 保留原来的 SSH 隧道和 TCP 启动参数，另设置：
+默认使用 TLS 或 SSH 内的 TCP。显式启用 UDP 时，在 Linux 增加 `--udp-listen <可达监听地址>:49091`；`--udp-mbps 200` 控制含校验片的发送速率上限，范围 1–1000 Mbit/s。它是固定速率节流，尚无自适应拥塞控制；应低于可用带宽。控制中心可直接配置 UDP；低层客户端的 SSH 兼容模式保留隧道和 TCP 启动参数，另设置：
 
 ```powershell
 $env:WAYBRIDGE_UDP_HOST = "<Windows 能直接访问的 Linux 地址>"
@@ -162,7 +175,7 @@ $env:WAYBRIDGE_UDP_PORT = "49091"
 .\waybridge-client.exe 127.0.0.1 49090 "<token>"
 ```
 
-SSH `-L` 只转发 TCP，不能承载这个 UDP 通道；可使用局域网或已有 VPN 的地址，需允许该 UDP 端口。握手和媒体密钥仍走原控制连接，应保留 SSH。UDP 每会话、每方向使用独立随机 AES-256-GCM 密钥、唯一计数 nonce、认证分片和重放检查；认证成功前不向 UDP 地址发送画面。
+SSH `-L` 只转发 TCP，不能承载这个 UDP 通道；可使用局域网或已有 VPN 的地址，需允许该 UDP 端口。握手和媒体密钥仍走受保护的 TLS 或 SSH 控制连接。UDP 每会话、每方向使用独立随机 AES-256-GCM 密钥、唯一计数 nonce、认证分片和重放检查；认证成功前不向 UDP 地址发送画面。
 
 画面分为 1024-byte 数据片，每 8 片增加一片 XOR 校验，可恢复该组单片丢失；乱序重组后按原顺序送入解码器。其余丢包通过原 TCP 媒体连接补同一帧，保留 H.264/HEVC/AV1/Main10 引用链。每窗口的两帧呈现 credit 保持有效。UDP 不通时继续 TCP，已建立的 UDP 中断时用 TCP 补帧；当前不支持 UDP endpoint 漫游，需重连。协议仍为 v3，未协商的客户端不受影响。
 
@@ -199,7 +212,7 @@ kernel 源码，可用 `bash scripts/build-gpu-kernel.sh` 重新生成；预生�
 默认仍为 8-bit BT.709 SDR。服务端显式使用
 `--hdr experimental-scrgb --codec hevc-nvenc`（或 `av1-nvenc`）；Windows
 PowerShell 设置 `$env:WAYBRIDGE_HDR="1"` 后运行客户端。此模式要求同一 NVIDIA
-GPU 执行 GL/CUDA/NVENC，自动为 HDR 开启 CUDA 输入；`auto` 仍保持 H.264 SDR。
+GPU 执行 GL/CUDA/NVENC，自动为 HDR 开启 CUDA 输入；启用 HDR 时 `--codec auto` 也会选择 HEVC。
 
 只有通过 `wp_color_manager_v1.create_windows_scrgb` 明确标记的 Wayland surface
 才进入 HDR。RGB 是线性 Rec.709/scRGB，每单位为 80 nits。surface tree 在真正的
@@ -248,6 +261,8 @@ LLVM_MINGW_ROOT=/path/to/llvm-mingw ./scripts/build-windows-arm64.sh
 也可在 Windows 上使用 MSVC/CMake 构建 `client/`。客户端使用 Win32、D3D11、DXGI、DirectComposition、GDI+、系统 Media Foundation 和系统剪贴板 API，无 WSL 或 Qt 运行时依赖。
 
 
+独立会话运行必需 `dbus-daemon`；管理入口需要 Python 3，应用目录启动需要 GIO。原生钱包和文件选择需要安装 `ksecretd`、`kwalletd6`、`xdg-desktop-portal`、GTK Portal 后端及 permission/document portal；缺少可选 provider 时状态文件明确报告不可用，本机验证组合为 KWallet 6.31.0。
+
 按需功能依赖：X11 需要 `Xwayland`，音频需要 `pactl`/`parec` 和可用的 PulseAudio 或 PipeWire-Pulse；SVG 图标需要 `rsvg-convert`。CUDA/HDR 需要兼容 NVIDIA GPU/驱动及构建时 CUDA/GL 开发头；缺少 CUDA 头时仍可构建 CPU/PNG 路径。测试另需 Pillow、wl-clipboard、Wayland scanner、Qt6Widgets、Wine/Xvfb/MinGW；HDR 数值测试需要 NumPy。
 
 ## 构建后的测试
@@ -256,6 +271,7 @@ LLVM_MINGW_ROOT=/path/to/llvm-mingw ./scripts/build-windows-arm64.sh
 
 ```bash
 ./scripts/test.sh
+./scripts/test-m0-m1.sh --with-wine  # M0/M1 完整 Linux/Wine 回归；需 NVIDIA/CUDA/NVENC
 python tests/session_integration_smoke.py
 ```
 
@@ -313,6 +329,6 @@ Linux 记录合成、回读、编码排队、转换、编码、发送及呈现�
 - 指针锁定和输入区域为有限子集；未支持通用跨进程透明点穿、KDE 模糊或 confined-pointer。
 - 文件只 Copy，不保留权限/时间戳/硬链接，无断点续传、FUSE 或 IStorage。Explorer/Outlook/压缩软件与不响应 COM 取消的源仍需实机兼容性验证。
 - 音频无 Opus、麦克风、严格音画同步和设备热切换；UDP 为固定节流与全局有序流，无自适应拥塞控制或 endpoint 漫游，弱网可能跨窗口阻塞。
-- TCP 需外部 SSH/VPN 保护；无内建完整端到端加密、会话管理或 Sunshine/Moonlight 线协议兼容。SIGKILL 无法执行资源清理。
+- 原始 v3 TCP 需经内建 TLS 入口或外部 SSH 等受保护传输；与 Sunshine/Moonlight 线协议不兼容。TLS 入口重启保留会话，合成器崩溃后的应用状态恢复未实现；SIGKILL 无法执行资源清理。
 
 普通 SHM、DMA-BUF 和可选 Xwayland 已接通；大型应用、驱动、多 GPU 与物理 Windows 组合仍需逐项测试，不能保证“All 应用”。
