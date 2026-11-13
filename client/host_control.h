@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -21,6 +22,7 @@ private:
   std::mutex mutex;
   std::condition_variable wake;
   std::deque<std::string> outgoing;
+  bool writing = false;
   std::vector<nlohmann::json> incoming;
   bool readLine(std::string &line) {
     char ch; DWORD count;
@@ -59,6 +61,7 @@ private:
         self->wake.wait(guard, [&] { return self->stopping || !self->outgoing.empty(); });
         if (self->stopping) break;
         line = std::move(self->outgoing.front()); self->outgoing.pop_front();
+        self->writing = true;
       }
       const char *data = line.data(); size_t left = line.size(); DWORD count;
       while (left && !self->stopping) {
@@ -67,6 +70,11 @@ private:
         }
         data += count; left -= count;
       }
+      {
+        std::lock_guard<std::mutex> guard(self->mutex);
+        self->writing = false;
+      }
+      self->wake.notify_all();
     }
     return 0;
   }
@@ -107,6 +115,13 @@ public:
   std::vector<nlohmann::json> take() {
     std::lock_guard<std::mutex> guard(mutex);
     auto result = std::move(incoming); incoming.clear(); return result;
+  }
+  // Startup failures occur before the message loop. Give their diagnostic event
+  // a bounded opportunity to reach the GUI before cancelling the pipe writer.
+  void flush(std::chrono::milliseconds timeout = std::chrono::milliseconds(250)) {
+    if (!active() || !writer) return;
+    std::unique_lock<std::mutex> guard(mutex);
+    wake.wait_for(guard, timeout, [&] { return stopping || (outgoing.empty() && !writing); });
   }
   void stop() {
     if (!connected.exchange(false)) return;

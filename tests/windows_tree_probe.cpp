@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <iostream>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -68,6 +69,7 @@ static std::string base64(const uint8_t *bytes, size_t n) {
 }
 static void sendJson(const Json &) {}
 static void cancelIncomingFiles() {}
+static void cancelIncomingFilesExcept(uint64_t) {}
 static HGLOBAL globalBytes(const void *bytes, size_t size) {
   HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size);
   if (!memory)
@@ -187,14 +189,116 @@ int wmain() {
       CloseClipboard();
     }
     FileTree::removeTree(complete);
+
+    // The production path stages on the file worker and publishes only on this
+    // STA. Stall that worker to exercise responsiveness and late cancellation.
+    FileIo::start([] {});
+    auto barrier = [] {
+      auto promise = std::make_shared<std::promise<void>>();
+      auto future = promise->get_future();
+      FileIo::cleanup([promise] { promise->set_value(); });
+      FileTree::require(future.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+                        "File worker did not complete");
+    };
+    auto flush = [&] { barrier(); FileIo::drain(); barrier(); };
+    FileTree::receive({{"type", "tree_begin"}, {"batch", 8},
+                       {"epoch", FileTree::epoch.load()}, {"entries", manifest}});
+    flush();
+    FileTree::require(FileTree::incoming != nullptr, "Async staging failed");
+    auto committed = FileTree::incoming->directory;
+    FileTree::receive({{"type", "tree_chunk"}, {"batch", 8}, {"file", 3}, {"data", "YWJj"}});
+    FileTree::receive({{"type", "tree_done"}, {"batch", 8}});
+    flush();
+    FileTree::require(FileTree::publishedGeneration == 8 && exists(committed + L"\\r\\data"),
+                      "Async clipboard publication failed");
+    FileTree::receive({{"type", "tree_begin"}, {"batch", 9},
+                       {"epoch", FileTree::epoch.load()}, {"entries", manifest}});
+    flush();
+    auto cancelled = FileTree::incoming->directory;
+    auto stalled = std::make_shared<std::promise<void>>();
+    auto entered = stalled->get_future();
+    FileIo::submit([stalled] {
+      stalled->set_value();
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    });
+    FileTree::require(entered.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+                      "Stalled I/O fixture did not start");
+    auto started = std::chrono::steady_clock::now();
+    FileTree::receive({{"type", "tree_chunk"}, {"batch", 9}, {"file", 3}, {"data", "YWJj"}});
+    FileTree::receive({{"type", "tree_done"}, {"batch", 9}});
+    FileTree::localClipboardChanged();
+    for (unsigned i = 0; i < 10000; ++i) FileTree::cancelIncoming();
+    {
+      std::lock_guard<std::mutex> lock(FileIo::mutex);
+      FileTree::require(FileIo::tasks.size() < 10, "Repeated cancellation grew an unbounded queue");
+    }
+    FileTree::require(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(100),
+                      "UI waited for filesystem worker");
+    flush();
+    FileTree::require(!exists(cancelled) && exists(committed),
+                      "Async supersession leaked staging or removed committed files");
+    FileTree::receive({{"type", "tree_begin"}, {"batch", 10},
+                       {"epoch", FileTree::epoch.load()}, {"entries", manifest}});
+    flush();
+    auto late = FileTree::incoming->directory;
+    FileTree::receive({{"type", "tree_chunk"}, {"batch", 10}, {"file", 3}, {"data", "YWJj"}});
+    FileTree::receive({{"type", "tree_done"}, {"batch", 10}});
+    barrier(); // staged result exists, but its UI completion has not run
+    FileTree::localClipboardChanged();
+    flush();
+    FileTree::require(!exists(late) && FileTree::publishedGeneration != 10,
+                      "Late completion overwrote a newer clipboard");
+    FileTree::receive({{"type", "tree_begin"}, {"batch", 11},
+                       {"epoch", FileTree::epoch.load()}, {"entries", manifest}});
+    flush();
+    auto announced = FileTree::incoming->directory;
+    FileTree::require(FileTree::serverClipboard(11), "New remote clipboard was rejected");
+    FileTree::require(OpenClipboard(controller), "Cannot update remote clipboard announcement");
+    EmptyClipboard(); CloseClipboard();
+    ownClipboardSequence = GetClipboardSequenceNumber();
+    FileTree::clipboardApplied(11, ownClipboardSequence);
+    FileTree::receive({{"type", "tree_chunk"}, {"batch", 11}, {"file", 3}, {"data", "YWJj"}});
+    FileTree::receive({{"type", "tree_done"}, {"batch", 11}});
+    flush();
+    FileTree::require(FileTree::publishedGeneration == 11 && exists(announced + L"\\r\\data"),
+                      "Matching remote clipboard announcement cancelled its own download");
+    FileTree::receive({{"type", "tree_begin"}, {"batch", 12},
+                       {"epoch", FileTree::epoch.load()}, {"entries", manifest}});
+    flush();
+    auto disabled = FileTree::incoming->directory;
+    FileTree::receive({{"type", "tree_chunk"}, {"batch", 12}, {"file", 3}, {"data", "YWJj"}});
+    FileTree::receive({{"type", "tree_done"}, {"batch", 12}});
+    barrier();
+    FileTree::setDownloadsEnabled(false);
+    FileTree::setDownloadsEnabled(true);
+    flush();
+    FileTree::require(!exists(disabled) && FileTree::publishedGeneration != 12,
+                      "Disabling sharing did not invalidate an already staged result");
+    FileTree::cancelIncoming();
+    FileIo::stop();
+    std::atomic<unsigned> failures{0};
+    FileIo::start([] {}, [&] { ++failures; });
+    FileIo::submit([] {
+      for (unsigned i = 0; i < 130; ++i) FileIo::postUi([] {});
+    });
+    barrier();
+    FileTree::require(failures == 1 && !FileIo::submit([] {}),
+                      "Completion overflow did not explicitly fail and stop admission");
+    FileIo::stop();
+    FileTree::removeTree(committed);
+    FileTree::removeTree(announced);
     DestroyWindow(controller);
     FileTree::cancelUploads();
     std::cout << "PASS: Win32 tree path/type/count/depth/byte validation; "
                  "partial/error/supersession/disconnect cleanup; complete roots retained, "
-                 "directory clipboard and source enumeration"
+                 "directory clipboard and source enumeration; async staging, responsive STA, "
+                 "late-completion cancellation and committed-file lifetime"
               << std::endl;
     return 0;
   } catch (const std::exception &error) {
+    running = false;
+    FileTree::cancelIncoming();
+    FileIo::stop();
     std::cerr << error.what() << std::endl;
     return 1;
   }

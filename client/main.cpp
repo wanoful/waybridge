@@ -25,7 +25,9 @@
 #include "relative_input.h"
 #include "ime.h"
 #include "third_party/json.hpp"
+#include "native_transport.h"
 #include "host_control.h"
+#include "ordered_sender.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -56,7 +58,9 @@ constexpr UINT NetworkReady = WM_APP + 1;
 SOCKET connection = INVALID_SOCKET;
 HWND controller = nullptr;
 std::atomic<bool> running{true};
-std::mutex sendMutex, inboxMutex;
+std::mutex inboxMutex;
+OrderedSender controlSender;
+DWORD uiThread = 0;
 std::condition_variable inboxWake, frameWake;
 std::deque<Json> controls;
 Json pendingCursor;
@@ -135,6 +139,7 @@ struct IncomingFile {
 };
 std::map<uint32_t, IncomingFile> incomingFiles;
 uint64_t incomingBatch = 0;
+uint64_t incomingSelectionEpoch = 0;
 DWORD incomingClipboardSequence = 0;
 std::wstring incomingDirectory;
 
@@ -260,7 +265,7 @@ std::vector<uint8_t> unbase64(const std::string &text) {
 bool sendAll(const void *bytes, size_t n) {
   auto p = static_cast<const char *>(bytes);
   while (n && running) {
-    int count = send(connection, p, static_cast<int>(std::min(n, size_t(65536))), 0);
+    int count = NativeTransport::write(connection, p, std::min(n, size_t(65536)));
     if (count <= 0)
       return false;
     p += count;
@@ -273,14 +278,20 @@ void sendJson(const Json &value) {
   if (text.size() + 1 > MaxPacket)
     return;
   uint32_t size = htonl(static_cast<uint32_t>(text.size() + 1));
-  uint8_t type = 0;
-  std::lock_guard<std::mutex> guard(sendMutex);
-  if (!sendAll(&size, 4) || !sendAll(&type, 1) || !sendAll(text.data(), text.size())) {
+  std::vector<uint8_t> packet(5 + text.size());
+  memcpy(packet.data(), &size, 4);
+  packet[4] = 0;
+  memcpy(packet.data() + 5, text.data(), text.size());
+  if (!controlSender.enqueue(std::move(packet), GetCurrentThreadId() != uiThread)) {
+    // Input edges and control transitions cannot be silently dropped. Abort an
+    // overloaded connection rather than blocking the STA or applying stale input.
     shutdown(connection, SD_BOTH);
+    if (controller) PostMessageW(controller, WM_CLOSE, 0, 0);
   }
 }
 HGLOBAL globalBytes(const void *data, size_t size);
 void cancelIncomingFiles();
+void cancelIncomingFilesExcept(uint64_t generation);
 #include "file_tree.h"
 #include "file_drag.h"
 #include "virtual_files.h"
@@ -288,7 +299,7 @@ void cancelIncomingFiles();
 bool readAll(SOCKET socket, void *bytes, size_t n) {
   auto p = static_cast<char *>(bytes);
   while (n && running) {
-    int count = recv(socket, p, static_cast<int>(std::min(n, size_t(65536))), 0);
+    int count = NativeTransport::read(socket, p, std::min(n, size_t(65536)));
     if (count <= 0)
       return false;
     networkBytes.fetch_add(uint64_t(count), std::memory_order_relaxed);
@@ -358,6 +369,10 @@ void receiveLoop(SOCKET socket) {
       if (control) {
         incoming = Json::parse(packet.begin() + 1, packet.end());
         if (FileTree::uploadResponse(incoming) || FileDrag::receive(incoming)) continue;
+        auto type = incoming.value("type", "");
+        if (type == "tree_begin" || type == "tree_chunk" || type == "tree_done" || type == "tree_error" ||
+            type == "files_begin" || type == "file_chunk" || type == "files_done" || type == "files_error")
+          incoming["_file_io_bytes"] = size; // receiver-derived; never trust a peer-supplied cost
       }
       {
         std::unique_lock<std::mutex> guard(inboxMutex);
@@ -435,6 +450,12 @@ void startMedia(const std::string &key) {
     mediaConnection = socket;
     int one = 1;
     setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char *>(&one), sizeof(one));
+    try { NativeTransport::attach(socket, serverHost); }
+    catch (const std::exception &error) {
+      std::cerr << "Media connection: " << error.what() << '\n';
+      mediaConnection = INVALID_SOCKET; closesocket(socket);
+      PostMessageW(controller, WM_CLOSE, 0, 0); return;
+    }
     auto text = Json({{"type", "hello"},
                       {"version", 3},
                       {"token", serverToken},
@@ -448,8 +469,7 @@ void startMedia(const std::string &key) {
     memcpy(wire.data() + 5, text.data(), text.size());
     size_t sent = 0;
     while (running && sent < wire.size()) {
-      int n = send(socket, reinterpret_cast<const char *>(wire.data() + sent),
-                   int(wire.size() - sent), 0);
+      int n = NativeTransport::write(socket, wire.data() + sent, wire.size() - sent);
       if (n <= 0)
         break;
       sent += n;
@@ -459,6 +479,7 @@ void startMedia(const std::string &key) {
     else
       PostMessageW(controller, WM_CLOSE, 0, 0);
     mediaConnection = INVALID_SOCKET;
+    NativeTransport::detach(socket);
     closesocket(socket);
   });
 }
@@ -503,8 +524,7 @@ void receiveAudio(SOCKET socket) {
       memcpy(wire.data() + 5, ack.data(), ack.size());
       size_t sent = 0;
       while (running && sent < wire.size()) {
-        int n = send(socket, reinterpret_cast<const char *>(wire.data() + sent),
-                     int(wire.size() - sent), 0);
+        int n = NativeTransport::write(socket, wire.data() + sent, wire.size() - sent);
         if (n <= 0)
           return;
         sent += size_t(n);
@@ -561,6 +581,11 @@ void startAudio(const std::string &key) {
     audioConnection = socket;
     int one = 1;
     setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char *>(&one), sizeof(one));
+    try { NativeTransport::attach(socket, serverHost); }
+    catch (const std::exception &error) {
+      std::cerr << "Audio connection: " << error.what() << '\n';
+      audioConnection = INVALID_SOCKET; closesocket(socket); return;
+    }
     auto text = Json({{"type", "hello"},
                       {"version", 3},
                       {"token", serverToken},
@@ -574,8 +599,7 @@ void startAudio(const std::string &key) {
     memcpy(wire.data() + 5, text.data(), text.size());
     size_t sent = 0;
     while (running && sent < wire.size()) {
-      int n = send(socket, reinterpret_cast<const char *>(wire.data() + sent),
-                   int(wire.size() - sent), 0);
+      int n = NativeTransport::write(socket, wire.data() + sent, wire.size() - sent);
       if (n <= 0)
         break;
       sent += n;
@@ -585,6 +609,7 @@ void startAudio(const std::string &key) {
     else
       std::cerr << "Audio channel unavailable; video continues\n";
     audioConnection = INVALID_SOCKET;
+    NativeTransport::detach(socket);
     closesocket(socket);
   });
 }
@@ -830,6 +855,8 @@ HGLOBAL globalBytes(const void *data, size_t size) {
 bool uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
   if (!hostedFiles) return false;
   if (paths.empty() || paths.size() > FileTree::MaxRoots) return false;
+  // Tree sources perform metadata checks and enumeration on their upload worker.
+  if (FileTree::supported) return FileTree::upload(std::move(paths), std::move(drop));
   for (const auto &path : paths) {
     WIN32_FILE_ATTRIBUTE_DATA metadata{};
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &metadata) || (metadata.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
@@ -839,7 +866,6 @@ bool uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
       std::cerr << "The server does not support file_tree; directories were not transferred\n"; return false;
     }
   }
-  if (FileTree::supported) return FileTree::upload(std::move(paths), std::move(drop));
   fileWorkers.emplace_back([paths = std::move(paths), drop = std::move(drop)] {
     Json transfers = Json::array();
     for (const auto &path : paths) {
@@ -982,7 +1008,7 @@ public:
   }
 };
 
-void cancelIncomingFiles() {
+void cancelIncomingFilesNow() {
   for (auto &[id, file] : incomingFiles) if (file.handle != INVALID_HANDLE_VALUE) CloseHandle(file.handle);
   incomingFiles.clear();
   if (!incomingDirectory.empty()) FileTree::removeTree(incomingDirectory);
@@ -990,8 +1016,16 @@ void cancelIncomingFiles() {
   incomingBatch = 0;
   incomingClipboardSequence = 0;
 }
+void cancelIncomingFiles() {
+  FileIo::cleanup(cancelIncomingFilesNow, &incomingFiles);
+}
+void cancelIncomingFilesExcept(uint64_t) {
+  FileIo::cleanup([] {
+    if (incomingBatch < FileTree::serverGeneration) cancelIncomingFilesNow();
+  }, &incomingBatch);
+}
 
-void receiveFiles(const Json &message) {
+void receiveFilesNow(const Json &message) {
   const std::string type = message.at("type");
   if (type == "files_begin") {
     uint64_t batch = message.at("batch").get<uint64_t>();
@@ -1001,6 +1035,7 @@ void receiveFiles(const Json &message) {
     FileTree::cancelIncoming();
     cancelIncomingFiles();
     incomingBatch = message.at("batch").get<uint64_t>();
+    incomingSelectionEpoch = FileTree::epoch.load();
     incomingClipboardSequence = GetClipboardSequenceNumber();
     wchar_t temp[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
@@ -1013,6 +1048,8 @@ void receiveFiles(const Json &message) {
     if (message.at("files").empty() || message.at("files").size() > 128)
       throw std::runtime_error("Too many incoming files");
     for (const auto &metadata : message.at("files")) {
+      const auto fileId = metadata.at("id").get<uint32_t>();
+      if (incomingFiles.count(fileId)) throw std::runtime_error("Duplicate incoming file ID");
       std::wstring name = wide(metadata.at("name").get<std::string>());
       if (!FileTree::validName(name))
         throw std::runtime_error("Invalid incoming filename");
@@ -1025,7 +1062,7 @@ void receiveFiles(const Json &message) {
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
       if (file.handle == INVALID_HANDLE_VALUE)
         throw std::runtime_error("Cannot create incoming file");
-      incomingFiles.emplace(metadata.at("id").get<uint32_t>(), std::move(file));
+      incomingFiles.emplace(fileId, std::move(file));
     }
   } else if (message.value("batch", uint64_t(0)) == incomingBatch) {
     if (type == "file_chunk") {
@@ -1039,6 +1076,9 @@ void receiveFiles(const Json &message) {
         throw std::runtime_error("Invalid incoming file chunk");
       file.remaining -= written;
     } else if (type == "files_done") {
+      const auto batch = incomingBatch;
+      const auto expectedClipboard = incomingClipboardSequence;
+      const auto selectionEpoch = incomingSelectionEpoch;
       std::vector<wchar_t> paths;
       for (auto &[id, file] : incomingFiles) {
         CloseHandle(file.handle);
@@ -1049,10 +1089,19 @@ void receiveFiles(const Json &message) {
         paths.push_back(L'\0');
       }
       paths.push_back(L'\0');
+      auto directory = std::shared_ptr<std::wstring>(new std::wstring(std::move(incomingDirectory)),
+          [](std::wstring *path) {
+            FileIo::cleanup([path] { if (!path->empty()) FileTree::removeTree(*path); delete path; });
+          });
+      incomingFiles.clear(); incomingDirectory.clear(); incomingBatch = 0;
+      FileIo::postUi([batch, expectedClipboard, selectionEpoch, paths = std::move(paths), directory] {
       // A newer local clipboard must win over a file download that finishes
       // late.
       bool published = false;
-      if (GetClipboardSequenceNumber() == incomingClipboardSequence && OpenClipboard(controller)) {
+      if (FileTree::downloadsEnabled && selectionEpoch == FileTree::epoch && batch >= FileTree::serverGeneration &&
+          batch > FileTree::blockedGeneration && batch >= FileTree::latestIncoming &&
+          GetClipboardSequenceNumber() == FileTree::publicationSequence(batch, expectedClipboard) &&
+          OpenClipboard(controller)) {
         EmptyClipboard();
         std::vector<uint8_t> data(sizeof(DROPFILES) + paths.size() * sizeof(wchar_t));
         DROPFILES header{};
@@ -1070,15 +1119,26 @@ void receiveFiles(const Json &message) {
       }
       if (published) {
         hostControl.emit({{"type","transfer"},{"event","download_complete"},
-                          {"batch",incomingBatch},{"directory",utf8(incomingDirectory)}});
-        FileTree::publishedGeneration = incomingBatch; incomingFiles.clear(); incomingDirectory.clear(); incomingBatch = 0;
+                          {"batch",batch},{"directory",utf8(*directory)}});
+        FileTree::publishedGeneration = batch;
+        directory->clear(); // committed paths outlive the viewer connection
       }
-      else cancelIncomingFiles();
+      });
     } else if (type == "files_error") {
       cancelIncomingFiles();
       std::cerr << message.value("message", "File transfer failed") << '\n';
     }
   }
+}
+void receiveFiles(const Json &message) {
+  size_t bytes = message.value("_file_io_bytes", size_t(65536));
+  FileTree::require(FileIo::submit([message] {
+    try { receiveFilesNow(message); }
+    catch (const std::exception &error) {
+      cancelIncomingFilesNow();
+      std::cerr << "File download: " << error.what() << '\n';
+    }
+  }, bytes), "File I/O queue full");
 }
 void setClipboard(const Json &items) {
   if (hostedClipboard == "off" || hostedClipboard == "send") return;
@@ -2519,7 +2579,6 @@ void dispatchNetwork() {
       if (FileTree::serverClipboard(generation)) {
         setClipboard(m.at("items"));
         FileTree::clipboardApplied(generation, ownClipboardSequence);
-        if (incomingBatch == generation && !incomingFiles.empty()) incomingClipboardSequence = ownClipboardSequence;
       }
     }
     else if (type == "files_begin" || type == "file_chunk" || type == "files_done" ||
@@ -2603,7 +2662,8 @@ void sendStreamConfiguration() {
   }
   sendJson({{"type","stream_config"},{"request_id",++streamRequest},
             {"fps",hostedSettings.value("fps",60)},{"bitrate",hostedSettings.value("bitrate",30000)},
-            {"codec",hostedSettings.value("codec","auto")},{"read_only",hostedReadOnly}});
+            {"codec",hostedSettings.value("codec","auto")},{"hdr",hostedSettings.value("hdr",false)},
+            {"read_only",hostedReadOnly}});
 }
 void applyHostedSettings(const Json &settings, bool live) {
   if (!settings.is_object()) throw std::runtime_error("Settings must be an object");
@@ -2628,6 +2688,7 @@ void applyHostedSettings(const Json &settings, bool live) {
   hostedReadOnly=settings.value("read_only",false); hostedIme=settings.value("ime",true);
   hostedFiles=settings.value("files",true); hostedImages=settings.value("clipboard_images",true);
   hostedClipboard=clipboard;
+  FileTree::setDownloadsEnabled(hostedFiles && hostedClipboard != "off" && hostedClipboard != "send");
   std::wstring scale=dpi?std::to_wstring(dpi):L"";
   SetEnvironmentVariableW(L"WAYBRIDGE_DPI",dpi?scale.c_str():nullptr);
   SetEnvironmentVariableW(L"WAYBRIDGE_HDR",settings.value("hdr",false)?L"1":nullptr);
@@ -2714,6 +2775,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     if (message == NetworkReady) {
       dispatchNetwork();
+      FileIo::drain();
       return 0;
     }
     if (message == WM_CLIPBOARDUPDATE) {
@@ -2759,11 +2821,13 @@ BOOL WINAPI consoleControl(DWORD) {
 }
 
 int wmain(int argc, wchar_t **argv) {
+  uiThread = GetCurrentThreadId();
   std::wstring hostedHost, hostedPort, hostedToken;
   wchar_t *hostedArguments[4]{};
   if (argc==3 && std::wstring(argv[1])==L"--control-pipe") {
     try {
       Json start=hostControl.connect(argv[2]);
+      NativeTransport::configuration = NativeTransport::Configuration::parse(start.value("transport", Json()));
       std::string host=start.at("host").get<std::string>(), token=start.at("token").get<std::string>();
       int port=start.at("port").get<int>();
       if (host.empty() || host.size()>255 || port<1 || port>65535 || token.size()<16 || token.size()>4096 ||
@@ -2893,6 +2957,7 @@ int wmain(int argc, wchar_t **argv) {
   if (connection == INVALID_SOCKET) {
     std::cerr << "Connection failed; check your SSH tunnel\n";
     hostControl.emit({{"type","error"},{"message","无法连接串流服务，请检查 SSH 隧道与服务端"}});
+    hostControl.flush();
     return 1;
   }
   int one = 1;
@@ -2900,6 +2965,25 @@ int wmain(int argc, wchar_t **argv) {
   DWORD sendTimeout = 3000;
   setsockopt(connection, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char *>(&sendTimeout),
              sizeof(sendTimeout));
+  try { NativeTransport::attach(connection, utf8(argv[1])); }
+  catch (const std::exception &error) {
+    std::cerr << error.what() << '\n';
+    hostControl.emit({{"type","error"},{"message",error.what()}});
+    hostControl.flush();
+    hostControl.stop(); closesocket(connection); return 1;
+  }
+  FileIo::start([] { PostMessageW(controller, NetworkReady, 0, 0); }, [] {
+    std::cerr << "File I/O queue failed; incomplete transfers cancelled\n";
+    hostControl.emit({{"type","error"},{"message","文件工作队列失败，连接已关闭以取消未完成传输"}});
+    shutdown(connection, SD_BOTH);
+    PostMessageW(controller, WM_CLOSE, 0, 0);
+  });
+  controlSender.start([](const OrderedSender::Packet &packet) {
+    return sendAll(packet.data(), packet.size());
+  }, [] {
+    shutdown(connection, SD_BOTH);
+    if (running && controller) PostMessageW(controller, WM_CLOSE, 0, 0);
+  });
   MONITORINFO monitor{};
   monitor.cbSize = sizeof(monitor);
   POINT point{};
@@ -2948,6 +3032,7 @@ int wmain(int argc, wchar_t **argv) {
   inboxWake.notify_all();
   frameWake.notify_all();
   shutdown(connection, SD_BOTH);
+  controlSender.stop();
   udpMedia.stop();
   SOCKET media = mediaConnection.load();
   if (media != INVALID_SOCKET)
@@ -2967,8 +3052,10 @@ int wmain(int argc, wchar_t **argv) {
     worker.join();
   }
   VirtualFiles::shutdown();
+  NativeTransport::detach(connection);
   closesocket(connection);
   cancelIncomingFiles();
+  FileIo::stop();
   for (auto &[id, w] : windows)
     DestroyWindow(w->hwnd);
   windows.clear();

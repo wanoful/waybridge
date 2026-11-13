@@ -5,6 +5,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include "file_io.h"
 
 namespace FileTree {
 constexpr size_t MaxEntries = 512, MaxDepth = 16, MaxRoots = 128, MaxPath = 240;
@@ -12,8 +13,11 @@ constexpr uint64_t MaxFile = 1024ULL * 1024 * 1024, MaxTotal = 8 * MaxFile;
 inline bool supported = false;
 inline std::function<void(const Json &)> activity;
 inline std::atomic<uint64_t> epoch{0};
-inline uint64_t latestIncoming = 0, serverGeneration = 0, blockedGeneration = 0,
-                publishedGeneration = 0;
+inline std::atomic<bool> downloadsEnabled{true};
+inline std::atomic<uint64_t> latestIncoming{0}, serverGeneration{0}, blockedGeneration{0},
+                             publishedGeneration{0};
+inline uint64_t appliedGeneration = 0;
+inline DWORD appliedClipboard = 0;
 struct Entry {
   size_t id;
   std::wstring name;
@@ -512,10 +516,15 @@ struct Incoming {
   }
 };
 inline std::unique_ptr<Incoming> incoming;
-inline void cancelIncoming() { incoming.reset(); }
+inline void cancelIncoming() { FileIo::cleanup([] { incoming.reset(); }, &incoming); }
+inline void setDownloadsEnabled(bool enabled) {
+  if (downloadsEnabled.exchange(enabled) == enabled) return;
+  if (!enabled) { ++epoch; cancelIncoming(); cancelIncomingFiles(); }
+  if (supported) sendJson({{"type", "file_tree_epoch"}, {"epoch", epoch.load()}});
+}
 inline void localClipboardChanged() {
   cancelIncoming();
-  blockedGeneration = serverGeneration;
+  blockedGeneration = serverGeneration.load();
   publishedGeneration = 0;
   cancelClipboardUploads();
   if (supported) {
@@ -531,16 +540,21 @@ inline bool serverClipboard(uint64_t generation) {
   if (generation > serverGeneration) {
     serverGeneration = generation;
     publishedGeneration = 0;
-    cancelIncoming();
-    cancelIncomingFiles();
+    FileIo::cleanup([] {
+      if (incoming && incoming->batch < serverGeneration) incoming.reset();
+    }, &serverGeneration);
+    cancelIncomingFilesExcept(generation);
   }
   return publishedGeneration != generation;
 }
 inline void clipboardApplied(uint64_t generation, DWORD sequence) {
-  if (incoming && incoming->batch == generation && incoming->selectionEpoch == epoch)
-    incoming->clipboard = sequence;
+  appliedGeneration = generation;
+  appliedClipboard = sequence;
 }
-inline bool receive(const Json &message) {
+inline DWORD publicationSequence(uint64_t generation, DWORD original) {
+  return generation && generation == appliedGeneration ? appliedClipboard : original;
+}
+inline bool receiveNow(const Json &message) {
   auto type = message.value("type", "");
   if (type != "tree_begin" && type != "tree_chunk" && type != "tree_done" && type != "tree_error")
     return false;
@@ -600,13 +614,19 @@ inline bool receive(const Json &message) {
         for (const auto &[id, file] : incoming->files)
           require(!file.remaining, "Incomplete tree");
         incoming->files.clear();
-        require(incoming->selectionEpoch == epoch &&
-                    incoming->clipboard == GetClipboardSequenceNumber(),
-                "Newer clipboard supersedes tree download");
+        auto state = std::shared_ptr<Incoming>(incoming.release(), [](Incoming *item) {
+          FileIo::cleanup([item] { delete item; });
+        });
+        FileIo::postUi([state] {
+        try {
+        const auto batch = state->batch;
+        if (!downloadsEnabled || state->selectionEpoch != epoch || batch < serverGeneration ||
+            batch <= blockedGeneration || batch < latestIncoming ||
+            publicationSequence(batch, state->clipboard) != GetClipboardSequenceNumber()) return;
         std::vector<wchar_t> paths;
-        for (const auto &entry : incoming->entries)
+        for (const auto &entry : state->entries)
           if (entry.name.find(L'/') == std::wstring::npos) {
-            auto path = incoming->directory + L"\\" + entry.name;
+            auto path = state->directory + L"\\" + entry.name;
             paths.insert(paths.end(), path.begin(), path.end());
             paths.push_back(L'\0');
           }
@@ -631,11 +651,14 @@ inline bool receive(const Json &message) {
           throw std::runtime_error("Cannot publish tree clipboard");
         }
         ownClipboardSequence = GetClipboardSequenceNumber();
-        incoming->published = true;
+        state->published = true;
         publishedGeneration = batch;
         if (activity) activity({{"type", "transfer"}, {"event", "download_complete"},
-                               {"batch", batch}, {"directory", utf8(incoming->directory)}});
-        incoming.reset();
+                               {"batch", batch}, {"directory", utf8(state->directory)}});
+        } catch (const std::exception &error) {
+          std::cerr << "Tree publication: " << error.what() << '\n';
+        }
+        });
       } else {
         std::cerr << "Tree download: " << message.value("message", "failed") << '\n';
         incoming.reset();
@@ -645,6 +668,15 @@ inline bool receive(const Json &message) {
       incoming.reset();
     }
   }
+  return true;
+}
+inline bool receive(const Json &message) {
+  auto type = message.value("type", "");
+  if (type != "tree_begin" && type != "tree_chunk" && type != "tree_done" && type != "tree_error")
+    return false;
+  if (!downloadsEnabled) return true;
+  size_t bytes = message.value("_file_io_bytes", size_t(65536));
+  require(FileIo::submit([message] { receiveNow(message); }, bytes), "File I/O queue full");
   return true;
 }
 } // namespace FileTree
