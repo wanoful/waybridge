@@ -1,6 +1,6 @@
 # 配置归属与桌面集成决策
 
-决策日期：2026-11-14。状态：已确认的设计，待实施。本文补充 [会话策略](SESSION_POLICY.md)，收敛桌面服务和应用兼容的职责边界，不代表以下配置入口已经可用。
+决策日期：2026-11-14。状态：首版配置、desktop 覆写与标准会话集成已实施。本文补充 [会话策略](SESSION_POLICY.md)，记录职责边界；具体语法与操作见 [配置与应用启动](CONFIGURATION.md)、[桌面组件](INTEGRATION.md)，验收范围见 [验证记录](VALIDATION.md)。
 
 ## 职责边界
 
@@ -71,7 +71,7 @@ Waybridge 负责合成、远程窗口、输入、媒体，以及可靠的图形�
 
 通用工作目录规则：桌面应用采用有效覆写后的 `Path`，未指定时默认用户 HOME；直接命令采用显式 `cwd`，未指定时默认 HOME；应用终端内的子程序正常继承 shell 当前目录。
 
-专用覆盖文件的精确 schema、参数插入语法和 action 寻址形式在实施时设计并验证。本次确认作用范围和行为约束，不把未定语法当作已可用接口。
+首版使用 `<desktop ID>.toml`、`[default]` 与 `[actions."ActionID"]`，字面参数插在可执行 token 后、原有参数前。精确 schema 和示例见 [配置与应用启动](CONFIGURATION.md)。
 
 ## 标准配置与推荐组合
 
@@ -91,6 +91,6 @@ Waybridge 负责合成、远程窗口、输入、媒体，以及可靠的图形�
 
 M1 收尾覆盖：默认和覆写后的工作目录、参数/字段展开与 shell 边界、D-Bus 激活冲突、不同动作的覆盖、环境变量取消、用户文件不被修改、非 Waybridge 启动不受影响，以及图形服务随声明的会话依赖正常结束。实际 systemd 用户会话集成需要独立验证，不能仅依靠模拟 D-Bus/logind 的结果。
 
-当前代码仍有硬编码的钱包激活/监控和运行期 Portal 配置，主配置及专用 desktop 覆写也未实现；这些属于下一轮调整范围。本次仅记录决策，不修改运行行为。
+当前核心已移除硬编码钱包激活和动态 Portal 配置；标准 target、静态 Portal 选择及用户组件声明位于 `integration/`。主配置、检查和来源查询由共享配置模块实现，desktop 启动助手复用 GIO；这些实现不扩大后续里程碑的功能支持范围。
 
 参考：[XDG 目录](https://specifications.freedesktop.org/basedir/latest/)、[Desktop Entry](https://specifications.freedesktop.org/desktop-entry/latest/)、[Portal 配置](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html)、[systemd unit](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)。

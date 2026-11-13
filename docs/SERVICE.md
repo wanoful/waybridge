@@ -20,6 +20,12 @@ The default TLS listener is `0.0.0.0:49092`. Use `--listen 127.0.0.1:0` for an
 isolated test or a specific LAN/VPN address for deployment. `serve` prints its
 actual endpoint and certificate fingerprint as JSON, without client secrets.
 
+Both Linux binaries read `$XDG_CONFIG_HOME/waybridge/config.toml` (normally
+`~/.config/waybridge/config.toml`). `--config FILE` replaces that lookup; explicit
+CLI values override the file. `--check-config` and `--print-config` work without
+starting the daemon or creating identity files. See [configuration](CONFIGURATION.md)
+for the schema, sources, server-side media limits and application overrides.
+
 State defaults to `$XDG_STATE_HOME/waybridge/service` or
 `~/.local/state/waybridge/service`. The owner-only administration socket and
 `ready.json` are under `$XDG_RUNTIME_DIR/waybridge-service`. Global flags
@@ -94,12 +100,28 @@ Authenticated management requests carry both credential fields:
 {"id":3,"op":"ensure","client_id":"ID","client_token":"TOKEN","session":"waybridge-0","mode":"auto","fps":60,"bitrate":30000,"codec":"auto","audio":false,"xwayland":false}
 ```
 
-`list`, `ensure`, `info`, `applications`, `launch`, and `end` use the same request
+`list`, `ensure`, `info`, `applications`, `launch-plan`, `launch`, and `end` use the same request
 fields/results as `scripts/session-control.py`. The configured compositor binary
 overrides any network `binary` field. The helper runs locally with isolated Python
 imports, controlled stdio, bounded responses and PID/ownership checks. `ensure`
 returns the session's v3 `token` only after client authentication; `info` and
 `list` omit it. `mode:"attach"` never starts or adopts a stale session.
+
+Newly created sessions return a `configuration` report with requested values and
+their sources. Omitted media fields preserve Linux defaults; explicit client
+requests must satisfy the same limits as startup and live stream changes. The
+service fixes the compositor and configuration path; a remote `binary` or
+`config` field cannot replace them. An existing-session reconnect retains that
+session's settings and does not load a new configuration. Live replies identify
+effective settings and rejection/fallback reasons without rewriting the TOML.
+
+`launch-plan` computes the effective argv/desktop source, action, working
+directory, activation mode and override provenance without executing it. Only
+environment variable names are reported. `launch` accepts an installed desktop
+ID with optional `action` or `uris`, or a separate literal `argv` mode with
+optional `cwd`, `env` and `unset_env`. Desktop requests use the scoped TOML for
+process overrides; action and nonempty URI lists cannot be combined. Dispatch
+and process creation are not window readiness. See [launch examples](CONFIGURATION.md).
 
 Only one Waybridge session per user is supported. `auto` reconnects an existing
 session even if its name differs; `new` rejects an existing session. Creation
@@ -154,7 +176,11 @@ python3 service/tests/direct_service_smoke.py --compositor target/debug/waybridg
 ```
 
 The installer copies the built binaries and writes a user unit. It does not start
-the service or change login persistence settings automatically. The smoke test
+the service or change login persistence settings automatically. It also installs
+independent Waybridge session targets, refuses to overwrite modified units, and
+installs the static Portal default only with explicit `--portal-directory`.
+Component selection and lifecycle examples are in [desktop integration](INTEGRATION.md).
+The smoke test
 uses temporary state, private runtime directories, actual loopback TLS and no
 real credentials. Its optional compositor mode adds a real v3 handshake through
 the encrypted gateway and verifies that disconnect leaves the session available.

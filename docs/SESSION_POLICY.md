@@ -2,7 +2,7 @@
 
 决策日期：2026-11-14。本文件取代 M1 最初的多桌面并行、私有钱包和浏览器 profile 默认隔离方案。
 
-后续确认的配置归属、标准桌面集成边界和 Waybridge 专用 `.desktop` 追加/覆写见 [CONFIGURATION_POLICY.md](CONFIGURATION_POLICY.md)。该文区分已确认设计与待实施部分，不将当前硬编码的服务启动方式固定为架构要求。
+配置归属、标准桌面集成边界和 Waybridge 专用 `.desktop` 追加/覆写见 [CONFIGURATION_POLICY.md](CONFIGURATION_POLICY.md)。实际操作见 [配置](CONFIGURATION.md) 与 [桌面组件](INTEGRATION.md)。
 
 ## 已确认的行为
 
@@ -18,7 +18,7 @@
 
 组件选择由用户或可选集成配置决定；Waybridge 提供可靠会话入口和标准生命周期接入，不建立按钱包或应用名称自动修复行为的核心兼容层。用户可通过标准配置或 Waybridge 专用 desktop 覆写显式定制启动行为，原始应用文件保持不变。
 
-Portal 选择适合 Waybridge 的现成后端，保留用户配置与持久数据；Waybridge 未实现的 ScreenCast 等能力仍不宣称支持。已有常驻服务沿用自身生命周期，不以进程名清理。会话退出后恢复本次设置的激活环境；如果新的桌面已经更新显示环境，不覆盖它。
+Portal 通过静态原生配置选择适合 Waybridge 的后端，保留用户配置与持久数据；Waybridge 未实现的 ScreenCast 等能力仍不宣称支持。已有常驻服务沿用自身生命周期，不以进程名清理。会话结束先停止明确归属的服务，再撤销仍属于本会话的环境；不恢复失效旧显示，不覆盖后登录桌面的环境。D-Bus daemon 无删除变量接口的限制在诊断与集成文档中明确记录。
 
 ## 兼容与验证
 

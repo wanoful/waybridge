@@ -8,7 +8,7 @@ C# / .NET 10 + WinUI 3 控制中心，配套独立的 C++ 串流内核。提供 
 
 1. 解压 **整个 ZIP**，运行 `Waybridge.Control.exe`。WoA 使用 `win-arm64` 包。
 2. .NET 与 Windows App SDK 已随包提供，无需另装。如果机器缺少 Visual C++ v14 运行库，先运行包内对应架构的 `vc_redist.arm64.exe` / `vc_redist.x64.exe`。来源为 [Microsoft 官方下载](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)。
-3. Linux 构建 `cargo build --release --workspace --locked`，启动 `./target/release/waybridge-service serve --compositor "$PWD/target/release/waybridge"`。需要 Python 3 及合成器运行依赖；直连模式无需 Windows OpenSSH。
+3. Linux 构建 `cargo build --release --workspace --locked`，启动 `./target/release/waybridge-service serve --compositor "$PWD/target/release/waybridge"`。需要 Python 3.11+、GIO 及合成器运行依赖；直连模式无需 Windows OpenSSH。标准组件生命周期的安装见 [桌面集成](INTEGRATION.md)。
 4. 在 Linux 另一个可信终端运行 `./target/release/waybridge-service pair --expires 120`，取得一次性配对码与 `certificate_sha256` 指纹。不要把网络端自行报告的指纹当作信任依据。
 5. GUI 选择「认证加密直连」，填写 LAN/VPN 地址、服务端口 `49092`、核对过的证书指纹和一次性配对码，点击「配对此设备」。客户端令牌保存在 Windows 凭据管理器；证书变化会拒绝连接。Linux 可用 `waybridge-service clients` / `revoke CLIENT_ID` 撤销信任，GUI 也可在断开后撤销当前设备。
 6. 选择「已有会话优先」并连接。在「远端应用」刷新并启动应用；「启动终端」默认运行 `ghostty`。关闭查看端保留应用，重新连接可接回仍存活的会话。服务部署与授权范围见 [服务说明](SERVICE.md)。
@@ -21,7 +21,7 @@ C# / .NET 10 + WinUI 3 控制中心，配套独立的 C++ 串流内核。提供 
 ## 页面与行为
 
 - **设备与连接**：保存多个连接，TLS 指纹与配对/撤销、可选 SSH 密钥认证、自动启动或接入会话、断线重连。
-- **远端应用**：搜索 Linux 已安装的 desktop 应用并启动；查看当前远端窗口并切换焦点。
+- **远端应用**：搜索 Linux 已安装的 desktop 应用并启动；自动应用用户明确配置的 [Waybridge desktop 覆写](CONFIGURATION.md)。查看当前远端窗口并切换焦点；启动请求已提交与窗口实际出现分别处理。
 - **画面与声音**：编码、FPS、每窗口码率、跟随 Windows 或手动 DPI、音量、输出设备、UDP、实验性 HDR、CPU/CUDA 输入。编码/FPS/码率/缩放/音量实时应用；输出设备和 UDP 需要重连；HDR 与 GPU 输入还取决于新建服务端时的设置。
 - **输入与共享**：只读、IME、剪贴板方向、剪贴板图片、文件目录共享。只读同时在服务端拒绝输入并释放按键/鼠标锁定。
 - **文件传输**：发送文件/目录到远端剪贴板，显示传输活动，打开最近完成的本地接收目录。可继续直接拖放。首版为活动记录，尚无逐文件进度、暂停/续传和统一取消按钮。

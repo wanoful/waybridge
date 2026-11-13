@@ -10,7 +10,7 @@ Waybridge 提供独立于宿主 DE 的 Linux 远程应用会话，以 Windows �
 
 会话与数据策略以 [SESSION_POLICY.md](SESSION_POLICY.md) 为准：默认共享用户数据，创建时单向检查，同一用户本地与远程桌面轮流使用。
 
-配置与桌面集成采用 [CONFIGURATION_POLICY.md](CONFIGURATION_POLICY.md) 的边界：核心提供通用会话机制，外部组件通过标准配置接入；提供用户显式的 Waybridge 专用 desktop 追加/覆写，不内置按应用名称猜测参数的兼容引擎。这是已确认的后续设计，尚未全部实现。
+配置与桌面集成采用 [CONFIGURATION_POLICY.md](CONFIGURATION_POLICY.md) 的边界：核心提供通用会话机制，外部组件通过标准配置接入；提供用户显式的 Waybridge 专用 desktop 追加/覆写，不内置按应用名称猜测参数的兼容引擎。首版 TOML、GIO 覆写启动与独立 systemd session target 已实现，操作见 [配置](CONFIGURATION.md) 与 [桌面组件](INTEGRATION.md)。
 
 ## v1 架构决策
 
@@ -160,9 +160,9 @@ Waybridge 定义为可独立启动的远程应用会话环境。部署不要求�
 | Portal、通知与窗口共享 | 使用标准应用接口，选择适合本会话的后端；需要合成器配合的部分对接 Waybridge |
 | 系统能力 | GPU 驱动、文件系统、网络、系统 D-Bus、logind 与 polkit 等按实际需要使用；桌面独立性不要求复制这些系统设施 |
 
-KWallet、Qt、GTK 或 KDE Frameworks 可以成为组件依赖，是否采用取决于它们能否在目标会话独立运行。应用要求的 KDE 专用接口逐项记录兼容范围，不将其等同于必须启动整个 Plasma。密钥服务优先依照 Secret Service 选择后端，KWallet 专用调用保留对应兼容实现；先提供一套经过验证的默认组合，再扩大可替换实现的范围。KWallet 当前版本的接口与后端分工见 [上游说明](https://raw.githubusercontent.com/KDE/kwallet/v6.31.0/README.md)。
+KWallet、Qt、GTK 或 KDE Frameworks 可以成为组件依赖，是否采用取决于它们能否在目标会话独立运行。应用要求的 KDE 专用接口逐项记录兼容范围，不将其等同于必须启动整个 Plasma。用户通过原生 D-Bus、unit 和应用参数选择组件，核心不建立按 provider 名称激活、降级或监控的框架。KWallet 当前版本的接口与后端分工见 [上游说明](https://raw.githubusercontent.com/KDE/kwallet/v6.31.0/README.md)。
 
-本会话使用 Waybridge 桌面身份和标准用户 D-Bus。`src/session_services.rs` 配置 D-Bus 与 systemd 用户服务激活显示环境，通过标准入口使用原有密钥服务及 Portal；退出时恢复变量，若新的桌面已替换显示环境则不覆盖。运行期 Portal 后端选择配置保留用户配置优先权，不改写持久配置。
+本会话使用 Waybridge 桌面身份和标准用户 D-Bus。[会话集成](../src/session_services.rs) 发布显示环境并异步启动独立的 `waybridge-session.target`；结束时先停止声明归属的服务，继续处理其显示请求，再撤销环境。失效旧显示不恢复，后登录桌面的环境不覆盖。D-Bus daemon 无 unset API 的限制明确记录。Portal 选择采用 `integration/` 中可选安装的静态标准配置，不生成运行期替代配置，不强制全局 Qt/GDK 后端。
 
 显示、输入、音频节点和诊断按会话管理；HOME、应用及钱包配置和数据默认共享。断开保留会话，结束时清理会话资源；共享服务遵循用户正常生命周期，不扫描或强杀其他后台进程。旧隔离数据保留，见 [会话策略](SESSION_POLICY.md)。
 
@@ -178,7 +178,7 @@ C# 控制中心通过当前用户专用 named pipe 管理原生内核，通过 T
 
 TCP 控制、媒体和音频连接分别认证，窗口控制与文件数据目前共用控制连接。可选 UDP 使用认证加密、XOR FEC 和 TCP 补帧，并按全局消息顺序交付媒体。TLS 网关与现有 SSH 隧道均可承载这些 TCP 连接。
 
-实现入口：[TLS 用户入口](../service/src/main.rs)、[合成器](../src/main.rs)、[会话环境](../src/launch.rs)、[桌面服务](../src/session_services.rs)、[文件工作队列](../src/transfer_worker.rs)、[网络](../src/network.rs)、[编码调度](../src/video.rs)、[Windows 内核](../client/main.cpp)、[Windows 呈现](../client/presentation.h)、[GUI 会话控制](../gui/Waybridge.Control.Core/SessionController.cs)。当前线协议见 [PROTOCOL.md](PROTOCOL.md)，设备验证范围见 [VALIDATION.md](VALIDATION.md)。
+实现入口：[TLS 用户入口](../service/src/main.rs)、[合成器](../src/main.rs)、[共享配置](../config/src/lib.rs)、[应用启动助手](../scripts/session-control.py)、[会话环境](../src/launch.rs)、[桌面服务](../src/session_services.rs)、[文件工作队列](../src/transfer_worker.rs)、[网络](../src/network.rs)、[编码调度](../src/video.rs)、[Windows 内核](../client/main.cpp)、[Windows 呈现](../client/presentation.h)、[GUI 会话控制](../gui/Waybridge.Control.Core/SessionController.cs)。当前线协议见 [PROTOCOL.md](PROTOCOL.md)，设备验证范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 画面路径的研究方向
 

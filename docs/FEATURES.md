@@ -81,7 +81,8 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | 网络 | 原生 TLS 直连、可选 SSH TCP、加密 UDP、丢包修复和 TCP 回退 | 需要手工配置可达 UDP 地址；固定节流，无自适应拥塞控制，媒体全局有序可能跨窗口阻塞 |
 | I/O 响应性 | 两端文件接收工作队列、连接/选择代次、Windows 有界有序发送 | 文件字节仍共用控制通道；旧式非 file_tree 上传元数据有同步预检，逐文件进度/限速/续传留到 M2 |
 | 控制与诊断 | 托盘、只读键鼠、共享开关、实时帧率和码率配置、实际画面路径及阶段计时、导出日志 | 没有游戏内状态浮层；阶段时间和 RTT 不等于物理输入到显示延迟 |
-| 桌面服务 | 共享用户 D-Bus 与数据、KWallet/Secret Service、Desktop Portal/GTK 文件选择、激活环境及状态 | 默认共享用户数据；旧隔离钱包迁移、Flatpak 文档授权未验证；ScreenCast 属于 M4 |
+| 配置与应用启动 | Linux TOML 默认值/限额/来源查询，按完整 desktop ID 的独立覆写，GIO 字段与动作，HOME/Path/cwd 规则 | 无配置 UI；action 与 URI 不能同请求；应用单实例转交不保证覆写作用于既有进程 |
+| 桌面服务 | 共享用户 D-Bus 与数据、激活环境、独立 systemd target；原生钱包/GTK Portal 可按标准配置接入 | 组件由用户选择，集成文件需明确安装；旧隔离钱包迁移、Flatpak 文档授权未验证；ScreenCast 属于 M4 |
 | 应用与平台 | 原生 Wayland、私有 Xwayland，Windows x64 与原生 ARM64 构建；桌面密钥服务在本会话原生运行 | X11 无 PRIMARY、XDND、XIM 和完整 EWMH；构建成功不代表所有应用、设备组合可用 |
 
 文件目前单个文件最多 1 GiB，目录批次内容最多 8 GiB、512 个条目；Windows 路径、名称、符号链接及 reparse point 等还有兼容限制。详见 [文件说明](README.md#使用数据交换) 与 [协议](PROTOCOL.md)。
@@ -188,7 +189,7 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | 权限认证 | 需要系统授权的已选应用，在当前会话显示认证或明确说明不支持；不改变宿主授权规则 | 注册与调用归属对应实际 Linux 登录会话或进程，认证可取消；系统设置类操作按需扩展 |
 | SSH / GPG 与开发工具 | 默认使用 Linux 侧现有身份与 agent；需要交互时提供本会话可见路径。Windows 密钥代理另列可选功能 | Git 操作、SSH 密钥口令及 GPG 签名按实际工具选择验收，不把 KWallet 通过视为 agent 集成通过 |
 
-实现见 [桌面服务](../src/session_services.rs) 与 [验证记录](VALIDATION.md)。默认使用原有用户总线上的 Secret Service/KWallet，解锁和应用授权沿用原生交互；SSH 密钥登录本身不提供钱包密码。
+实现见 [桌面服务](../src/session_services.rs)、[集成步骤](INTEGRATION.md) 与 [验证记录](VALIDATION.md)。原有用户总线上的 Secret Service/KWallet 沿用原生解锁和授权，按应用请求或用户 unit 配置启动；核心不强制激活某个钱包。SSH 密钥登录本身不提供钱包密码。
 
 应用与用户服务共享用户数据和总线，Waybridge 配置当前显示和激活环境，不另做通用密码对话框。
 

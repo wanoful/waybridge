@@ -1,6 +1,6 @@
 # Waybridge 0.3.0
 
-配置归属、桌面集成边界及 Waybridge 专用 `.desktop` 追加/覆写的已确认设计见 [配置决策](CONFIGURATION_POLICY.md)；这是后续实施方案，当前还不能使用其中规划的配置入口。
+Linux TOML、配置检查、Waybridge 专用 `.desktop` 追加/覆写与工作目录规则见 [配置与应用启动](CONFIGURATION.md)；钱包、Portal 和 systemd 生命周期的安装与接入见 [桌面组件](INTEGRATION.md)。设计依据见 [配置决策](CONFIGURATION_POLICY.md)。
 
 这是 Linux → Windows 独立应用窗口原型。服务端是私有无头 Smithay Wayland 合成器，可选择启动 rootless Xwayland；不接入 KWin，不迁移已有桌面窗口。Windows 客户端为 Win32，提供 x64 和原生 ARM64 构建。功能来源见 [整合清单](PARALLEL_FEATURES.md)，实际验收范围见 [VALIDATION.md](VALIDATION.md)。
 
@@ -8,7 +8,7 @@
 
 现有能力与目标范围见 [功能规格](FEATURES.md)，技术边界见 [架构](ARCHITECTURE.md)，里程碑见 [Roadmap](ROADMAP.md)。默认采用[共享用户数据与单向会话检查](SESSION_POLICY.md)：先注销同一用户的本地桌面，再创建 Waybridge；已有会话可以重连。M0/M1 设备验证与本次策略变更分开记录，见 [VALIDATION.md](VALIDATION.md)。
 
-同级 `../sunshine/` 和 `../moonlight/` 是未修改的本地参考源码，不纳入本仓库；参考版本见 [upstreams.json](../upstreams.json)。完整 Git 历史与功能来源分支保留，早期提交使用 `waybridge/` 路径前缀。协议为独立 v3，普通 Moonlight 不能直接连接。
+仓库同级的 `sunshine/` 和 `moonlight/` 是未修改的本地参考源码，不纳入本仓库；参考版本见 [upstreams.json](../upstreams.json)。完整 Git 历史与功能来源分支保留，早期提交使用 `waybridge/` 路径前缀。协议为独立 v3，普通 Moonlight 不能直接连接。
 
 每个顶层窗口对应一个 Windows 窗口，标题栏只由一端拥有；越界/嵌套菜单映射为独立 owned popup，不改变父窗口尺寸。绘制跟随 Windows DPI，Qt 分数缩放、透明 alpha、父子对话框与原生输入分别处理。断线保留应用，重连恢复窗口；旧焦点的按键、组合和指针锁定不会继续作用于新目标。
 
@@ -85,11 +85,11 @@ ssh -N -L 49090:127.0.0.1:49090 wano@<Linux-IP>
 
 自定义 socket 的会话同时指定 `--socket <名称>`。`--launch` 读取 0600 权限描述文件，带上 Waybridge 的显示、用户 D-Bus、IME 和音频环境。过期描述会被拒绝，正常退出时移除。已有本地窗口不会迁入 Waybridge。
 
-会话使用标准用户 D-Bus、原有钱包及应用配置和数据。Waybridge 设置当前显示与服务激活环境，退出时恢复；钱包解锁和 Portal 文件选择使用现成原生界面。服务状态见 `WAYBRIDGE_DESKTOP_SERVICES`。不要求运行 KWin 或其他 DE；Flatpak 文档授权待逐项验证，窗口共享尚未实现。
+会话使用标准用户 D-Bus、原有钱包及应用配置和数据。Waybridge 发布显示环境，并通过独立的 systemd session target 管理用户声明的组件；结束时先停归属服务，再撤销环境和关闭显示。钱包和 Portal 采用用户配置的原生实现，不在核心按 provider 名称强制启动。集成文件需明确安装，步骤见 [桌面组件](INTEGRATION.md)，状态见 `WAYBRIDGE_DESKTOP_SERVICES`。不要求运行 KWin 或其他 DE；Flatpak 文档授权待逐项验证，窗口共享尚未实现。
 
-控制中心、管理 API 和 `--launch` 均不自动添加 Chrome 的 `--user-data-dir` 或密码后端参数，默认使用原有数据，显式参数原样保留。旧 `~/.local/share/waybridge/sessions/` 隔离数据保留，不自动迁移或覆盖。数据目录占用沿用应用原有机制；现有 Steam 跨会话启动检查保留，不终止冲突进程。
+控制中心、管理 API 和 `--launch` 均不自动添加 Chrome 的 `--user-data-dir` 或密码后端参数，默认使用原有数据，显式参数原样保留。旧 `~/.local/share/waybridge/sessions/` 隔离数据保留，不自动迁移或覆盖。数据目录占用沿用应用原有机制，不按应用名称扫描或终止冲突进程。应用目录启动会应用用户明确设置的 [Waybridge desktop 覆写](CONFIGURATION.md)。
 
-Chrome 会按桌面身份选择密码后端。原来使用 KDE/KWallet 6 的用户可运行 `waybridge --launch -- google-chrome-stable --password-store=kwallet6`，或将该选项保存在浏览器自身的用户 flags 中；这仍使用原有 profile。Waybridge 不自动转换密码存储后端，见 [Chromium 说明](https://chromium.googlesource.com/chromium/src/+/HEAD/docs/linux/password_storage.md)。
+Chrome 会按桌面身份选择密码后端。原来使用 KDE/KWallet 6 的用户可运行 `waybridge --launch -- google-chrome-stable --password-store=kwallet6`，或使用专用 desktop 覆写保存该参数；这仍使用原有 profile。Waybridge 不自动转换密码存储后端，见 [Chromium 说明](https://chromium.googlesource.com/chromium/src/+/HEAD/docs/linux/password_storage.md)。
 
 正常启动 `./target/release/waybridge -- ghostty` 会自动启用已安装的 Xwayland，以及可用的私有音频 sink。`--no-xwayland` / `--no-audio` 可分别关闭；`--xwayland` / `--audio` 则要求该功能初始化成功，失败时直接报错。可选功能不可用时默认保留原生 Wayland 窗口。
 
@@ -265,7 +265,7 @@ LLVM_MINGW_ROOT=/path/to/llvm-mingw ./scripts/build-windows-arm64.sh
 
 也可在 Windows 上使用 MSVC/CMake 构建 `client/`。客户端使用 Win32、D3D11、DXGI、DirectComposition、GDI+、系统 Media Foundation 和系统剪贴板 API，无 WSL 或 Qt 运行时依赖。
 
-运行需要 systemd-logind 和可用的用户 D-Bus（dbus-daemon 或 dbus-broker），可用 `systemctl --user start dbus.service` 启动用户总线。管理入口需要 Python 3，应用目录需要 GIO。钱包与文件选择需安装所选 Secret Service/KWallet、`xdg-desktop-portal` 与 GTK 后端；缺少可选 provider 时状态文件报告不可用。
+运行需要 systemd-logind 和可用的用户 D-Bus（dbus-daemon 或 dbus-broker），可用 `systemctl --user start dbus.service` 启动用户总线。管理入口需要 Python 3.11 或更新版本，应用目录需要 GIO；声明式组件生命周期需要 systemd 用户管理器及已安装的 Waybridge target。钱包与文件选择需安装并配置所选 Secret Service/KWallet、`xdg-desktop-portal` 与 GTK 后端；核心不自动选择这些组件。
 
 按需功能依赖：X11 需要 `Xwayland`，音频需要 `pactl`/`parec` 和可用的 PulseAudio 或 PipeWire-Pulse；SVG 图标需要 `rsvg-convert`。CUDA/HDR 需要兼容 NVIDIA GPU/驱动及构建时 CUDA/GL 开发头；缺少 CUDA 头时仍可构建 CPU/PNG 路径。测试另需 Pillow、wl-clipboard、Wayland scanner、Qt6Widgets、Wine/Xvfb/MinGW；HDR 数值测试需要 NumPy。
 
@@ -278,6 +278,8 @@ LLVM_MINGW_ROOT=/path/to/llvm-mingw ./scripts/build-windows-arm64.sh
 ./scripts/test-m0-m1.sh --with-wine  # M0/M1 完整 Linux/Wine 回归；需 NVIDIA/CUDA/NVENC
 python tests/session_integration_smoke.py
 ```
+
+新增配置与桌面集成验证为 `tests/configuration_smoke.py`、`tests/desktop_overrides_smoke.py` 和 `tests/session_lifecycle_smoke.py`。前两项已纳入组合脚本；生命周期测试在组合脚本的模拟总线包装之前，通过单独的 delegated scope 运行临时真实 systemd 用户管理器，验证显示可用期间完成组件启动和停止。
 
 组合脚本同时启用 X11/音频/UDP/GPU/HDR，验证能力、独立音频认证、PNG-only 回退、Wayland+X11 共存、控制响应及共享退出清理；它不代表所有 14 项功能在一个真实 Windows 会话中完成验收。完整文件整合后的组合脚本、原生文件/IME 和媒体回归已通过，分层结果见 [VALIDATION.md](VALIDATION.md)。
 

@@ -1,5 +1,73 @@
 # Validation
 
+## Configuration, desktop overrides and standard session lifecycle — 2026-11-14
+
+Project documentation is now under `docs/`, with a root navigation README. Usage,
+configuration syntax and component installation are documented in
+[configuration](CONFIGURATION.md) and [desktop integration](INTEGRATION.md).
+
+The Linux/Wine M0/M1 regression passed, including workspace formatting, strict
+Clippy and unit tests, real Linux graphics/input/files, TLS/OpenSSH/.NET, actual
+NVENC/HDR, native Schannel/GUI IPC, audio and OLE file/directory flows. The suite
+was run as `python3 tests/session_fixture.py ./scripts/test-m0-m1.sh --with-wine`;
+the real systemd test was run separately outside the simulated user manager.
+The regular script now performs that real-manager test before entering its
+fixture. Logs are `build/tests/config-session-regression.log`,
+`config-final-clippy.log`, `config-final-unit.log`, and `config-real-lifecycle.log`.
+
+- `configuration_smoke.py` checks both binaries' defaults, XDG lookup/fallback,
+  explicit file replacement, CLI precedence, unknown/type/range errors,
+  provenance and absence of state/network/session side effects. Management and
+  explicitly named existing-session attachment remain usable with a malformed
+  new config. Configuration errors do not echo file contents.
+- `desktop_overrides_smoke.py` uses actual GIO and a disposable bus. It covers
+  complete folded desktop IDs, original `%k`, literal arguments/percent/quotes,
+  extra arguments before `--`, independent actions, Path/HOME/cwd, environment
+  unset, standard Activate/Open/ActivateAction, process-override conflicts and
+  explicit Exec mode. Source entries and ordinary local GIO launches remain
+  unchanged. Derived entries stay private and survive until session cleanup.
+  Additional regressions check a legal NBSP in an executable filename and an
+  application-only `PYTHONHOME`: overrides use GIO launch context rather than
+  altering the Python dispatcher environment.
+- `session_launch_policy_smoke.py --actual-chrome` passes with temporary Chrome
+  data, including an explicit scoped overlay, actual remote windows and reuse of
+  the same original-profile instance. It does not read the user's real wallet,
+  cookies or saved passwords, or certify restoration of their account sign-in.
+- `direct_service_smoke.py` checks the actual TLS service/compositor with an
+  explicitly selected TOML: omitted media fields use file defaults, over-limit
+  startup and live requests fail, allowed updates return effective policy, and
+  requests cannot select server executables/configuration or rewrite the file.
+  Reconnect retains the same session despite a newly invalid config.
+  `launch-plan` does not execute the application or expose environment values.
+  The embedded TLS helper also launches a real shell desktop entry with scoped
+  cwd and `PYTHONHOME`, verifying dispatch and the target's effective environment.
+- `session_lifecycle_smoke.py` runs a real nested systemd user manager and real
+  user bus inside a delegated test scope, with temporary HOME/runtime and a
+  restricted unit search path. A `Type=notify` service connects and round-trips
+  Wayland before READY and again during shutdown. Declared `PartOf` services stop
+  before display destruction; an unrelated service survives. It also checks
+  true unset versus explicit empty values, D-Bus/systemd activation forwarding,
+  mixed valid/stale previous displays, later-desktop environment preservation,
+  and refusal to adopt an already active target or pending startup transaction.
+  The host manager only allocates the test scope; host desktop targets and
+  activation environment are untouched.
+- Native wallet/GTK Portal tests pass with components selected explicitly by
+  fixture D-Bus aliases and Portal configuration. The production core no longer
+  activates or polls named wallet providers, generates Portal configuration, or
+  forces Qt/GDK backends. Installer tests use temporary paths and verify layout,
+  idempotence and refusal of modified-unit/Portal conflicts before any writes.
+
+Debug and Release workspace builds pass. Windows x64 and ARM64 portable packages
+are rebuilt with the matching embedded SSH helper and the `docs/` directory.
+The native worker is unchanged. Python 3.11+ and system GIO/GLib are required for
+the management helper; no Python package installation is needed.
+
+This revision has not been retested on physical Windows. The existing x64 device
+results below keep their original scope. Existing saved-credential access,
+Flatpak document grants, physical WoA/HDR and later-roadmap features remain
+separate acceptance work. The D-Bus daemon's missing unset API is explicitly
+reported; systemd applies genuine unset after daemon activation forwarding.
+
 ## Shared user data and one-way session admission — 2026-11-14
 
 This supersedes the earlier private-bus/per-session wallet and browser-profile policy; the historical device results below retain their original scope. See [SESSION_POLICY.md](SESSION_POLICY.md).
