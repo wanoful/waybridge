@@ -8,6 +8,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo build --locked
+python3 tests/session_service_status_smoke.py
 python tests/output_bind_race_smoke.py
 python tests/smoke.py
 python tests/cursor_smoke.py

@@ -14,8 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SessionFixture:
-    def __init__(self, directory, real_manager=False):
+    def __init__(self, directory, real_manager=False, status_write_failure=False):
         self.real_manager = real_manager
+        self.status_write_failure = status_write_failure
         self.root = Path(directory)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.env = dict(os.environ)
@@ -67,7 +68,8 @@ class SessionFixture:
         self.env.update(DBUS_SESSION_BUS_ADDRESS=address, DBUS_SYSTEM_BUS_ADDRESS=address,
                         WAYBRIDGE_TEST_SESSION_FIXTURE='1')
         self.server = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--server',
-                                        str(self.sessions), str(self.manager), "real" if self.real_manager else "fake"], env=self.env,
+                                        str(self.sessions), str(self.manager),
+                                        "real" if self.real_manager else "status-failure" if self.status_write_failure else "fake"], env=self.env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         assert self.server.stdout.readline().strip() == 'ready', self.server.stderr.read()
         return self
@@ -122,6 +124,10 @@ def server(sessions_path, manager_path, mode="fake"):
                 else:
                     values.pop(value, None)
             manager_path.write_text(json.dumps(values))
+            if mode == 'status-failure' and name == 'SetEnvironment' and values.get('WAYBRIDGE_SESSION_ID'):
+                # Fail the compositor's first status persist, after environment
+                # publication but before its lifecycle worker starts.
+                (Path(values['WAYBRIDGE_SESSION_ID']) / 'status.json').mkdir(exist_ok=True)
             invocation.return_value(GLib.Variant('()', ()))
     manager_xml = '''<node><interface name="org.freedesktop.login1.Manager"><method name="ListSessions"><arg type="a(susso)" direction="out"/></method></interface></node>'''
     session_xml = '''<node><interface name="org.freedesktop.login1.Session"><property name="Type" type="s" access="read"/><property name="Class" type="s" access="read"/><property name="State" type="s" access="read"/></interface></node>'''

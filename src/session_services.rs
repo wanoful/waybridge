@@ -223,7 +223,16 @@ fn active(bus: &Connection, name: &str) -> Result<String> {
     }
 }
 
-fn report(path: &Path, lifecycle: &str, detail: &str, bus: &Connection) -> Result<()> {
+// Diagnostics must never prevent service shutdown or activation-environment
+// cleanup. In particular, a full/unwritable runtime must not strand services
+// pointing at a compositor that has already gone away.
+fn report(path: &Path, lifecycle: &str, detail: &str, bus: &Connection) {
+    if let Err(error) = write_report(path, lifecycle, detail, bus) {
+        tracing::warn!(%error, %lifecycle, path=%path.display(), "cannot write desktop-service status");
+    }
+}
+
+fn write_report(path: &Path, lifecycle: &str, detail: &str, bus: &Connection) -> Result<()> {
     let names: Vec<String> = bus
         .call_method(
             Some("org.freedesktop.DBus"),
@@ -394,7 +403,7 @@ fn lifecycle(
         match manager_call(&bus, "StartUnit", &(TARGET, "fail")) {
             Ok(_) => started = true,
             Err(error) => {
-                report(&status, "unavailable", &error.to_string(), &bus)?;
+                report(&status, "unavailable", &error.to_string(), &bus);
             }
         }
     }
@@ -406,7 +415,7 @@ fn lifecycle(
             }
             match active(&bus, TARGET).as_deref() {
                 Ok("active") => {
-                    report(&status, "ready", "Waybridge session target is active", &bus)?;
+                    report(&status, "ready", "Waybridge session target is active", &bus);
                     break;
                 }
                 Ok("failed") => {
@@ -415,7 +424,7 @@ fn lifecycle(
                         "unavailable",
                         "session target startup did not complete",
                         &bus,
-                    )?;
+                    );
                     break;
                 }
                 _ if Instant::now() >= deadline => {
@@ -424,7 +433,7 @@ fn lifecycle(
                         "unavailable",
                         "session target startup timed out",
                         &bus,
-                    )?;
+                    );
                     break;
                 }
                 _ => thread::sleep(Duration::from_millis(20)),
@@ -445,7 +454,7 @@ fn lifecycle(
                 "stopping",
                 "stopping only units declaring PartOf=waybridge-session.target",
                 &bus,
-            )?;
+            );
             let mut units = Vec::new();
             owned_units(&bus, TARGET, &mut units)?;
             manager_call(&bus, "StartUnit", &(SHUTDOWN, "replace"))?;
@@ -470,7 +479,7 @@ fn lifecycle(
         "stopped",
         "owned services stopped; systemd environment restored/unset; D-Bus has no unset API",
         &bus,
-    )?;
+    );
     Ok(())
 }
 
@@ -584,13 +593,34 @@ impl Services {
                 "install Waybridge user session units and use a systemd user manager for declared service lifecycle"
             },
             &self.bus,
-        )?;
+        );
         let bus = self.bus.clone();
         let status = self.status_file();
         let stopped = self.stopped.clone();
-        self.worker = Some(thread::spawn(move || {
-            lifecycle(bus, status, target, previous, written, stopped)
-        }));
+        let worker_previous = previous.clone();
+        let worker_written = written.clone();
+        match thread::Builder::new()
+            .name("waybridge-services".into())
+            .spawn(move || {
+                lifecycle(
+                    bus,
+                    status,
+                    target,
+                    worker_previous,
+                    worker_written,
+                    stopped,
+                )
+            }) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(error) => {
+                // Environment publication has already succeeded. Do not lose
+                // its rollback state if allocating the worker itself fails.
+                if let Err(cleanup) = cleanup_environment(&self.bus, previous.as_ref(), &written) {
+                    tracing::warn!(%cleanup, "cannot roll back activation environment after worker startup failure");
+                }
+                return Err(error).context("Starting desktop-service lifecycle worker");
+            }
+        }
         Ok(())
     }
     pub fn stop(&mut self, mut pump: impl FnMut() -> Result<()>) -> Result<()> {
