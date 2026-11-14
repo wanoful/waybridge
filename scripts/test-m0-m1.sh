@@ -11,6 +11,7 @@ if [[ "${WAYBRIDGE_TEST_SESSION_FIXTURE:-}" != 1 ]]; then
   # it must run before the remaining suite replaces the manager with a fixture.
   cargo build --workspace --locked
   python3 tests/session_lifecycle_smoke.py
+  python3 tests/session_error_shutdown_smoke.py
   exec python3 tests/session_fixture.py bash "$0" "$@"
 fi
 verification_data=$(mktemp -d -t waybridge-validation-data.XXXXXXXX)
@@ -35,6 +36,7 @@ python3 tests/hdr_video_smoke.py
 if [[ "${1:-}" == --with-wine ]]; then
   cmake -S client -B build/windows -G Ninja -DCMAKE_TOOLCHAIN_FILE=mingw.cmake -DCMAKE_BUILD_TYPE=Release
   cmake --build build/windows --target waybridge-client
+  python3 tests/windows_drop_lifetime_smoke.py
   c++ -std=c++17 -Wall -Wextra -Werror -pthread tests/ordered_sender_probe.cpp -o build/tests/ordered-sender-probe
   build/tests/ordered-sender-probe
   python3 tests/windows_tls_smoke.py

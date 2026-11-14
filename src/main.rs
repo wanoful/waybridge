@@ -2894,187 +2894,205 @@ fn main() -> Result<()> {
         &args.listen,
         &token_path,
     )?;
-    if let Some(program) = args.command.first() {
-        let mut command = Command::new(program);
-        command.args(&args.command[1..]);
-        application_session.configure(&mut command, app.audio.as_ref());
-        let cwd = args
-            .cwd
-            .clone()
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .context("HOME is required for application launch without --cwd")?;
-        if !cwd.is_absolute() || !cwd.is_dir() {
-            bail!("application working directory must be an existing absolute directory");
+    // Service shutdown must run for application-launch and event-loop errors too.
+    // Keep the display alive and dispatchable until owned components have stopped.
+    let run_result = (|| -> Result<()> {
+        application_session.start_services()?;
+        if let Some(program) = args.command.first() {
+            let mut command = Command::new(program);
+            command.args(&args.command[1..]);
+            application_session.configure(&mut command, app.audio.as_ref());
+            let cwd = args
+                .cwd
+                .clone()
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                .context("HOME is required for application launch without --cwd")?;
+            if !cwd.is_absolute() || !cwd.is_dir() {
+                bail!("application working directory must be an existing absolute directory");
+            }
+            command.current_dir(cwd);
+            children.push(
+                command
+                    .spawn()
+                    .with_context(|| format!("launching {program}"))?,
+            );
         }
-        command.current_dir(cwd);
-        children.push(
-            command
-                .spawn()
-                .with_context(|| format!("launching {program}"))?,
-        );
-    }
-    tracing::info!(socket = %args.socket, token_file = %token_path.display(), "ready; launch apps with WAYLAND_DISPLAY set to this socket");
-    let mut next_frame = Instant::now();
-    while !shutdown::requested() {
-        app.reap_retired_outputs();
-        xloop.dispatch(Some(Duration::ZERO), &mut app)?;
-        while let Some(stream) = socket.accept()? {
-            app.dh
-                .insert_client(stream, Arc::new(ClientState::default()))?;
-        }
-        display.dispatch_clients(&mut app)?;
-        app.poll_window_drag();
-        app.sync_pointer_lock();
-        app.pump_outbound()?;
-        app.finish_file_drop();
-        app.read_pending_clipboard();
-        // Bound input work per cycle so a busy peer cannot starve Wayland or rendering.
-        for _ in 0..256 {
-            let Ok(event) = events.try_recv() else { break };
-            match event {
-                Event::Connected(peer) => {
-                    app.read_only = false;
-                    if let Some(audio) = &app.audio {
-                        audio.set_peer(Some(&peer));
-                    }
-                    app.x11.grab = None;
-                    app.release_input();
-                    app.peer = Some(peer);
-                    app.cursor.dirty = true;
-                    app.configure_capabilities();
-                    app.ime.republish();
-                    app.publish_ime();
-                    for p in &mut app.remote_popups {
-                        p.last_info = Value::Null;
-                        p.dirty = true;
-                    }
-                    if let Some((root, grab)) = &app.popup_grab {
-                        if !grab.has_ended() {
-                            app.control(json!({"type":"popup_grab","root":root,"active":true}));
+        tracing::info!(socket = %args.socket, token_file = %token_path.display(), "ready; launch apps with WAYLAND_DISPLAY set to this socket");
+        let mut next_frame = Instant::now();
+        while !shutdown::requested() {
+            app.reap_retired_outputs();
+            xloop.dispatch(Some(Duration::ZERO), &mut app)?;
+            while let Some(stream) = socket.accept()? {
+                app.dh
+                    .insert_client(stream, Arc::new(ClientState::default()))?;
+            }
+            display.dispatch_clients(&mut app)?;
+            app.poll_window_drag();
+            app.sync_pointer_lock();
+            app.pump_outbound()?;
+            app.finish_file_drop();
+            app.read_pending_clipboard();
+            // Bound input work per cycle so a busy peer cannot starve Wayland or rendering.
+            for _ in 0..256 {
+                let Ok(event) = events.try_recv() else { break };
+                match event {
+                    Event::Connected(peer) => {
+                        app.read_only = false;
+                        if let Some(audio) = &app.audio {
+                            audio.set_peer(Some(&peer));
                         }
-                    }
-                    for w in &mut app.windows {
-                        w.state.visible = true;
-                        w.state.minimized = false;
-                        if let Some(top) = w.window.toplevel() {
-                            top.with_pending_state(|s| {
-                                s.states.unset(xdg_toplevel::State::Suspended);
-                            });
-                            top.send_pending_configure();
-                        } else if let Some(x) = w.window.x11_surface() {
-                            let _ = x.set_suspended(false);
-                        }
-                        w.announced = false;
-                        w.icon.sent = false;
-                        w.dirty = true;
-                    }
-                    let items: BTreeMap<_, _> = app
-                        .clipboard
-                        .iter()
-                        .map(|(mime, data)| (mime.clone(), B64.encode(data)))
-                        .collect();
-                    if !items.is_empty() {
-                        app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
-                    }
-                }
-                Event::Message(value) => app.message(value),
-                Event::UploadedFiles(completed) => {
-                    if !app.transfers.current(completed.epoch)
-                        || !app
-                            .peer
-                            .as_ref()
-                            .is_some_and(|peer| Arc::ptr_eq(peer, &completed.peer))
-                    {
-                        continue;
-                    }
-                    let value = &completed.message;
-                    let tree = value["type"] == "tree_upload_commit";
-                    let dropped = value["drop"].as_bool() == Some(true);
-                    let valid = if dropped {
-                        value["id"].as_u64().is_some_and(|id| {
-                            app.windows
-                                .iter()
-                                .any(|w| u64::from(w.id) == id && w.mapped)
-                        })
-                    } else {
-                        completed.clipboard_generation == app.clipboard_generation
-                            && (!tree
-                                || value["epoch"]
-                                    .as_u64()
-                                    .is_none_or(|epoch| epoch == completed.peer.file_epoch()))
-                    };
-                    if !valid {
-                        completed.peer.control(if tree {
-                            json!({"type":"tree_upload_error","batch":value["batch"],"message":"Upload target or clipboard was superseded"})
-                        } else {
-                            json!({"type":"error","message":"Upload target or clipboard was superseded"})
-                        });
-                        continue;
-                    }
-                    app.publish_uploaded_files(value, completed.uris);
-                    completed.peer.control(if tree {
-                        json!({"type":"tree_upload_ready","batch":value["batch"],"stage":"commit"})
-                    } else {
-                        json!({"type":"upload_ready","files":value["transfers"].as_array().map_or(0, Vec::len)})
-                    });
-                }
-                Event::Icon {
-                    id,
-                    revision,
-                    app_id,
-                    png,
-                } => {
-                    if let Some(window) = app.windows.iter_mut().find(|w| w.id == id) {
-                        window.icon.complete(revision, &app_id, png);
-                    }
-                }
-                Event::DragFiles { id, result } => {
-                    if let Some(drag) = app.outbound.as_mut().filter(|d| d.id == id) {
-                        match result {
-                            Ok(files) => {
-                                let manifest = files.manifest.clone();
-                                let tree = files.tree;
-                                let window = drag.window;
-                                drag.files = Some(files);
-                                app.control(json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"tree":tree,"action":"copy"}));
-                            }
-                            Err(error) => {
-                                tracing::debug!(%error, "outbound drag not supported");
-                                app.end_outbound(false);
-                            }
-                        }
-                    }
-                }
-                Event::Disconnected => {
-                    app.cancel_window_drag();
-                    app.poll_window_drag();
-                    app.window_drag.available = false;
-                    app.release_gpu_sources();
-                    if let Some(audio) = &app.audio {
-                        audio.set_peer(None);
-                    }
-                    if let Some(root) = app.x11.grab {
-                        app.x11_cancel_popup(root);
                         app.x11.grab = None;
+                        app.release_input();
+                        app.peer = Some(peer);
+                        app.cursor.dirty = true;
+                        app.configure_capabilities();
+                        app.ime.republish();
+                        app.publish_ime();
+                        for p in &mut app.remote_popups {
+                            p.last_info = Value::Null;
+                            p.dirty = true;
+                        }
+                        if let Some((root, grab)) = &app.popup_grab {
+                            if !grab.has_ended() {
+                                app.control(json!({"type":"popup_grab","root":root,"active":true}));
+                            }
+                        }
+                        for w in &mut app.windows {
+                            w.state.visible = true;
+                            w.state.minimized = false;
+                            if let Some(top) = w.window.toplevel() {
+                                top.with_pending_state(|s| {
+                                    s.states.unset(xdg_toplevel::State::Suspended);
+                                });
+                                top.send_pending_configure();
+                            } else if let Some(x) = w.window.x11_surface() {
+                                let _ = x.set_suspended(false);
+                            }
+                            w.announced = false;
+                            w.icon.sent = false;
+                            w.dirty = true;
+                        }
+                        let items: BTreeMap<_, _> = app
+                            .clipboard
+                            .iter()
+                            .map(|(mime, data)| (mime.clone(), B64.encode(data)))
+                            .collect();
+                        if !items.is_empty() {
+                            app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
+                        }
                     }
-                    app.relative_available(false);
-                    app.end_outbound(false);
-                    app.drag_enabled = false;
-                    app.release_input();
-                    app.encoder.reset();
-                    app.focus(None);
-                    app.transfers.cancel();
-                    app.peer = None;
-                    app.configure_capabilities();
-                }
-                Event::Clipboard {
-                    generation,
-                    mime,
-                    bytes,
-                } if generation == app.clipboard_generation => {
-                    if mime == "text/uri-list" {
+                    Event::Message(value) => app.message(value),
+                    Event::UploadedFiles(completed) => {
+                        if !app.transfers.current(completed.epoch)
+                            || !app
+                                .peer
+                                .as_ref()
+                                .is_some_and(|peer| Arc::ptr_eq(peer, &completed.peer))
+                        {
+                            continue;
+                        }
+                        let value = &completed.message;
+                        let tree = value["type"] == "tree_upload_commit";
+                        let dropped = value["drop"].as_bool() == Some(true);
+                        let valid = if dropped {
+                            value["id"].as_u64().is_some_and(|id| {
+                                app.windows
+                                    .iter()
+                                    .any(|w| u64::from(w.id) == id && w.mapped)
+                            })
+                        } else {
+                            completed.clipboard_generation == app.clipboard_generation
+                                && (!tree
+                                    || value["epoch"]
+                                        .as_u64()
+                                        .is_none_or(|epoch| epoch == completed.peer.file_epoch()))
+                        };
+                        if !valid {
+                            completed.peer.control(if tree {
+                                json!({"type":"tree_upload_error","batch":value["batch"],"message":"Upload target or clipboard was superseded"})
+                            } else {
+                                json!({"type":"error","message":"Upload target or clipboard was superseded"})
+                            });
+                            continue;
+                        }
+                        app.publish_uploaded_files(value, completed.uris);
+                        completed.peer.control(if tree {
+                            json!({"type":"tree_upload_ready","batch":value["batch"],"stage":"commit"})
+                        } else {
+                            json!({"type":"upload_ready","files":value["transfers"].as_array().map_or(0, Vec::len)})
+                        });
+                    }
+                    Event::Icon {
+                        id,
+                        revision,
+                        app_id,
+                        png,
+                    } => {
+                        if let Some(window) = app.windows.iter_mut().find(|w| w.id == id) {
+                            window.icon.complete(revision, &app_id, png);
+                        }
+                    }
+                    Event::DragFiles { id, result } => {
+                        if let Some(drag) = app.outbound.as_mut().filter(|d| d.id == id) {
+                            match result {
+                                Ok(files) => {
+                                    let manifest = files.manifest.clone();
+                                    let tree = files.tree;
+                                    let window = drag.window;
+                                    drag.files = Some(files);
+                                    app.control(json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"tree":tree,"action":"copy"}));
+                                }
+                                Err(error) => {
+                                    tracing::debug!(%error, "outbound drag not supported");
+                                    app.end_outbound(false);
+                                }
+                            }
+                        }
+                    }
+                    Event::Disconnected => {
+                        app.cancel_window_drag();
+                        app.poll_window_drag();
+                        app.window_drag.available = false;
+                        app.release_gpu_sources();
+                        if let Some(audio) = &app.audio {
+                            audio.set_peer(None);
+                        }
+                        if let Some(root) = app.x11.grab {
+                            app.x11_cancel_popup(root);
+                            app.x11.grab = None;
+                        }
+                        app.relative_available(false);
+                        app.end_outbound(false);
+                        app.drag_enabled = false;
+                        app.release_input();
+                        app.encoder.reset();
+                        app.focus(None);
+                        app.transfers.cancel();
+                        app.peer = None;
+                        app.configure_capabilities();
+                    }
+                    Event::Clipboard {
+                        generation,
+                        mime,
+                        bytes,
+                    } if generation == app.clipboard_generation => {
+                        if mime == "text/uri-list" {
+                            if app.x11.clipboard_generation == Some(generation) {
+                                app.clipboard.insert(mime.clone(), bytes.clone());
+                                set_data_device_selection(
+                                    &app.dh,
+                                    &app.seat,
+                                    app.clipboard.keys().cloned().collect(),
+                                    Arc::new(app.clipboard.clone()),
+                                );
+                            }
+                            if let Some(peer) = &app.peer {
+                                transfer::export(peer.clone(), generation, bytes);
+                            }
+                            continue;
+                        }
+                        app.clipboard.insert(mime, bytes);
                         if app.x11.clipboard_generation == Some(generation) {
-                            app.clipboard.insert(mime.clone(), bytes.clone());
                             set_data_device_selection(
                                 &app.dh,
                                 &app.seat,
@@ -3082,67 +3100,74 @@ fn main() -> Result<()> {
                                 Arc::new(app.clipboard.clone()),
                             );
                         }
-                        if let Some(peer) = &app.peer {
-                            transfer::export(peer.clone(), generation, bytes);
-                        }
-                        continue;
+                        let items: BTreeMap<_, _> = app
+                            .clipboard
+                            .iter()
+                            .map(|(mime, data)| (mime.clone(), B64.encode(data)))
+                            .collect();
+                        app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                     }
-                    app.clipboard.insert(mime, bytes);
-                    if app.x11.clipboard_generation == Some(generation) {
-                        set_data_device_selection(
-                            &app.dh,
-                            &app.seat,
-                            app.clipboard.keys().cloned().collect(),
-                            Arc::new(app.clipboard.clone()),
-                        );
-                    }
-                    let items: BTreeMap<_, _> = app
-                        .clipboard
-                        .iter()
-                        .map(|(mime, data)| (mime.clone(), B64.encode(data)))
-                        .collect();
-                    app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
+                    Event::Clipboard { .. } => {}
                 }
-                Event::Clipboard { .. } => {}
+            }
+            if app.ime.focus(
+                app.seat
+                    .get_keyboard()
+                    .unwrap()
+                    .current_focus()
+                    .and_then(|s| s.wl_surface().map(|s| s.into_owned())),
+            ) {
+                app.publish_ime();
+            }
+            if Instant::now() >= next_frame {
+                app.render()?;
+                let interval = Duration::from_secs_f64(1.0 / app.stream_fps as f64);
+                next_frame += interval;
+                if next_frame < Instant::now() {
+                    next_frame = Instant::now() + interval;
+                }
+            }
+            display.flush_clients()?;
+            // Reap launched apps without terminating a session when one app exits.
+            children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Ok(())
+    })();
+    let mut xloop_error_reported = false;
+    let shutdown_result = application_session.stop_services(|| {
+        // A failed Xwayland event source must not prevent native clients from
+        // completing their final roundtrips on an otherwise healthy display.
+        if let Err(error) = xloop.dispatch(Some(Duration::ZERO), &mut app) {
+            if !xloop_error_reported {
+                tracing::warn!(%error, "Xwayland event dispatch failed during session shutdown");
+                xloop_error_reported = true;
             }
         }
-        if app.ime.focus(
-            app.seat
-                .get_keyboard()
-                .unwrap()
-                .current_focus()
-                .and_then(|s| s.wl_surface().map(|s| s.into_owned())),
-        ) {
-            app.publish_ime();
-        }
-        if Instant::now() >= next_frame {
-            app.render()?;
-            let interval = Duration::from_secs_f64(1.0 / app.stream_fps as f64);
-            next_frame += interval;
-            if next_frame < Instant::now() {
-                next_frame = Instant::now() + interval;
-            }
-        }
-        display.flush_clients()?;
-        // Reap launched apps without terminating a session when one app exits.
-        children.retain_mut(|child| child.try_wait().ok().flatten().is_none());
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    application_session.stop_services(|| {
-        xloop.dispatch(Some(Duration::ZERO), &mut app)?;
-        while let Some(stream) = socket.accept()? {
+        while let Some(stream) = socket
+            .accept()
+            .context("accepting shutdown Wayland clients")?
+        {
             app.dh
                 .insert_client(stream, Arc::new(ClientState::default()))?;
         }
         display.dispatch_clients(&mut app)?;
         display.flush_clients()?;
         Ok(())
-    })?;
+    });
     if let Some(token) = app.x11.token.take() {
         xloop.handle().remove(token);
     }
     drop(xloop);
-    Ok(())
+    if let Err(error) = shutdown_result {
+        if run_result.is_ok() {
+            return Err(error).context("stopping Waybridge session services");
+        }
+        // Keep the original failure as the returned error; record an independent
+        // cleanup failure as well so neither cause is lost.
+        tracing::error!(error = %format!("{error:#}"), "Waybridge session shutdown also failed");
+    }
+    run_result
 }
 
 fn dpi_scale(value: &Value) -> f64 {

@@ -83,10 +83,12 @@ Portal 前端可额外声明 `After=xdg-desktop-portal-gtk.service`，明确所�
 1. 合成器完成单向准入检查、创建显示，并发布本会话显示与身份环境。
 2. 异步启动 `waybridge-session.target` 和它声明的依赖，主线程继续处理 Wayland，允许需要显示交互的 `Type=notify`/D-Bus 服务完成启动。
 3. target 进入 active 后，生命周期诊断报告 `ready`。具体组件是否成功仍由它的 unit 状态判断；`Wants` 的组件失败可以不阻止 target 激活，应用是否已显示窗口也另行判断。
-4. 正常结束时，启动 shutdown target，停止通过 `PartOf` 声明归属的服务；这段时间继续处理显示请求。
+4. 正常结束或启动应用、事件循环发生可返回错误时，启动 shutdown target，停止通过 `PartOf` 声明归属的服务；这段时间继续处理显示请求。
 5. 服务停止后撤销本会话仍拥有的激活环境，再销毁显示。后登录桌面已经改写的环境予以保留，注销前已失效的显示地址不恢复。
 
 这三个 target 独立于 `graphical-session.target`、`plasma-workspace.target` 和其他 DE target。标准 systemd 用户管理器及已安装的集成文件提供声明式生命周期；缺失时诊断标记 `unavailable`，不假装已经管理了外部服务。
+
+状态文件只用于诊断：写入失败会记录警告，不阻止服务启动、停止和环境清理。会话发生错误时先完成收尾，再返回原始错误；如果收尾也失败，会同时报告。强制终止进程或显示连接本身已不可用时，无法保证组件仍能完成显示交互。
 
 systemd 的环境支持真正删除未设置变量，原先用户显式设置的空值则保持为空。D-Bus daemon 的 `UpdateActivationEnvironment` 没有删除接口；只能以空值禁用失效地址，诊断会说明这一限制。清理先更新 D-Bus，再让 systemd 恢复或删除变量，避免 daemon 的 systemd 激活转发把未设置变量变为空字符串。没有可查询的用户管理器环境时，也无法安全判断 daemon 环境是否已被后登录桌面接管。会话不将 Qt/GDK 后端偏好、每应用音频设置或数据目录导入全局用户服务环境。
 

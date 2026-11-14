@@ -1,5 +1,42 @@
 # Validation
 
+## Error shutdown and Windows drop-target lifetime — 2026-11-15
+
+Desktop-service status reporting is now best-effort. A failed status write or
+observation no longer skips service startup, shutdown or activation-environment
+cleanup. Failure to allocate the lifecycle worker rolls back the environment
+using the existing ownership checks. `session_service_status_smoke.py` blocks the
+initial status write; the real-manager `session_lifecycle_smoke.py` also blocks
+ready and stopping reports. Sessions remain usable, components stop successfully
+with a live display, and unset/empty values and unrelated services are preserved.
+
+Application startup, session descriptor publication and event-loop errors now
+share the normal display-aware shutdown path. `session_error_shutdown_smoke.py`
+injects one accept error on its disposable Wayland socket, and separately checks
+an unavailable application and failed descriptor publication. The original error
+is returned after service cleanup. Against the prior installed Release binary,
+the event-loop case left the component unable to finish its Wayland roundtrip
+and systemd killed it after its stop timeout; the fixed binary stops it normally.
+The injection is a test-only preload library, not a production runtime option.
+
+Windows drop callbacks now identify their target by window ID and a weak lifetime
+token, retain their own COM reference during reentrant callbacks, and revalidate
+after external data/medium operations. Closing a target also invalidates queued
+virtual-file and filesystem uploads, including replacement with the same ID.
+`windows_drop_lifetime_smoke.py` passes under Wine: normal accept/leave plus
+twelve closure/replacement combinations during query, data retrieval, medium
+release and asynchronous setup cancel without scheduling an upload.
+
+Workspace formatting, strict Clippy, 29 Rust tests, Debug/Release builds,
+`GVFS_DISABLE_FUSE=1 ./scripts/test.sh`, the real-manager lifecycle/error tests,
+session admission, native fixture KWallet/GTK Portal and Windows x64/ARM64 client
+builds pass. Existing Wine virtual-file stream/HGLOBAL/pending cases and
+bidirectional file/directory clipboard and OLE drag regressions also pass. New
+regressions are included in the regular or M0/M1 test entrypoints. Logs are under `build/tests/lifecycle-fixes/`,
+with the drop callback trace at `build/tests/windows-drop-lifetime.log`.
+This change has not been retested on physical Windows and does not modify the
+user's installed services, real wallet data or deployed binaries.
+
 ## KWallet protocol disconnect and Portal activation — 2026-11-15
 
 The user's Chrome Paused report coincided with `kwalletd6` exiting on

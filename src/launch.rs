@@ -114,11 +114,18 @@ pub fn available(program: &str) -> bool {
     })
 }
 
+struct Prepared {
+    path: PathBuf,
+    file: tempfile::NamedTempFile,
+    environment: BTreeMap<String, Option<String>>,
+}
+
 pub struct Session {
     socket: String,
     display: Option<u32>,
     address: Option<String>,
     saved: Option<(PathBuf, u64, u64)>,
+    prepared: Option<Prepared>,
     services: Option<crate::session_services::Services>,
 }
 impl Session {
@@ -134,6 +141,7 @@ impl Session {
             display,
             address: None,
             saved: None,
+            prepared: None,
             services: None,
         };
         let descriptor_path = descriptor(socket)?;
@@ -153,7 +161,6 @@ impl Session {
                 )
             })
             .collect();
-        session.services.as_mut().unwrap().start(&environment)?;
         let path = descriptor(socket)?;
         let mut command = Command::new("env");
         session.configure(&mut command, audio);
@@ -177,11 +184,26 @@ impl Session {
         };
         let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
         serde_json::to_writer(file.as_file_mut(), &saved)?;
-        let metadata = file.as_file().metadata()?;
-        file.persist(&path).map_err(|e| e.error)?;
-        session.saved = Some((path.clone(), metadata.dev(), metadata.ino()));
-        tracing::info!(path=%path.display(), "application environment ready; use --launch -- <application> to join");
+        session.prepared = Some(Prepared {
+            path,
+            file,
+            environment,
+        });
         Ok(session)
+    }
+    /// Publish activation state only after the caller can dispatch service
+    /// shutdown on failure. The descriptor becomes visible after that state.
+    pub fn start_services(&mut self) -> Result<()> {
+        let prepared = self.prepared.take().context("session already started")?;
+        self.services
+            .as_mut()
+            .unwrap()
+            .start(&prepared.environment)?;
+        let metadata = prepared.file.as_file().metadata()?;
+        prepared.file.persist(&prepared.path).map_err(|e| e.error)?;
+        self.saved = Some((prepared.path.clone(), metadata.dev(), metadata.ino()));
+        tracing::info!(path=%prepared.path.display(), "application environment ready; use --launch -- <application> to join");
+        Ok(())
     }
     /// Keep dispatching the compositor while declared services finish shutdown.
     pub fn stop_services(&mut self, pump: impl FnMut() -> Result<()>) -> Result<()> {
