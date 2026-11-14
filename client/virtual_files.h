@@ -82,6 +82,7 @@ struct Request {
   IStream *marshaled = nullptr;
   HANDLE finished = nullptr;
   HWND target = nullptr;
+  std::optional<std::weak_ptr<void>> targetLifetime;
   uint64_t selectionEpoch = 0;
   bool clipboard = true;
   bool asyncStarted = false, uiReleased = false;
@@ -98,6 +99,7 @@ struct Request {
   bool current() const {
     return running && !FileTree::uploadStopping && !cancelled &&
            (!clipboard || selectionEpoch == FileTree::epoch.load()) &&
+           (!targetLifetime || !targetLifetime->expired()) &&
            (!target || IsWindow(target));
   }
   void ensureCurrent() const {
@@ -454,39 +456,44 @@ inline void cancel() {
       request->cancel();
 }
 inline std::shared_ptr<Request> submit(IDataObject *data, Json drop = Json::object(),
-                                       HWND target = nullptr) {
+                                       HWND target = nullptr,
+                                       std::optional<std::weak_ptr<void>> targetLifetime = {}) {
   drain();
-  if (!supports(data) || requests.size() >= 3)
+  if ((targetLifetime && targetLifetime->expired()) || !supports(data) || requests.size() >= 3)
     return {};
   auto request = std::make_shared<Request>(++nextRequest);
   request->target = target;
+  request->targetLifetime = std::move(targetLifetime);
   request->clipboard = !drop.value("drop", false);
   request->selectionEpoch = FileTree::epoch.load();
-  if (!request->finished)
+  if (!request->finished || !request->current())
     return {};
   data->AddRef();
   request->original = data;
   try {
-    if (SUCCEEDED(data->QueryInterface(IID_PPV_ARGS(&request->async)))) {
+    request->ensureCurrent();
+    HRESULT asyncInterface = data->QueryInterface(IID_PPV_ARGS(&request->async));
+    request->ensureCurrent();
+    if (SUCCEEDED(asyncInterface)) {
       BOOL mode = FALSE;
       check(request->async->GetAsyncMode(&mode), "Get virtual async mode");
+      request->ensureCurrent();
       if (mode) {
         check(request->async->StartOperation(nullptr), "Start virtual-file operation");
         request->asyncStarted = true;
+        request->ensureCurrent();
       }
     }
     check(CoMarshalInterThreadInterfaceInStream(IID_IDataObject, data, &request->marshaled),
           "Marshal virtual source");
+    request->ensureCurrent();
     requests.emplace(request->id, request);
     FileTree::UploadRequest upload{{},
                                    std::move(drop),
                                    FileTree::epoch.load(),
                                    [request] { return std::make_unique<Input>(request); },
                                    [request](bool success) { request->complete(success); },
-                                   [request] {
-                                     return !request->cancelled.load() &&
-                                            (!request->target || IsWindow(request->target));
-                                   },
+                                   [request] { return request->current(); },
                                    request->id};
     if (!FileTree::enqueue(std::move(upload))) {
       requests.erase(request->id);

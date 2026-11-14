@@ -472,8 +472,8 @@ inline bool enqueue(UploadRequest request) {
   requestsWake.notify_one();
   return true;
 }
-inline bool upload(std::vector<std::wstring> paths, Json drop) {
-  return enqueue({std::move(paths), std::move(drop), epoch.load(), {}, {}, {}, 0});
+inline bool upload(std::vector<std::wstring> paths, Json drop, std::function<bool()> current = {}) {
+  return enqueue({std::move(paths), std::move(drop), epoch.load(), {}, {}, std::move(current), 0});
 }
 
 inline void removeTree(const std::wstring &path) {

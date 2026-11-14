@@ -144,6 +144,9 @@ DWORD incomingClipboardSequence = 0;
 std::wstring incomingDirectory;
 
 struct RemoteWindow {
+  // Drop callbacks and virtual-file workers may outlive the HWND. Never keep
+  // the RemoteWindow alive merely to finish a transfer to a closed window.
+  std::shared_ptr<void> dropLifetime = std::make_shared<char>();
   NativeIcon icon;
   std::string appId;
   uint64_t iconRevision = 0;
@@ -852,11 +855,12 @@ HGLOBAL globalBytes(const void *data, size_t size) {
   return mem;
 }
 
-bool uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
-  if (!hostedFiles) return false;
+bool uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object(),
+                 std::function<bool()> current = {}) {
+  if (!hostedFiles || (current && !current())) return false;
   if (paths.empty() || paths.size() > FileTree::MaxRoots) return false;
   // Tree sources perform metadata checks and enumeration on their upload worker.
-  if (FileTree::supported) return FileTree::upload(std::move(paths), std::move(drop));
+  if (FileTree::supported) return FileTree::upload(std::move(paths), std::move(drop), std::move(current));
   for (const auto &path : paths) {
     WIN32_FILE_ATTRIBUTE_DATA metadata{};
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &metadata) || (metadata.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
@@ -866,10 +870,11 @@ bool uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
       std::cerr << "The server does not support file_tree; directories were not transferred\n"; return false;
     }
   }
-  fileWorkers.emplace_back([paths = std::move(paths), drop = std::move(drop)] {
+  fileWorkers.emplace_back([paths = std::move(paths), drop = std::move(drop), current = std::move(current)] {
+    auto valid = [&] { return running && (!current || current()); };
     Json transfers = Json::array();
     for (const auto &path : paths) {
-      if (!running)
+      if (!valid())
         return;
       HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -882,28 +887,32 @@ bool uploadFiles(std::vector<std::wstring> paths, Json drop = Json::object()) {
       }
       size_t slash = path.find_last_of(L"/\\");
       std::string name = utf8(path.substr(slash == std::wstring::npos ? 0 : slash + 1));
+      if (!valid()) {
+        CloseHandle(file);
+        return;
+      }
       uint64_t id = ++nextUpload;
       sendJson(
           {{"type", "upload_begin"}, {"transfer", id}, {"name", name}, {"size", size.QuadPart}});
       std::vector<uint8_t> buffer(65536);
       DWORD n = 0;
       bool ok = true;
-      while (running) {
+      while (valid()) {
         if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &n, nullptr)) {
           ok = false;
           break;
         }
-        if (!n)
+        if (!n || !valid())
           break;
         sendJson({{"type", "upload_chunk"}, {"transfer", id}, {"data", base64(buffer.data(), n)}});
       }
       CloseHandle(file);
-      if (!ok || !running)
+      if (!ok || !valid())
         return;
       sendJson({{"type", "upload_end"}, {"transfer", id}});
       transfers.push_back(id);
     }
-    if (!transfers.empty()) {
+    if (!transfers.empty() && valid()) {
       Json commit = drop;
       commit["type"] = "upload_commit";
       commit["transfers"] = transfers;
@@ -917,11 +926,21 @@ RECT imageRect(RemoteWindow *w);
 
 class FileDropTarget final : public IDropTarget {
   LONG refs = 1;
-  RemoteWindow *window;
+  uint32_t windowId;
+  std::weak_ptr<void> lifetime;
   bool accepted = false;
 
+  RemoteWindow *findWindow() const {
+    if (lifetime.expired())
+      return nullptr;
+    auto found = windows.find(windowId);
+    if (found == windows.end() || found->second->dropLifetime != lifetime.lock())
+      return nullptr;
+    return found->second.get();
+  }
+
 public:
-  explicit FileDropTarget(RemoteWindow *w) : window(w) {}
+  explicit FileDropTarget(RemoteWindow *w) : windowId(w->id), lifetime(w->dropLifetime) {}
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
     if (iid == IID_IUnknown || iid == IID_IDropTarget) {
       *out = static_cast<IDropTarget *>(this);
@@ -939,14 +958,18 @@ public:
     return count;
   }
   HRESULT STDMETHODCALLTYPE DragEnter(IDataObject *data, DWORD, POINTL, DWORD *effect) override {
+    // Reentrant OLE calls can close the window and revoke its registration.
+    AddRef();
+    VirtualFiles::Com<IDropTarget> self(this);
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    accepted = hostedFiles && (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
+    accepted = findWindow() && hostedFiles && (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
                (SUCCEEDED(data->QueryGetData(&format)) || VirtualFiles::supports(data));
+    accepted = accepted && findWindow();
     *effect = accepted ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD *effect) override {
-    *effect = accepted && (*effect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    *effect = accepted && findWindow() && (*effect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragLeave() override {
@@ -954,13 +977,19 @@ public:
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE Drop(IDataObject *data, DWORD, POINTL point, DWORD *effect) override {
+    AddRef();
+    VirtualFiles::Com<IDropTarget> self(this);
     bool copyAllowed = (*effect & DROPEFFECT_COPY) != 0;
     *effect = DROPEFFECT_NONE;
-    if (!copyAllowed || FileDrag::isOwn(data))
+    accepted = false;
+    if (!copyAllowed || !hostedFiles || !findWindow() || FileDrag::isOwn(data))
       return S_OK;
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     STGMEDIUM storage{};
     if (FAILED(data->GetData(&format, &storage))) {
+      auto *window = findWindow();
+      if (!window)
+        return S_OK;
       POINT position{point.x, point.y};
       ScreenToClient(window->hwnd, &position);
       RECT r = imageRect(window);
@@ -972,8 +1001,8 @@ public:
                 {"origin_y", window->originY},
                 {"x", double(position.x - r.left) * window->width / (r.right - r.left)},
                 {"y", double(position.y - r.top) * window->height / (r.bottom - r.top)}};
-      auto request = VirtualFiles::submit(data, std::move(drop), window->hwnd);
-      if (request && (request->asyncStarted || VirtualFiles::wait(request)))
+      auto request = VirtualFiles::submit(data, std::move(drop), window->hwnd, lifetime);
+      if (request && (request->asyncStarted || VirtualFiles::wait(request)) && findWindow())
         *effect = DROPEFFECT_COPY;
       return S_OK;
     }
@@ -991,6 +1020,9 @@ public:
       paths.push_back(std::move(path));
     }
     ReleaseStgMedium(&storage);
+    auto *window = findWindow();
+    if (!window)
+      return S_OK;
     POINT position{point.x, point.y};
     ScreenToClient(window->hwnd, &position);
     RECT r = imageRect(window);
@@ -1001,7 +1033,8 @@ public:
                    {"origin_x", window->originX},
                    {"origin_y", window->originY},
                    {"x", double(position.x - r.left) * window->width / (r.right - r.left)},
-                   {"y", double(position.y - r.top) * window->height / (r.bottom - r.top)}});
+                   {"y", double(position.y - r.top) * window->height / (r.bottom - r.top)}},
+                  [lifetime = lifetime] { return !lifetime.expired(); });
       *effect = scheduled ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     }
     return S_OK;
@@ -1867,6 +1900,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_DESTROY:
+    w->dropLifetime.reset();
     if (relativeInput.active(hwnd))
       releasePointer();
     RevokeDragDrop(hwnd);
@@ -2217,6 +2251,7 @@ void destroyRemote(uint32_t id) {
   auto found = windows.find(id);
   if (found == windows.end())
     return;
+  found->second->dropLifetime.reset();
   if (grabbedRoot == id)
     setPopupGrab(id, false);
   HWND oldOwner = GetWindow(found->second->hwnd, GW_OWNER);
