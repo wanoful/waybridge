@@ -1,5 +1,35 @@
 # Validation
 
+## KWallet protocol disconnect and Portal activation — 2026-11-15
+
+The user's Chrome Paused report coincided with `kwalletd6` exiting on
+`Invalid binding of wl_output version 4`, followed immediately by Chrome's token
+decryption error. Window destruction removed a per-window output global before
+another client's already queued bind reached the compositor. Outputs are now
+disabled immediately and reclaimed after a ten-second grace period, following
+the wayland-server global-lifetime contract. New clients do not see retired
+outputs, and existing bound objects remain valid through global reclamation.
+
+`output_bind_race_smoke.py` deterministically queues a real wl_output v4 bind,
+closes another client's window, then flushes the bind. The old server rejects it
+with the same protocol error; the fix passes. The test also checks hidden retired
+globals and releasing an already bound object after deferred reclamation. It is
+included in `scripts/test.sh`.
+
+The machine's earlier renamed Portal wrapper units also conflicted with the
+distribution's D-Bus `SystemdService=` mapping. They were backed up and removed;
+the canonical `xdg-desktop-portal.service` and GTK unit now use Waybridge lifecycle
+drop-ins. A real isolated systemd user manager checks the deployed configuration
+with native activation names, provider startup and shutdown. Component setup must
+reuse existing unit names rather than allocate the same BusName twice.
+
+Strict workspace Clippy, 29 Rust tests, Debug/Release builds,
+`GVFS_DISABLE_FUSE=1 ./scripts/test.sh`, and the native KWallet/GTK Portal UI tests
+pass. Logs are under `build/tests/wallet-reliability/`. The fixed Release compositor
+and corrected user configuration are deployed. After reconnecting and unlocking
+the real wallet, the user confirmed Chrome returned to normal. No Cookie/password
+database, wallet secret or OAuth token contents were inspected, migrated or reset.
+
 ## X11 absolute-pointer clipping — HMCL and Minecraft laptop retest
 
 The reported inaccessible HMCL buttons and Minecraft menu offsets were traced to

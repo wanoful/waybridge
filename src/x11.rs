@@ -409,7 +409,7 @@ impl App {
         }
         let remote = self.windows.remove(index);
         if let Some(global) = remote.output_global {
-            self.dh.remove_global::<App>(global);
+            self.retire_output(global);
         }
         self.encoder.forget(id);
         if let Some(peer) = &self.peer {

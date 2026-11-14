@@ -58,6 +58,26 @@ systemctl --user enable example-waybridge-agent.service
 
 共享的持久用户服务可以继续采用自己的生命周期，不必全部归属 Waybridge。未声明归属的后台进程不会因名称或 UID 被扫描、终止。是否将一个现成 provider 绑定会话，应由用户根据其生命周期选择。
 
+如果组件已经提供 systemd unit 和带 `SystemdService=` 的 D-Bus 激活文件，应沿用该 unit 名称，通过 drop-in 接入。不要复制一个不同名称的 `Type=dbus` 包装服务来占用相同 `BusName`；即使两个服务没有同时运行，systemd 也可能因名称分配冲突拒绝激活。
+
+例如，已安装的 Portal 可通过 `~/.config/systemd/user/waybridge-session.target.d/portals.conf` 拉起：
+
+```ini
+[Unit]
+Wants=xdg-desktop-portal.service xdg-desktop-portal-gtk.service
+```
+
+再分别为这两个原生 unit 添加 `waybridge.conf` drop-in：
+
+```ini
+[Unit]
+PartOf=waybridge-session.target
+After=waybridge-session-pre.target
+Before=waybridge-session.target
+```
+
+Portal 前端可额外声明 `After=xdg-desktop-portal-gtk.service`，明确所选后端的启动顺序。修改后运行 `systemctl --user daemon-reload`。这保持 D-Bus 激活文件、systemd unit 与实际服务一致；钱包等组件同样应避免重复分配名称。
+
 ## 就绪与退出顺序
 
 1. 合成器完成单向准入检查、创建显示，并发布本会话显示与身份环境。

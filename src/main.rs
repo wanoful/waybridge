@@ -344,6 +344,7 @@ struct App {
     remote_popups: Vec<RemotePopup>,
     popup_grab: Option<(u32, PopupGrab<Self>)>,
     windows: Vec<RemoteWindow>,
+    retired_outputs: Vec<(Instant, GlobalId)>,
     next_id: u32,
     peer: Option<Arc<Peer>>,
     events: SyncSender<Event>,
@@ -1423,10 +1424,13 @@ impl App {
                     });
                 self.focus(parent);
             }
-            if let Some(remote) = self.windows.iter().find(|w| w.id == id) {
-                if let Some(global) = &remote.output_global {
-                    self.dh.remove_global::<App>(global.clone());
-                }
+            if let Some(global) = self
+                .windows
+                .iter()
+                .find(|w| w.id == id)
+                .and_then(|w| w.output_global.clone())
+            {
+                self.retire_output(global);
             }
             self.windows.retain(|w| w.id != id);
             self.icons.forget(id);
@@ -2836,6 +2840,7 @@ fn main() -> Result<()> {
         remote_popups: vec![],
         popup_grab: None,
         windows: vec![],
+        retired_outputs: vec![],
         next_id: 1,
         peer: None,
         events: tx,
@@ -2911,6 +2916,7 @@ fn main() -> Result<()> {
     tracing::info!(socket = %args.socket, token_file = %token_path.display(), "ready; launch apps with WAYLAND_DISPLAY set to this socket");
     let mut next_frame = Instant::now();
     while !shutdown::requested() {
+        app.reap_retired_outputs();
         xloop.dispatch(Some(Duration::ZERO), &mut app)?;
         while let Some(stream) = socket.accept()? {
             app.dh
@@ -3202,6 +3208,26 @@ fn monitor_mode(value: &Value, refresh: i32) -> Option<Mode> {
 }
 
 impl App {
+    fn retire_output(&mut self, global: GlobalId) {
+        // A client may already have queued a bind before global_remove reaches
+        // it. Stop advertising now, but retain valid bind state for in-flight
+        // requests instead of disconnecting that client with a protocol error.
+        self.dh.disable_global::<App>(global.clone());
+        self.retired_outputs
+            .push((Instant::now() + Duration::from_secs(10), global));
+    }
+
+    fn reap_retired_outputs(&mut self) {
+        let now = Instant::now();
+        self.retired_outputs.retain(|(deadline, global)| {
+            if *deadline > now {
+                return true;
+            }
+            self.dh.remove_global::<App>(global.clone());
+            false
+        });
+    }
+
     fn constrain_popup(&self, popup: &PopupSurface, positioner: PositionerState) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
