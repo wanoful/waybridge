@@ -243,6 +243,37 @@ pub fn info(
     json!({"type":"window","id":id,"title":x.title(),"app_id":x.class(),"width":size.w,"height":size.h,"scale":scale,"parent":parent.map(|(_,id)|id),"decoration":if !x.is_decorated() && !x.is_override_redirect(){"server"}else{"client"},"x11":true})
 }
 impl App {
+    pub(super) fn x11_geometry(
+        &self,
+        window: &X11Surface,
+        mut geometry: Rectangle<i32, Logical>,
+    ) -> Rectangle<i32, Logical> {
+        if window.is_override_redirect() {
+            return geometry;
+        }
+        // Native viewer windows have independent positions. Xwayland still
+        // clips absolute pointer input to its shared root screen: an invisible
+        // off-screen X11 position must not make a visible native button inert.
+        let pixels = self.output.current_mode().unwrap().size;
+        let width = (f64::from(pixels.w) / self.default_scale).floor().max(1.0) as i32;
+        let height = (f64::from(pixels.h) / self.default_scale).floor().max(1.0) as i32;
+        geometry.size.w = geometry.size.w.clamp(1, width);
+        geometry.size.h = geometry.size.h.clamp(1, height);
+        geometry.loc.x = geometry.loc.x.clamp(0, width - geometry.size.w);
+        geometry.loc.y = geometry.loc.y.clamp(0, height - geometry.size.h);
+        geometry
+    }
+
+    pub(super) fn x11_reflow(&self) {
+        for window in self.windows.iter().filter_map(|w| w.window.x11_surface()) {
+            let geometry = window.geometry();
+            let fitted = self.x11_geometry(window, geometry);
+            if fitted != geometry {
+                let _ = window.configure(fitted);
+            }
+        }
+    }
+
     fn x11_fullscreen(&mut self, window: &X11Surface, value: bool) {
         let _ = window.set_fullscreen(value);
         if let Some(remote) = self
@@ -422,6 +453,7 @@ impl XwmHandler for App {
     }
 
     fn map_window_request(&mut self, _: XwmId, window: X11Surface) {
+        let _ = window.configure(self.x11_geometry(&window, window.geometry()));
         if window.set_mapped(true).is_ok() {
             self.x11_add(window);
         }
@@ -462,7 +494,7 @@ impl XwmHandler for App {
         if let Some(h) = h {
             r.size.h = h.clamp(1, 8192) as i32;
         }
-        let _ = window.configure(r);
+        let _ = window.configure(self.x11_geometry(&window, r));
     }
     fn configure_notify(
         &mut self,
@@ -471,6 +503,10 @@ impl XwmHandler for App {
         geometry: Rectangle<i32, Logical>,
         _: Option<u32>,
     ) {
+        let fitted = self.x11_geometry(&window, geometry);
+        if fitted != geometry {
+            let _ = window.configure(fitted);
+        }
         self.x11.geometries.insert(window.window_id(), geometry);
         if let Some(w) = self
             .windows

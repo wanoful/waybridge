@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Real GLFW X11 client pixels after resize/DPI and game pointer-grab teardown."""
-import os,re,socket,subprocess,tempfile,time
+import os,re,socket,subprocess,sys,tempfile,time
 from pathlib import Path
 from smoke import ROOT,Viewer
 
 class LockedViewer(Viewer):
     def __init__(self,*args,**kwargs):
         self.lock_active=False
-        super().__init__(*args,**kwargs)
+        port,token=args
+        self.sock=socket.create_connection(('127.0.0.1',port),timeout=10)
+        self.geometry={}
+        self.send(type='hello',version=3,token=token,dpi=kwargs.get('dpi',96),window_semantics_v1=True,pointer_lock=True)
+        assert self.receive()[1]['type']=='hello'
     def receive(self):
         packet=super().receive()
         kind,value=packet
@@ -26,6 +30,7 @@ def wait(check,seconds=12):
     raise AssertionError('X11 pointer fixture timed out')
 
 def main():
+    bounded = '--bounded-screen' in sys.argv
     flags=subprocess.check_output(['pkg-config','--cflags','--libs','glfw3','gl'],text=True).split()
     subprocess.run(['cc','tests/x11_pointer_app.c','-o','build/tests/x11-pointer-app',*flags],cwd=ROOT,check=True)
     subprocess.run(['bash','tests/build-fixture.sh'],cwd=ROOT,check=True)
@@ -37,8 +42,9 @@ def main():
         app=viewer=native=None
         try:
             wait(lambda:(Path(directory)/'pointer-0.session.json').exists())
-            viewer=LockedViewer(port,token,dpi=168)
-            viewer.send(type='hello',dpi=168,pointer_lock=True)
+            viewer=LockedViewer(port,token,dpi=120 if bounded else 168)
+            viewer.send(type='hello',dpi=120 if bounded else 168,pointer_lock=True,
+                        **(dict(work_width=1920,work_height=1080,monitor_width=1920,monitor_height=1200) if bounded else {}))
             viewer.send(type='ping',nonce=123);viewer.until(lambda k,v:k=='control' and v.get('type')=='pong')
             app=subprocess.Popen([str(ROOT/'target/debug/waybridge'),'--socket','pointer-0','--launch','--',str(ROOT/'build/tests/x11-pointer-app')],env=env,stdin=subprocess.PIPE,stdout=app_log,stderr=app_log)
             def window(title):return viewer.until(lambda k,v:k=='control' and v.get('type')=='window' and v.get('title')==title)['id']
@@ -62,6 +68,9 @@ def main():
                 assert abs(cx-expected[0])<2 and abs(cy-expected[1])<2,(match,expected,viewer.geometry[id])
             initial=frame(launcher)
             click(launcher,initial,40,50,'Waybridge GLFW launcher')
+            if bounded:
+                app.stdin.write(b'o');app.stdin.flush();wait(lambda:'OFFSCREEN_REQUEST' in Path(app_log.name).read_text());time.sleep(.15)
+                for x,y in [(20,20),(300,200),(480,370)]:click(launcher,initial,x,y,'Waybridge GLFW launcher')
             app.stdin.write(b'g');app.stdin.flush();game=window('Waybridge GLFW game');current=frame(game)
             assert topology()==original
             native=subprocess.Popen([str(ROOT/'target/debug/waybridge'),'--socket','pointer-0','--launch','--',str(ROOT/'build/tests/test-app')],env=env,stdout=app_log,stderr=app_log)
@@ -72,6 +81,15 @@ def main():
                 current=frame(game,int(width*dpi/96+.5),int(height*dpi/96+.5))
                 for x,y in [(30,40),(width*.5,height*.5),(width-35,height-45)]:click(game,current,x,y,'Waybridge GLFW game')
                 assert topology()==original,'X11 window resize/DPI must not change shared monitors'
+            if bounded:
+                for command in (b'm',b'f'):
+                    app.stdin.write(command);app.stdin.flush()
+                    viewer.until(lambda k,v:k=='control' and v.get('type')=='window_action' and v.get('id')==game)
+                    viewer.send(type='resize',id=game,width=1536,height=960 if command==b'f' else 864,dpi=120,
+                                fullscreen=command==b'f',fullscreen_epoch=1 if command==b'f' else 0,maximized=command==b'm')
+                    current=frame(game,1920,1200 if command==b'f' else 1080)
+                    for x,y in [(25,30),(768,400),(1500,930 if command==b'f' else 830)]:click(game,current,x,y,'Waybridge GLFW game')
+                    assert topology()==original,'maximizing/fullscreen must not resize the shared monitor'
             app.stdin.write(b'l');app.stdin.flush();wait(lambda:'LOCKED' in Path(app_log.name).read_text())
             viewer.until(lambda k,v:k=='control' and v.get('type')=='pointer_lock' and v.get('active'))
             viewer.send(type='ping',nonce=456);viewer.until(lambda k,v:k=='control' and v.get('type')=='pong')
@@ -83,6 +101,8 @@ def main():
             for x,y in [(20,30),(180,140),(300,200)]:click(launcher,initial,x,y,'Waybridge GLFW launcher')
             assert topology()==original
             print('PASS: actual GLFW X11 cursor/button pixels across resize and 175%/125% DPI, launcher clicks restored after disabled-cursor game closes')
+            if bounded:
+                print('PASS: negative X11 placement, finite 1920x1200 monitor vs 1920x1080 work area, maximized/fullscreen edge coordinates and stable RandR topology')
         finally:
             if native and native.poll() is None:native.terminate();native.wait(timeout=5)
             if app and app.poll() is None:app.terminate();app.wait(timeout=5)

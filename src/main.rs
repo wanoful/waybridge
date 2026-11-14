@@ -1039,6 +1039,7 @@ impl App {
                 for id in self.windows.iter().map(|w| w.id).collect::<Vec<_>>() {
                     self.set_scale(id, self.default_scale, mode);
                 }
+                self.x11_reflow();
             }
             "focus" => {
                 if value["focused"].as_bool().unwrap_or(false) {
@@ -1201,7 +1202,7 @@ impl App {
                         }
                         let mut geometry = x.geometry();
                         geometry.size = (width, height).into();
-                        let _ = x.configure(geometry);
+                        let _ = x.configure(self.x11_geometry(x, geometry));
                         if let Some(maximized) = value["maximized"].as_bool() {
                             let _ = x.set_maximized(maximized);
                         }
@@ -3184,8 +3185,16 @@ smithay::delegate_fractional_scale!(App);
 smithay::delegate_viewporter!(App);
 
 fn monitor_mode(value: &Value, refresh: i32) -> Option<Mode> {
-    let width = value["work_width"].as_i64()?.clamp(64, 16384) as i32;
-    let height = value["work_height"].as_i64()?.clamp(64, 16384) as i32;
+    let width = value
+        .get("monitor_width")
+        .unwrap_or(&value["work_width"])
+        .as_i64()?
+        .clamp(64, 16384) as i32;
+    let height = value
+        .get("monitor_height")
+        .unwrap_or(&value["work_height"])
+        .as_i64()?
+        .clamp(64, 16384) as i32;
     Some(Mode {
         size: (width, height).into(),
         refresh,

@@ -26,6 +26,9 @@ int main(void) {
       if(c=='g'&&!game)game=create("Waybridge GLFW game",430,210);
       if(c=='l'&&game){glfwSetInputMode(game,GLFW_CURSOR,GLFW_CURSOR_DISABLED);puts("LOCKED");}
       if(c=='c'&&game){glfwDestroyWindow(game);game=NULL;puts("GAME_CLOSED");}
+      if(c=='o'){glfwSetWindowPos(launcher,-283,591);puts("OFFSCREEN_REQUEST");}
+      if(c=='m'&&game){glfwMaximizeWindow(game);puts("MAXIMIZE_REQUEST");}
+      if(c=='f'&&game){GLFWmonitor *monitor=glfwGetPrimaryMonitor();const GLFWvidmode *mode=glfwGetVideoMode(monitor);glfwSetWindowMonitor(game,monitor,0,0,mode->width,mode->height,mode->refreshRate);puts("FULLSCREEN_REQUEST");}
       if(c=='q')glfwSetWindowShouldClose(launcher,GLFW_TRUE);
     }
     GLFWwindow *windows[]={launcher,game};

@@ -3012,6 +3012,8 @@ int wmain(int argc, wchar_t **argv) {
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},
+            {"monitor_width", monitor.rcMonitor.right - monitor.rcMonitor.left},
+            {"monitor_height", monitor.rcMonitor.bottom - monitor.rcMonitor.top},
             {"work_width", monitor.rcWork.right - monitor.rcWork.left},
             {"work_height", monitor.rcWork.bottom - monitor.rcWork.top}});
   std::thread decoder(decodeLoop);

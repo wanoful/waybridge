@@ -20,6 +20,7 @@ python tests/decorations_smoke.py
 python tests/window_semantics_smoke.py
 if command -v Xwayland >/dev/null && command -v xrandr >/dev/null && pkg-config --atleast-version=3.4 glfw3 && pkg-config --exists gl; then
   python tests/x11_pointer_smoke.py
+  python tests/x11_pointer_smoke.py --bounded-screen
 fi
 if command -v google-chrome-stable >/dev/null; then
   python tests/chrome_drag_smoke.py

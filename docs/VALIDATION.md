@@ -1,5 +1,49 @@
 # Validation
 
+## X11 absolute-pointer clipping — HMCL and Minecraft laptop retest
+
+The reported inaccessible HMCL buttons and Minecraft menu offsets were traced to
+Xwayland's root-screen clipping. The native viewer displayed the entire HMCL
+window while its X11 geometry was `1236x571-283+591` on a `1920x1080` screen.
+Positions outside the root were clipped before reaching JavaFX/GLFW. A controlled
+regression against the old server requests local X=25 and observes X=283.
+
+Managed X11 top-levels are now fitted inside the shared screen on mapping,
+configure requests/notifications, viewer resize and reconnect. The shared RandR
+topology remains stable across individual-window operations. The viewer also
+reports full monitor dimensions separately from work-area dimensions, so a
+taskbar does not shorten the fullscreen coordinate space. Old v3 clients retain
+the work-area fallback; update both binaries for full-monitor reporting.
+
+Physical `laptop` verification used the existing TLS/Tailscale connection, its
+actual x64 worker, 125% DPI and hardware presentation:
+
+- HMCL 3.16.4: Settings navigation, custom minimize/restore and close buttons
+  respond; reopening uses valid X11 geometry `1236x571+0+509`. Clicking Launch
+  Game starts the user's installed Minecraft 26.1.2 Fabric instance.
+- Actual Minecraft main-menu pointer samples match Windows client coordinates
+  in windowed `854x480`, maximized `1920x1051`, and true F11 fullscreen
+  `1920x1080`. Both corner samples were checked; fullscreen `(1880,1040)` and
+  `(40,40)` reach exactly those X11 local positions. The fullscreen Options
+  button opens the real settings screen; Escape returns to the main menu.
+  No world was opened. Interactive automation restores the game if its normal
+  fullscreen focus-loss policy iconifies it between scheduled test actions.
+- The installed Linux Release compositor and laptop worker were updated; the
+  previous laptop executable is retained as a backup. Pairing identity and the
+  TLS entry remain unchanged.
+
+Automated coverage: `x11_pointer_smoke.py --bounded-screen` reproduces negative
+placement with a finite 1920x1200 monitor/1920x1080 work area, maximized/fullscreen
+edge clicks and pointer-lock teardown. The original 175%/125% GLFW case, real
+GLX and bidirectional X11 clipboard tests pass. `GVFS_DISABLE_FUSE=1
+./scripts/test.sh`, strict workspace Clippy, 29 Rust tests, Debug/Release and
+x64/ARM64 packaging pass. The FUSE variable prevents an unrelated GVFS mount
+from outliving a short-lived test directory. Generated measurements/screenshots
+and transcripts are under `build/tests/pointer-laptop/`.
+
+Coverage is the tested single-monitor configuration and selected game/launcher,
+not every modpack, display-hotplug or mixed-monitor configuration.
+
 ## Configuration, desktop overrides and standard session lifecycle — 2026-11-14
 
 Project documentation is now under `docs/`, with a root navigation README. Usage,

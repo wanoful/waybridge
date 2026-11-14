@@ -154,6 +154,8 @@ Xft/DPI 和 X11 客户端密度为这个 X 服务器共享，初始跟随 Window
 
 所有 X11 窗口共用一个稳定的 RandR 输出，原生 Wayland 的逐窗口输出对 Xwayland 隐藏。调整 MC 等单个窗口的尺寸/呈现 DPI 或关闭游戏，不再创建、移除或缩放整个 X11 会话的显示器；真实 GLFW 回归覆盖缩放后菜单坐标，以及禁用光标的游戏窗口关闭后再次点击启动器。
 
+X11 顶层窗口在该虚拟屏幕内布局，避免 HMCL 等应用的负坐标或越界位置让按钮点击被 Xwayland 截断。连接时分别传递完整显示器和工作区尺寸，全屏包含任务栏区域；这项修复需更新 Linux 合成器和 Windows 客户端，并重建会话。
+
 当前 X11 子集不含 PRIMARY、XDND 文件拖放桥、XIM/Windows IME、完整 EWMH fullscreen/尺寸提示及自动 Xwayland 崩溃重启。崩溃/关闭 X11 应用不会关闭其余 Wayland 窗口；正常退出/SIGINT/SIGTERM 回收私有 X socket 和锁。可以与本版的原生 Wayland、音频和媒体功能共用会话。
 
 ## 使用数据交换
