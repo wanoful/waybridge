@@ -34,8 +34,17 @@ builds pass. Existing Wine virtual-file stream/HGLOBAL/pending cases and
 bidirectional file/directory clipboard and OLE drag regressions also pass. New
 regressions are included in the regular or M0/M1 test entrypoints. Logs are under `build/tests/lifecycle-fixes/`,
 with the drop callback trace at `build/tests/windows-drop-lifetime.log`.
-This change has not been retested on physical Windows and does not modify the
-user's installed services, real wallet data or deployed binaries.
+The tested Release compositor was subsequently deployed to
+`~/.local/bin/waybridge`, and the x64 worker replaced the existing executable in
+`laptop`'s `%LOCALAPPDATA%\Waybridge-Test\m0-m1-20261114\app\Waybridge`.
+Installed hashes match the build outputs; the Windows checksum manifest was
+updated and all 517 package entries verify. No old-version backup was created,
+as requested. The deployed Linux binary passes the isolated error-shutdown
+regression, and the existing TLS entry point remains healthy. The Windows worker
+version and capability commands exit normally over SSH; codecs are unavailable
+in that SSH context, so this does not establish interactive hardware decoding or
+physical drag-and-drop acceptance. Existing services, credentials and real wallet
+data were not reconfigured.
 
 ## KWallet protocol disconnect and Portal activation — 2026-11-15
 
