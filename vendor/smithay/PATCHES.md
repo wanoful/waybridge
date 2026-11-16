@@ -27,3 +27,12 @@ Modified areas are Xwayland, GLES texture caching, Wayland output visibility and
 The X11/Qt and native Windows regressions in the parent project exercise the X11 patches; the HDR branch exercises the format-cache transition. The two hooks above add default-compatible public API; no private-layout access is used. `x11_pointer_smoke.py` checks real RandR monitor stability and GLFW input; `chrome_drag_smoke.py` and `windows_chrome_smoke.py` exercise actual Chrome detach, reattach and cancellation.
 
 9. Optional per-server-drag source cookies preserve the payload identity of delayed `receive`/`finish` requests. `start_dnd` and existing handler implementations retain their default behavior. Combined MIME/action callbacks report actual acceptance for native COPY drag feedback; a matching optional callback for client drags lets an OLE handoff resume the original source. Pre-v3 offers use their implicit COPY action.
+
+10. Client-originated DND forwards valid MIME acceptance through the standard
+    `wl_data_source.target` event, including nil rejection and a nil reset when
+    leaving a receiver. Unsupported MIME values become rejection; requests on
+    departed or finished offers cannot change source MIME/action feedback. The
+    final accepted target remains valid through drop/finish (the drop's terminal
+    leave is not treated as a hover leave). This fixes independent source
+    toolkits reporting Ignore despite a negotiated and finished Copy. The real
+    Wayland source/target and Qt-to-Win32 OLE regressions cover these boundaries.

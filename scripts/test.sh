@@ -24,6 +24,7 @@ if command -v rsvg-convert >/dev/null; then
 fi
 python tests/relative_smoke.py
 python tests/drag_out_smoke.py
+python3 tests/dnd_source_feedback_smoke.py
 python tests/data_drag_smoke.py
 python tests/drag_visual_smoke.py
 if command -v Xwayland >/dev/null; then

@@ -144,6 +144,12 @@ where
                     if let Some(offer_data) = self.offer_data.take() {
                         offer_data.lock().unwrap().active = false;
                     }
+                    // MIME acceptance belongs to the current target. A source
+                    // must not retain the previous receiver's feedback while
+                    // outside a target or awaiting the new offer's response.
+                    if let Some(source) = &self.data_source {
+                        source.target(None);
+                    }
                 }
             }
         }
@@ -554,18 +560,19 @@ where
     let mut data = data.offer_data.lock().unwrap();
     match request {
         Request::Accept { mime_type, .. } => {
-            if let Some(mtype) = mime_type {
-                if let Err(crate::utils::UnmanagedResource) = with_source_metadata(source, |meta| {
-                    data.accepted = meta.mime_types.contains(&mtype);
-                }) {
-                    data.accepted = false;
-                }
-            } else {
-                data.accepted = false;
+            if !data.active {
+                return;
             }
-            if data.active {
-                handler.client_offer_status(source, data.accepted, data.chosen_action);
-            }
+            let accepted_mime = mime_type.filter(|mime| {
+                with_source_metadata(source, |meta| meta.mime_types.contains(mime)).unwrap_or(false)
+            });
+            data.accepted = accepted_mime.is_some();
+            // wl_data_source.action alone does not indicate MIME acceptance.
+            // Forward the standard feedback used by source toolkits when
+            // deciding their executed drop action; never advertise an
+            // unsupported MIME or resurrect a departed/finished offer.
+            source.target(accepted_mime);
+            handler.client_offer_status(source, data.accepted, data.chosen_action);
         }
         Request::Receive { mime_type, fd } => {
             // check if the source and associated mime type is still valid
@@ -619,6 +626,9 @@ where
             dnd_actions,
             preferred_action,
         } => {
+            if !data.active {
+                return;
+            }
             let dnd_actions = dnd_actions.into_result().unwrap_or(DndAction::None);
             let preferred_action = preferred_action.into_result().unwrap_or(DndAction::None);
 

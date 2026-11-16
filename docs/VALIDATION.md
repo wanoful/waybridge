@@ -711,6 +711,25 @@ association results; no user application profile, wallet or real desktop service
 was modified, and HMCL/QQ visual acceptance on Windows remains an integration
 check after installing the fix.
 
+## DND source acceptance and completion (2026-11-16)
+
+Source completion is also verified separately. The enhanced
+`tests/windows_data_drag_smoke.py` checks the source's `QDrag::exec` result,
+in addition to the Win32 target receiving the text: outbound delivery returns
+Copy (1), while the existing native/returned Qt drags retain Move (2). Before
+the fix, the same real OLE delivery and `dnd_finished` returned Ignore (0).
+The missing standard `wl_data_source.target` MIME feedback kept the source
+toolkit's acceptance state false despite a Copy action and finished event.
+
+`tests/dnd_source_feedback_smoke.py` passed with two independent native Wayland
+clients on a disposable bus. It checks valid/nil/unsupported MIME feedback,
+hover leave reset, late Accept/SetActions on departed and completed offers,
+successful Copy completion and rejection of a fresh drag. The completed source
+is deliberately kept alive so bad late events remain observable. Outbound
+range-read/cancellation/disconnect and Qt file MOVE/return regressions, plus
+strict Rust Clippy, passed. These checks use the protocol for all applications;
+there is no Qt-specific production rule.
+
 ## Generic DND icon feedback (2026-11-16)
 
 - `tests/drag_visual_smoke.py` passed a real Wayland `dnd_icon` surface and SHM

@@ -51,7 +51,11 @@ static void source_dropped(void *d, struct wl_data_source *source) {
 }
 static void source_finished(void *d, struct wl_data_source *source) {
   visual_cancel();
-  (void)d; wl_data_source_destroy(source); drag_source = NULL;
+  (void)d;
+  // Keep the completed resource alive in this opt-in probe so illegal late
+  // target feedback remains observable instead of becoming a discarded event.
+  if (!getenv("WAYBRIDGE_TEST_DND_SOURCE_FEEDBACK")) wl_data_source_destroy(source);
+  drag_source = NULL;
   printf("SOURCE_FINISHED\n"); fflush(stdout);
 }
 static void source_action(void *d, struct wl_data_source *source, uint32_t action) {
@@ -62,6 +66,13 @@ static const struct wl_data_source_listener source_listener = {
   .dnd_drop_performed = source_dropped, .dnd_finished = source_finished, .action = source_action,
 };
 static struct wl_data_offer *drop_offer;
+static uint32_t drop_serial;
+static void target_feedback(double x) {
+  if (!drop_offer) return;
+  const char *mime = x < 100 ? "text/uri-list" : (x < 200 ? NULL : "application/x-unsupported");
+  wl_data_offer_accept(drop_offer, drop_serial, mime);
+  printf("TARGET_ACCEPT %s\n", mime ? mime : "none"); fflush(stdout);
+}
 static void offer_mime(void *d, struct wl_data_offer *o, const char *mime) {
   (void)d;
   (void)o;
@@ -88,6 +99,13 @@ static void drag_enter(void *d, struct wl_data_device *device, uint32_t serial,
   (void)x;
   (void)y;
   drop_offer = offer;
+  drop_serial = serial;
+  if (offer && getenv("WAYBRIDGE_TEST_DND_FEEDBACK")) {
+    wl_data_offer_set_actions(offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+                              WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+    target_feedback(wl_fixed_to_double(x));
+    return;
+  }
   // This fixture also exports files. Its target models an external receiver,
   // so releasing over the source must reject a self-drop in both test modes.
   if (offer && !drag_source) {
@@ -99,6 +117,15 @@ static void drag_enter(void *d, struct wl_data_device *device, uint32_t serial,
 static void drag_leave(void *d, struct wl_data_device *device) {
   (void)d;
   (void)device;
+  if (drop_offer && getenv("WAYBRIDGE_TEST_DND_FEEDBACK")) {
+    // Intentionally late: these requests must not revive MIME/action feedback
+    // after this receiver has lost the drag's pointer focus.
+    wl_data_offer_accept(drop_offer, drop_serial, "text/uri-list");
+    wl_data_offer_set_actions(drop_offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
+                              WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+    puts("TARGET_LEFT_STALE"); fflush(stdout);
+    wl_data_offer_destroy(drop_offer); drop_offer = NULL;
+  }
 }
 static void drag_motion(void *d, struct wl_data_device *device, uint32_t time, wl_fixed_t x,
                         wl_fixed_t y) {
@@ -107,6 +134,7 @@ static void drag_motion(void *d, struct wl_data_device *device, uint32_t time, w
   (void)time;
   (void)x;
   (void)y;
+  if (getenv("WAYBRIDGE_TEST_DND_FEEDBACK")) target_feedback(wl_fixed_to_double(x));
 }
 static void drag_drop(void *d, struct wl_data_device *device) {
   (void)d;
@@ -118,6 +146,15 @@ static void drag_drop(void *d, struct wl_data_device *device) {
     close(fd);
     printf("DROP\n");
     fflush(stdout);
+    if (getenv("WAYBRIDGE_TEST_DND_FEEDBACK")) {
+      wl_data_offer_finish(drop_offer);
+      wl_data_offer_accept(drop_offer, drop_serial, NULL);
+      wl_data_offer_set_actions(drop_offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
+                                WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+      puts("TARGET_FINISHED_STALE"); fflush(stdout);
+      wl_data_offer_destroy(drop_offer);
+      drop_offer = NULL;
+    }
   }
 }
 static void selection(void *d, struct wl_data_device *device, struct wl_data_offer *offer) {

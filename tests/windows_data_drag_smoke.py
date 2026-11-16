@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Production viewer + real Qt + real OLE/SendInput in a private Wine desktop."""
 import os
+import re
 from pathlib import Path
 import socket
 import subprocess
@@ -56,6 +57,7 @@ def main():
                     deadline = time.monotonic() + 30
                     while True:
                         before = (root / 'app.log').read_text().count('OTHER ')
+                        ended = (root / 'app.log').read_text().count('TEXT_DRAG_ENDED ')
                         result = subprocess.run(['wine', str(output), mode], env=wine, capture_output=True, text=True, timeout=25)
                         log.write(result.stdout + result.stderr)
                         log.flush()
@@ -67,6 +69,12 @@ def main():
                         wait_for(lambda: (root / 'app.log').read_text().count('OTHER ') > before, 5)
                     if mode == 'in':
                         assert 'Windows 你好' in (root / 'app.log').read_text()
+                    else:
+                        wait_for(lambda: (root / 'app.log').read_text().count('TEXT_DRAG_ENDED ') > ended, 5)
+                        action = int(re.findall(r'TEXT_DRAG_ENDED (\d+)', (root / 'app.log').read_text())[-1])
+                        print('SOURCE_RESULT', mode, action, flush=True)
+                        if mode == 'out':
+                            assert action == 1, 'Qt source must observe Copy after successful external OLE drop'
                     assert server.poll() is None and app.poll() is None and client.poll() is None
                 print('PASS: production viewer native capture between Qt windows, OLE-return, Unicode OLE out/in')
             except Exception:
@@ -74,6 +82,8 @@ def main():
                 print((root / 'app.log').read_text())
                 raise
             finally:
+                (ROOT / 'build/tests/data-drag-source-app.log').write_text((root / 'app.log').read_text())
+                (ROOT / 'build/tests/data-drag-source-run.log').write_text((root / 'run.log').read_text())
                 subprocess.run(['wineserver', '-k'], env=wine, stdout=log, stderr=log, timeout=10)
                 for child in reversed(children):
                     if child.poll() is None:
