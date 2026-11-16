@@ -167,7 +167,12 @@ public sealed class SessionController(string directory, string enginePath, Func<
     {
         if ((agent is null && direct is null) || active is null || currentSession is null) throw new InvalidOperationException("请先连接可管理的远端会话");
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-        await ManagementAsync(new { op = "launch", session = currentSession, binary = active.ServerBinary, app, argv }, timeout.Token);
+        var currentEngine = engine;
+        var activation = currentEngine is not null ? await currentEngine.PrepareActivationAsync(app, timeout.Token) : null;
+        var result = await ManagementAsync(new { op = "launch", session = currentSession, binary = active.ServerBinary, app, argv, activation_token = activation?.Token }, timeout.Token);
+        if (activation is not null && ReferenceEquals(engine, currentEngine))
+            await currentEngine!.SendAsync(new { type = "activation_launch", request_id = activation.RequestId,
+                pid = result.TryGetProperty("pid", out var pid) ? pid.GetInt32() : (int?)null }, timeout.Token);
     }
     public async Task EndSessionAsync()
     {
@@ -179,6 +184,7 @@ public sealed class SessionController(string directory, string enginePath, Func<
         await DisconnectAsync();
     }
     public Task SendEngineAsync(object request) => engine?.SendAsync(request) ?? throw new InvalidOperationException("请先连接");
+    public Task ActivateWindowAsync(uint id) => engine?.ActivateWindowAsync(id) ?? throw new InvalidOperationException("请先连接");
     private Task<JsonElement> ManagementAsync(object request, CancellationToken token)
     {
         var directAgent = direct;

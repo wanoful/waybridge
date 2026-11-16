@@ -329,6 +329,10 @@ pub trait XwmHandler {
     fn property_notify(&mut self, xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
         let _ = (xwm, window, property);
     }
+    /// EWMH activation request. Source and timestamp do not authorize focus theft.
+    fn activation_request(&mut self, xwm: XwmId, window: X11Surface, source: u32, timestamp: u32) {
+        let _ = (xwm, window, source, timestamp);
+    }
     /// Window requests to be maximized.
     fn maximize_request(&mut self, xwm: XwmId, window: X11Surface) {
         let _ = (xwm, window);
@@ -2247,6 +2251,13 @@ where
                 );
             }
             match msg.type_ {
+                x if x == xwm.atoms._NET_ACTIVE_WINDOW => {
+                    if let Some(window) = xwm.windows.iter().find(|w| w.window_id() == msg.window).cloned() {
+                        let data = msg.data.as_data32();
+                        drop(_guard);
+                        state.activation_request(xwm_id, window, data[0], data[1]);
+                    }
+                }
                 x if x == xwm.atoms.WL_SURFACE_ID => {
                     let wid = msg.data.as_data32()[0];
                     info!(

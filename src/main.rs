@@ -1,4 +1,5 @@
 //! Headless compositor. It never connects to a host desktop or injects host input.
+mod activation;
 mod app_icon;
 mod audio;
 mod color;
@@ -338,6 +339,7 @@ struct App {
     compositor: CompositorState,
     x11: x11::State,
     shell: XdgShellState,
+    activation: activation::Activation,
     _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState,
     _decorations: XdgDecorationState,
     _fractional_scale: FractionalScaleManagerState,
@@ -511,7 +513,9 @@ impl App {
             keyboard.unset_grab(self);
         }
         if !keyboard.is_grabbed() {
-            keyboard.set_focus(self, surface, SERIAL_COUNTER.next_serial());
+            let serial = SERIAL_COUNTER.next_serial();
+            self.activation.focus_serial = id.map(|id| (serial, id, Instant::now()));
+            keyboard.set_focus(self, surface, serial);
         }
         // Smithay 0.7 does not call SeatHandler::focus_changed when focus becomes None.
         self.ime.focus(
@@ -1145,6 +1149,9 @@ impl App {
     }
 
     fn message(&mut self, value: Value) {
+        if self.activation_message(&value) {
+            return;
+        }
         if self.read_only
             && matches!(
                 value["type"].as_str(),
@@ -1202,6 +1209,7 @@ impl App {
             }
             "ping" => self.control(json!({"type":"pong","nonce":value["nonce"]})),
             "hello" => {
+                self.activation.negotiated = value["activation_v1"] == true;
                 self.window_drag.available = value["toplevel_drag_v1"].as_bool().unwrap_or(false);
                 self.relative_available(value["pointer_lock"].as_bool().unwrap_or(false));
                 self.drag_enabled = value["file_drop_out"].as_bool().unwrap_or(false);
@@ -1221,6 +1229,13 @@ impl App {
             }
             "focus" => {
                 if value["focused"].as_bool().unwrap_or(false) {
+                    if !self
+                        .windows
+                        .iter()
+                        .any(|w| w.id == id && w.mapped && w.window.alive())
+                    {
+                        return;
+                    }
                     self.focus(Some(id));
                 } else if self.focused_window == Some(id) {
                     self.focus(None);
@@ -2300,7 +2315,9 @@ impl XdgShellHandler for App {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         surface.with_pending_state(|s| {
             s.size = Some((960, 640).into());
-            s.states.set(xdg_toplevel::State::Activated);
+            if !self.activation.negotiated {
+                s.states.set(xdg_toplevel::State::Activated);
+            }
         });
         surface.send_configure();
         let id = self.next_id;
@@ -2350,7 +2367,9 @@ impl XdgShellHandler for App {
             mapped: false,
             work_area: Rectangle::from_size((3840, 2160).into()),
         });
-        self.focus(Some(id));
+        if !self.activation.negotiated {
+            self.focus(Some(id));
+        }
         tracing::info!(id, "new application window");
     }
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -3053,6 +3072,7 @@ fn main() -> Result<()> {
         window_drag: toplevel_drag::State::default(),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
+        activation: activation::Activation::new(&dh),
         dh,
         compositor,
         x11,
@@ -3183,6 +3203,7 @@ fn main() -> Result<()> {
                 let Ok(event) = events.try_recv() else { break };
                 match event {
                     Event::Connected(peer) => {
+                        app.activation.connection();
                         notifications.connection(peer.notifications_initial());
                         if peer.notifications_enabled() {
                             peer.control(notifications.status());
@@ -3323,6 +3344,7 @@ fn main() -> Result<()> {
                     }
                     Event::Disconnected => {
                         app.cancel_text_drag();
+                        app.activation.connection();
                         notifications.connection(false);
                         if let Some(tray) = &app.tray {
                             tray.set_peer(None);
@@ -3398,6 +3420,7 @@ fn main() -> Result<()> {
             }
             if Instant::now() >= next_frame {
                 app.render()?;
+                app.activation_flush();
                 let interval = Duration::from_secs_f64(1.0 / app.stream_fps as f64);
                 next_frame += interval;
                 if next_frame < Instant::now() {

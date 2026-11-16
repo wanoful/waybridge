@@ -591,7 +591,7 @@ internal sealed class MainWindow : Window
                 string description = $"{title} · {window.GetProperty("codec")} · {(window.GetProperty("hardware_decode").GetBoolean() ? "GPU 解码" : "PNG/非视频")} · {window.GetProperty("presentation")}";
                 descriptions.Add(description);
                 var focus = Button("切换");
-                focus.Click += async (_, _) => await GuardAsync(() => controller.SendEngineAsync(new { type = "focus_window", id }));
+                focus.Click += async (_, _) => await GuardAsync(() => controller.ActivateWindowAsync(id));
                 windowList.Items.Add(Row(description, $"{window.GetProperty("width")} × {window.GetProperty("height")} 逻辑像素", focus));
             }
             actual.Text = descriptions.Count > 0 ? string.Join('\n', descriptions) : "已连接，等待远端应用窗口";

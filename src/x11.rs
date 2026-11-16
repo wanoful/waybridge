@@ -351,7 +351,7 @@ impl App {
             mapped,
             work_area: Rectangle::from_size((3840, 2160).into()),
         });
-        if !popup {
+        if !popup && !self.activation.negotiated {
             self.focus(Some(id));
         }
         tracing::info!(id, popup, "new X11 application surface");
@@ -405,7 +405,17 @@ impl App {
         };
         let id = self.windows[index].id;
         if self.focused_window == Some(id) {
-            self.focus(None);
+            let parent = surface.is_transient_for().and_then(|xid| {
+                self.windows
+                    .iter()
+                    .find(|w| {
+                        w.id != id
+                            && w.mapped
+                            && w.window.x11_surface().is_some_and(|x| x.window_id() == xid)
+                    })
+                    .map(|w| w.id)
+            });
+            self.focus(parent);
         }
         let remote = self.windows.remove(index);
         if let Some(global) = remote.output_global {
@@ -438,6 +448,9 @@ impl XWaylandShellHandler for App {
     }
 }
 impl XwmHandler for App {
+    fn activation_request(&mut self, _: XwmId, window: X11Surface, _: u32, _: u32) {
+        self.activation_x11(window);
+    }
     fn xwm_state(&mut self, _: XwmId) -> &mut X11Wm {
         self.x11.wm.as_mut().expect("active XWM callback")
     }
@@ -538,6 +551,7 @@ impl XwmHandler for App {
         self.x11_action(&window, "minimize", None);
     }
     fn unminimize_request(&mut self, _: XwmId, window: X11Surface) {
+        self.activation_x11(window.clone());
         let _ = window.set_suspended(false);
         self.x11_action(&window, "restore", None);
     }

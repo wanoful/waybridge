@@ -35,6 +35,16 @@ static void semantics_key(uint32_t key) {
   if (!getenv("WAYBRIDGE_TEST_SEMANTICS"))
     return;
   struct window *main = &windows[0], *dialog = &windows[2];
+  if (key == 44 && dialog->surface) {
+    dialog->hidden = 1; wl_surface_attach(dialog->surface, NULL, 0, 0); wl_surface_commit(dialog->surface);
+  }
+  if (key == 21 && dialog->surface) {
+    dialog->hidden = 0; xdg_toplevel_set_title(dialog->top, "Waybridge semantics 3");
+    xdg_toplevel_set_app_id(dialog->top, "waybridge.fixture");
+    xdg_toplevel_set_parent(dialog->top, windows[1].top);
+    if (test_dialog) xdg_dialog_v1_set_modal(test_dialog);
+    wl_surface_commit(dialog->surface); wl_display_roundtrip(display); draw(dialog);
+  }
   if (key == 30 && main->surface) {
     if (main->fullscreen)
       xdg_toplevel_unset_fullscreen(main->top);

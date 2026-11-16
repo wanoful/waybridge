@@ -264,6 +264,7 @@ static const struct xdg_toplevel_listener top_listener = {.configure = sized,
                                                           .configure_bounds = configure_bounds,
                                                           .wm_capabilities = wm_capabilities};
 #include "semantics_fixture.h"
+#include "activation_fixture.h"
 static void ping(void *data, struct xdg_wm_base *base, uint32_t serial) {
   (void)data;
   xdg_wm_base_pong(base, serial);
@@ -420,6 +421,7 @@ static void key(void *d, struct wl_keyboard *k, uint32_t s, uint32_t t, uint32_t
   }
   if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
     semantics_key(code);
+  if (state == WL_KEYBOARD_KEY_STATE_PRESSED) activation_key(s, code);
   printf("KEY %u %u\n", code, state);
   fflush(stdout);
 }
@@ -468,6 +470,8 @@ static void global(void *data, struct wl_registry *r, uint32_t name, const char 
     dialog_manager = wl_registry_bind(r, name, &xdg_wm_dialog_v1_interface, 1);
   if (!strcmp(interface, "wl_subcompositor"))
     subcompositor = wl_registry_bind(r, name, &wl_subcompositor_interface, 1);
+  if (!strcmp(interface, "xdg_activation_v1"))
+    activation_manager = wl_registry_bind(r, name, &xdg_activation_v1_interface, 1);
   if (!strcmp(interface, "wl_compositor"))
     compositor = wl_registry_bind(r, name, &wl_compositor_interface, version < 4 ? version : 4);
   if (!strcmp(interface, "wl_shm"))

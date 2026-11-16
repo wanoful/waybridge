@@ -242,11 +242,20 @@ impl App {
         }
     }
     pub(crate) fn unmap_toplevel(&mut self, id: u32) {
+        self.activation.unmap(id);
         let Some(window) = self.window(id) else {
             return;
         };
         let Some(top) = window.toplevel() else { return };
         let surface = top.wl_surface().clone();
+        let focus_parent = top.parent().and_then(|p| {
+            self.windows
+                .iter()
+                .find(|w| {
+                    w.mapped && w.window.alive() && w.window.wl_surface().as_deref() == Some(&p)
+                })
+                .map(|w| w.id)
+        });
         self.window_drag.unmap(&surface);
         self.reparent_children(&surface, top.parent());
         with_states(&surface, |states| {
@@ -268,7 +277,7 @@ impl App {
             s.states = Default::default();
         });
         if self.focused_window == Some(id) {
-            self.focus(None);
+            self.focus(focus_parent);
         }
         if self.pointer_window == Some(id) && !self.window_drag.active() {
             self.pointer_window = None;

@@ -24,6 +24,7 @@
 #include "application_identity.h"
 #include "remote_tray.h"
 #include "window_semantics.h"
+#include "window_activation.h"
 #include "relative_input.h"
 #include "ime.h"
 #include "third_party/json.hpp"
@@ -48,6 +49,7 @@
 
 using Json = nlohmann::json;
 HostControl hostControl;
+NativeActivation nativeActivation;
 Json hostedSettings = Json::object();
 bool hostedReadOnly = false, hostedIme = true, hostedFiles = true, hostedImages = true;
 std::string hostedClipboard = "both";
@@ -2294,6 +2296,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
 }
 
 void destroyRemote(uint32_t id) {
+  nativeActivation.closed(id);
   std::vector<uint32_t> children;
   for (auto &[child, w] : windows)
     if (w->popup && w->parent == id)
@@ -2316,11 +2319,10 @@ void destroyRemote(uint32_t id) {
     }
   found->second->state.modal = false;
   reconcileWindows();
+  if (restoreFocus) NativeActivation::restoreOwner(found->second->hwnd, oldOwner);
   DestroyWindow(found->second->hwnd);
   windows.erase(found);
   reconcileWindows();
-  if (restoreFocus && oldOwner && IsWindow(oldOwner) && IsWindowEnabled(oldOwner))
-    SetForegroundWindow(oldOwner);
 }
 
 void dispatchNetwork() {
@@ -2360,6 +2362,7 @@ void dispatchNetwork() {
       if (remoteTray.receive(m,*iconDecoder)) continue;
     }
     if (type == "hello") {
+      nativeActivation.hello(m.value("activation_v1", false));
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
       if (m.value("version", 0) != 3 || m.value("codec", "") != "mixed") {
         std::cerr << "Incompatible server; update both ends to 0.3.0\n";
@@ -2386,9 +2389,17 @@ void dispatchNetwork() {
         startMedia(m.at("media_key").get<std::string>());
       publishClipboard();
       hostControl.emit({{"type","connected"},{"version",3},{"features",m.value("features",Json::array())},
+                        {"activation_v1",nativeActivation.enabled()},
                         {"hardware_codecs",supportedVideoKinds},{"stream_config",streamConfigNegotiated}});
       remoteNotifications.hello(m);
       if (hostControl.active()) sendStreamConfiguration();
+    } else if (type == "activation_prepared") {
+      hostControl.emit(m);
+    } else if (type == "window_activate") {
+      auto target = windows.find(m.value("id", 0u));
+      auto source = windows.find(m.value("origin", Json()).is_number_unsigned() ? m["origin"].get<uint32_t>() : 0u);
+      if (target != windows.end() && !target->second->popup)
+        nativeActivation.request(m, target->second->hwnd, source != windows.end() ? source->second->hwnd : nullptr, target->second->shown);
     } else if (type == "stream_config") {
       hostControl.emit(m);
     } else if (type == "toplevel_drag") {
@@ -2430,6 +2441,11 @@ void dispatchNetwork() {
       w->state.mapped = m.value("mapped", true);
       w->state.stateSent = false;
       if (!w->state.mapped) {
+        nativeActivation.closed(w->id);
+        // Unmapping usually precedes destruction. Re-enable and restore the
+        // owner before hiding its foreground modal, while we still own focus.
+        reconcileWindows();
+        NativeActivation::restoreOwner(w->hwnd, GetWindow(w->hwnd, GW_OWNER));
         ShowWindow(w->hwnd, SW_HIDE);
         auto fullscreenEpoch = m.value("fullscreen_epoch", w->state.fullscreenEpoch);
         if (fullscreenEpoch >= w->state.fullscreenEpoch) {
@@ -2746,8 +2762,9 @@ void dispatchNetwork() {
     if (!w->shown) {
       w->shown = true;
       if (w->state.mapped)
-        ShowWindow(w->hwnd, w->popup || windowDrag.active ? SW_SHOWNOACTIVATE : SW_SHOW);
+        ShowWindow(w->hwnd, w->popup || windowDrag.active || nativeActivation.enabled() ? SW_SHOWNOACTIVATE : SW_SHOW);
       reconcileWindows();
+      if (!w->popup) nativeActivation.shown(w->id, w->hwnd);
       sendWindowState(w);
       if (!w->popup && grabbedRoot == w->id)
         SetCapture(w->hwnd);
@@ -2843,6 +2860,14 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         try {
           std::string type=request.value("type","");
           if (type=="disconnect") PostMessageW(hwnd,WM_CLOSE,0,0);
+          else if (type=="activation_prepare") {
+            auto requestId=request.value("request_id", "");
+            if (nativeActivation.prepare(requestId,request.value("foreground",false))) {
+              Json command={{"type","activation_prepare"},{"request_id",requestId},{"app",request.value("app","")}};
+              sendJson(command);
+            }
+          }
+          else if (type=="activation_launch") sendJson(request);
           else if (remoteNotifications.command(request)) {}
           else if (type=="settings") applyHostedSettings(request.at("settings"),true);
           else if (type=="tray_action") {
@@ -2861,7 +2886,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
           } else if (type=="status") publishHostedStatus();
           else if (type=="focus_window") {
             auto found=windows.find(request.value("id",0u));
-            if (found!=windows.end()) {ShowWindow(found->second->hwnd,SW_RESTORE);SetForegroundWindow(found->second->hwnd);}
+            if (found!=windows.end()) NativeActivation::user(found->second->hwnd, request.value("foreground",false));
           }
         } catch (const std::exception &error) {
           hostControl.emit({{"type","error"},{"message",error.what()}});
@@ -3156,6 +3181,7 @@ int wmain(int argc, wchar_t **argv) {
             {"window_icon_v1", true},
             {"tray_v1", true},
             {"window_semantics_v1", true},
+            {"activation_v1", true},
             {"notifications_v1", hostControl.active()},
             {"notifications_enabled", false},
             {"pointer_lock", true},

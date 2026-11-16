@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text.Json;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 
 namespace Waybridge.Control.Core;
 
@@ -15,6 +17,34 @@ public sealed class EngineChannel : IAsyncDisposable
     private readonly Task<string> errors;
     private string secret;
     private string directSecret;
+    private bool activation;
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<string>> activations = new();
+    public sealed record LaunchActivation(string RequestId, string Token);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool AllowSetForegroundWindow(uint pid);
+    private bool GrantForeground()
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        GetWindowThreadProcessId(GetForegroundWindow(), out uint owner);
+        return owner == Environment.ProcessId && AllowSetForegroundWindow((uint)process.Id);
+    }
+    public Task ActivateWindowAsync(uint id) => SendAsync(new { type = "focus_window", id, foreground = GrantForeground() });
+    public async Task<LaunchActivation?> PrepareActivationAsync(string? app, CancellationToken token)
+    {
+        if (!activation) return null;
+        string request = Guid.NewGuid().ToString("N");
+        var pending = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!activations.TryAdd(request, pending)) throw new IOException("激活请求冲突");
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(5));
+        try
+        {
+            await SendAsync(new { type = "activation_prepare", request_id = request, app = app ?? "", foreground = GrantForeground() }, timeout.Token);
+            return new LaunchActivation(request, await pending.Task.WaitAsync(timeout.Token));
+        }
+        finally { activations.TryRemove(request, out _); }
+    }
     public event Action<JsonElement>? Message;
     public event Action<string>? Log;
     public Task Exited => process.WaitForExitAsync(lifetime.Token);
@@ -104,7 +134,17 @@ public sealed class EngineChannel : IAsyncDisposable
             var input = new JsonLines(pipe);
             while (await input.ReadAsync(lifetime.Token) is { } message)
             {
-                if (message.GetProperty("type").GetString() == "connected") ready.TrySetResult();
+                if (message.GetProperty("type").GetString() == "connected")
+                {
+                    activation = message.TryGetProperty("activation_v1", out var support) && support.ValueKind == JsonValueKind.True;
+                    ready.TrySetResult();
+                }
+                if (message.GetProperty("type").GetString() == "activation_prepared")
+                {
+                    if (message.TryGetProperty("request_id", out var id) && activations.TryGetValue(id.GetString() ?? "", out var pending) &&
+                        message.TryGetProperty("token", out var value) && value.GetString() is { Length:32 } token && token.All(char.IsAsciiLetterOrDigit)) pending.TrySetResult(token);
+                    continue;
+                }
                 if (message.GetProperty("type").GetString() == "error" && !ready.Task.IsCompleted)
                     ready.TrySetException(new IOException(message.GetProperty("message").GetString()));
                 Message?.Invoke(message);
@@ -112,6 +152,7 @@ public sealed class EngineChannel : IAsyncDisposable
             ready.TrySetException(new IOException("串流控制通道已关闭"));
         }
         catch (Exception error) { ready.TrySetException(error); }
+        finally { foreach (var pending in activations.Values) pending.TrySetException(new IOException("激活请求所属连接已断开")); }
     }
     public async ValueTask DisposeAsync()
     {

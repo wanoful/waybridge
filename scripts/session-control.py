@@ -294,7 +294,31 @@ get_id = bind(gio, "g_app_info_get_id", C.c_char_p, C.c_void_p)
 actual_id = get_id(app)
 if not actual_id or actual_id.decode() != plan["desktop_id"]:
     raise SystemExit("GIO desktop identity differs from the original desktop ID")
-context = bind(gio, "g_app_launch_context_new", C.c_void_p)()
+activation = plan.get("activation_token")
+if activation:
+    # Standard GAppLaunchContext virtual: GIO uses this ID for both startup
+    # notification and D-Bus platform_data, not just the child environment.
+    # Query the ABI parent sizes instead of hardcoding 32/64-bit class offsets.
+    gobject = C.CDLL(C.util.find_library("gobject-2.0") or "libgobject-2.0.so.0")
+    class TypeQuery(C.Structure):
+        _fields_ = [("type", C.c_size_t), ("name", C.c_void_p), ("class_size", C.c_uint), ("instance_size", C.c_uint)]
+    query = bind(gobject, "g_type_query", None, C.c_size_t, C.POINTER(TypeQuery))
+    parent = bind(gio, "g_app_launch_context_get_type", C.c_size_t)()
+    parent_info, object_info = TypeQuery(), TypeQuery()
+    query(parent, C.byref(parent_info))
+    query(bind(gobject, "g_object_get_type", C.c_size_t)(), C.byref(object_info))
+    duplicate = bind(glib, "g_strdup", C.c_void_p, C.c_char_p)
+    @C.CFUNCTYPE(C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p)
+    def startup_id(context, info, files):
+        return duplicate(activation.encode())
+    @C.CFUNCTYPE(None, C.c_void_p, C.c_void_p)
+    def initialize(context_class, data):
+        C.c_void_p.from_address(context_class + object_info.class_size + C.sizeof(C.c_void_p)).value = C.cast(startup_id, C.c_void_p).value
+    register = bind(gobject, "g_type_register_static_simple", C.c_size_t, C.c_size_t, C.c_char_p, C.c_uint, C.c_void_p, C.c_uint, C.c_void_p, C.c_uint)
+    derived = register(parent, b"WaybridgeActivationLaunchContext", parent_info.class_size, C.cast(initialize, C.c_void_p), parent_info.instance_size, None, 0)
+    context = bind(gobject, "g_object_new", C.c_void_p, C.c_size_t, C.c_void_p)(derived, None)
+else:
+    context = bind(gio, "g_app_launch_context_new", C.c_void_p)()
 setenv = bind(gio, "g_app_launch_context_setenv", None, C.c_void_p, C.c_char_p, C.c_char_p)
 unsetenv = bind(gio, "g_app_launch_context_unsetenv", None, C.c_void_p, C.c_char_p)
 for key, value in plan["environment_set"].items():
@@ -607,6 +631,18 @@ def launch_application(request, saved, session, diagnostic=False):
     plan, environment, config = launch_plan(request, saved)
     if diagnostic:
         return plan
+    activation_token = request.get("activation_token")
+    if activation_token is not None:
+        if not isinstance(activation_token, str) or not re.fullmatch(r"[A-Za-z0-9]{32}", activation_token):
+            raise ValueError("Invalid activation token")
+        environment["XDG_ACTIVATION_TOKEN"] = activation_token
+        environment["DESKTOP_STARTUP_ID"] = activation_token
+        if config is not None:
+            # GIO only asks LaunchContext for a startup ID when this launch is
+            # startup-notification aware. Scope that capability to our derived
+            # entry and owned token; never edit the installed Desktop Entry.
+            config["Desktop Entry"]["StartupNotify"] = "true"
+            plan["derived"] = True
     with owned_log(session) as log:
         if plan["kind"] == "argv":
             process = subprocess.Popen(plan["argv"], env=environment, cwd=plan["cwd"],
@@ -649,6 +685,9 @@ def launch_application(request, saved, session, diagnostic=False):
         work = {**plan, "entry": path,
                 "environment_set": {key: environment[key] for key in plan["env_keys"]},
                 "environment_unset": plan["unset_env"]}
+        if activation_token:
+            work["activation_token"] = activation_token
+            work["environment_set"].update({"XDG_ACTIVATION_TOKEN": activation_token, "DESKTOP_STARTUP_ID": activation_token})
         process = subprocess.Popen([sys.executable, "-I", "-c", GIO_WORKER], env=session_environment(saved), cwd=plan["cwd"],
                                    stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=True, close_fds=True)

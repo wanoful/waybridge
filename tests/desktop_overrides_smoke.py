@@ -52,7 +52,7 @@ def main():
         nested = applications / "suite % quote's $"
         nested.mkdir()
         exe = home / 'fixture executable'
-        exe.write_text('#!' + sys.executable + '\nimport json,os,sys,pathlib\npathlib.Path(os.environ["MARKER"]).write_text(json.dumps({"argv":sys.argv,"cwd":os.getcwd(),"keep":os.environ.get("KEEP"),"drop":os.environ.get("DROP"),"desktop":os.environ.get("XDG_CURRENT_DESKTOP"),"gio_file":os.environ.get("GIO_LAUNCHED_DESKTOP_FILE")}))\n')
+        exe.write_text('#!' + sys.executable + '\nimport json,os,sys,pathlib\npathlib.Path(os.environ["MARKER"]).write_text(json.dumps({"argv":sys.argv,"cwd":os.getcwd(),"keep":os.environ.get("KEEP"),"drop":os.environ.get("DROP"),"desktop":os.environ.get("XDG_CURRENT_DESKTOP"),"gio_file":os.environ.get("GIO_LAUNCHED_DESKTOP_FILE"),"activation":os.environ.get("XDG_ACTIVATION_TOKEN"),"startup":os.environ.get("DESKTOP_STARTUP_ID")}))\n')
         exe.chmod(0o700)
         source = nested / 'fixture.desktop'
         original_text = '[Desktop Entry]\nType=Application\nName=Fixture 你好\nIcon=fixture-icon\nExec=' + helper.desktop_escape(helper.exec_literal(str(exe))) + ' base -- %U %c %k %i %% %%k\nActions=Edit;Other;\n\n[Desktop Action Edit]\nName=Edit\nExec=' + helper.desktop_escape(helper.exec_literal(str(exe))) + ' action-edit %k\n\n[Desktop Action Other]\nName=Other\nExec=' + helper.desktop_escape(helper.exec_literal(str(exe))) + ' action-other\n'
@@ -85,6 +85,11 @@ def main():
         assert result['cwd'] == str(home)
         assert result['argv'] == [str(exe), 'raw literal $() ; 你好']
         assert response['pid_role'] == 'spawned-process'
+        token = 'A'*32
+        assert len(token) == 32
+        activated, _ = launch(argv=[str(exe)], activation_token=token)
+        assert activated['activation'] == activated['startup'] == token
+        reject(lambda: request(argv=[str(exe)], activation_token='bad token'), 'Invalid activation token')
         result, _ = launch(argv=[str(exe)], cwd=str(cwd), env={'KEEP': 'changed'}, unset_env=['DROP'])
         assert result['cwd'] == str(cwd) and result['keep'] == 'changed' and result['drop'] is None
         print('PASS: raw argv defaults HOME, explicit cwd/env/unset are scoped, no executable-name policy')
@@ -209,6 +214,8 @@ GLib.MainLoop().run()
                 wait(events.exists)
                 return json.loads(events.read_text())
             assert activate()['method'] == 'Activate'
+            activated = activate(activation_token=token)
+            assert activated['args'][0].get('desktop-startup-id') == token or activated['args'][0].get('activation-token') == token
             opened = activate(uris=['https://example.invalid/'])
             assert opened['method'] == 'Open' and opened['args'][0] == ['https://example.invalid/']
             action = activate(action='Edit')

@@ -82,8 +82,11 @@ def main():
             wait(lambda:state(3)["owner"]==0 and state(3)["enabled"] and state(3)["visible"]);assert app.poll() is None
             key(48);wait(lambda:state(3)["owner"]==2)
             key(32);wait(lambda:not state(2)["enabled"])
+            key(44,3);wait(lambda:not state(3)["visible"])
+            wait(lambda:state(2)["enabled"] and state(2)["foreground"])
+            key(21,2);wait(lambda:state(3)["visible"] and not state(2)["enabled"])
             key(46,3);wait(lambda:probe("exists",3,check=False).returncode!=0)
-            wait(lambda:state(2)["enabled"])
+            wait(lambda:state(2)["enabled"] and state(2)["foreground"])
             key(12);wait(lambda:"SEM_KEY 2 12" in Path(log.name).read_text())
             print("PASS: actual Win32 fullscreen/maximize/placement, min/max native resize, owner reparent/clear/survival, real modal disable+cleanup, HTTRANSPARENT input masks, unmap/remap, minimize/suspended/restore and fresh pixels after hidden-frame credits")
         finally:
