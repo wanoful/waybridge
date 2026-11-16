@@ -47,6 +47,34 @@ int main(int argc, char **argv) {
         checkIcon(hwnd, ICON_BIG, GetSystemMetricsForDpi(SM_CXICON, dpi));
         checkIcon(hwnd, ICON_SMALL, GetSystemMetricsForDpi(SM_CXSMICON, dpi));
       }
+      auto defaultBadge = icon.badgedPng(64);
+      std::vector<uint8_t> rendered;
+      require(decoder.decode(defaultBadge.data(), defaultBadge.size(), 64, 64, false, rendered), "badged PNG roundtrip");
+      auto blue = [&](const std::vector<uint8_t> &image) {
+        size_t at = (16 * 64 + 59) * 4;
+        return image[at] == 0xeb && image[at + 1] == 0x63 && image[at + 2] == 0x25 && image[at + 3] == 255;
+      };
+      require(blue(rendered), "upper-right blue Waybridge badge missing");
+      require(rendered[(50 * 64 + 10) * 4 + 2] == 255, "badge changed original lower-left pixels");
+      std::vector<uint8_t> green(64 * 64 * 4, 0);
+      for (size_t i = 0; i < green.size(); i += 4) { green[i + 1] = 255; green[i + 3] = 255; }
+      auto custom = IconBadge::png(green, 64);
+      auto oldHandle = SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0);
+      require(IconBadge::configure(custom, decoder), "custom badge rejected");
+      icon.apply(hwnd, 384);
+      require(SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0) != oldHandle, "same-DPI badge change not applied");
+      auto customPng = icon.badgedPng(64);
+      require(decoder.decode(customPng.data(), customPng.size(), 64, 64, false, rendered), "custom PNG roundtrip");
+      require(rendered[(16 * 64 + 59) * 4 + 1] == 255, "custom badge not composed");
+      auto revision = IconBadge::state().revision;
+      require(!IconBadge::configure(png, decoder), "128px custom badge accepted");
+      require(!IconBadge::configure({1, 2, 3}, decoder), "invalid custom badge accepted");
+      require(IconBadge::state().revision == revision, "invalid custom badge changed active settings");
+      require(IconBadge::configure({}, decoder), "badge reset");
+      require(icon.badgedPng(64) == defaultBadge, "custom badge permanently changed original master");
+      auto owned = icon.createOwnedIcon(144);
+      require(owned != nullptr, "caller-owned tray icon");
+      DestroyIcon(owned);
       require(!icon.update({1, 2, 3}, decoder), "invalid PNG accepted");
       require(!icon.update(std::vector<uint8_t>(96 * 1024 + 1), decoder), "oversized PNG accepted");
       nlohmann::json message = {
@@ -82,13 +110,15 @@ int main(int argc, char **argv) {
       icon.clear();
       icon.apply(hwnd, 168);
       checkIcon(hwnd, ICON_BIG, GetSystemMetricsForDpi(SM_CXICON, 168));
+      auto fallbackPng = icon.badgedPng(64);
+      require(decoder.decode(fallbackPng.data(), fallbackPng.size(), 64, 64, false, rendered) && blue(rendered), "fallback missing badge");
       checkIcon(hwnd, ICON_SMALL, GetSystemMetricsForDpi(SM_CXSMICON, 168));
       require(NativeIcon::appId("../../app").empty() &&
                   NativeIcon::appId("org.example.App") == "org.example.App",
               "app-id normalization");
       DestroyWindow(hwnd);
       std::cout << "PASS: native WM_SETICON/WM_GETICON large/small, 100/125/175/400% DPI, invalid "
-                   "PNG/size rejection, generic fallback and 300 resource replacements\n";
+                   "PNG/size rejection, default/custom/reset badges, generic fallback and 300 resource replacements\n";
       return 0;
     }
     HWND hwnd = FindWindowW(L"WaybridgeRemote", L"Waybridge fixture 1");

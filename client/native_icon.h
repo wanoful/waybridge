@@ -1,6 +1,6 @@
 #pragma once
 #include <windows.h>
-#include "image_decoder.h"
+#include "icon_badge.h"
 #include "third_party/json.hpp"
 #include <algorithm>
 #include <cmath>
@@ -15,6 +15,7 @@ class NativeIcon {
   HICON large = nullptr, smallIcon = nullptr;
   bool ownLarge = false, ownSmall = false;
   UINT lastDpi = 0;
+  uint64_t lastBadgeRevision = 0;
 
   HICON create(int edge) const {
     BITMAPINFO bi{};
@@ -34,22 +35,12 @@ class NativeIcon {
     size_t stride = size_t((edge + 15) / 16) * 2;
     std::vector<uint8_t> andMask(stride * edge, 0);
     auto out = static_cast<uint8_t *>(bits);
+    auto composed = IconBadge::compose(pixels, edge);
+    std::copy(composed.begin(), composed.end(), out);
     for (int y = 0; y < edge; ++y)
-      for (int x = 0; x < edge; ++x) {
-        double sx = std::clamp((x + .5) * 128 / edge - .5, 0.0, 127.0),
-               sy = std::clamp((y + .5) * 128 / edge - .5, 0.0, 127.0);
-        int x0 = int(sx), y0 = int(sy), x1 = std::min(127, x0 + 1), y1 = std::min(127, y0 + 1);
-        double fx = sx - x0, fy = sy - y0;
-        for (int c = 0; c < 4; ++c) {
-          double top =
-              pixels[(y0 * 128 + x0) * 4 + c] * (1 - fx) + pixels[(y0 * 128 + x1) * 4 + c] * fx;
-          double bottom =
-              pixels[(y1 * 128 + x0) * 4 + c] * (1 - fx) + pixels[(y1 * 128 + x1) * 4 + c] * fx;
-          out[(y * edge + x) * 4 + c] = uint8_t(std::lround(top * (1 - fy) + bottom * fy));
-        }
+      for (int x = 0; x < edge; ++x)
         if (!out[(y * edge + x) * 4 + 3])
           andMask[size_t(y) * stride + x / 8] |= uint8_t(0x80 >> (x % 8));
-      }
     HBITMAP mask = CreateBitmap(edge, edge, 1, 1, andMask.data());
     ICONINFO icon{};
     icon.fIcon = TRUE;
@@ -115,14 +106,22 @@ public:
     pixels.clear();
     lastDpi = 0;
   }
+  // Each caller owns its returned handle; no HWND or shared handle is borrowed.
+  HICON createOwnedIcon(UINT dpi, bool largeIcon = false) const {
+    dpi = std::clamp<UINT>(dpi, 96, 384);
+    return create(std::clamp(GetSystemMetricsForDpi(largeIcon ? SM_CXICON : SM_CXSMICON, dpi), 8, 128));
+  }
+  std::vector<uint8_t> badgedPng(UINT edge = 64) const {
+    edge = std::clamp<UINT>(edge, 8, 128);
+    return IconBadge::png(IconBadge::compose(pixels, int(edge)), edge);
+  }
   void apply(HWND hwnd, UINT dpi) {
     dpi = std::clamp<UINT>(dpi, 96, 384);
-    if (lastDpi == dpi)
+    if (lastDpi == dpi && lastBadgeRevision == IconBadge::state().revision)
       return;
     int bigSize = std::clamp(GetSystemMetricsForDpi(SM_CXICON, dpi), 1, 128);
     int smallSize = std::clamp(GetSystemMetricsForDpi(SM_CXSMICON, dpi), 1, 128);
-    HICON nextLarge = pixels.empty() ? nullptr : create(bigSize),
-          nextSmall = pixels.empty() ? nullptr : create(smallSize);
+    HICON nextLarge = create(bigSize), nextSmall = create(smallSize);
     bool nextOwnLarge = nextLarge != nullptr, nextOwnSmall = nextSmall != nullptr;
     if (!nextLarge)
       nextLarge = static_cast<HICON>(
@@ -143,5 +142,6 @@ public:
     ownLarge = nextOwnLarge;
     ownSmall = nextOwnSmall;
     lastDpi = dpi;
+    lastBadgeRevision = IconBadge::state().revision;
   }
 };
