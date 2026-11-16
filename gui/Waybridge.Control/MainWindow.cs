@@ -22,6 +22,7 @@ internal sealed class MainWindow : Window
     private readonly ProfileStore store;
     private readonly CredentialStore secrets = new();
     private readonly SessionController controller;
+    private readonly DesktopNotifications desktopNotifications;
     private readonly TrayIcon tray;
     private readonly ObservableCollection<ConnectionProfile> profiles = [];
     private readonly ComboBox profilePicker = new() { DisplayMemberPath = "Name", MinWidth = 220, HorizontalAlignment = HorizontalAlignment.Stretch };
@@ -35,6 +36,7 @@ internal sealed class MainWindow : Window
     private readonly ComboBox sessionMode = Combo(["已有会话优先，未运行时启动", "仅接入已有会话", "创建独立会话"]);
     private readonly NumberBox sshPort = Number(22, 1, 65535), remotePort = Number(49090, 0, 65535);
     private readonly ToggleSwitch reconnect = Toggle(true), audio = Toggle(true), files = Toggle(true), images = Toggle(true), readOnly = Toggle(false), ime = Toggle(true), udp = Toggle(false), hdr = Toggle(false);
+    private readonly ToggleSwitch notifications = Toggle(true);
     private readonly ComboBox codec = Combo(["自动", "H.264", "HEVC", "AV1", "PNG 无损"]);
     private readonly ComboBox scale = Combo(["跟随 Windows", "100%", "125%", "150%", "175%", "200%", "250%", "300%", "400%"]);
     private readonly ComboBox clipboard = Combo(["双向同步", "仅 Windows → Linux", "仅 Linux → Windows", "关闭"]);
@@ -76,9 +78,11 @@ internal sealed class MainWindow : Window
         string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Waybridge");
         store = new(directory);
         controller = new(directory, Path.Combine(AppContext.BaseDirectory, "waybridge-client.exe"), ConfirmHostAsync);
+        desktopNotifications = new(request => controller.SendEngineAsync(request), message => UI(() => Inform(message)));
         controller.Status += text => UI(() => status.Text = text);
         controller.ConnectionChanged += connected => UI(() =>
         {
+            desktopNotifications.ConnectionChanged(connected);
             connect.Content = connected ? "断开连接" : (busy || controller.IsRunning) ? "取消连接" : "连接";
             end.IsEnabled = connected && selected.Mode is "ssh" or "direct";
             tray?.Update(connected);
@@ -86,7 +90,7 @@ internal sealed class MainWindow : Window
             if (!connected) { actual.Text = "实际编码／解码／呈现：等待连接"; lastTick = lastBytes = lastUpdates = 0; }
         });
         controller.Log += _ => UI(() => logs.Text = string.Join(Environment.NewLine, controller.Logs));
-        controller.Message += message => UI(() => Receive(message));
+        controller.Message += message => { if (!desktopNotifications.Receive(message)) UI(() => Receive(message)); };
         tray = new(action => UI(() => TrayAction(action)));
         root.RowDefinitions.Add(new() { Height = GridLength.Auto });
         root.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
@@ -310,6 +314,7 @@ internal sealed class MainWindow : Window
         return Column(BadgeEditor(), Row("剪贴板方向", "可分别限制 Windows 与 Linux 间的数据同步", clipboard),
             Row("剪贴板图片", "文本同步保持独立", images),
             Row("文件与目录共享", "控制剪贴板文件、拖入与拖出", files),
+            Row("桌面通知", "Linux 应用通知与动作，遵循 Windows 通知设置及免打扰", notifications),
             Row("只读模式", "暂停键盘和鼠标输入，服务端同时释放按键与指针锁定", readOnly),
             Row("Windows 本地 IME", "使用本地候选窗口与远端预编辑", ime),
             Row("紧急释放鼠标", "游戏捕获鼠标时可随时释放", Text("Ctrl + Alt + Shift + F12")), apply);
@@ -426,6 +431,8 @@ internal sealed class MainWindow : Window
         gpu.SelectedIndex = settings.GpuInput == "cuda" ? 1 : 0;
         clipboard.SelectedIndex = Array.IndexOf(new[] { "both", "send", "receive", "off" }, settings.Clipboard);
         images.IsOn = settings.ClipboardImages; files.IsOn = settings.Files; readOnly.IsOn = settings.ReadOnly; ime.IsOn = settings.Ime;
+        notifications.IsOn = settings.Notifications;
+        desktopNotifications.SharingChanged(settings.Notifications);
         loading = false; UpdateMode();
     }
     private ConnectionProfile ReadEditor()
@@ -438,7 +445,8 @@ internal sealed class MainWindow : Window
             Audio = audio.IsOn, Volume = (int)volume.Value, AudioDevice = audioDevices[Math.Clamp(output.SelectedIndex, 0, audioDevices.Count - 1)].Id,
             Hdr = hdr.IsOn, Udp = udp.IsOn, UdpHost = udpHost.Text.Trim(), GpuInput = gpu.SelectedIndex == 1 ? "cuda" : "cpu",
             Clipboard = new[] { "both", "send", "receive", "off" }[Math.Max(0, clipboard.SelectedIndex)],
-            BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn
+            BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn,
+            Notifications = notifications.IsOn
         };
         var result = selected with
         {
@@ -468,6 +476,7 @@ internal sealed class MainWindow : Window
         }
         var profile = ReadEditor();
         busy = true; connect.Content = "取消连接"; notice.IsOpen = false; UpdateMode();
+        desktopNotifications.SharingChanged(profile.Settings.Notifications);
         try
         {
             await controller.ConnectAsync(profile, token.Password); connect.Content = "断开连接";
@@ -485,6 +494,7 @@ internal sealed class MainWindow : Window
         var profile = ReadEditor();
         if (controller.ActiveProfileId != profile.Id) throw new InvalidOperationException("当前连接属于另一个配置，请先选择该连接");
         await controller.ApplyAsync(profile.Settings); await SaveAsync();
+        desktopNotifications.SharingChanged(profile.Settings.Notifications);
     }
     private async Task RefreshApplicationsAsync()
     {
@@ -499,7 +509,9 @@ internal sealed class MainWindow : Window
     }
     private void Receive(JsonElement message)
     {
+        if (desktopNotifications.Receive(message)) return;
         string? type = message.GetProperty("type").GetString();
+        if (type == "notification_status") { Inform(message.GetProperty("message").GetString() ?? "通知服务状态已更新"); return; }
         if (type == "connected" && message.TryGetProperty("hardware_codecs", out var supported))
         {
             var capabilities = supported.EnumerateArray().Select(v => v.GetInt32()).ToHashSet();
@@ -603,7 +615,7 @@ internal sealed class MainWindow : Window
             if (action == "mute") { audio.IsOn = !audio.IsOn; if (controller.Connected) await ApplyAsync(); }
             if (action == "quit")
             {
-                quitting = true; activeDialog?.Hide(); await controller.DisposeAsync(); tray.Dispose();
+                quitting = true; activeDialog?.Hide(); await desktopNotifications.DisposeAsync(); await controller.DisposeAsync(); tray.Dispose();
                 Close(); Application.Current.Exit();
             }
         });

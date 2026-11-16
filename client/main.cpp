@@ -28,6 +28,7 @@
 #include "third_party/json.hpp"
 #include "native_transport.h"
 #include "host_control.h"
+#include "remote_notifications.h"
 #include "ordered_sender.h"
 #include <algorithm>
 #include <atomic>
@@ -54,6 +55,9 @@ std::atomic<uint64_t> networkBytes{0}, presentedFrames{0};
 uint64_t streamRequest = 0;
 void applyHostedSettings(const Json &settings, bool live);
 void sendStreamConfiguration();
+void sendJson(const Json &value);
+RemoteNotifications remoteNotifications([](Json message) { hostControl.emit(std::move(message)); },
+                                      [](Json message) { sendJson(message); });
 constexpr size_t MaxPacket = 72 * 1024 * 1024;
 constexpr UINT NetworkReady = WM_APP + 1;
 SOCKET connection = INVALID_SOCKET;
@@ -2308,6 +2312,7 @@ void dispatchNetwork() {
                          type == "tree_begin" || type == "tree_entry" || type == "tree_chunk" ||
                          type == "tree_done")) || (!hostedFiles && type=="drag_offer")) continue;
     if (FileTree::receive(m) || FileDrag::control(m, controller, sourceWindow)) continue;
+    if (remoteNotifications.receive(m)) continue;
     if (type == "hello") {
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
       if (m.value("version", 0) != 3 || m.value("codec", "") != "mixed") {
@@ -2332,6 +2337,7 @@ void dispatchNetwork() {
       publishClipboard();
       hostControl.emit({{"type","connected"},{"version",3},{"features",m.value("features",Json::array())},
                         {"hardware_codecs",supportedVideoKinds},{"stream_config",streamConfigNegotiated}});
+      remoteNotifications.hello(m);
       if (hostControl.active()) sendStreamConfiguration();
     } else if (type == "stream_config") {
       hostControl.emit(m);
@@ -2739,6 +2745,7 @@ void applyHostedSettings(const Json &settings, bool live) {
     for (auto &[id,window] : windows) sendJson({{"type","cancel_input"},{"id",id}});
   }
   hostedSettings=settings;
+  remoteNotifications.settings(settings.value("notifications",true));
   hostedReadOnly=settings.value("read_only",false); hostedIme=settings.value("ime",true);
   hostedFiles=settings.value("files",true); hostedImages=settings.value("clipboard_images",true);
   hostedClipboard=clipboard;
@@ -2781,6 +2788,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         try {
           std::string type=request.value("type","");
           if (type=="disconnect") PostMessageW(hwnd,WM_CLOSE,0,0);
+          else if (remoteNotifications.command(request)) {}
           else if (type=="settings") applyHostedSettings(request.at("settings"),true);
           else if (type=="send_files") {
             if (!hostedFiles) throw std::runtime_error("File transfers disabled");
@@ -2997,6 +3005,15 @@ int wmain(int argc, wchar_t **argv) {
                                nullptr, instance, nullptr);
   hostControl.start(controller);
   FileTree::activity = [](const Json &event) { hostControl.emit(event); };
+  remoteNotifications.decorate = [](Json &message) {
+    NativeIcon icon;
+    if (message.contains("png") && message["png"].is_string()) {
+      if (!iconDecoder) iconDecoder = std::make_unique<ImageDecoder>();
+      icon.update(unbase64(message["png"].get<std::string>()), *iconDecoder);
+    }
+    auto png = icon.badgedPng(64);
+    message["png"] = png.empty() ? Json(nullptr) : Json(base64(png.data(), png.size()));
+  };
   AddClipboardFormatListener(controller);
   SetTimer(controller, 1, 2000, nullptr);
   SetConsoleCtrlHandler(consoleControl, TRUE);
@@ -3069,6 +3086,8 @@ int wmain(int argc, wchar_t **argv) {
             {"cursor_v1", true},
             {"window_icon_v1", true},
             {"window_semantics_v1", true},
+            {"notifications_v1", hostControl.active()},
+            {"notifications_enabled", hostedSettings.value("notifications",true)},
             {"pointer_lock", true},
             {"toplevel_drag_v1", true},
             {"file_drop_out", hostedFiles},

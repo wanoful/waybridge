@@ -108,11 +108,19 @@ pub struct Peer {
     acknowledgements: bool,
     cursor_v1: bool,
     window_icon_v1: bool,
+    notifications_v1: bool,
+    notifications_initial: bool,
     window_semantics_v1: bool,
     media_attached: AtomicBool,
 }
 
 impl Peer {
+    pub fn notifications_enabled(&self) -> bool {
+        self.notifications_v1
+    }
+    pub fn notifications_initial(&self) -> bool {
+        self.notifications_v1 && self.notifications_initial
+    }
     pub fn audio_frame(&self, frame: Vec<u8>) {
         if !self.audio_enabled || !self.audio_attached.load(Ordering::Relaxed) {
             return;
@@ -632,6 +640,8 @@ pub fn listen(
                     acknowledgements: hello["frame_ack"].as_bool().unwrap_or(false),
                     cursor_v1: hello["cursor_v1"].as_bool().unwrap_or(false),
                     window_icon_v1: hello["window_icon_v1"].as_bool().unwrap_or(false),
+                    notifications_v1: hello["notifications_v1"].as_bool().unwrap_or(false),
+                    notifications_initial: hello["notifications_enabled"].as_bool().unwrap_or(true),
                     window_semantics_v1: hello["window_semantics_v1"].as_bool().unwrap_or(false),
                 });
                 let mut key = [0; 32];
@@ -659,7 +669,7 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","file_drop_out","file_tree","window_decorations","dpi","alpha","cursor_v1","window_icon_v1","window_semantics_v1","relative_pointer_locked","locked_pointer","ime_v3","toplevel_drag_v1","stream_config_v1"]}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1,"notifications_v1":peer.notifications_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","file_drop_out","file_tree","window_decorations","dpi","alpha","cursor_v1","window_icon_v1","window_semantics_v1","relative_pointer_locked","locked_pointer","ime_v3","toplevel_drag_v1","stream_config_v1","notifications_v1"]}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

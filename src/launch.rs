@@ -205,6 +205,12 @@ impl Session {
         tracing::info!(path=%prepared.path.display(), "application environment ready; use --launch -- <application> to join");
         Ok(())
     }
+    pub fn service_runtime(&self) -> &Path {
+        self.services.as_ref().unwrap().runtime()
+    }
+    pub fn service_bus_address(&self) -> &str {
+        self.services.as_ref().unwrap().address()
+    }
     /// Keep dispatching the compositor while declared services finish shutdown.
     pub fn stop_services(&mut self, pump: impl FnMut() -> Result<()>) -> Result<()> {
         if let Some(services) = self.services.as_mut() {

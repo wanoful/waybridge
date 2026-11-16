@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--unit-directory", type=Path, default=Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "systemd/user")
     parser.add_argument("--portal-directory", type=Path,
                         help="explicit standard Portal configuration directory (e.g. /usr/share/xdg-desktop-portal); omitted leaves Portal configuration unchanged")
+    parser.add_argument("--notification-provider", action="store_true",
+                        help="install the optional Waybridge notification provider unit; does not enable it or replace another provider")
     args = parser.parse_args()
     service_source = args.service_binary.resolve(strict=True)
     compositor_source = args.compositor_binary.resolve(strict=True)
@@ -29,6 +31,10 @@ def main():
     files = {args.unit_directory / "waybridge.service": template.encode()}
     files.update((args.unit_directory / source.name, source.read_bytes())
                  for source in sorted((integration / "systemd/user").glob("*.target")))
+    if args.notification_provider:
+        notification_template = (integration / "systemd/user/waybridge-notifications.service.in").read_text()
+        files[args.unit_directory / "waybridge-notifications.service"] = notification_template.replace(
+            "@COMPOSITOR_BINARY@", unit_quote(binary_directory / "waybridge")).encode()
     if args.portal_directory:
         source = integration / "xdg-desktop-portal/waybridge-portals.conf"
         files[args.portal_directory / source.name] = source.read_bytes()
@@ -50,6 +56,9 @@ def main():
     print("Session targets activate only when the compositor publishes its display environment.")
     print("Start explicitly: systemctl --user daemon-reload && systemctl --user enable --now waybridge.service")
     print(f"Create a pairing code: {binary_directory / 'waybridge-service'} pair")
+    if args.notification_provider:
+        print("Notification provider installed but not enabled. Select it explicitly, with no other notification server in this session:")
+        print("  systemctl --user enable waybridge-notifications.service")
 
 
 if __name__ == "__main__":

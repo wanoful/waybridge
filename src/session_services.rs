@@ -519,6 +519,9 @@ impl Services {
     pub fn address(&self) -> &str {
         &self.address
     }
+    pub fn runtime(&self) -> &Path {
+        self.runtime.path()
+    }
     pub fn status_file(&self) -> PathBuf {
         self.runtime.path().join("status.json")
     }

@@ -4,6 +4,7 @@ mod audio;
 mod color;
 mod color_management;
 mod cursor;
+mod desktop_notifications;
 mod drag;
 mod file_tree;
 mod ime;
@@ -166,6 +167,9 @@ struct Args {
     /// Launch an application inside the running --socket session, including its audio and D-Bus.
     #[arg(long)]
     launch: bool,
+    /// Run the explicitly selected freedesktop notification provider (user service).
+    #[arg(long, conflicts_with = "launch")]
+    notification_provider: bool,
     /// Absolute working directory for an application (defaults to HOME).
     #[arg(long)]
     cwd: Option<PathBuf>,
@@ -207,14 +211,15 @@ impl Args {
         let matches = Self::command().get_matches();
         let mut args = Self::from_arg_matches(&matches)?;
         let explicit_socket = matches.value_source("socket") == Some(ValueSource::CommandLine);
-        let mut loaded =
-            if args.launch && explicit_socket && !args.check_config && !args.print_config {
-                // Attaching to a named existing session does not create or change
-                // its stream configuration. A newly broken file cannot block it.
-                waybridge_config::Loaded::load_path(None, false)?
-            } else {
-                waybridge_config::Loaded::load(args.config.as_deref())?
-            };
+        let mut loaded = if args.notification_provider
+            || (args.launch && explicit_socket && !args.check_config && !args.print_config)
+        {
+            // Attaching to a named existing session does not create or change
+            // its stream configuration. A newly broken file cannot block it.
+            waybridge_config::Loaded::load_path(None, false)?
+        } else {
+            waybridge_config::Loaded::load(args.config.as_deref())?
+        };
         // Clap defaults preserve --help compatibility, but only explicit command
         // line values may replace the file's values.
         macro_rules! explicit {
@@ -2610,6 +2615,9 @@ fn token(path: &PathBuf) -> Result<String> {
 
 fn main() -> Result<()> {
     let (args, configuration) = Args::configured()?;
+    if args.notification_provider {
+        return desktop_notifications::run_provider();
+    }
     if args.print_config {
         println!("{}", serde_json::to_string_pretty(&configuration.report())?);
         return Ok(());
@@ -2895,6 +2903,10 @@ fn main() -> Result<()> {
         &args.listen,
         &token_path,
     )?;
+    let mut notifications = desktop_notifications::Bridge::new(
+        application_session.service_runtime(),
+        application_session.service_bus_address(),
+    )?;
     // Service shutdown must run for application-launch and event-loop errors too.
     // Keep the display alive and dispatchable until owned components have stopped.
     let run_result = (|| -> Result<()> {
@@ -2921,6 +2933,11 @@ fn main() -> Result<()> {
         tracing::info!(socket = %args.socket, token_file = %token_path.display(), "ready; launch apps with WAYLAND_DISPLAY set to this socket");
         let mut next_frame = Instant::now();
         while !shutdown::requested() {
+            notifications.receive(|value| {
+                if let Some(peer) = app.peer.as_ref().filter(|p| p.notifications_enabled()) {
+                    peer.control(value);
+                }
+            });
             app.reap_retired_outputs();
             xloop.dispatch(Some(Duration::ZERO), &mut app)?;
             while let Some(stream) = socket.accept()? {
@@ -2938,6 +2955,10 @@ fn main() -> Result<()> {
                 let Ok(event) = events.try_recv() else { break };
                 match event {
                     Event::Connected(peer) => {
+                        notifications.connection(peer.notifications_initial());
+                        if peer.notifications_enabled() {
+                            peer.control(notifications.status());
+                        }
                         app.read_only = false;
                         if let Some(audio) = &app.audio {
                             audio.set_peer(Some(&peer));
@@ -2982,7 +3003,18 @@ fn main() -> Result<()> {
                             app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                         }
                     }
-                    Event::Message(value) => app.message(value),
+                    Event::Message(value) => {
+                        if value["type"] == "notification_feedback" {
+                            notifications.feedback(&value);
+                        } else if value["type"] == "notifications_enabled" {
+                            notifications.enabled(
+                                value["enabled"] == true
+                                    && app.peer.as_ref().is_some_and(|p| p.notifications_enabled()),
+                            );
+                        } else {
+                            app.message(value);
+                        }
+                    }
                     Event::UploadedFiles(completed) => {
                         if !app.transfers.current(completed.epoch)
                             || !app
@@ -3051,6 +3083,7 @@ fn main() -> Result<()> {
                         }
                     }
                     Event::Disconnected => {
+                        notifications.connection(false);
                         app.cancel_window_drag();
                         app.poll_window_drag();
                         app.window_drag.available = false;

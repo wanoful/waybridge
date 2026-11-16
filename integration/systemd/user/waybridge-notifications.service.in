@@ -1,0 +1,16 @@
+[Unit]
+Description=Waybridge freedesktop notification provider (explicit selection)
+PartOf=waybridge-session.target
+After=waybridge-session-pre.target
+Conflicts=waybridge-session-shutdown.target
+Before=waybridge-session-shutdown.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.Notifications
+ExecStart="@COMPOSITOR_BINARY@" --notification-provider
+Restart=no
+TimeoutStopSec=5
+
+[Install]
+WantedBy=waybridge-session.target

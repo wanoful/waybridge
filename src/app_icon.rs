@@ -224,6 +224,28 @@ struct Resolver {
     roots: Vec<PathBuf>,
     theme: String,
 }
+
+/// Reuse the bounded icon-theme reader from the notification helper process.
+pub(crate) fn notification_icon(icon: &str, desktop: &str) -> Option<Vec<u8>> {
+    let resolver = Resolver::environment();
+    let path = if !icon.is_empty() && Path::new(icon).is_absolute() {
+        regular_image(PathBuf::from(icon))
+    } else if identifier(icon) {
+        resolver
+            .theme_icon(&resolver.theme, icon, &mut HashSet::new())
+            .or_else(|| resolver.theme_icon("hicolor", icon, &mut HashSet::new()))
+            .or_else(|| {
+                resolver
+                    .data
+                    .iter()
+                    .find_map(|data| candidate(&data.join("pixmaps"), icon))
+            })
+    } else {
+        None
+    }
+    .or_else(|| resolver.resolve(desktop))?;
+    load(&path)
+}
 impl Resolver {
     fn environment() -> Self {
         let home = std::env::var_os("HOME")

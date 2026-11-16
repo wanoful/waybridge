@@ -168,7 +168,13 @@ public:
     if (line.size() > 1024 * 1024) return;
     std::lock_guard<std::mutex> guard(mutex);
     // Telemetry and lifecycle updates must remain bounded even if the UI stops reading.
-    if (outgoing.size() >= 128) outgoing.pop_front();
+    if (outgoing.size() >= 128) {
+      // Losing a notification close/reset (or a tray lifecycle transition)
+      // would retain stale interactive UI. Disconnect an unresponsive host
+      // instead; connection teardown invalidates all such entries and actions.
+      if (target) PostMessageW(target, WM_CLOSE, 0, 0);
+      return;
+    }
     outgoing.push_back(std::move(line)); wake.notify_one();
   }
   std::vector<nlohmann::json> take() {
