@@ -162,16 +162,16 @@ X11 顶层窗口在该虚拟屏幕内布局，避免 HMCL 等应用的负坐标�
 
 ## 使用数据交换
 
-已确认的后续策略是跨端文件统一只读交付；需要保存或正常编辑时，先通过 Dolphin/Explorer 复制到自己的目录。当前版本接收缓存尚未统一只读化，下面的 Copy 行为不代表已经禁止覆盖缓存。决策与验收见 [只读交付规格](FEATURES.md#跨端文件的只读交付)。
+跨端文件现统一只读交付；应用可以读取/导入，原位写入及替换会失败。需要保存或正常编辑时，通过 Dolphin/Explorer 复制到自己的目录，新副本正常可写。Linux 通过只读 FUSE 视图交付，Windows 实体缓存用 DACL 保护；Wine 的属性映射不满足副本语义，会明确拒绝该批实体剪贴板下载并清理，虚拟流和 Windows→Linux 上传仍可用。决策与验收见 [只读交付规格](FEATURES.md#跨端文件的只读交付)。
 
 - 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
 - Windows 资源管理器中复制文件或目录，传输完成后可在支持文件粘贴的 Linux 应用里粘贴；Linux 应用提供 `text/uri-list` 时，目录树下载后可粘贴到 Windows 资源管理器。两端会协商 `file_tree` 能力，保留层级、空目录、零字节文件和名称；旧端仍只支持普通文件。
 - 从 Windows 资源管理器拖文件或目录到远端窗口，先上传完整数据，再由合成器向目标应用协商 Copy 拖放。当前不会在上传期间显示远端拖动预览。
-- Windows 应用仅提供 `FILEDESCRIPTORW/A` + `FILECONTENTS`、没有 `CF_HDROP` 路径时，也可复制或拖入远端窗口。独立 COM worker 按文件获取并以 64 KiB 分块读取流；支持 Clone/Seek、顺序流、未知大小流的 Stat，以及最多 12 MiB 的已知大小 HGLOBAL。异步源在 Linux 提交后收到完成通知，同步拖入等完整接收后返回，等待期间 Esc 可取消。Linux 应用读取的是完成后保留的本地文件，尚未提供 FUSE 按需文件系统；IStorage 和未知大小 HGLOBAL 暂不支持。
+- Windows 应用仅提供 `FILEDESCRIPTORW/A` + `FILECONTENTS`、没有 `CF_HDROP` 路径时，也可复制或拖入远端窗口。独立 COM worker 按文件获取并以 64 KiB 分块读取流；支持 Clone/Seek、顺序流、未知大小流的 Stat，以及最多 12 MiB 的已知大小 HGLOBAL。异步源在 Linux 提交后收到完成通知，同步拖入等完整接收后返回，等待期间 Esc 可取消。Linux 应用通过只读 FUSE 视图读取完整接收并保留的本地文件，尚未提供网络按需读取；IStorage 和未知大小 HGLOBAL 暂不支持。
 - Linux 应用提供标准文件/目录拖放时，可按住左键拖出远端窗口，到支持 Windows 虚拟文件的原生目标释放。文件内容按目标读取请求传输，无需先下载完整文件；支持异步提取、取消以及断线清理，始终使用 Copy，保留 Linux 源文件并保持剪贴板内容。仅接受 CF_HDROP 的目标暂不支持这一拖出路径。
 - 目录批次最多 128 个顶层项、512 个条目、16 层路径、总文件内容 8 GiB，单文件最多 1 GiB；相对路径最多 240 个 UTF-16 单元，单个名称最多 240 UTF-8 字节/UTF-16 单元。Windows 临时目录加完整相对路径还必须小于 MAX_PATH，超限会报错。仅 Copy，不保留权限、时间戳和硬链接关系。
 - 符号链接、NTFS reparse point（含 junction/云占位文件）、特殊文件、非本地 URI、Windows 保留名/ADS/尾点空格及同一父目录下的大小写冲突会拒绝整批，绝不静默覆盖或改名。Linux 拖出要求应用使用 Wayland data-device v3 并支持 Copy；一次一个出站操作，空闲超过 120 秒取消。
-- 未完成的私有目标树会在取消、错误、替换剪贴板或断线时清理。通过新协议完成的文件/目录批次保留在 Linux `$XDG_RUNTIME_DIR/waybridge-inbox/tree-<batch>/` 或 Windows `%TEMP%\Waybridge-tree-*`；旧普通文件路径分别为 `<transfer-id>/` 和 `%TEMP%\Waybridge-*`。应用可能延迟读取，成功后不立即删除；确认无消费者后可手动清理。原生拖出目标自己创建的文件由目标管理，Waybridge 不删除用户目标目录或源文件。
+- 未完成的私有目标树会在取消、错误、替换剪贴板或断线时清理。Linux 完整接收批次公开为 `$XDG_RUNTIME_DIR/waybridge-inbox/readonly/tree-<batch>/` 或 `readonly/<transfer-id>/` 下的只读 URI；重连复用编号会生成独立后缀目录，保留旧 URI。Windows 完整缓存保留在 `%TEMP%\Waybridge-tree-*` 或 `%TEMP%\Waybridge-*` 并保护公开内容。应用可能延迟读取，成功后不随查看端断线删除；自动缓存回收和配额尚未实现，不要在消费者仍使用时清理。原生拖出目标自己创建的文件由目标管理，Waybridge 不删除用户目标目录或源文件。
 
 应用对粘贴和拖入的数据类型有自己的限制；私有应用格式不做跨平台转换。
 

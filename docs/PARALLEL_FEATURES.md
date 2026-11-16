@@ -51,4 +51,6 @@
 
 真实 Wayland/Qt/GTK/X11、NVIDIA NVENC/CUDA 和私有 Wine/Xvfb 中的 Windows PE/API 已覆盖完整合并后的回归。结果包括全部 UDP 媒体 kind、音频、流控、文件/目录/OLE/21 种虚拟源，以及 X11/音频/UDP/GPU/HDR 同时启用时的 PNG-only 回退和共享退出清理。GPU 隐藏/重映射、持有编码缓存时退出也已通过；分层结果见 [VALIDATION.md](VALIDATION.md)。
 
-Wine 的 Unicode 注入不代表微软拼音引擎、候选面板或选词验收；软件 D3D11 数值检查不代表物理 HDR/MFT。Explorer、Outlook、压缩软件、真实 WoA 新 codec、多显示器 DPI 和输入到显示延迟仍需相应实机测试。完整 HDR、XIM/XDND/PRIMARY、跨进程透明点穿、FUSE、Opus、自适应拥塞控制与 Moonlight 线协议兼容未实现。
+Wine 的 Unicode 注入不代表微软拼音引擎、候选面板或选词验收；软件 D3D11 数值检查不代表物理 HDR/MFT。Explorer、Outlook、压缩软件、真实 WoA 新 codec、多显示器 DPI 和输入到显示延迟仍需相应实机测试。完整 HDR、XIM/XDND/PRIMARY、跨进程透明点穿、网络按需 FUSE、Opus、自适应拥塞控制与 Moonlight 线协议兼容未实现。
+
+跨端只读文件交付已加入：Linux 使用完整缓存上的只读 FUSE 视图，Windows 实体剪贴板缓存使用 DACL。Linux/Dolphin、Windows 11 的文件与目录 Shell 复制及缓存生命周期通过验证；Wine 明确拒绝会传播 READONLY 属性的实体缓存，并验证拒绝后无公开路径或残留暂存，不能将其计作 NTFS 成功发布覆盖。虚拟文件流继续拒绝写入，验收记录见 [VALIDATION.md](VALIDATION.md#m2-read-only-file-delivery--2026-11-16)。
