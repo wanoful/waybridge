@@ -346,3 +346,5 @@ Linux 记录合成、回读、编码排队、转换、编码、发送及呈现�
 - 原始 v3 TCP 需经内建 TLS 入口或外部 SSH 等受保护传输；与 Sunshine/Moonlight 线协议不兼容。TLS 入口重启保留会话，合成器崩溃后的应用状态恢复未实现；SIGKILL 无法执行资源清理。
 
 普通 SHM、DMA-BUF 和可选 Xwayland 已接通；大型应用、驱动、多 GPU 与物理 Windows 组合仍需逐项测试，不能保证“All 应用”。
+
+窗口激活、托盘操作和拖放的当前支持边界见 [DESKTOP_INTERACTIONS.md](DESKTOP_INTERACTIONS.md)。
