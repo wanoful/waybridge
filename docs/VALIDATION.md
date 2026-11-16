@@ -1,11 +1,29 @@
 # Validation
 
+## Linux server deployment — 2026-11-16
+
+The M2 Release compositor and TLS entry point were atomically installed as
+`~/.local/bin/waybridge` and `~/.local/bin/waybridge-service`, without old-version
+backups. `waybridge.service` was restarted and is executing the new entry-point
+inode. Installed SHA-256 hashes match the build outputs. Both installed binaries
+pass configuration validation; the local administration endpoint and a real TLS
+handshake succeed, with the existing certificate and `0.0.0.0:49092` listener
+preserved. No Waybridge compositor session was running during this update.
+
+Existing service drop-ins and user configuration were preserved. Notification
+provider selection was not changed: this machine has installed `mako.service`
+and `dms.service` units declaring the same notification BusName. No Waybridge
+notification unit was installed or enabled as part of this binary update.
+Windows deployment was not changed. New sessions use the updated compositor;
+new desktop capabilities require a matching Windows client.
+
 ## M2 integrated desktop delivery — 2026-11-16
 
 The first M2 batch is integrated: shared branding and connection badges,
 read-only file inputs, SNI/DBusMenu trays and background actions, and explicitly
-selected native desktop notifications. Current installed programs were not
-replaced; device probes used their own temporary objects and registrations.
+selected native desktop notifications. At this verification stage installed
+programs were not replaced; device probes used their own temporary objects and
+registrations. The subsequent Linux deployment is recorded above.
 
 - Workspace formatting, strict Clippy, workspace unit tests and the explicit real
   FUSE acceptance pass. After the final descriptor-budget fix, tree transfer,
