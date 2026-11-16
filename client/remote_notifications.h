@@ -11,12 +11,16 @@ class RemoteNotifications {
   std::function<void(Json)> publish, transmit;
   std::map<uint32_t, uint64_t> active;
   std::string instance, binding;
-  bool negotiated = false, enabled = true, available = true;
+  // Only the initialized GUI notification worker can open forwarding. A TCP
+  // hello alone must never race ahead of native toast registration/readiness.
+  bool negotiated = false, enabled = true, available = false;
+  bool readOnly = false;
   void reset() {
     active.clear(); instance.clear(); binding.clear();
     publish({{"type","notification_reset"}});
   }
 public:
+  void inputReadOnly(bool value) { readOnly = value; }
   // Parent integration may supply a NativeIcon badgedPng callback. This is also
   // used for the placeholder when the source notification has no application icon.
   std::function<void(Json &)> decorate;
@@ -72,8 +76,10 @@ public:
         request.value("revision",uint64_t(0))!=found->second) return true;
     Json message={{"type","notification_feedback"},{"instance",instance},{"binding",binding},
       {"id",id},{"revision",found->second}};
-    if (request.contains("action") && request["action"].is_string() && request["action"].get_ref<const std::string &>().size()<=256)
-      message["action"]=request["action"];
+    if (request.contains("action") && request["action"].is_string() && request["action"].get_ref<const std::string &>().size()<=256) {
+      if (readOnly) message["reason"]=2u;
+      else message["action"]=request["action"];
+    }
     else if (request.contains("reason") && request["reason"].is_number_unsigned() &&
              (request["reason"]==2 || request["reason"]==4)) message["reason"]=request["reason"];
     else return true;

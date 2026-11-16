@@ -49,6 +49,9 @@ def main():
         bus=Gio.DBusConnection.new_for_address_sync(fixture.env['DBUS_SESSION_BUS_ADDRESS'],Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT|Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,None,None)
         def notify():
             return bus.call_sync(NAME,OBJECT,NAME,'Notify',GLib.Variant('(susssasa{sv}i)',('fixture',0,'','通知','','default 打开'.split(),{},10000)),None,Gio.DBusCallFlags.NONE,3000,None).unpack()[0]
+        actions=[]
+        bus.signal_subscribe(None,NAME,'ActionInvoked',OBJECT,None,Gio.DBusSignalFlags.NONE,
+            lambda c,s,p,i,m,v,u:actions.append(v.unpack()),None)
         try:
             deadline=time.monotonic()+15
             descriptor=runtime/'notify-fixture.session.json'
@@ -64,6 +67,15 @@ def main():
             id=notify();value=viewer.until('notification');assert value['id']==id and value['summary']=='通知'
             viewer.send(**{**value,'type':'notification_feedback','action':'default'})
             viewer.until('notification_close')
+            while GLib.MainContext.default().iteration(False):pass
+            actions.clear()
+            viewer.send(type='stream_config',request_id=73,fps=60,bitrate=30000,codec='png',read_only=True)
+            assert viewer.until('stream_config')['ok']
+            notify();value=viewer.until('notification')
+            viewer.send(**{**value,'type':'notification_feedback','action':'default'})
+            viewer.until('notification_close');time.sleep(.05)
+            while GLib.MainContext.default().iteration(False):pass
+            assert not actions,'read-only action reached Linux application'
             # Disconnect drops all pending notifications, including resident ones.
             notify();viewer.until('notification');viewer.close();viewer=None;time.sleep(.15)
             viewer=Viewer(port,token,enabled=False)

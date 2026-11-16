@@ -396,31 +396,86 @@ impl Notifications {
             ));
         }
         let sender = owner(&header)?;
+        let admitted_binding = {
+            let mut state = self.state.lock().unwrap();
+            if !state.enabled || state.last_state.elapsed() > Duration::from_secs(3) {
+                return Err(fdo::Error::Failed(
+                    "Waybridge notification forwarding has no enabled, capable viewer".into(),
+                ));
+            }
+            if state.rate.0.elapsed() >= Duration::from_secs(1) {
+                state.rate = (Instant::now(), 0);
+            }
+            if state.rate.1 >= 16 {
+                return Err(fdo::Error::LimitsExceeded(
+                    "notification update rate exceeded".into(),
+                ));
+            }
+            state.rate.1 += 1;
+            if replaces_id != 0
+                && state
+                    .entries
+                    .get(&replaces_id)
+                    .is_some_and(|entry| entry.owner != sender)
+            {
+                return Err(fdo::Error::AccessDenied(
+                    "notification belongs to another unique bus owner".into(),
+                ));
+            }
+            if state.entries.len() >= MAX_ACTIVE && !state.entries.contains_key(&replaces_id) {
+                return Err(fdo::Error::LimitsExceeded(
+                    "too many active notifications".into(),
+                ));
+            }
+            state.binding.clone()
+        };
         // Icon decoding and theme lookup run only in this explicit helper.
+        // Admission is cheap and precedes I/O. Do not hold the state lock here:
+        // expiry, viewer detach and the provider heartbeat must keep progressing.
         let desktop = hints
             .get("desktop-entry")
             .and_then(|v| <&str>::try_from(v).ok())
             .unwrap_or("");
-        let png = image_data(&hints).or_else(|| {
-            crate::app_icon::notification_icon(app_icon, desktop)
-                .filter(|bytes| bytes.len() <= MAX_ICON)
-                .map(|bytes| B64.encode(bytes))
-        });
+        let png = image_data(&hints)
+            .or_else(|| {
+                hints
+                    .get("image-path")
+                    .and_then(|value| <&str>::try_from(value).ok())
+                    .filter(|value| text(value, 4096))
+                    .and_then(|value| {
+                        if let Some(path) = value.strip_prefix("file://") {
+                            let path = path
+                                .strip_prefix("localhost/")
+                                .map(|p| format!("/{p}"))
+                                .unwrap_or_else(|| path.to_owned());
+                            if !path.starts_with('/') {
+                                return None;
+                            }
+                            let decoded = percent_encoding::percent_decode_str(&path)
+                                .decode_utf8()
+                                .ok()?;
+                            crate::app_icon::notification_icon(&decoded, "")
+                        } else {
+                            crate::app_icon::notification_icon(value, "")
+                        }
+                    })
+                    .filter(|bytes| bytes.len() <= MAX_ICON)
+                    .map(|bytes| B64.encode(bytes))
+            })
+            .or_else(|| {
+                crate::app_icon::notification_icon(app_icon, desktop)
+                    .filter(|bytes| bytes.len() <= MAX_ICON)
+                    .map(|bytes| B64.encode(bytes))
+            });
         let mut state = self.state.lock().unwrap();
-        if !state.enabled || state.last_state.elapsed() > Duration::from_secs(3) {
+        if !state.enabled
+            || state.binding != admitted_binding
+            || state.last_state.elapsed() > Duration::from_secs(3)
+        {
             return Err(fdo::Error::Failed(
                 "Waybridge notification forwarding has no enabled, capable viewer".into(),
             ));
         }
-        if state.rate.0.elapsed() >= Duration::from_secs(1) {
-            state.rate = (Instant::now(), 0);
-        }
-        if state.rate.1 >= 16 {
-            return Err(fdo::Error::LimitsExceeded(
-                "notification update rate exceeded".into(),
-            ));
-        }
-        state.rate.1 += 1;
         if replaces_id != 0
             && state
                 .entries

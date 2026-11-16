@@ -4,6 +4,7 @@
 Never acquires a name on the user's bus or reads an application/wallet profile.
 """
 import json
+import base64
 import os
 from pathlib import Path
 import socket
@@ -63,6 +64,15 @@ def main():
             receive('notification_register'); time.sleep(.08)
             assert set(call('GetCapabilities')[0]) == {'body','actions','icon-static'}
             assert call('GetServerInformation')[-1]=='1.2'
+            try:notify(body='x'*8193);raise AssertionError('oversize body accepted')
+            except GLib.Error as error:assert 'InvalidArgs' in str(error)
+            try:notify(actions=['a','one','a','duplicate']);raise AssertionError('duplicate action accepted')
+            except GLib.Error as error:assert 'InvalidArgs' in str(error)
+            raw=GLib.Variant('(iiibiiay)',(2,1,8,True,8,4,[255,0,0,255,0,255,0,255]))
+            image_id=call('Notify','(susssasa{sv}i)',('image fixture',0,'','icon','',[],{'image-data':raw},10000))[0]
+            icon=receive('notification');assert base64.b64decode(icon['png']).startswith(b'\x89PNG\r\n\x1a\n')
+            call('CloseNotification','(u)',(image_id,));wait_signal('NotificationClosed',(image_id,3));receive('notification_close')
+            signals.clear()
             first=notify(); old=receive('notification')
             assert old['summary']=='通知标题' and old['body']=='中文正文'
             assert notify(first)==first

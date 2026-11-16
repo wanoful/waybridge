@@ -53,6 +53,10 @@ internal sealed class DesktopNotifications : IAsyncDisposable
         }
         catch
         {
+            if (manager is not null)
+                try { manager.NotificationInvoked -= Invoked; } catch (COMException) { }
+            manager = null;
+            registered = false;
             available = false;
             status("Windows 原生通知不可用；桌面通知转发已关闭。请检查 Windows 通知设置与 Windows App Runtime。");
         }
@@ -135,7 +139,7 @@ internal sealed class DesktopNotifications : IAsyncDisposable
     }
     private async Task AvailabilityAsync()
     {
-        bool current = manager is not null && manager.Setting == AppNotificationSetting.Enabled;
+        bool current = registered && manager is not null && manager.Setting == AppNotificationSetting.Enabled;
         if (current != available && !current)
         {
             await ResetAsync();
@@ -263,14 +267,13 @@ internal sealed class DesktopNotifications : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         queue.Writer.TryComplete(); lifetime.Cancel();
-        try { await Task.WhenAll(worker, polling); } catch (OperationCanceledException) { }
-        if (manager is not null)
+        try
         {
-            manager.NotificationInvoked -= Invoked;
-            if (registered)
-                try { manager.Unregister(); }
-                catch (COMException error) when (error.HResult == unchecked((int)0x80070490)) { /* OS registration already gone */ }
+            try { await Task.WhenAll(worker, polling); } catch (OperationCanceledException) { }
+            if (manager is not null)
+                try { manager.NotificationInvoked -= Invoked; if (registered) manager.Unregister(); }
+                catch (COMException) { /* best effort shutdown; never block session/tray cleanup */ }
         }
-        lifetime.Dispose();
+        finally { lifetime.Dispose(); }
     }
 }

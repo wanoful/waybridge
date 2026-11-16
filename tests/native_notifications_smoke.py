@@ -63,9 +63,11 @@ def main():
                     item=receive()
                     if item['type']==kind: return item
                 raise AssertionError('missing server feedback '+kind)
-            hello=receive();assert hello['notifications_v1'] and hello['notifications_enabled']
+            hello=receive();assert hello['notifications_v1'] and not hello['notifications_enabled']
             server(type='hello',version=3,codec='mixed',notifications_v1=True,features=['notifications_v1'])
-            until('connected');assert incoming('notifications_enabled')['enabled']
+            until('connected');assert not incoming('notifications_enabled')['enabled']
+            command(type='notification_available',available=True)
+            assert incoming('notifications_enabled')['enabled']
             record=dict(type='notification',instance='a'*32,binding='b'*32,id=17,revision=1,app_name='测试应用',summary='中文标题',body='只存在于内存的内容',timeout_ms=10000,actions=[dict(key='default',label='打开')],png=None)
             server(**record)
             received=until('notification');assert received['summary']==record['summary']
@@ -79,6 +81,11 @@ def main():
             command(**{**record,'type':'notification_feedback','revision':1,'action':'default'})
             command(**{**record,'type':'notification_feedback','action':'default'})
             assert incoming('notification_feedback')['revision']==2
+            record['revision']=3;server(**record);until('notification')
+            settings['read_only']=True;command(type='settings',settings=settings)
+            until('local_settings_applied')
+            command(**{**record,'type':'notification_feedback','action':'default'})
+            readonly=incoming('notification_feedback');assert readonly['reason']==2 and 'action' not in readonly
             settings['notifications']=False;command(type='settings',settings=settings)
             assert incoming('notifications_enabled')['enabled'] is False
             command(type='disconnect');connection.shutdown(socket.SHUT_RDWR);connection.close()

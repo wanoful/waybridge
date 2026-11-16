@@ -2747,6 +2747,7 @@ void applyHostedSettings(const Json &settings, bool live) {
   hostedSettings=settings;
   remoteNotifications.settings(settings.value("notifications",true));
   hostedReadOnly=settings.value("read_only",false); hostedIme=settings.value("ime",true);
+  remoteNotifications.inputReadOnly(hostedReadOnly);
   hostedFiles=settings.value("files",true); hostedImages=settings.value("clipboard_images",true);
   hostedClipboard=clipboard;
   FileTree::setDownloadsEnabled(hostedFiles && hostedClipboard != "off" && hostedClipboard != "send");
@@ -3087,7 +3088,7 @@ int wmain(int argc, wchar_t **argv) {
             {"window_icon_v1", true},
             {"window_semantics_v1", true},
             {"notifications_v1", hostControl.active()},
-            {"notifications_enabled", hostedSettings.value("notifications",true)},
+            {"notifications_enabled", false},
             {"pointer_lock", true},
             {"toplevel_drag_v1", true},
             {"file_drop_out", hostedFiles},

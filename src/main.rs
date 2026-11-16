@@ -3003,8 +3003,14 @@ fn main() -> Result<()> {
                             app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                         }
                     }
-                    Event::Message(value) => {
+                    Event::Message(mut value) => {
                         if value["type"] == "notification_feedback" {
+                            if app.read_only && value.get("action").is_some() {
+                                if let Some(fields) = value.as_object_mut() {
+                                    fields.remove("action");
+                                    fields.insert("reason".into(), json!(2));
+                                }
+                            }
                             notifications.feedback(&value);
                         } else if value["type"] == "notifications_enabled" {
                             notifications.enabled(
