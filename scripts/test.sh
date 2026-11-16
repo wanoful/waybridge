@@ -9,6 +9,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo test --locked readonly_delivery -- --ignored
 cargo build --locked
+python3 tests/notifications_smoke.py
+python3 tests/notifications_bridge_smoke.py
+python3 tests/tray_smoke.py
 python3 tests/session_service_status_smoke.py
 python tests/output_bind_race_smoke.py
 python tests/smoke.py
