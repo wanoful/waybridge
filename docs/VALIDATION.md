@@ -2,6 +2,23 @@
 
 ## Desktop interaction follow-up — 2026-11-16
 
+Delivery status: both installed programs were updated after acceptance. Linux
+`~/.local/bin/waybridge` and `waybridge-service` match the final Release outputs;
+`waybridge.service` restarted at 21:44 CST, its executable path/start time and
+real TLS handshake were checked, and the certificate and 49092 listener remain
+unchanged. No user compositor session was active during replacement. Windows
+x64 at `%LOCALAPPDATA%\Waybridge-Test\m0-m1-20261114\app\Waybridge` was updated
+with the matching GUI, worker and runtime bundle; all 537 inventory entries
+matched SHA-256, and the existing profiles file hash was preserved. No old-version
+backups were created. Service configuration, pairing identity and notification
+provider selection were preserved.
+
+Final `scripts/test.sh` and `scripts/test-windows.sh` both passed, as did Core
+unit tests, Release workspace build, x64/ARM64 publishing and packaging checks.
+Logs: `build/final-linux-suite.log`, `build/final-windows-suite.log`,
+`build/current-core-tests.log`, `build/final-control-packages.log`,
+`build/final-gui-focus-run.log` and `build/final-deployment.json`.
+
 The tray callback/activation, runtime window-icon, foreground/modal-owner,
 generic Unicode DND/capture/return and DND-icon fixes are integrated. Direction,
 format and remaining interoperability limits are recorded in
