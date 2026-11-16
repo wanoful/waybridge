@@ -36,7 +36,7 @@ items, checkmarks, radio marks and mnemonics. Existing Linux windows provide a
 bounded fallback for applications that expose ContextMenu without DBusMenu.
 
 The worker has 64 action slots, 500 ms per-method bus timeouts, bounded menu
-size/depth and a rotating poll budget (up to 8 items per pass, stopping the pass
+size/depth and a rotating poll budget (up to 8 items per pass, stopping the pass between items
 after its 750 ms time budget). It checks fresh lifecycle state between passes.
 Normal source changes appear within a polling interval; unresponsive sources
 can delay their own refresh. Metadata and icons use separate bounded queues;
@@ -69,7 +69,7 @@ without replacing it, providing a watcher when absent, KDE/freedesktop item
 interfaces, ARGB pixel conversion, nested/check/radio/disabled/hidden menus,
 ancestor policy enforcement, activation/secondary/scroll, layout revisions,
 source owner replacement, reconnect epochs, capability absence, server read-only
-policy, and ContextMenu-only paths with/without a matching remote window.
+policy (including policy changes while GetLayout is blocked), and ContextMenu-only paths with/without a matching remote window.
 
 The same integration launches actual VLC on private Xwayland: a background SNI
 entry activates a streamed application window; the application's exported Quit
@@ -87,5 +87,12 @@ paths but does not claim Wine is a Windows Explorer acceptance test.
 probe using a unique temporary executable/report and a Limited interactive
 scheduled task. It opens only its own window/menu/tray entry, exits automatically,
 and removes its task/files. It never replaces a deployed Waybridge binary or
-closes another application's windows. Native test results are recorded in the
-implementation completion report.
+closes another application's windows. The native x64 `laptop` run passed: Explorer accepted the independent tray icon
+(`Shell_NotifyIconGetRect` succeeded), real HMENU hierarchy/check/radio/disabled
+states matched, a keyboard mnemonic dispatched the expected application menu
+identity, and read-only/hide/cleanup checks passed. The task returned exit code
+0; its temporary executable/report and task were removed. A duplicate
+TaskbarCreated broadcast repairs existing IDs using NIM_MODIFY if NIM_ADD finds
+the icon already present. This exercises recovery logic without restarting the
+user's actual Explorer. ARM64 was cross-compiled; this x64 device does not execute
+ARM64 binaries.

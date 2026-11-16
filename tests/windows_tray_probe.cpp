@@ -111,10 +111,12 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
 int main(int argc, char **argv) {
   if (argc > 1)
     std::freopen(argv[1], "w", stdout);
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  std::puts("probe_started");
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  ImageDecoder images;
-  decoder = &images;
+  auto images = std::make_unique<ImageDecoder>();
+  decoder = images.get();
   WNDCLASSW wc{};
   wc.lpfnWndProc = procedure;
   wc.hInstance = GetModuleHandleW(nullptr);
@@ -139,7 +141,7 @@ int main(int argc, char **argv) {
       },
       [](const Json &event) { std::printf("%s\n", event.dump().c_str()); });
   tray.configure(true, true, false);
-  tray.receive({{"type", "tray_snapshot"}, {"epoch", 1u}, {"items", Json::array({item})}}, images);
+  tray.receive({{"type", "tray_snapshot"}, {"epoch", 1u}, {"items", Json::array({item})}}, *images);
   SetTimer(owner, 1, 500, nullptr);
   MSG msg{};
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -148,6 +150,8 @@ int main(int argc, char **argv) {
   }
   tray.clear();
   DestroyWindow(owner);
+  decoder = nullptr;
+  images.reset();
   CoUninitialize();
   return int(msg.wParam);
 }

@@ -84,6 +84,10 @@ class RemoteTray {
     wcsncpy(d.szTip, title.c_str(), 127);
     d.szTip[127] = 0;
     BOOL ok = Shell_NotifyIconW(item.added ? NIM_MODIFY : NIM_ADD, &d);
+    // A duplicate/synthetic TaskbarCreated broadcast can arrive while Explorer
+    // still retains this ID. Repair its content without claiming a failure.
+    if (!ok && !item.added)
+      ok = Shell_NotifyIconW(NIM_MODIFY, &d);
     if (ok) {
       item.added = true;
       d.uVersion = NOTIFYICON_VERSION_4;

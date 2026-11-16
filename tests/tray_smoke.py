@@ -54,7 +54,13 @@ def main():
             action('menu_event',node=5,revision=menu['revision'],menu_token=menu['menu_token'])
             time.sleep(.25);assert any(v['method']=='Event' and v['args'][0]==5 for v in calls()),calls()
             assert all(any(v['method']==method for v in calls()) for method in ['Activate','SecondaryActivate','Scroll','AboutToShow'])
-            rpc('SetStatus','NeedsAttention');viewer.control('tray_snapshot',lambda s:s['items'][0]['status']=='NeedsAttention')
+            rpc('SetStatus','NeedsAttention');attention=viewer.control('tray_snapshot',lambda s:s['items'][0]['status']=='NeedsAttention')
+            assert attention['items'][0]['icon_revision']==item['icon_revision'] and 'png' not in attention['items'][0]
+            viewer.send(type='ping',nonce=909)
+            while True:
+                kind,value=viewer.receive()
+                assert kind!='control' or value['type']!='tray_icon','unchanged icons were retransmitted for status only'
+                if kind=='control' and value['type']=='pong' and value['nonce']==909:break
             action('menu');menu=viewer.control('tray_menu');rpc('BumpRevision');action('menu_event',node=6,revision=menu['revision'],menu_token=menu['menu_token']);assert 'changed' in viewer.control('tray_error')['message']
             # Read-only must be checked server-side, independent of the Windows UI.
             before=len([v for v in calls() if v['method']=='Activate'])
