@@ -180,13 +180,10 @@ def main():
             uri=wait_for(lambda:pasted("text/uri-list"))
             uploaded=Path(unquote(urlparse(uri.decode().strip()).path));assert uploaded.read_bytes()==data
             exported=Path(runtime)/"export-file.bin";exported.write_bytes(data)
+            from windows_readonly import cache_roots, assert_refused
+            previous=cache_roots(prefix)
             copy((exported.as_uri()+"\r\n").encode(),"text/uri-list")
-            def remote_files():
-                r=probe("files",check=False)
-                return r.stdout.strip() if r.returncode==0 and "export-file.bin" in r.stdout else None
-            windows_path=wait_for(remote_files)
-            linux_path=subprocess.run(["winepath","-u",windows_path],env=wine_env,capture_output=True,text=True,check=True,timeout=10).stdout.strip()
-            assert Path(linux_path).read_bytes()==data
+            assert_refused(prefix,previous,log,probe,"export-file.bin")
             probe("drop",win_source)
             drop=Path(runtime)/"drop.txt"
             wait_for(lambda:drop.exists() and drop.stat().st_size)
@@ -194,7 +191,7 @@ def main():
             if csd:
                 probe("click","-20","16")
                 wait_for(lambda:app.poll() is not None)
-            print("PASS: native Win32 window paints correct pixels; native resize reaches Wayland; Windows/Linux Unicode clipboard; native bidirectional file clipboard; OLE file drop reaches Wayland with exact bytes (Wine/Xvfb)")
+            print("PASS: native Win32 window paints correct pixels; native resize reaches Wayland; Windows/Linux Unicode clipboard; Windows→Linux file clipboard; Wine rejects unsupported read-only Linux→Windows cache without publishing/leaking; OLE file drop reaches Wayland with exact bytes (Wine/Xvfb)")
             print("PASS: single decoration owner ("+("CSD fallback; move, maximize, restore, minimize, close" if csd else "negotiated native Windows frame")+")")
             app_log.close()
         finally:

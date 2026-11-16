@@ -10,6 +10,7 @@ waybridge-codec = { path = "native" }
 waybridge-config = { path = "config" }
 anyhow = "1"
 libc = "0.2"
+fuser = "0.16"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

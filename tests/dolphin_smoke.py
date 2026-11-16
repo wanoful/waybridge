@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 from smoke import ROOT, Viewer
+from urllib.parse import unquote, urlparse
 
 
 def main():
@@ -31,7 +32,7 @@ def main():
                 while not (Path(runtime)/"dolphin-0").exists():
                     assert host.poll() is None and time.monotonic()<deadline
                     time.sleep(.05)
-                viewer=Viewer(port,token,dpi=168)
+                viewer=Viewer(port,token,dpi=168,file_tree=True)
                 app=subprocess.Popen(["dbus-run-session","--","dolphin","--new-window",str(source)],env=env,stdout=app_log,stderr=app_log,start_new_session=True)
                 info=viewer.until(lambda k,v:k=="control" and v["type"]=="window" and v["decoration"]=="server" and v["app_id"]=="org.kde.dolphin")
                 id=info["id"]
@@ -54,8 +55,31 @@ def main():
                         if k=="frame" and v[0]==id:frame=v
                     except socket.timeout:pass
                 frame[-1].save(ROOT/"build/tests/dolphin-175.png")
+                # A real KIO paste from the read-only delivery view must produce
+                # an ordinary writable user copy, including empty directories.
+                manifest = [dict(id=0,name="delivered",kind="directory",size=0),
+                            dict(id=1,name="delivered/empty",kind="directory",size=0),
+                            dict(id=2,name="delivered/project.blend",kind="file",size=4)]
+                viewer.send(type="tree_upload_begin",batch=801,entries=manifest,epoch=0)
+                viewer.until(lambda k,v:k=="control" and v.get("type")=="tree_upload_ready" and v.get("batch")==801)
+                viewer.send(type="tree_upload_chunk",batch=801,file=2,data=base64.b64encode(b"data").decode())
+                viewer.send(type="tree_upload_end",batch=801,file=2)
+                viewer.send(type="tree_upload_commit",batch=801)
+                viewer.until(lambda k,v:k=="control" and v.get("type")=="tree_upload_ready" and v.get("stage")=="commit")
+                uri=subprocess.check_output(["wl-paste","--no-newline","--type","text/uri-list"],env=env).decode().strip()
+                delivered=Path(unquote(urlparse(uri).path))
+                key(29,True);key(47,True);key(47,False);key(29,False)
+                copied=target/"delivered/project.blend"
+                deadline=time.monotonic()+10
+                while not copied.exists():
+                    assert time.monotonic()<deadline, "Dolphin did not paste the received tree"
+                    time.sleep(.05)
+                copied.write_bytes(b"editable user copy")
+                (target/"delivered/empty/new").write_bytes(b"new file")
+                assert (delivered/"project.blend").read_bytes()==b"data"
                 viewer.sock.close()
-                print("PASS: actual Dolphin with server decoration at 175% accepts focus, Ctrl+L, clipboard paste and Enter; navigates to the requested directory")
+                assert copied.read_bytes()==b"editable user copy"
+                print("PASS: actual Dolphin with server decoration at 175% accepts focus, Ctrl+L, clipboard paste and Enter; navigates to requested directory; actual KIO paste makes writable independent tree copy from read-only delivery")
             finally:
                 if app and app.poll() is None:
                     os.killpg(app.pid,signal.SIGTERM)

@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -23,8 +23,25 @@ struct Upload {
 }
 pub struct Transfers {
     root: PathBuf,
+    export: Option<crate::readonly_export::Export>,
     uploads: BTreeMap<u64, Upload>,
     trees: BTreeMap<u64, (crate::file_tree::Inbox, Option<u64>)>,
+}
+
+/// Protocol IDs can restart when a viewer reconnects. Never overwrite an old
+/// successful cache; use a fresh namespace while preserving its published URI.
+pub fn batch_directory(root: &Path, name: &str) -> Result<PathBuf> {
+    let directory = root.join(name);
+    match fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(tempfile::Builder::new()
+                .prefix(&format!("{name}-"))
+                .tempdir_in(root)?
+                .keep())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn safe_name(name: &str) -> bool {
@@ -61,10 +78,17 @@ impl Transfers {
     pub fn new(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)?;
         Ok(Self {
+            export: None,
             root: fs::canonicalize(root)?,
             uploads: BTreeMap::new(),
             trees: BTreeMap::new(),
         })
+    }
+    fn readonly(&mut self) -> Result<&crate::readonly_export::Export> {
+        if self.export.is_none() {
+            self.export = Some(crate::readonly_export::Export::new(&self.root)?);
+        }
+        Ok(self.export.as_ref().unwrap())
     }
     pub fn begin_tree(
         &mut self,
@@ -101,7 +125,14 @@ impl Transfers {
         if selection.is_none() != drop || selection.is_some_and(|selection| selection != epoch) {
             bail!("tree upload purpose changed or clipboard superseded");
         }
-        inbox.finish()
+        let paths = inbox.finish_paths()?;
+        let view = self.readonly()?.publish(inbox.directory())?;
+        let uris = paths
+            .iter()
+            .map(|path| file_uri(&view.join(path.strip_prefix(inbox.directory())?)))
+            .collect::<Result<Vec<_>>>()?;
+        inbox.commit();
+        Ok((uris.join("\r\n") + "\r\n").into_bytes())
     }
     pub fn has_tree(&self, batch: u64) -> bool {
         self.trees.contains_key(&batch)
@@ -117,8 +148,7 @@ impl Transfers {
         {
             bail!("invalid file metadata or transfer limit exceeded");
         }
-        let directory = self.root.join(id.to_string());
-        fs::create_dir(&directory)?;
+        let directory = batch_directory(&self.root, &id.to_string())?;
         let path = directory.join(name);
         let file = match OpenOptions::new()
             .write(true)
@@ -169,16 +199,27 @@ impl Transfers {
     pub fn finish(&mut self, ids: &[u64]) -> Result<Vec<u8>> {
         if ids.is_empty()
             || ids.len() > 128
+            || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
             || ids
                 .iter()
                 .any(|id| self.uploads.get(id).is_none_or(|u| !u.complete))
         {
             bail!("incomplete batch");
         }
-        let uris: Vec<_> = ids
+        let paths = ids
             .iter()
-            .map(|id| file_uri(&self.uploads[id].path))
-            .collect::<Result<_>>()?;
+            .map(|id| self.uploads[id].path.clone())
+            .collect::<Vec<_>>();
+        let directories = paths
+            .iter()
+            .map(|p| p.parent().context("missing batch directory"))
+            .collect::<Result<Vec<_>>>()?;
+        let views = self.readonly()?.publish_batch(&directories)?;
+        let uris = paths
+            .iter()
+            .zip(views)
+            .map(|(path, view)| file_uri(&view.join(path.file_name().context("missing filename")?)))
+            .collect::<Result<Vec<_>>>()?;
         for id in ids {
             self.uploads.remove(id);
         }
@@ -287,6 +328,21 @@ mod tests {
             assert!(!safe_name(name));
         }
         assert!(safe_name("图片 a.png"));
+    }
+    #[test]
+    fn unavailable_readonly_delivery_never_publishes_or_deletes_saved_copy() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("readonly"), b"mount cannot be created").unwrap();
+        let saved = root.path().join("user-saved");
+        fs::write(&saved, b"independent copy").unwrap();
+        let mut transfers = Transfers::new(root.path().to_owned()).unwrap();
+        transfers.begin(42, "project.blend", 4).unwrap();
+        transfers.chunk(42, "ZGF0YQ==").unwrap();
+        transfers.end(42).unwrap();
+        assert!(transfers.finish(&[42]).is_err());
+        transfers.cancel();
+        assert!(!root.path().join("42").exists());
+        assert_eq!(fs::read(&saved).unwrap(), b"independent copy");
     }
     #[test]
     fn unicode_uri_roundtrip() {

@@ -56,7 +56,7 @@ def main():
         try:
             subprocess.run(["wineboot", "-u"], env=wine, stdout=log, stderr=log, timeout=60, check=True)
             if tree:
-                checks = subprocess.run(["wine", str(ROOT / "build/tests/windows_tree_probe.exe")], env=wine, capture_output=True, text=True, timeout=15, check=True)
+                checks = subprocess.run(["wine", str(ROOT / "build/tests/windows_tree_probe.exe"), "--expect-unsupported"], env=wine, capture_output=True, text=True, timeout=15, check=True)
                 assert "PASS: Win32 tree" in checks.stdout, checks.stdout
             host = subprocess.Popen([str(ROOT / "target/debug/waybridge"), "--socket", "drag-native-0", "--listen", f"127.0.0.1:{port}", "--token-file", str(token), "--codec", "png"], env=env, stdout=log, stderr=log)
             processes.append(host)
@@ -78,12 +78,12 @@ def main():
                 wait_for(lambda: (root / "drop.txt").exists() and (root / "drop.txt").stat().st_size)
                 dropped = Path(unquote(urlparse((root / "drop.txt").read_text().strip()).path))
                 assert snapshot(dropped) == expected
+                from windows_readonly import cache_roots, assert_refused
+                previous = cache_roots(prefix)
                 copier = subprocess.Popen(["wl-copy", "--foreground", "--type", "text/uri-list"], env=env, stdin=subprocess.PIPE, stdout=log, stderr=log)
                 processes.append(copier)
                 copier.stdin.write((tree_source.as_uri() + "\r\n").encode()); copier.stdin.close()
-                path = wait_for(lambda: (lambda r: r.stdout.strip() if r.returncode == 0 and "Waybridge-tree-" in r.stdout else None)(probe("files", check=False)))
-                staged = Path(subprocess.check_output(["winepath", "-u", path], env=wine, text=True).strip())
-                assert snapshot(staged) == expected
+                assert_refused(prefix, previous, log, probe, tree_source.name)
                 (root / "enable-drag").touch()
             probe("clipboard", "drag clipboard sentinel")
             finished = cancelled = 0
@@ -110,7 +110,7 @@ def main():
                 assert client.poll() is None and host.poll() is None and app.poll() is None
             assert "drag clipboard sentinel" in probe("clipboard").stdout
             if tree:
-                assert snapshot(tree_source) == expected and snapshot(uploaded) == expected and snapshot(dropped) == expected and snapshot(staged) == expected
+                assert snapshot(tree_source) == expected and snapshot(uploaded) == expected and snapshot(dropped) == expected
             else:
                 assert sources[0].read_bytes() == payload and sources[1].exists()
             # Disconnect while OLE owns capture and the real mouse is still down.
@@ -125,7 +125,7 @@ def main():
                 client.wait(timeout=2)
                 assert drop.wait(timeout=8) == 0
             if tree:
-                print("PASS: native directory clipboard in both directions and Windows OLE folder drop in/out; relative virtual directory descriptors, empty/Unicode/zero/same-basename entries, sync/async extraction; completed trees retained")
+                print("PASS: native Windows→Linux directory clipboard; Wine rejects unsupported read-only return cache and Windows OLE folder drop in/out; relative virtual directory descriptors, empty/Unicode/zero/same-basename entries, sync/async extraction; completed trees retained")
             print("PASS: actual Windows PE OLE drag source -> native virtual-file target; Unicode/multiple/empty files; IStream Stat/Seek/Clone/EOF; async extraction; Esc/rejection/early-release/disconnect; clipboard and source files preserved (Wine/Xvfb)")
         except BaseException:
             print(Path(log.name).read_text())

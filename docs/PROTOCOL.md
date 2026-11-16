@@ -347,10 +347,22 @@ commit acknowledgement or failure. Other OLE drops keep Drop open with COM-aware
 message dispatch until the full tree succeeds/fails, returning COPY/NONE
 accordingly; Escape cancels this synchronous wait. Async COPY acceptance means
 the import was scheduled, with final success reported by EndOperation. Linux
-publishes only complete destination-local paths; there is no lazy FUSE filesystem
-or remote IStream backing Linux application reads. Successful imports retain the
+publishes only complete destination-local paths through a read-only FUSE view;
+reads use the already-downloaded private cache, not network-lazy FUSE or remote
+IStream backing. File and directory modes remain 0600/0700 so saved copies are
+ordinarily writable; the RO mount rejects overwrite/create/rename/remove. Successful imports retain the
 same private inbox lifetime as filesystem tree imports, and never delete source
 items. Windows/Outlook/archive-provider compatibility requires real-Windows tests.
+
+Completed Windows CF_HDROP caches are protected by explicit user DACLs denying
+write/delete and directory child deletion, not by FILE_ATTRIBUTE_READONLY. Copies
+through Explorer/Shell inherit ordinary destination permissions. A filesystem that
+maps those ACLs into READONLY (currently Wine) is rejected with a transfer
+`download_error`; no CF_HDROP is published and unpublished staging is removed.
+OLE FileContents streams expose STGM_READ and reject Write/SetSize. Cache lifetime
+permits delayed reads and viewer disconnect; only the transfer's incomplete or
+unpublished objects are cleaned. This is a delivery contract for normal desktop
+applications, not a same-user/admin security boundary.
 
 A tree manifest is a parent-before-child array of
 `{id,name,kind,size}`. IDs are consecutive from zero, `kind` is `"file"` or

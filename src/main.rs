@@ -11,6 +11,7 @@ mod launch;
 mod metrics;
 mod network;
 mod protocol;
+mod readonly_export;
 mod relative_input;
 mod session_guard;
 mod session_services;

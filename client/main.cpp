@@ -1122,6 +1122,7 @@ void receiveFilesNow(const Json &message) {
         paths.push_back(L'\0');
       }
       paths.push_back(L'\0');
+      ReadOnlyFiles::protectTree(incomingDirectory);
       auto directory = std::shared_ptr<std::wstring>(new std::wstring(std::move(incomingDirectory)),
           [](std::wstring *path) {
             FileIo::cleanup([path] { if (!path->empty()) FileTree::removeTree(*path); delete path; });
@@ -1170,6 +1171,7 @@ void receiveFiles(const Json &message) {
     catch (const std::exception &error) {
       cancelIncomingFilesNow();
       std::cerr << "File download: " << error.what() << '\n';
+      hostControl.emit({{"type", "transfer"}, {"event", "download_error"}, {"message", error.what()}});
     }
   }, bytes), "File I/O queue full");
 }

@@ -53,6 +53,11 @@ static void extract(IDataObject *data) {
     STATSTG stat{};
     check(content.pstm->Stat(&stat, STATFLAG_NONAME));
     uint64_t size = (uint64_t(files[i].nFileSizeHigh) << 32) | files[i].nFileSizeLow;
+    ULONG attempted = 123;
+    ULARGE_INTEGER changedSize{}; changedSize.QuadPart = size + 1;
+    if (content.pstm->Write("edit", 4, &attempted) != STG_E_ACCESSDENIED ||
+        content.pstm->SetSize(changedSize) != STG_E_ACCESSDENIED || stat.grfMode != STGM_READ)
+      throw E_FAIL;
     if (stat.cbSize.QuadPart != size)
       throw E_FAIL;
     std::vector<unsigned char> sample;

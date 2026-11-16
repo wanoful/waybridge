@@ -33,6 +33,8 @@ cargo build --release --workspace --locked
 
 GUI 选择「认证加密直连」，填写 Linux LAN/VPN 地址及端口 `49092`，从可信 Linux 终端核对并填写 `certificate_sha256` 指纹和一次性配对码，再配对、连接。客户端令牌保存到 Windows 凭据管理器，指纹变化会拒绝连接。默认服务监听 `0.0.0.0:49092`，可用 `--listen` 绑定具体 LAN/VPN 地址。安装可选用户单元、信任撤销及协议细节见 [service README](SERVICE.md)，GUI 与 SSH 兼容模式见 [GUI README](GUI.md)。
 
+Linux 接收跨端文件需要 `fusermount3` 和允许当前用户访问的 `/dev/fuse`（发行版通常在 `fuse3` 软件包中）。首次完整接收时创建只读导出视图；不可用时该批传输报错，窗口串流继续运行。Windows 临时目录需要正常 NTFS DACL 支持。经 Dolphin/Explorer 复制到用户选择位置的新副本正常可写；原位修改交付缓存会失败，不自动回传。Wine 目前将此 DACL 映射成可传播的 READONLY 属性，因此拒绝实体文件剪贴板下载；只读虚拟流拖出及 Windows→Linux 上传可继续验证。
+
 ## 直接运行
 
 构建产物：

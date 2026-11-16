@@ -4,6 +4,8 @@ import base64
 import os
 from pathlib import Path
 import socket
+import shutil
+import errno
 import subprocess
 import tempfile
 import time
@@ -87,6 +89,20 @@ def main():
                 pasted = subprocess.check_output(["wl-paste", "--no-newline", "--type", "text/uri-list"], env=env).decode().strip()
                 destination = Path(unquote(urlparse(pasted).path))
                 assert destination.name == source.name and snapshot(destination) == expected
+                for change in (lambda: (destination / "a/same.bin").write_bytes(b"edit"),
+                               lambda: (destination / "empty/new").mkdir(),
+                               lambda: (destination / "b/same.bin").unlink(),
+                               lambda: (destination / "a/same.bin").replace(destination / "b/same.bin")):
+                    try:
+                        change()
+                        raise AssertionError("received tree remained writable")
+                    except OSError as error:
+                        assert error.errno == errno.EROFS, error
+                saved = runtime / "user-saved"
+                shutil.copytree(destination, saved)
+                (saved / "a/same.bin").write_bytes(b"saved edit")
+                (saved / "empty/new").mkdir()
+                assert snapshot(destination) == expected
                 upload(502, drop=True)
                 wait_for(lambda: (runtime / "drop").exists() and (runtime / "drop").stat().st_size)
                 dropped = Path(unquote(urlparse((runtime / "drop").read_text().strip()).path))
@@ -170,7 +186,15 @@ def main():
                 viewer.until(lambda k, m: k == "control" and m["type"] == "tree_upload_ready" and m["batch"] == 703)
                 viewer.sock.close()
                 wait_for(lambda: not (runtime / "waybridge-inbox/tree-703").exists())
+                assert (saved / "a/same.bin").read_bytes() == b"saved edit" and (saved / "empty/new").is_dir()
                 assert snapshot(source) == expected and snapshot(destination) == expected and snapshot(dropped) == expected
+                viewer = Viewer(port, token.read_text(), file_tree=True, file_drop_out=True)
+                viewer.until(lambda k, m: k == "frame")
+                upload(501)
+                retry_uri = subprocess.check_output(["wl-paste", "--no-newline", "--type", "text/uri-list"], env=env).decode().strip()
+                retry = Path(unquote(urlparse(retry_uri).path))
+                assert retry != destination and snapshot(retry) == expected and snapshot(destination) == expected
+                viewer.sock.close()
                 assert host.poll() is None and app.poll() is None
                 print("PASS: negotiated real directory tree clipboard/drop/export/lazy drag; empty/Unicode/zero/same-basename entries; traversal/ADS/devices/case collision rejection; incomplete/cancel/disconnect cleanup; completed trees and source retained")
             except BaseException:

@@ -265,8 +265,7 @@ impl Drop for Inbox {
 impl Inbox {
     pub fn new(root: &Path, batch: u64, entries: Vec<Entry>) -> Result<Self> {
         validate(&entries)?;
-        let directory = root.join(format!("tree-{batch}"));
-        fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let directory = crate::transfer::batch_directory(root, &format!("tree-{batch}"))?;
         let mut inbox = Self {
             directory,
             entries,
@@ -322,21 +321,25 @@ impl Inbox {
         file.complete = true;
         Ok(())
     }
-    pub fn finish(&mut self) -> Result<Vec<u8>> {
+    pub fn commit(&mut self) {
+        self.committed = true;
+    }
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+    pub fn finish_paths(&mut self) -> Result<Vec<PathBuf>> {
         if self.files.values().any(|file| !file.complete) {
             bail!("incomplete tree");
         }
         let roots = validate(&self.entries)?;
-        let uris = roots
+        let paths = roots
             .into_iter()
-            .map(|id| crate::transfer::file_uri(&self.directory.join(&self.entries[id].path)))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|id| self.directory.join(&self.entries[id].path))
+            .collect::<Vec<_>>();
         self.files.clear();
-        self.committed = true;
-        Ok((uris.join("\r\n") + "\r\n").into_bytes())
+        Ok(paths)
     }
 }
-use std::os::unix::fs::DirBuilderExt;
 
 #[cfg(test)]
 mod tests {
@@ -452,10 +455,10 @@ mod tests {
                 inbox.end(entry.id).unwrap();
             }
         }
-        let uris = inbox.finish().unwrap();
+        let paths = inbox.finish_paths().unwrap();
+        inbox.commit();
         drop(inbox);
-        let destination =
-            crate::transfer::uri_path(std::str::from_utf8(&uris).unwrap().trim()).unwrap();
+        let destination = &paths[0];
         assert!(destination.join("empty").is_dir());
         assert_eq!(fs::read(destination.join("a/same.txt")).unwrap(), b"a");
         assert_eq!(fs::read(destination.join("b/same.txt")).unwrap(), b"b");
@@ -490,12 +493,16 @@ mod tests {
         {
             let mut inbox = Inbox::new(&temp.0, 1, entries.clone()).unwrap();
             assert!(inbox.chunk(1, b"long").is_err());
-            assert!(inbox.finish().is_err());
+            assert!(inbox.finish_paths().is_err());
         }
         assert!(!temp.0.join("tree-1").exists());
         fs::create_dir(temp.0.join("tree-2")).unwrap();
         fs::write(temp.0.join("tree-2/keep"), b"keep").unwrap();
-        assert!(Inbox::new(&temp.0, 2, entries).is_err());
+        let retry = Inbox::new(&temp.0, 2, entries).unwrap();
+        assert_ne!(retry.directory(), temp.0.join("tree-2"));
+        let pending = retry.directory().to_path_buf();
+        drop(retry);
+        assert!(!pending.exists());
         assert_eq!(fs::read(temp.0.join("tree-2/keep")).unwrap(), b"keep");
     }
 }

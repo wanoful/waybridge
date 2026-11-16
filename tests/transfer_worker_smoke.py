@@ -4,6 +4,8 @@ import base64
 import os
 from pathlib import Path
 import socket
+import errno
+import shutil
 import subprocess
 import tempfile
 import time
@@ -70,10 +72,41 @@ def main():
                 pasted = subprocess.check_output(["wl-paste", "--no-newline", "--type", "text/uri-list"], env=env).decode().strip()
                 received = Path(unquote(urlparse(pasted).path))
                 assert received.read_bytes() == b"done"
+                for change in (lambda: received.write_bytes(b"changed"), lambda: received.unlink(),
+                               lambda: (received.parent / "replace").write_bytes(b"replacement")):
+                    try:
+                        change()
+                        raise AssertionError("delivered file/parent remained writable")
+                    except OSError as error:
+                        assert error.errno == errno.EROFS, error
+                replacement = runtime / "replace"
+                replacement.write_bytes(b"replacement")
+                try:
+                    replacement.replace(received)
+                    raise AssertionError("atomic replacement succeeded")
+                except OSError:
+                    pass
+                saved = runtime / "saved.bin"
+                shutil.copy2(received, saved)
+                saved.write_bytes(b"saved edit")
                 viewer.sock.close()
                 viewer = None
                 time.sleep(.1)
                 assert received.read_bytes() == b"done", "committed files were removed on disconnect"
+                assert saved.read_bytes() == b"saved edit", "saved copy was changed on disconnect"
+                viewer = Viewer(port, token.read_text())
+                viewer.until(lambda k, v: k == "frame")
+                # A fresh viewer may restart transfer numbering. New content gets
+                # a fresh cache namespace without overwriting a retained URI.
+                viewer.send(type="upload_begin", transfer=701, name="complete.bin", size=3)
+                viewer.send(type="upload_chunk", transfer=701, data=base64.b64encode(b"new").decode())
+                viewer.send(type="upload_end", transfer=701)
+                viewer.send(type="upload_commit", transfers=[701])
+                viewer.until(lambda k, v: k == "control" and v.get("type") == "upload_ready")
+                new_uri = subprocess.check_output(["wl-paste", "--no-newline", "--type", "text/uri-list"], env=env).decode().strip()
+                newer = Path(unquote(urlparse(new_uri).path))
+                assert newer != received and newer.read_bytes() == b"new"
+                assert received.read_bytes() == b"done" and saved.read_bytes() == b"saved edit"
                 print("PASS: stalled actual disk write leaves input/ping/reconnect responsive; old queued commits canceled; completed files retained")
             finally:
                 release.touch()

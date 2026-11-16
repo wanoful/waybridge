@@ -6,6 +6,7 @@
 #include <set>
 #include <stdexcept>
 #include "file_io.h"
+#include "readonly_files.h"
 
 namespace FileTree {
 constexpr size_t MaxEntries = 512, MaxDepth = 16, MaxRoots = 128, MaxPath = 240;
@@ -480,6 +481,7 @@ inline void removeTree(const std::wstring &path) {
   DWORD attributes = GetFileAttributesW(path.c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES)
     return;
+  ReadOnlyFiles::allowCleanup(path);
   if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
     DeleteFileW(path.c_str());
     return;
@@ -614,6 +616,7 @@ inline bool receiveNow(const Json &message) {
         for (const auto &[id, file] : incoming->files)
           require(!file.remaining, "Incomplete tree");
         incoming->files.clear();
+        ReadOnlyFiles::protectTree(incoming->directory);
         auto state = std::shared_ptr<Incoming>(incoming.release(), [](Incoming *item) {
           FileIo::cleanup([item] { delete item; });
         });
@@ -665,6 +668,8 @@ inline bool receiveNow(const Json &message) {
       }
     } catch (const std::exception &error) {
       std::cerr << "Tree download: " << error.what() << '\n';
+      if (activity) activity({{"type", "transfer"}, {"event", "download_error"},
+                              {"batch", batch}, {"message", error.what()}});
       incoming.reset();
     }
   }

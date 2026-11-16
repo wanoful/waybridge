@@ -390,3 +390,85 @@ This physical evidence applies to that earlier H.264/PNG/resize baseline. It doe
 - Cross-process transparent click-through and KDE blur are not implemented. Relative-only/unlocked motion, confined-pointer and popup locks remain unsupported. X11 lacks PRIMARY, XDND, XIM, full EWMH and automatic crash restart.
 - General multi-GPU/driver/application coverage, congestion adaptation, endpoint roaming, Opus, microphone, strict A/V synchronization and device hot-switching remain outside this implementation. CUDA retains GPU copies/synchronous waits and independent alpha readback; it is not an entirely zero-copy pipeline.
 - Actual input-to-display latency, high-refresh-rate/bandwidth behavior and comparative latency against Moonlight remain unmeasured. Sunshine/Moonlight source trees are unchanged references; their wire protocol is not used.
+
+## M2 read-only file delivery — 2026-11-16
+
+Linux now publishes completed legacy uploads, directory uploads and virtual-file
+imports through a session-owned RO FUSE view over their already-complete private
+cache. The view advertises ordinary 0600/0700 modes; kernel mount protection
+rejects file writes, creation, unlink and replacement without making saved copies
+read-only. Mount setup is lazy: unavailable FUSE reports a transfer error without
+stopping window streaming or exposing a writable fallback. Completed descriptors
+and paths survive viewer disconnect. Reused protocol IDs after reconnect receive
+fresh cache directories rather than overwrite an old successful delivery.
+
+Verified on this Linux host:
+
+- `cargo clippy --all-targets --locked -- -D warnings`, workspace tests and normal
+  build pass (pre-existing warnings in vendored Smithay remain dependency warnings).
+- Explicit `cargo test --locked readonly_delivery -- --ignored` uses a real FUSE
+  mount. Actual overwrite/create/unlink return EROFS; rename replacement fails;
+  `cp -a` produces writable independent files/directories, preserves empty
+  directories and leaves delivered content unchanged. Failed publication rolls
+  back staged nodes and open descriptors, including multi-directory commits;
+  duplicate published names cannot overwrite an old view.
+- `tests/tree_smoke.py` and `tests/transfer_worker_smoke.py` exercise real transfer
+  commits, cancellations, disk stalls, viewer disconnect/reconnect and reused
+  protocol IDs. Old URIs remain readable, saved copies remain editable, and only
+  the canceled task's own staging is removed.
+- `tests/dolphin_smoke.py` pastes an actual received directory through Dolphin/KIO
+  into the chosen target directory; its files and empty-directory descendants
+  accept writes and the delivered original stays unchanged.
+
+Windows materialized clipboard caches deny write/delete and directory child
+mutation through DACLs, with no DOS READONLY attribute. Filesystems that synthesize
+READONLY from these ACLs are explicitly rejected and cleaned before CF_HDROP
+publication. Windows OLE virtual streams remain read-only and reject both Write
+and SetSize; saved stream content is an ordinary destination file.
+
+Real Windows 11 on `laptop` passed both the standalone
+`waybridge-readonly-probe.exe` and the complete `windows_tree_probe.exe`:
+
+- Direct file write, `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`, deletion and directory
+  mutation are refused; CopyFile and SHFileOperation directory copies are writable,
+  retain empty directories and leave original content unchanged.
+- Full native tree validation, synchronous/worker staging, clipboard publication,
+  cancellation, supersession, late-completion rejection and committed-cache
+  lifetime pass.
+- OpenSSH initially supplied the standalone probe an administrative token with
+  backup/restore privileges enabled. Such a token can bypass normal filesystem
+  ACL checks. The probe disables privileges **only in its own process token** to
+  validate normal desktop application permissions. This is not an administrator
+  or same-UID sandbox and does not resist deliberately changing ACLs or bypassing
+  the public delivery path.
+- Only uniquely named test files/directories in the remote user's Temp and the
+  uploaded test executables/scripts were created; those objects were removed.
+  No deployed binary, desktop service, session or wallet was changed.
+
+On Wine, DACLs map to Unix permissions and READONLY attributes, which would make
+ordinary copies read-only. Tests explicitly require the unsupported error,
+absence of CF_HDROP and cleanup of partially protected staging; they do not
+silently accept writable delivery or report NTFS behavior as Wine coverage.
+`tests/windows_smoke.py` and `tests/windows_drag_out_smoke.py --tree` pass this
+refusal path, Windows→Linux uploads, and actual OLE virtual stream reads including
+Write/SetSize rejection. Both x64 and ARM64 clients compile successfully.
+
+Focused repeatable commands (run from repository root):
+
+```bash
+cargo test --workspace --locked
+cargo test --locked readonly_delivery -- --ignored
+cargo build --locked
+python3 tests/session_fixture.py python3 tests/tree_smoke.py
+python3 tests/session_fixture.py python3 tests/transfer_worker_smoke.py
+GVFS_DISABLE_FUSE=1 python3 tests/session_fixture.py python3 tests/dolphin_smoke.py
+GVFS_DISABLE_FUSE=1 python3 tests/session_fixture.py python3 tests/windows_smoke.py
+GVFS_DISABLE_FUSE=1 python3 tests/session_fixture.py python3 tests/windows_drag_out_smoke.py --tree
+cmake --build build/windows --target waybridge-readonly-probe
+scripts/build-windows-arm64.sh
+```
+
+The standalone Windows probe uses its own Temp directory and may be run directly
+on Windows. On Wine, pass `--expect-unsupported` to require the error/cleanup path.
+`windows_tree_probe.exe --expect-unsupported` additionally asserts that neither
+synchronous nor worker receive publication leaks CF_HDROP or staging.

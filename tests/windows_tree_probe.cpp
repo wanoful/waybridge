@@ -100,7 +100,12 @@ static void reject(const Json &entries) {
   }
   FileTree::require(rejected, "Accepted adversarial tree manifest");
 }
-int wmain() {
+int wmain(int argc, wchar_t **argv) {
+  const bool expectUnsupported = argc == 2 && std::wstring(argv[1]) == L"--expect-unsupported";
+  std::string downloadFailure;
+  FileTree::activity = [&](const Json &event) {
+    if (event.value("event", "") == "download_error") downloadFailure = event.value("message", "");
+  };
   try {
     controller = CreateWindowExW(0, L"STATIC", L"Tree probe", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
                                  nullptr, nullptr);
@@ -157,6 +162,38 @@ int wmain() {
     auto complete = begin(4);
     FileTree::receive({{"type", "tree_chunk"}, {"batch", 4}, {"file", 3}, {"data", "YWJj"}});
     FileTree::receive({{"type", "tree_done"}, {"batch", 4}});
+    if (expectUnsupported) {
+      FileTree::require(downloadFailure.find("Read-only delivery unsupported") != std::string::npos,
+                        "Missing explicit read-only capability error");
+      FileTree::require(!FileTree::incoming && !exists(complete) && FileTree::publishedGeneration != 4,
+                        "Unsupported filesystem leaked or published writable staging");
+      FileTree::require(OpenClipboard(controller), "Cannot inspect rejected clipboard");
+      bool exposed = IsClipboardFormatAvailable(CF_HDROP);
+      CloseClipboard();
+      FileTree::require(!exposed, "Unsupported read-only delivery exposed CF_HDROP");
+      // The production worker must report the same error and remove its own
+      // partly protected staging, rather than leaking a poisoned cache.
+      downloadFailure.clear();
+      FileIo::start([] {});
+      auto barrier = [] {
+        auto done = std::make_shared<std::promise<void>>(); auto future = done->get_future();
+        FileIo::cleanup([done] { done->set_value(); });
+        FileTree::require(future.wait_for(std::chrono::seconds(3)) == std::future_status::ready, "File worker timeout");
+      };
+      FileTree::receive({{"type", "tree_begin"}, {"batch", 8}, {"epoch", FileTree::epoch.load()}, {"entries", manifest}});
+      barrier();
+      FileTree::require(FileTree::incoming != nullptr, "Unsupported async begin failed");
+      auto staged = FileTree::incoming->directory;
+      FileTree::receive({{"type", "tree_chunk"}, {"batch", 8}, {"file", 3}, {"data", "YWJj"}});
+      FileTree::receive({{"type", "tree_done"}, {"batch", 8}});
+      barrier(); FileIo::drain(); barrier();
+      FileTree::require(downloadFailure.find("Read-only delivery unsupported") != std::string::npos &&
+                        !FileTree::incoming && !exists(staged) && FileTree::publishedGeneration != 8,
+                        "Unsupported asynchronous delivery did not fail closed and clean staging");
+      FileIo::stop(); DestroyWindow(controller);
+      std::cout << "PASS: Win32 tree validation and cancel/error cleanup; unsupported read-only filesystem explicitly rejected sync/worker publication, CF_HDROP absent, staging removed" << std::endl;
+      return 0;
+    }
     FileTree::require(!FileTree::incoming && exists(complete + L"\\r\\empty") &&
                           exists(complete + L"\\r\\zero"),
                       "Completed tree not retained");
