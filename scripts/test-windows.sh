@@ -17,5 +17,6 @@ build/tests/ordered-sender-probe
 python3 tests/windows_tls_smoke.py
 python3 tests/windows_direct_smoke.py
 python3 tests/gui_native_smoke.py
+python3 tests/windows_data_drag_smoke.py
 python3 tests/windows_drag_out_smoke.py --tree
 python3 tests/windows_drag_out_smoke.py

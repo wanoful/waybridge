@@ -25,6 +25,10 @@ fi
 python tests/relative_smoke.py
 python tests/drag_out_smoke.py
 python tests/data_drag_smoke.py
+python tests/drag_visual_smoke.py
+if command -v Xwayland >/dev/null; then
+  python tests/xdnd_bridge_smoke.py
+fi
 python tests/tree_smoke.py
 python tests/decorations_smoke.py
 python tests/window_semantics_smoke.py

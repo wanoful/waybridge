@@ -1464,9 +1464,11 @@ void sendWindowDragMotion(bool release = false) {
     motion["down"] = false;
     sendJson(motion);
     windowDrag.released = true;
+    dragVisual.reset();
   }
 }
 void cancelWindowDrag() {
+  dragVisual.reset();
   if (!windowDrag.active || windowDrag.cancelled) return;
   windowDrag.cancelled = true;
   windowDrag.released = true;

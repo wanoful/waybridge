@@ -5,6 +5,7 @@ mod audio;
 mod color;
 mod color_management;
 mod cursor;
+mod data_drop;
 mod desktop_notifications;
 mod desktop_tray;
 mod drag;
@@ -370,6 +371,8 @@ struct App {
     clipboard_reads: Vec<(u64, String)>,
     transfers: transfer_worker::Worker,
     drop_data: Option<Clipboard>,
+    x11_drop: Option<data_drop::XDrop>,
+    drop_window: u32,
     incoming_text_drag: Option<u64>,
     server_drop_generation: u64,
     server_drop_payloads: BTreeMap<u64, (Clipboard, Instant)>,
@@ -696,172 +699,6 @@ impl App {
 
     fn time(&self) -> u32 {
         self.start.elapsed().as_millis() as u32
-    }
-
-    fn begin_file_drop(&mut self, id: u32, x: f64, y: f64, uris: Vec<u8>) {
-        self.begin_data_drop(
-            id,
-            x,
-            y,
-            Arc::new(BTreeMap::from([("text/uri-list".into(), uris)])),
-            true,
-        );
-    }
-    fn begin_data_drop(&mut self, id: u32, x: f64, y: f64, payload: Clipboard, drop: bool) -> bool {
-        if !self.input_allowed(id) || !x.is_finite() || !y.is_finite() {
-            return false;
-        }
-        self.server_drop_payloads
-            .retain(|_, (_, created)| created.elapsed() < Duration::from_secs(120));
-        if self.server_drop_payloads.len() >= 16 {
-            return false;
-        }
-        let pointer = self.seat.get_pointer().unwrap();
-        // Discard old offers before releasing buttons; never turn cancellation
-        // into a drop on the previous target. Synthetic setup must not click an app.
-        pointer.motion(
-            self,
-            None,
-            &MotionEvent {
-                location: pointer.current_location(),
-                serial: SERIAL_COUNTER.next_serial(),
-                time: self.time(),
-            },
-        );
-        pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), self.time());
-        self.release_input();
-        let serial = SERIAL_COUNTER.next_serial();
-        pointer.button(
-            self,
-            &ButtonEvent {
-                button: 0x110,
-                state: ButtonState::Pressed,
-                serial,
-                time: self.time(),
-            },
-        );
-        self.pressed_buttons.insert(0x110);
-        let start = smithay::input::pointer::GrabStartData {
-            focus: None,
-            button: 0x110,
-            location: pointer.current_location(),
-        };
-        let mimes = payload.keys().cloned().collect();
-        self.server_drop_generation = self.server_drop_generation.wrapping_add(1).max(1);
-        self.server_drop_payloads.insert(
-            self.server_drop_generation,
-            (payload.clone(), Instant::now()),
-        );
-        self.drop_data = Some(payload);
-        self.drop_accepted = false;
-        self.drop_deadline = drop.then(|| Instant::now() + Duration::from_secs(5));
-        let dh = self.dh.clone();
-        let seat = self.seat.clone();
-        start_dnd_with_id(
-            &dh,
-            &seat,
-            self,
-            serial,
-            Some(start),
-            None,
-            SourceMetadata {
-                mime_types: mimes,
-                dnd_action: DndAction::Copy,
-            },
-            self.server_drop_generation,
-        );
-        self.pointer_motion(id, x, y);
-        true
-    }
-
-    fn cancel_text_drag(&mut self) {
-        if self.incoming_text_drag.take().is_none() {
-            return;
-        }
-        let pointer = self.seat.get_pointer().unwrap();
-        pointer.motion(
-            self,
-            None,
-            &MotionEvent {
-                location: pointer.current_location(),
-                serial: SERIAL_COUNTER.next_serial(),
-                time: self.time(),
-            },
-        );
-        self.release_input();
-        self.drop_data = None;
-    }
-    fn text_drag_message(&mut self, value: &Value) {
-        if !self.peer.as_ref().is_some_and(|p| p.data_drag_enabled()) {
-            return;
-        }
-        let Some(drag) = value["drag"].as_u64().filter(|id| *id > 0) else {
-            return;
-        };
-        let kind = value["type"].as_str().unwrap_or("");
-        if kind == "text_drag_cancel" {
-            if self.incoming_text_drag == Some(drag) {
-                self.cancel_text_drag();
-            }
-            return;
-        }
-        let Some(id) = value["id"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
-            return;
-        };
-        if self.read_only || !self.input_allowed(id) {
-            self.cancel_text_drag();
-            return;
-        }
-        if kind == "text_drag_enter" {
-            self.cancel_text_drag();
-            let Some(data) = value["data"]
-                .as_str()
-                .filter(|s| s.len() <= 1_400_000)
-                .and_then(|s| B64.decode(s).ok())
-            else {
-                return;
-            };
-            if data.len() > drag::MAX_TEXT
-                || data.contains(&0)
-                || std::str::from_utf8(&data).is_err()
-            {
-                return;
-            }
-            let (x, y) = self.message_position(id, value);
-            let payload = Arc::new(BTreeMap::from([
-                ("text/plain;charset=utf-8".into(), data.clone()),
-                ("text/plain".into(), data),
-            ]));
-            if self.begin_data_drop(id, x, y, payload, false) {
-                self.incoming_text_drag = Some(drag);
-            }
-        } else if self.incoming_text_drag == Some(drag) {
-            self.pointer_message(id, value);
-            if kind == "text_drag_drop" {
-                self.drop_deadline = Some(Instant::now() + Duration::from_secs(2));
-            }
-        }
-    }
-
-    fn finish_file_drop(&mut self) {
-        if self
-            .drop_deadline
-            .is_some_and(|deadline| self.drop_accepted || Instant::now() >= deadline)
-        {
-            self.drop_deadline = None;
-            self.pressed_buttons.remove(&0x110);
-            let pointer = self.seat.get_pointer().unwrap();
-            pointer.button(
-                self,
-                &ButtonEvent {
-                    button: 0x110,
-                    state: ButtonState::Released,
-                    serial: SERIAL_COUNTER.next_serial(),
-                    time: self.time(),
-                },
-            );
-            pointer.frame(self);
-        }
     }
 
     fn external_drag_input(&self) -> bool {
@@ -3149,6 +2986,8 @@ fn main() -> Result<()> {
         clipboard_reads: vec![],
         transfers,
         drop_data: None,
+        x11_drop: None,
+        drop_window: 0,
         incoming_text_drag: None,
         server_drop_generation: 0,
         server_drop_payloads: BTreeMap::new(),
@@ -3409,6 +3248,7 @@ fn main() -> Result<()> {
                     }
                     Event::Disconnected => {
                         app.cancel_text_drag();
+                        app.cancel_x11_drop();
                         app.stop_drag_visual();
                         app.drag_visual.enabled = false;
                         app.activation.connection();
