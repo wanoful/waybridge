@@ -21,7 +21,7 @@ class RemoteTray {
     Json info;
     NativeIcon icon;
     HICON shellIcon = nullptr;
-    bool added = false;
+    bool added = false, version4 = false;
     ~Item() {
       if (shellIcon)
         DestroyIcon(shellIcon);
@@ -83,6 +83,7 @@ class RemoteTray {
       title = L"● " + title;
     wcsncpy(d.szTip, title.c_str(), 127);
     d.szTip[127] = 0;
+    const bool adding = !item.added;
     BOOL ok = Shell_NotifyIconW(item.added ? NIM_MODIFY : NIM_ADD, &d);
     // A duplicate/synthetic TaskbarCreated broadcast can arrive while Explorer
     // still retains this ID. Repair its content without claiming a failure.
@@ -90,8 +91,12 @@ class RemoteTray {
       ok = Shell_NotifyIconW(NIM_MODIFY, &d);
     if (ok) {
       item.added = true;
-      d.uVersion = NOTIFYICON_VERSION_4;
-      Shell_NotifyIconW(NIM_SETVERSION, &d);
+      if (adding) {
+        d.uVersion = NOTIFYICON_VERSION_4;
+        item.version4 = Shell_NotifyIconW(NIM_SETVERSION, &d) != FALSE;
+        if (GetEnvironmentVariableW(L"WAYBRIDGE_TRAY_TRACE", nullptr, 0))
+          std::fprintf(stderr, "Tray shell id=%u version4=%d\n", item.shellId, int(item.version4));
+      }
     } else if (emit)
       emit({{"type", "tray_warning"},
             {"message", "Windows Shell could not add a remote tray icon"}});
@@ -209,7 +214,12 @@ class RemoteTray {
     event["node"] = actions[selected];
     event["revision"] = message.value("revision", 0u);
     event["menu_token"] = message.value("menu_token", uint64_t(0));
-    event["timestamp"] = GetTickCount();
+    // The Linux adapter owns its event clock; Windows uptime cannot be used.
+    event["timestamp"] = 0u;
+    if (GetEnvironmentVariableW(L"WAYBRIDGE_TRAY_TRACE", nullptr, 0))
+      std::fprintf(stderr, "Tray menu select node=%d token=%llu revision=%u\n", actions[selected],
+                   (unsigned long long)message.value("menu_token", uint64_t(0)),
+                   message.value("revision", 0u));
     send(event);
   }
   static LRESULT CALLBACK wheel(int code, WPARAM wp, LPARAM lp) {
@@ -312,6 +322,10 @@ public:
       pendingMenu = id;
       pendingGeneration = found->second->generation;
     }
+    if (GetEnvironmentVariableW(L"WAYBRIDGE_TRAY_TRACE", nullptr, 0))
+      std::fprintf(stderr, "Tray request epoch=%llu generation=%llu action=%s\n",
+                   (unsigned long long)epoch, (unsigned long long)found->second->generation,
+                   effective.c_str());
     send(action(id, *found->second, effective));
     return true;
   }
@@ -323,6 +337,9 @@ public:
     if (!negotiated)
       return true;
     if (type == "tray_status" || type == "tray_error" || type == "tray_warning") {
+      if (type == "tray_error")
+        std::fprintf(stderr, "Remote tray action failed: %s\n",
+                     message.value("message", std::string("unknown error")).c_str());
       if (emit)
         emit(message);
       if (type == "tray_status" && !message.value("available", false))
@@ -416,7 +433,7 @@ public:
       emit({{"type", "tray_background"}, {"items", background()}});
     return true;
   }
-  bool message(UINT message, WPARAM, LPARAM lp) {
+  bool message(UINT message, WPARAM wp, LPARAM lp) {
     if (message == taskbarCreated && taskbarCreated) {
       for (auto &[id, item] : items) {
         item->added = false;
@@ -430,17 +447,28 @@ public:
     }
     if (message != CallbackMessage)
       return false;
-    UINT id = HIWORD(lp), event = LOWORD(lp);
-    for (const auto &[key, item] : items)
-      if (item->shellId == id) {
-        if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP)
-          request(key, "menu");
-        else if (event == NIN_SELECT || event == NIN_KEYSELECT || event == WM_LBUTTONUP)
-          request(key, item->info.value("item_is_menu", false) ? "menu" : "activate");
-        else if (event == WM_MBUTTONUP)
-          request(key, "secondary");
-        break;
-      }
+    const UINT event = LOWORD(lp);
+    if (GetEnvironmentVariableW(L"WAYBRIDGE_TRAY_TRACE", nullptr, 0))
+      std::fprintf(stderr, "Tray callback v4_id=%u legacy_id=%u event=0x%x\n", HIWORD(lp), UINT(wp),
+                   event);
+    for (const auto &[key, item] : items) {
+      const UINT callbackId = item->version4 ? HIWORD(lp) : UINT(wp);
+      if (item->shellId != callbackId)
+        continue;
+      // Explorer sends compatibility mouse UP messages *and* the version-4
+      // semantic event for one click. Handling both toggles applications twice
+      // and requests two menus, invalidating the first menu's action token.
+      const bool menu = item->version4 ? event == WM_CONTEXTMENU : event == WM_RBUTTONUP;
+      const bool activate =
+          item->version4 ? (event == NIN_SELECT || event == NIN_KEYSELECT) : event == WM_LBUTTONUP;
+      if (menu)
+        request(key, "menu");
+      else if (activate)
+        request(key, item->info.value("item_is_menu", false) ? "menu" : "activate");
+      else if (event == WM_MBUTTONUP)
+        request(key, "secondary");
+      break;
+    }
     return true;
   }
 };

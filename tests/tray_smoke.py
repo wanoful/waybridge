@@ -52,8 +52,8 @@ def main():
             menu=viewer.control('tray_menu');nodes=menu['root']['children'];assert nodes[1]['enabled']==False and nodes[2]['checked'] and nodes[3]['children'][0]['toggle']=='radio'
             for forbidden in [2,9,11]:
                 action('menu_event',node=forbidden,revision=menu['revision'],menu_token=menu['menu_token']);assert 'disabled' in viewer.control('tray_error')['message']
-            action('menu_event',node=5,revision=menu['revision'],menu_token=menu['menu_token'])
-            time.sleep(.25);assert any(v['method']=='Event' and v['args'][0]==5 for v in calls()),calls()
+            action('menu_event',node=5,revision=menu['revision'],menu_token=menu['menu_token'],timestamp=987654321)
+            time.sleep(.25);assert any(v['method']=='Event' and v['args'][0]==5 and v['args'][3]==0 for v in calls()),calls()
             assert all(any(v['method']==method for v in calls()) for method in ['Activate','SecondaryActivate','Scroll','AboutToShow'])
             rpc('SetStatus','NeedsAttention');attention=viewer.control('tray_snapshot',lambda s:s['items'][0]['status']=='NeedsAttention')
             assert attention['items'][0]['icon_revision']==item['icon_revision'] and 'png' not in attention['items'][0]

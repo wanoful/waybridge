@@ -541,7 +541,9 @@ fn action(
                     node,
                     "clicked",
                     zbus::zvariant::Value::from(0i32),
-                    value["timestamp"].as_u64().unwrap_or(0) as u32,
+                    // Windows uptime is not an X11/Wayland timestamp. DBusMenu
+                    // defines 0 as unknown; forwarding another clock can reject focus.
+                    0u32,
                 ),
             )?;
             item.enabled_actions.clear();
@@ -608,6 +610,7 @@ fn run(address: &str, receiver: &Receiver<Command>, desired: &DesiredPeer) -> Re
                         &windows,
                         (desired, desired_revision),
                     ) {
+                        tracing::debug!(action=value["action"].as_str().unwrap_or(""), epoch, %error, "tray action rejected");
                         source.control(json!({"type":"tray_error","id":value["id"],"message":error.to_string()}));
                     }
                 }

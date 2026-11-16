@@ -530,7 +530,7 @@ Client actions are `tray_action {epoch,id,generation,action,...}`:
 | `secondary` | none | SecondaryActivate(0,0) |
 | `scroll` | `delta` (-1200..1200), `orientation` (`vertical`/`horizontal`) | SNI Scroll |
 | `menu` | none | AboutToShow + DBusMenu GetLayout, or constrained ContextMenu fallback |
-| `menu_event` | `revision,menu_token,node,timestamp` | DBusMenu Event(node,"clicked",0,timestamp) |
+| `menu_event` | `revision,menu_token,node,timestamp` | DBusMenu Event(node,"clicked",0,0) |
 
 `tray_menu` echoes `{epoch,id,generation,revision,menu_token,root}`. A node has
 `{id,label,enabled,visible,separator,toggle,checked,children}`; toggle is the
@@ -538,7 +538,7 @@ application's checkmark/radio value. At most 256 nodes and 8 nested levels are
 accepted. A menu token belongs to one exported menu. The server verifies the
 current bus owner, exported token/revision, current application layout revision,
 and enabled/visible state of the node **and every ancestor** before dispatch.
-A successfully dispatched token is consumed. Read-only input policy also applies
+A successfully dispatched token is consumed. The legacy `timestamp` field is accepted for compatibility but not forwarded: Windows uptime belongs to a different clock domain, so the Linux adapter uses DBusMenu's unknown-time value `0`. Read-only input policy also applies
 to tray activation, scrolling, menus and menu actions, including queued work.
 
 For an SNI without DBusMenu, ContextMenu is called only when its DesktopEntry/Id

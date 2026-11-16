@@ -98,3 +98,43 @@ TaskbarCreated broadcast repairs existing IDs using NIM_MODIFY if NIM_ADD finds
 the icon already present. This exercises recovery logic without restarting the
 user's actual Explorer. ARM64 was cross-compiled; this x64 device does not execute
 ARM64 binaries.
+
+## Click and menu action repair — 2026-11-16
+
+An isolated native Explorer probe reproduced the user's no-op clicks. With
+NOTIFYICON_VERSION_4 successfully selected, one physical left click emits both
+WM_LBUTTONUP and NIN_SELECT; a physical right click emits both WM_RBUTTONUP and
+WM_CONTEXTMENU. Previously both compatibility and semantic messages dispatched
+an operation. A toggle-style application therefore restored and immediately hid
+its window. Two menu exports also advanced the token twice; the first displayed
+menu then submitted a superseded token and its selection was rejected.
+
+Each icon now remembers the Shell version actually accepted. Version 4 dispatches
+only NIN_SELECT/NIN_KEYSELECT and WM_CONTEXTMENU; the older format dispatches only
+mouse-up messages and obtains the icon ID from wParam. An icon update does not
+renegotiate the event format unnecessarily. This follows the distinct event
+contracts in Microsoft's [Shell_NotifyIcon documentation](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw).
+
+The adapter also stops treating Windows GetTickCount as a Linux event timestamp.
+The DBusMenu Event timestamp is zero (unknown), including when an older native
+client supplies its uptime. Opaque menu identity and read-only checks still apply.
+`WAYBRIDGE_TRAY_TRACE=1` on the Windows worker traces the negotiated Shell format,
+callbacks, outgoing operations and menu selections without logging app content.
+Rejected Linux actions are also visible on stderr and the control center.
+
+`python3 tests/tray_actions_e2e.py` runs the production Windows client in an
+isolated Wine desktop, connected over the real v3 stream to the compositor and
+an actual Qt QSystemTrayIcon/DBusMenu exporter. It replays the callback sequences
+captured from Explorer and checks application effects: exactly one activation
+leaves the window visible, the native menu Increment action changes a Qt QAction
+counter, and Quit exits the application. The pre-fix client reproduces two
+activations (visible then hidden); `--single-left` separately reproduces menu
+selection with no QAction execution. The repaired client passes both paths.
+This test builds its Qt and Win32 driver fixtures; it requires the compositor
+and `build/windows/waybridge-client.exe` to have been built first.
+
+`python3 tests/windows_tray_shell_events_laptop.py --host laptop` is an opt-in
+physical-input capture against a unique temporary icon/task. It waits for an
+auto-hidden taskbar/overflow and targets only rectangles returned for that icon,
+rejects non-tray roots (including a locked desktop), restores the mouse and
+removes its icon/task/files. It is deliberately separate from unattended tests.
