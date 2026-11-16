@@ -1,6 +1,7 @@
 #pragma once
 // Bounded OLE Unicode text <-> Wayland MIME data. Never creates a file or
 // changes the clipboard. All state belongs to the controller STA.
+#include "drag_trace.h"
 namespace TextDrag {
 inline uint64_t sequence = 0, active = 0, targetEpoch = 0;
 inline bool accepted = false;
@@ -22,7 +23,9 @@ inline uint64_t begin(IDataObject *data, Json position, uint64_t target, const s
   if (!currentTarget(target) || !current()) return 0;
   FORMATETC format{CF_UNICODETEXT,nullptr,DVASPECT_CONTENT,-1,TYMED_HGLOBAL};
   STGMEDIUM medium{};
-  if (FAILED(data->GetData(&format,&medium))) return 0;
+  HRESULT read=data->GetData(&format,&medium);
+  DragTrace::event("text.read",{{"hresult",read},{"tymed",medium.tymed}});
+  if (FAILED(read)) return 0;
   std::string text;
   if (medium.tymed==TYMED_HGLOBAL && medium.hGlobal) {
     SIZE_T length=GlobalSize(medium.hGlobal);
@@ -47,6 +50,7 @@ inline uint64_t begin(IDataObject *data, Json position, uint64_t target, const s
   cancel(active);active=++sequence;accepted=false;
   position["type"]="text_drag_enter";position["drag"]=active;
   position["data"]=base64(reinterpret_cast<const uint8_t *>(text.data()),text.size());
+  DragTrace::event("text.enter",{{"drag",active},{"window",position.value("id",0u)},{"bytes",text.size()}});
   sendJson(position);return active;
 }
 inline void motion(uint64_t id, Json position) {
@@ -61,6 +65,7 @@ inline bool drop(uint64_t id, Json position) {
 }
 inline bool control(const Json &message) {
   if(message.value("type","")!="text_drag_status")return false;
+  DragTrace::event("text.status",{{"drag",message.value("drag",uint64_t(0))},{"active",active},{"accepted",message.value("accepted",false)}});
   if(message.value("drag",uint64_t(0))==active)accepted=message.value("accepted",false);
   return true;
 }

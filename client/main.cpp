@@ -311,6 +311,7 @@ void sendJson(const Json &value) {
 HGLOBAL globalBytes(const void *data, size_t size);
 void cancelIncomingFiles();
 void cancelIncomingFilesExcept(uint64_t generation);
+#include "drag_trace.h"
 #include "file_tree.h"
 #include "file_drag.h"
 #include "text_drag.h"
@@ -997,6 +998,7 @@ public:
     // Reentrant OLE calls can close the window and revoke its registration.
     AddRef();
     VirtualFiles::Com<IDropTarget> self(this);
+    DragTrace::event("ole.enter",{{"window",windowId},{"effects",*effect},{"files",hostedFiles},{"read_only",hostedReadOnly},{"data_drag",dataDragNegotiated}});
     const uint64_t target = TextDrag::enterTarget();
     textTarget = target; textDrag = 0; accepted = false;
     const auto current = [this, target] {
@@ -1006,6 +1008,7 @@ public:
     if (dataDragNegotiated && current() && FileDrag::returnToRemote(data, position(point))) {
       *effect=DROPEFFECT_NONE;return S_OK;
     }
+    DragTrace::formats(data);
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     bool files = current() && (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
                  (SUCCEEDED(data->QueryGetData(&format)) || VirtualFiles::supports(data));
@@ -1020,6 +1023,7 @@ public:
     // new sharing settings. Do not overwrite state committed by that reentry.
     if (!current()) { TextDrag::cancel(candidate); *effect = DROPEFFECT_NONE; return S_OK; }
     accepted = files; textDrag = candidate;
+    DragTrace::event("ole.enter.result",{{"window",windowId},{"files",files},{"text_drag",textDrag},{"accepted",TextDrag::allowed(textDrag)}});
     *effect = accepted || TextDrag::allowed(textDrag) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
@@ -1041,6 +1045,7 @@ public:
   HRESULT STDMETHODCALLTYPE Drop(IDataObject *data, DWORD, POINTL point, DWORD *effect) override {
     AddRef();
     VirtualFiles::Com<IDropTarget> self(this);
+    DragTrace::event("ole.drop",{{"window",windowId},{"text_drag",textDrag},{"effects",*effect},{"accepted",TextDrag::allowed(textDrag)}});
     bool copyAllowed = (*effect & DROPEFFECT_COPY) != 0;
     *effect = DROPEFFECT_NONE;
     accepted = false;
