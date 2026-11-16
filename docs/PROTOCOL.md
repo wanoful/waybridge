@@ -487,3 +487,59 @@ regular files. A pidfd plus `/proc` start identity pins an explicit shutdown to
 the expected server. Detaching the SSH helper leaves daemonized sessions alive.
 
 Managed application launch in both TLS and SSH modes uses the same helper. Recognized native Chrome/Chromium launches receive a persistent session-specific user-data directory and scoped Secret Service backend unless explicitly configured. Derived browser desktop entries preserve GIO field expansion; other desktop entries retain normal GIO behavior. Detected host Steam instances fail with an actionable conflict rather than forwarding silently. Low-level compositor `--launch` retains literal argv behavior.
+
+## Remote application trays (`tray_v1`)
+
+Both hellos explicitly set `tray_v1:true`; this negotiates the adapter protocol,
+not desktop availability. `tray_status` reports `available`, a diagnostic
+`message`, `mode:watcher_host|existing_watcher_host`, and `xembed:false`.
+An older peer receives no tray snapshots/icons and its actions are ignored.
+
+The server sends reliable `tray_snapshot` messages with `{epoch,items}`. Each
+item has `{id,generation,app_id,title,status,menu,item_is_menu,icon_revision}`;
+status follows SNI's Active/Passive/NeedsAttention. A snapshot replaces the list,
+including background-only and Passive items. `id` is an opaque SNI identity, not
+a process ID. `epoch` changes on viewer replacement/refresh; `generation`
+changes when the source bus owner changes. Both must be echoed by every action.
+Snapshots contain no image bytes and have a 256 KiB serialized ceiling.
+
+`tray_icon {epoch,id,generation,revision,width:128,height:128,png}` carries a
+normalized PNG (or null for the placeholder), only when its revision changes or
+a viewer reconnects. `revision` must match the current item's `icon_revision`.
+These messages use a separate latest-per-item queue: at most 64 entries, 132 KiB
+per JSON message and 512 KiB total pending bytes. Control/input acknowledgements
+remain ahead of the icon queue. Overflow reports `tray_warning`, keeps the
+placeholder, and retries on the next adapter poll; it does not resend every icon
+when a title or status changes.
+
+Client actions are `tray_action {epoch,id,generation,action,...}`:
+
+| Action | Extra fields | Linux operation |
+|---|---|---|
+| `activate` | none | SNI Activate(0,0) |
+| `secondary` | none | SecondaryActivate(0,0) |
+| `scroll` | `delta` (-1200..1200), `orientation` (`vertical`/`horizontal`) | SNI Scroll |
+| `menu` | none | AboutToShow + DBusMenu GetLayout, or constrained ContextMenu fallback |
+| `menu_event` | `revision,menu_token,node,timestamp` | DBusMenu Event(node,"clicked",0,timestamp) |
+
+`tray_menu` echoes `{epoch,id,generation,revision,menu_token,root}`. A node has
+`{id,label,enabled,visible,separator,toggle,checked,children}`; toggle is the
+application's checkmark/radio value. At most 256 nodes and 8 nested levels are
+accepted. A menu token belongs to one exported menu. The server verifies the
+current bus owner, exported token/revision, current application layout revision,
+and enabled/visible state of the node **and every ancestor** before dispatch.
+A successfully dispatched token is consumed. Read-only input policy also applies
+to tray activation, scrolling, menus and menu actions, including queued work.
+
+For an SNI without DBusMenu, ContextMenu is called only when its DesktopEntry/Id
+matches an already mapped remote window's app ID. It returns
+`tray_menu {epoch,id,generation,fallback:"remote_window"}`; the application draws
+that menu through its own remote window. Otherwise a visible `tray_error`
+explains the missing path. The bridge does not manufacture a Quit operation;
+normal exit uses a menu action supplied by the application.
+
+`tray_refresh` requests a fresh snapshot/epoch. This is a read-only operation;
+normal snapshots and icon deltas are automatic. Action payload fields and sizes
+are bounded before entering the 64-slot worker queue. Session lifecycle state
+uses a separate latest state/revision, so reconnect/disconnect cannot be dropped
+behind a full action queue.

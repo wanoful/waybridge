@@ -22,6 +22,7 @@
 #include "native_cursor.h"
 #include "native_icon.h"
 #include "application_identity.h"
+#include "remote_tray.h"
 #include "window_semantics.h"
 #include "relative_input.h"
 #include "ime.h"
@@ -70,6 +71,8 @@ std::condition_variable inboxWake, frameWake;
 std::deque<Json> controls;
 Json pendingCursor;
 NativeCursor nativeCursor;
+RemoteTray remoteTray;
+bool trayNegotiated = false;
 bool cursorNegotiated = false;
 struct EncodedFrame {
   uint8_t kind = 0;
@@ -2313,6 +2316,10 @@ void dispatchNetwork() {
                          type == "tree_done")) || (!hostedFiles && type=="drag_offer")) continue;
     if (FileTree::receive(m) || FileDrag::control(m, controller, sourceWindow)) continue;
     if (remoteNotifications.receive(m)) continue;
+    if (type.rfind("tray_",0)==0) {
+      if (!iconDecoder) iconDecoder=std::make_unique<ImageDecoder>();
+      if (remoteTray.receive(m,*iconDecoder)) continue;
+    }
     if (type == "hello") {
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
       if (m.value("version", 0) != 3 || m.value("codec", "") != "mixed") {
@@ -2327,6 +2334,9 @@ void dispatchNetwork() {
       semanticsNegotiated = m.value("window_semantics_v1", false);
       cursorNegotiated = m.value("cursor_v1", false);
       iconsNegotiated = m.value("window_icon_v1", false);
+      trayNegotiated = m.value("tray_v1", false);
+      remoteTray.configure(trayNegotiated,hostedSettings.value("tray",true),hostedReadOnly);
+      if (!trayNegotiated) hostControl.emit({{"type","tray_status"},{"available",false},{"message","Linux 服务端未协商 tray_v1，请更新服务端"},{"xembed",false}});
       if (m.contains("features") && m["features"].is_array())
       {
         FileTree::supported = std::find(m["features"].begin(), m["features"].end(), "file_tree") != m["features"].end();
@@ -2746,6 +2756,8 @@ void applyHostedSettings(const Json &settings, bool live) {
   }
   hostedSettings=settings;
   remoteNotifications.settings(settings.value("notifications",true));
+  remoteTray.configure(trayNegotiated,settings.value("tray",true),settings.value("read_only",false));
+  remoteTray.repaint();
   hostedReadOnly=settings.value("read_only",false); hostedIme=settings.value("ime",true);
   remoteNotifications.inputReadOnly(hostedReadOnly);
   hostedFiles=settings.value("files",true); hostedImages=settings.value("clipboard_images",true);
@@ -2780,10 +2792,11 @@ void publishHostedStatus() {
       {"hardware_decode",bool(w->frame&&w->frame->video.texture)},{"presentation",w->presentation?"D3D11 / DirectComposition":"GDI"}});
   }
   hostControl.emit({{"type","status"},{"uptime_ms",GetTickCount64()},{"tcp_bytes",networkBytes.load()},
-                    {"presented_updates",presentedFrames.load()},{"windows",list}});
+                    {"presented_updates",presentedFrames.load()},{"windows",list},{"background",remoteTray.background()}});
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
+    if (remoteTray.message(message,wp,lp)) return 0;
     if (message == HostControl::Message) {
       for (const auto &request : hostControl.take()) {
         try {
@@ -2791,6 +2804,10 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
           if (type=="disconnect") PostMessageW(hwnd,WM_CLOSE,0,0);
           else if (remoteNotifications.command(request)) {}
           else if (type=="settings") applyHostedSettings(request.at("settings"),true);
+          else if (type=="tray_action") {
+            if (!(request.value("epoch",uint64_t(0)) && request.value("generation",uint64_t(0)) && remoteTray.request(request.value("id",std::string()),request.value("action",std::string()),request.value("epoch",uint64_t(0)),request.value("generation",uint64_t(0)))))
+              throw std::runtime_error("Tray action is unavailable or input is read-only");
+          }
           else if (type=="send_files") {
             if (!hostedFiles) throw std::runtime_error("File transfers disabled");
             std::vector<std::wstring> paths;
@@ -2850,6 +2867,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_TIMER) {
+      remoteTray.tick();
       for (auto &entry : windows)
         if (!entry.second->popup)
           sendColorMode(entry.second.get());
@@ -2860,6 +2878,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_CLOSE) {
+      remoteTray.clear();
       windowDrag.cancelled = true;
       endWindowDrag();
       releasePointer(false);
@@ -3015,6 +3034,7 @@ int wmain(int argc, wchar_t **argv) {
     auto png = icon.badgedPng(64);
     message["png"] = png.empty() ? Json(nullptr) : Json(base64(png.data(), png.size()));
   };
+  remoteTray.attach(controller,sendJson,[](const Json &event){hostControl.emit(event);});
   AddClipboardFormatListener(controller);
   SetTimer(controller, 1, 2000, nullptr);
   SetConsoleCtrlHandler(consoleControl, TRUE);
@@ -3086,6 +3106,7 @@ int wmain(int argc, wchar_t **argv) {
             {"color_spaces", Json::array({"bt709_sdr", "bt2020_pq"})},
             {"cursor_v1", true},
             {"window_icon_v1", true},
+            {"tray_v1", true},
             {"window_semantics_v1", true},
             {"notifications_v1", hostControl.active()},
             {"notifications_enabled", false},
@@ -3107,6 +3128,7 @@ int wmain(int argc, wchar_t **argv) {
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
+  remoteTray.clear();
   windowDrag.cancelled = true;
   endWindowDrag();
   releasePointer(false);

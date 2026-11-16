@@ -46,6 +46,7 @@ struct Queue {
     controls: VecDeque<Vec<u8>>,
     cursor: Option<Vec<u8>>,
     icons: BTreeMap<u32, Vec<u8>>,
+    tray_icons: BTreeMap<String, Vec<u8>>,
     frames: BTreeMap<u32, VecDeque<QueuedFrame>>,
     png_only: BTreeSet<u32>,
     active_codec: BTreeMap<u32, waybridge_codec::Codec>,
@@ -111,6 +112,8 @@ pub struct Peer {
     notifications_v1: bool,
     notifications_initial: bool,
     window_semantics_v1: bool,
+    tray_v1: bool,
+    desktop_input: AtomicBool,
     media_attached: AtomicBool,
 }
 
@@ -192,6 +195,36 @@ impl Peer {
         true
     }
 
+    pub fn set_desktop_input(&self, enabled: bool) {
+        self.desktop_input.store(enabled, Ordering::SeqCst);
+    }
+    pub fn desktop_input(&self) -> bool {
+        self.desktop_input.load(Ordering::SeqCst) && !self.is_closed()
+    }
+    pub fn tray_enabled(&self) -> bool {
+        self.tray_v1
+    }
+    pub fn tray_icon(&self, id: &str, message: Value) -> bool {
+        if !self.tray_v1 {
+            return false;
+        }
+        let bytes = serde_json::to_vec(&message).unwrap();
+        if bytes.len() > 132 * 1024 {
+            return false;
+        }
+        let mut q = self.queue.lock().unwrap();
+        let cost: usize = q.tray_icons.values().map(Vec::len).sum();
+        let replaced = q.tray_icons.get(id).map_or(0, Vec::len);
+        if q.closed
+            || q.tray_icons.len() >= 64 && !q.tray_icons.contains_key(id)
+            || cost - replaced + bytes.len() > 512 * 1024
+        {
+            return false;
+        }
+        q.tray_icons.insert(id.to_owned(), bytes);
+        self.wake.notify_all();
+        true
+    }
     pub fn semantics_enabled(&self) -> bool {
         self.window_semantics_v1
     }
@@ -401,7 +434,8 @@ impl Peer {
                         && (!q.controls.is_empty()
                             || !q.bulk.is_empty()
                             || q.cursor.is_some()
-                            || !q.icons.is_empty()))
+                            || !q.icons.is_empty()
+                            || !q.tray_icons.is_empty()))
                         || (frames_allowed && (!q.repairs.is_empty() || frame_ready));
                     if q.closed || ready {
                         break;
@@ -419,6 +453,8 @@ impl Peer {
                     (protocol::JSON, q.cursor.take().unwrap(), None)
                 } else if !media && !q.icons.is_empty() {
                     (protocol::JSON, q.icons.pop_first().unwrap().1, None)
+                } else if !media && !q.tray_icons.is_empty() {
+                    (protocol::JSON, q.tray_icons.pop_first().unwrap().1, None)
                 } else if frames_allowed && !q.frames.is_empty() {
                     let id = q.next_frame().unwrap().0;
                     q.last_frame_id = id;
@@ -643,6 +679,8 @@ pub fn listen(
                     notifications_v1: hello["notifications_v1"].as_bool().unwrap_or(false),
                     notifications_initial: hello["notifications_enabled"].as_bool().unwrap_or(true),
                     window_semantics_v1: hello["window_semantics_v1"].as_bool().unwrap_or(false),
+                    tray_v1: hello["tray_v1"].as_bool().unwrap_or(false),
+                    desktop_input: AtomicBool::new(true),
                 });
                 let mut key = [0; 32];
                 if std::fs::File::open("/dev/urandom")
@@ -669,7 +707,7 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1,"notifications_v1":peer.notifications_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","file_drop_out","file_tree","window_decorations","dpi","alpha","cursor_v1","window_icon_v1","window_semantics_v1","relative_pointer_locked","locked_pointer","ime_v3","toplevel_drag_v1","stream_config_v1","notifications_v1"]}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1,"notifications_v1":peer.notifications_v1,"tray_v1":peer.tray_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","file_drop_out","file_tree","window_decorations","dpi","alpha","cursor_v1","window_icon_v1","window_semantics_v1","relative_pointer_locked","locked_pointer","ime_v3","toplevel_drag_v1","stream_config_v1","notifications_v1","tray_v1"]}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

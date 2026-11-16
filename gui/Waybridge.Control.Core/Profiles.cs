@@ -22,6 +22,7 @@ public sealed record ClientSettings
     public bool Files { get; set; } = true;
     public string BadgePng { get; set; } = "";
     public bool Notifications { get; set; } = true;
+    public bool Tray { get; set; } = true;
     public int Volume { get; set; } = 100;
     public string GpuInput { get; set; } = "cpu";
     public void Validate()

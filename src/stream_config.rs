@@ -58,6 +58,9 @@ impl App {
             self.release_input();
         }
         self.read_only = read_only;
+        if let Some(peer) = &self.peer {
+            peer.set_desktop_input(!read_only);
+        }
         if self.stream_fps != fps as u32
             || self.stream_bitrate != bitrate as u32
             || self.video_codec != codec

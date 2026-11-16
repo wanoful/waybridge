@@ -129,6 +129,9 @@ pub struct Session {
     services: Option<crate::session_services::Services>,
 }
 impl Session {
+    pub fn bus_address(&self) -> &str {
+        self.address.as_deref().unwrap_or("")
+    }
     pub fn new(
         socket: &str,
         display: Option<u32>,

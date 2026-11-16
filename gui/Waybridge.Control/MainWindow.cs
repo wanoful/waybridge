@@ -52,6 +52,9 @@ internal sealed class MainWindow : Window
     private readonly TextBox applicationSearch = new() { PlaceholderText = "搜索已安装应用" };
     private readonly ListView applicationList = new() { SelectionMode = ListViewSelectionMode.Single, MaxHeight = 430 };
     private readonly ListView windowList = new() { SelectionMode = ListViewSelectionMode.None, MaxHeight = 280 };
+    private readonly ToggleSwitch remoteTray = Toggle(true);
+    private readonly TextBlock trayStatus = new() { Text = "托盘：等待连接", TextWrapping = TextWrapping.Wrap };
+    private readonly ListView backgroundList = new() { SelectionMode = ListViewSelectionMode.None, MaxHeight = 280 };
     private readonly ListView transfers = new() { SelectionMode = ListViewSelectionMode.None, MaxHeight = 350 };
     private readonly TextBox logs = new() { IsReadOnly = true, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 180, MaxHeight = 320 };
     private readonly Dictionary<string, TextBlock> metrics = new();
@@ -83,6 +86,7 @@ internal sealed class MainWindow : Window
         controller.ConnectionChanged += connected => UI(() =>
         {
             desktopNotifications.ConnectionChanged(connected);
+            if (!connected) { backgroundList.Items.Clear(); trayStatus.Text = "托盘：未连接"; }
             connect.Content = connected ? "断开连接" : (busy || controller.IsRunning) ? "取消连接" : "连接";
             end.IsEnabled = connected && selected.Mode is "ssh" or "direct";
             tray?.Update(connected);
@@ -315,6 +319,7 @@ internal sealed class MainWindow : Window
             Row("剪贴板图片", "文本同步保持独立", images),
             Row("文件与目录共享", "控制剪贴板文件、拖入与拖出", files),
             Row("桌面通知", "Linux 应用通知与动作，遵循 Windows 通知设置及免打扰", notifications),
+            Row("远端应用托盘", "在 Windows 通知区域显示应用托盘，关闭主窗口后仍可从后台列表恢复", remoteTray),
             Row("只读模式", "暂停键盘和鼠标输入，服务端同时释放按键与指针锁定", readOnly),
             Row("Windows 本地 IME", "使用本地候选窗口与远端预编辑", ime),
             Row("紧急释放鼠标", "游戏捕获鼠标时可随时释放", Text("Ctrl + Alt + Shift + F12")), apply);
@@ -329,7 +334,8 @@ internal sealed class MainWindow : Window
         });
         applicationSearch.TextChanged += (_, _) => FilterApplications();
         return Column(Text("从 Linux 已安装应用中选择，启动到当前私有会话。"), Actions(refresh, terminal, launch),
-            applicationSearch, applicationList, Text("当前远端窗口", 18), windowList);
+            applicationSearch, applicationList, Text("当前远端窗口", 18), windowList,
+            Text("后台应用", 18), trayStatus, backgroundList);
     }
     private UIElement TransfersPage()
     {
@@ -430,6 +436,7 @@ internal sealed class MainWindow : Window
         udp.IsOn = settings.Udp; udpHost.Text = settings.UdpHost; hdr.IsOn = settings.Hdr;
         gpu.SelectedIndex = settings.GpuInput == "cuda" ? 1 : 0;
         clipboard.SelectedIndex = Array.IndexOf(new[] { "both", "send", "receive", "off" }, settings.Clipboard);
+        remoteTray.IsOn = settings.Tray;
         images.IsOn = settings.ClipboardImages; files.IsOn = settings.Files; readOnly.IsOn = settings.ReadOnly; ime.IsOn = settings.Ime;
         notifications.IsOn = settings.Notifications;
         desktopNotifications.SharingChanged(settings.Notifications);
@@ -446,7 +453,7 @@ internal sealed class MainWindow : Window
             Hdr = hdr.IsOn, Udp = udp.IsOn, UdpHost = udpHost.Text.Trim(), GpuInput = gpu.SelectedIndex == 1 ? "cuda" : "cpu",
             Clipboard = new[] { "both", "send", "receive", "off" }[Math.Max(0, clipboard.SelectedIndex)],
             BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn,
-            Notifications = notifications.IsOn
+            Notifications = notifications.IsOn, Tray = remoteTray.IsOn
         };
         var result = selected with
         {
@@ -507,6 +514,25 @@ internal sealed class MainWindow : Window
         foreach (var app in applications.Where(a => a.Name.Contains(applicationSearch.Text, StringComparison.OrdinalIgnoreCase)))
             applicationList.Items.Add(new ListViewItem { Content = Text(app.Name), Tag = app });
     }
+    private void UpdateBackground(JsonElement items)
+    {
+        backgroundList.Items.Clear();
+        foreach (var item in items.EnumerateArray())
+        {
+            string id = item.GetProperty("id").GetString() ?? "";
+            ulong epoch = item.GetProperty("epoch").GetUInt64(), generation = item.GetProperty("generation").GetUInt64();
+            string title = item.GetProperty("title").GetString() ?? "";
+            if (title.Length == 0) title = item.GetProperty("app_id").GetString() ?? id;
+            string state = item.TryGetProperty("status", out var value) ? value.GetString() ?? "" : "";
+            var restore = Button("打开／恢复");
+            restore.IsEnabled = !readOnly.IsOn;
+            restore.Click += async (_, _) => await GuardAsync(() => controller.SendEngineAsync(new { type = "tray_action", id, epoch, generation, action = "activate" }));
+            var menu = Button("应用菜单");
+            menu.IsEnabled = !readOnly.IsOn;
+            menu.Click += async (_, _) => await GuardAsync(() => controller.SendEngineAsync(new { type = "tray_action", id, epoch, generation, action = "menu" }));
+            backgroundList.Items.Add(Row(title, state == "NeedsAttention" ? "应用需要注意" : "通过应用菜单正常退出", Actions(restore, menu)));
+        }
+    }
     private void Receive(JsonElement message)
     {
         if (desktopNotifications.Receive(message)) return;
@@ -518,6 +544,14 @@ internal sealed class MainWindow : Window
             foreach (var (index, kind) in new[] { (1, 2), (2, 4), (3, 5) })
                 ((ComboBoxItem)codec.Items[index]).IsEnabled = capabilities.Contains(kind);
         }
+        else if (type == "tray_status")
+        {
+            trayStatus.Text = message.GetProperty("available").GetBoolean()
+                ? "SNI 托盘已连接；旧式 XEmbed 托盘尚不支持。"
+                : "托盘不可用：" + (message.TryGetProperty("message", out var reason) ? reason.GetString() : "未知原因");
+        }
+        else if (type is "tray_error" or "tray_warning" or "tray_info") Inform(message.GetProperty("message").GetString() ?? "托盘操作未完成");
+        else if (type == "tray_background") UpdateBackground(message.GetProperty("items"));
         else if (type == "stream_config")
         {
             if (message.GetProperty("ok").GetBoolean())
@@ -547,6 +581,7 @@ internal sealed class MainWindow : Window
                 metrics["updates"].Text = $"{(updates-lastUpdates)*1000.0/(tick-lastTick):F1} 次/秒";
             }
             lastTick = tick; lastBytes = bytes; lastUpdates = updates;
+            if (message.TryGetProperty("background", out var background)) UpdateBackground(background);
             windowList.Items.Clear();
             var descriptions = new List<string>();
             foreach (var window in message.GetProperty("windows").EnumerateArray())

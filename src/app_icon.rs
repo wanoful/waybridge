@@ -219,6 +219,34 @@ fn unescape(value: &str) -> String {
     out
 }
 
+/// Tray icon names use the same bounded theme lookup/decoder as window icons.
+pub fn tray_icon(name: &str, extra: &str) -> Option<Vec<u8>> {
+    if name.len() > 4096 || name.chars().any(char::is_control) {
+        return None;
+    }
+    if Path::new(name).is_absolute() {
+        return load(&regular_image(PathBuf::from(name))?);
+    }
+    if !relative(name) || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    let mut resolver = Resolver::environment();
+    if Path::new(extra).is_absolute() {
+        resolver.roots.insert(0, PathBuf::from(extra));
+    }
+    let mut seen = HashSet::new();
+    let path = resolver
+        .theme_icon(&resolver.theme, name, &mut seen)
+        .or_else(|| resolver.theme_icon("hicolor", name, &mut seen))
+        .or_else(|| resolver.roots.iter().find_map(|root| candidate(root, name)))
+        .or_else(|| {
+            resolver
+                .data
+                .iter()
+                .find_map(|data| candidate(&data.join("pixmaps"), name))
+        })?;
+    load(&path)
+}
 struct Resolver {
     data: Vec<PathBuf>,
     roots: Vec<PathBuf>,

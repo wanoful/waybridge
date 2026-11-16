@@ -5,6 +5,7 @@ mod color;
 mod color_management;
 mod cursor;
 mod desktop_notifications;
+mod desktop_tray;
 mod drag;
 mod file_tree;
 mod ime;
@@ -319,6 +320,7 @@ struct App {
     cursor: cursor::Cursor,
     _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState,
     icons: app_icon::Icons,
+    tray: Option<desktop_tray::Tray>,
     relative: relative_input::RelativeInput,
     _relative_manager: RelativePointerManagerState,
     _constraints: PointerConstraintsState,
@@ -1012,6 +1014,28 @@ impl App {
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0);
         match value["type"].as_str().unwrap_or("") {
+            "tray_action" if !self.read_only => {
+                if let Some(peer) = self
+                    .peer
+                    .as_ref()
+                    .filter(|p| p.tray_enabled() && !p.is_closed())
+                {
+                    let windows = self
+                        .windows
+                        .iter()
+                        .filter(|w| w.mapped)
+                        .map(|w| w.icon.app_id.clone())
+                        .collect();
+                    if let Some(tray) = &self.tray {
+                        tray.action(peer.clone(), value, windows);
+                    }
+                }
+            }
+            "tray_refresh" if self.peer.as_ref().is_some_and(|p| p.tray_enabled()) => {
+                if let Some(tray) = &self.tray {
+                    tray.set_peer(self.peer.clone());
+                }
+            }
             "stream_config" => self.stream_config(&value),
             "file_drop_out_enabled" => {
                 self.drag_enabled = value["enabled"].as_bool().unwrap_or(false);
@@ -2818,6 +2842,7 @@ fn main() -> Result<()> {
         cursor: cursor::Cursor::default(),
         _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<App>(&dh),
         icons: app_icon::Icons::new(tx.clone()),
+        tray: None,
         _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<App>(&dh),
         relative: relative_input::RelativeInput::default(),
         _relative_manager: RelativePointerManagerState::new::<App>(&dh),
@@ -2907,6 +2932,9 @@ fn main() -> Result<()> {
         application_session.service_runtime(),
         application_session.service_bus_address(),
     )?;
+    app.tray = Some(desktop_tray::Tray::new(
+        application_session.bus_address().to_owned(),
+    ));
     // Service shutdown must run for application-launch and event-loop errors too.
     // Keep the display alive and dispatchable until owned components have stopped.
     let run_result = (|| -> Result<()> {
@@ -2958,6 +2986,9 @@ fn main() -> Result<()> {
                         notifications.connection(peer.notifications_initial());
                         if peer.notifications_enabled() {
                             peer.control(notifications.status());
+                        }
+                        if let Some(tray) = &app.tray {
+                            tray.set_peer(Some(peer.clone()));
                         }
                         app.read_only = false;
                         if let Some(audio) = &app.audio {
@@ -3090,6 +3121,9 @@ fn main() -> Result<()> {
                     }
                     Event::Disconnected => {
                         notifications.connection(false);
+                        if let Some(tray) = &app.tray {
+                            tray.set_peer(None);
+                        }
                         app.cancel_window_drag();
                         app.poll_window_drag();
                         app.window_drag.available = false;
