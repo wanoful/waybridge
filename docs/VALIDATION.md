@@ -398,8 +398,8 @@ imports through a session-owned RO FUSE view over their already-complete private
 cache. The view advertises ordinary 0600/0700 modes; kernel mount protection
 rejects file writes, creation, unlink and replacement without making saved copies
 read-only. Mount setup is lazy: unavailable FUSE reports a transfer error without
-stopping window streaming or exposing a writable fallback. Completed descriptors
-and paths survive viewer disconnect. Reused protocol IDs after reconnect receive
+stopping window streaming or exposing a writable fallback. Completed backing paths survive viewer disconnect; reads open and release
+file descriptors for each request, rather than retaining one per cached file. Reused protocol IDs after reconnect receive
 fresh cache directories rather than overwrite an old successful delivery.
 
 Verified on this Linux host:
@@ -472,6 +472,13 @@ The standalone Windows probe uses its own Temp directory and may be run directly
 on Windows. On Wine, pass `--expect-unsupported` to require the error/cleanup path.
 `windows_tree_probe.exe --expect-unsupported` additionally asserts that neither
 synchronous nor worker receive publication leaks CF_HDROP or staging.
+
+Read-only delivery descriptor regression: four completed batches totaling 1,024
+files retain bounded process FD usage (within eight descriptors of baseline).
+The real FUSE test randomly reopens/range-reads files across all batches 128 times
+and repeatedly reads an old URI, while publication failure still rolls back nodes
+and descriptors. Backing files remain complete local caches; this is not network
+lazy reading or a new filesystem protocol.
 
 ## M2 standard notifications (2026-11-16)
 

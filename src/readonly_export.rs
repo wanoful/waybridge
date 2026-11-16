@@ -9,10 +9,10 @@ use fuser::{
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     os::unix::{
         ffi::OsStrExt,
-        fs::{FileExt, MetadataExt},
+        fs::{FileExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -20,11 +20,32 @@ use std::{
 };
 
 const TTL: Duration = Duration::ZERO;
+#[derive(Clone)]
+struct Backing {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+impl Backing {
+    fn open(&self) -> std::io::Result<File> {
+        // Successful caches have session-owned, unique paths. A transient read
+        // must not follow an unexpectedly replaced symlink or block on a FIFO.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&self.path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.dev() != self.dev || metadata.ino() != self.ino {
+            return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+        }
+        Ok(file)
+    }
+}
 struct Node {
     attr: FileAttr,
     parent: u64,
     children: BTreeMap<OsString, u64>,
-    file: Option<File>,
+    backing: Option<Backing>,
 }
 #[derive(Default)]
 struct Tree {
@@ -47,8 +68,16 @@ impl Tree {
             Node {
                 parent,
                 children: BTreeMap::new(),
-                file: if meta.is_file() {
-                    Some(File::open(path)?)
+                backing: if meta.is_file() {
+                    let backing = Backing {
+                        path: path.to_owned(),
+                        dev: meta.dev(),
+                        ino: meta.ino(),
+                    };
+                    // Validate readability before publication, then release the
+                    // descriptor. Completed batches must not exhaust RLIMIT_NOFILE.
+                    drop(backing.open()?);
+                    Some(backing)
                 } else {
                     None
                 },
@@ -117,7 +146,7 @@ impl Filesystem for View {
             .unwrap()
             .nodes
             .get(&ino)
-            .is_some_and(|n| n.file.is_some())
+            .is_some_and(|n| n.backing.is_some())
         {
             reply.opened(0, 0);
         } else {
@@ -135,8 +164,14 @@ impl Filesystem for View {
         _: Option<u64>,
         reply: ReplyData,
     ) {
-        let tree = self.0.lock().unwrap();
-        let Some(file) = tree.nodes.get(&ino).and_then(|n| n.file.as_ref()) else {
+        let backing = self
+            .0
+            .lock()
+            .unwrap()
+            .nodes
+            .get(&ino)
+            .and_then(|n| n.backing.clone());
+        let Some(backing) = backing else {
             reply.error(libc::ENOENT);
             return;
         };
@@ -145,7 +180,10 @@ impl Filesystem for View {
             return;
         }
         let mut bytes = vec![0; size as usize];
-        match file.read_at(&mut bytes, offset as u64) {
+        match backing
+            .open()
+            .and_then(|file| file.read_at(&mut bytes, offset as u64))
+        {
             Ok(n) => reply.data(&bytes[..n]),
             Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
@@ -218,8 +256,8 @@ impl Export {
             _session: session,
         })
     }
-    /// Register only a complete private batch. Keep file descriptors pinned for
-    /// random reads and reopening until session shutdown, across viewer detach.
+    /// Register only a complete private batch. Retain its managed backing path
+    /// across viewer detach; each read opens and releases its own descriptor.
     pub fn publish(&self, directory: &Path) -> Result<PathBuf> {
         Ok(self.publish_batch(&[directory])?.remove(0))
     }
@@ -338,6 +376,52 @@ mod tests {
         fs::create_dir(temp.path().join("partial")).unwrap();
         fs::remove_dir_all(temp.path().join("partial")).unwrap();
         assert_eq!(fs::read(&file).unwrap(), b"original project");
+        // Four large successful batches used to retain 1,024 descriptors. Keep
+        // publication/reads bounded while every old URI remains usable.
+        let descriptors = fs::read_dir("/proc/self/fd").unwrap().count();
+        let content = |index: usize| {
+            (0..4096)
+                .map(|offset| ((index * 31 + offset * 7) % 251) as u8)
+                .collect::<Vec<_>>()
+        };
+        let mut published = Vec::new();
+        for batch in 0..4 {
+            let directory = temp.path().join(format!("pressure-{batch}"));
+            fs::create_dir(&directory).unwrap();
+            for index in batch * 256..(batch + 1) * 256 {
+                fs::write(directory.join(format!("file-{index}")), content(index)).unwrap();
+            }
+            let delivery = export.publish(&directory).unwrap();
+            published.extend(
+                (batch * 256..(batch + 1) * 256)
+                    .map(|index| delivery.join(format!("file-{index}"))),
+            );
+            assert!(
+                fs::read_dir("/proc/self/fd").unwrap().count() <= descriptors + 8,
+                "successful batches retained a descriptor per cached file"
+            );
+        }
+        for attempt in 0..128 {
+            let index = (attempt * 131 + 19) % published.len();
+            let offset = (attempt * 113 % 4000) as u64;
+            let mut bytes = [0u8; 73];
+            assert_eq!(
+                File::open(&published[index])
+                    .unwrap()
+                    .read_at(&mut bytes, offset)
+                    .unwrap(),
+                bytes.len()
+            );
+            assert_eq!(
+                &bytes[..],
+                &content(index)[offset as usize..offset as usize + bytes.len()]
+            );
+            assert_eq!(fs::read(&file).unwrap(), b"original project");
+        }
+        assert!(
+            fs::read_dir("/proc/self/fd").unwrap().count() <= descriptors + 8,
+            "repeated random reads retained descriptors"
+        );
         drop(export);
         assert_eq!(
             fs::read(saved.join("nested/project.blend")).unwrap(),
