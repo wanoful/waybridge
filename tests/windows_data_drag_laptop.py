@@ -95,6 +95,8 @@ Start-ScheduledTask -TaskName $name
                 assert result and result.splitlines()[0] == '0', result + '\nQT events:\n' + (root / 'app.log').read_text()
                 text = (root / 'app.log').read_text()
                 assert text.count('OTHER ') >= 3 and 'Windows 你好' in text, text
+                assert text.count('TEXT_DRAG_ENDED 2') >= 2 and text.count('TEXT_DRAG_ENDED 1') >= 1, text
+                log.write('\nQt source/target events:\n' + text); log.flush()
                 print('PASS: physical Windows production viewer, Qt cross-window capture, OLE-return, native Unicode out/in; owned fixture only')
                 print('Transcript:', logpath)
             finally:
