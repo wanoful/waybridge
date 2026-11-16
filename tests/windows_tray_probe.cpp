@@ -8,7 +8,7 @@ using Json = nlohmann::json;
 RemoteTray tray;
 ImageDecoder *decoder = nullptr;
 bool activated = false, secondary = false, clicked = false, checkedMenu = false, shellAdded = false;
-int phase = 0;
+int phase = 0, menuRequests = 0;
 HWND owner = nullptr;
 Json item = {{"id", "fixture"},       {"generation", 1u},
              {"icon_revision", 1u},   {"app_id", "org.waybridge.TrayFixture"},
@@ -85,6 +85,11 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       SendMessageW(hwnd, RemoteTray::CallbackMessage, 0, MAKELPARAM(WM_MBUTTONUP, 100));
       SendMessageW(hwnd, RemoteTray::CallbackMessage, 0, MAKELPARAM(WM_CONTEXTMENU, 100));
     } else if (phase > 8) {
+      item["item_is_menu"] = true;
+      tray.receive({{"type", "tray_snapshot"}, {"epoch", 1u}, {"items", Json::array({item})}},
+                   *decoder);
+      int previousMenus = menuRequests;
+      bool menuOnly = tray.request("fixture", "activate") && menuRequests == previousMenus + 1;
       bool unavailable = !tray.request("missing", "activate");
       tray.configure(true, true, true);
       bool readonly = !tray.request("fixture", "activate");
@@ -96,11 +101,11 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       tray.clear();
       bool cleared = tray.background().empty() && !tray.request("fixture", "activate");
       std::printf("activate=%d secondary=%d menu_checked=%d menu_clicked=%d shell_rect=%d "
-                  "readonly=%d disabled=%d cleared=%d missing=%d\n",
+                  "readonly=%d disabled=%d cleared=%d missing=%d menu_only=%d\n",
                   activated, secondary, checkedMenu, clicked, shellAdded, readonly, disabled,
-                  cleared, unavailable);
+                  cleared, unavailable, menuOnly);
       PostQuitMessage(activated && secondary && checkedMenu && clicked && readonly && disabled &&
-                              cleared && unavailable
+                              cleared && unavailable && menuOnly
                           ? 0
                           : 1);
     }
@@ -133,7 +138,7 @@ int main(int argc, char **argv) {
           activated = true;
         if (action == "secondary")
           secondary = true;
-        if (action == "menu")
+        if (action == "menu" && ++menuRequests == 1)
           PostMessageW(owner, WM_APP + 2, 0, 0);
         if (action == "menu_event")
           clicked = event.value("node", 0) == 1 && event.value("epoch", 0) == 1 &&

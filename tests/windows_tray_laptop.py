@@ -37,6 +37,7 @@ def main():
         print(result)
         print(ps('Get-ScheduledTaskInfo -TaskName '+quoted(name)+' | Select-Object LastTaskResult,LastRunTime | ConvertTo-Json -Compress'))
         assert 'activate=1 secondary=1 menu_checked=1 menu_clicked=1 shell_rect=1 readonly=1 disabled=1 cleared=1 missing=1' in result,result
+        assert 'menu_only=1' in result
         print('PASS: native Windows Explorer Shell icon accepted, real popup menu/callback, settings and cleanup')
     finally:
         ps('$task=Get-ScheduledTask -TaskName '+quoted(name)+' -ErrorAction SilentlyContinue; if($task){Stop-ScheduledTask -TaskName '+quoted(name)+' -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName '+quoted(name)+' -Confirm:$false}; Remove-Item -Recurse -Force '+quoted(root)+' -ErrorAction SilentlyContinue')

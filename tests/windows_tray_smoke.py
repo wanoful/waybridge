@@ -17,7 +17,7 @@ def main():
         try:
             result=subprocess.run(['wine',str(build/'windows-tray-probe.exe')],env=env,capture_output=True,text=True,timeout=90)
             print(result.stdout);assert result.returncode==0,result.stderr
-            assert 'menu_checked=1 menu_clicked=1' in result.stdout
+            assert 'menu_checked=1 menu_clicked=1' in result.stdout and 'menu_only=1' in result.stdout
             print('PASS: production Win32 tray callbacks, native nested/check/radio/disabled HMENU, real keyboard mnemonic action, input disable, Explorer re-add and cleanup')
             # shell_rect may be 0 in Wine; native Windows Explorer acceptance remains separate.
         finally:

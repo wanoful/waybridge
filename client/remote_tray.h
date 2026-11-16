@@ -306,11 +306,13 @@ public:
     if ((expectedEpoch && expectedEpoch != epoch) ||
         (expectedGeneration && expectedGeneration != found->second->generation))
       return false;
-    if (verb == "menu") {
+    const std::string effective =
+        verb == "activate" && found->second->info.value("item_is_menu", false) ? "menu" : verb;
+    if (effective == "menu") {
       pendingMenu = id;
       pendingGeneration = found->second->generation;
     }
-    send(action(id, *found->second, verb));
+    send(action(id, *found->second, effective));
     return true;
   }
   bool receive(const Json &message, ImageDecoder &decoder) {

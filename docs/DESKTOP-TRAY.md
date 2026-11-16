@@ -6,7 +6,7 @@ Waybridge presents Linux StatusNotifierItem applications as independent native
 Windows notification-area icons. The control center's “远端应用 → 后台应用” list
 keeps the same entries accessible when an application has closed its main
 window, or Windows has put its tray icon in the overflow area. “打开／恢复” invokes
-the application's activation method; “应用菜单” contains its own normal exit
+the application's activation method (or its menu for ItemIsMenu entries); “应用菜单” contains its own normal exit
 operation where provided. No application name/PID search or forced termination
 is involved.
 
