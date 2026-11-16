@@ -35,6 +35,9 @@ def main():
    with os.fdopen(read) as pipe:display=':'+pipe.readline().strip()
    wine={**os.environ,'DISPLAY':display,'WINEPREFIX':str(root/'wine'),'WINEDEBUG':'-all','WINEDLLOVERRIDES':'winemenubuilder.exe=d;mscoree,mshtml=','WAYBRIDGE_PNG':'1','WAYBRIDGE_GDI':'1','WAYBRIDGE_TRAY_TRACE':'1'}
    client=spawn(['wine',str(args.client),'127.0.0.1',str(port),token],wine)
+   # The controller HWND exists before the asynchronously delivered tray item.
+   # Wait for registration before sending the fixture's one real click.
+   wait(lambda:'Tray shell id=100 version4=1' in (root/'run.log').read_text(),45)
    def driver(*args):return subprocess.run(['wine',str(ROOT/'build/tests/windows-tray-driver.exe'),*args],cwd=ROOT,env=wine,stdout=log,stderr=log,timeout=5).returncode==0
    wait(lambda:driver('left' if args.single_left else 'left-sequence'),45);wait(lambda:any(e['event']=='activate' and e['visible'] for e in events()))
    wait(lambda:any(e['event']=='focus' for e in events()))

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production XDND source → real Qt/X11 dropEvent, text/URI and INCR."""
+"""Independent XDND peer → real Qt/X11 dropEvent, text/URI and INCR."""
 import base64,json,os,shlex,subprocess,tempfile,time
 from pathlib import Path
 from smoke import ROOT

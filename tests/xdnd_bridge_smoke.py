@@ -24,7 +24,7 @@ def main():
         token.write_text('xdnd-bridge-' + '5' * 40)
         token.chmod(0o600)
         env = {**os.environ, 'XDG_RUNTIME_DIR': directory, 'WAYLAND_DISPLAY': 'xdnd-0',
-               'QT_QPA_PLATFORM': 'xcb', 'GVFS_DISABLE_FUSE': '1', 'RUST_LOG': 'waybridge=debug'}
+               'QT_QPA_PLATFORM': 'xcb', 'GVFS_DISABLE_FUSE': '1', 'WAYBRIDGE_DND_FIXTURE_MOVE':'1', 'RUST_LOG': 'waybridge=debug'}
         with socket.socket() as free:
             free.bind(('127.0.0.1', 0))
             port = free.getsockname()[1]

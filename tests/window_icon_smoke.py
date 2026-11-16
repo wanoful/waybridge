@@ -67,7 +67,8 @@ def main():
                         for line in app.stdout: app.lines.put(line.rstrip('\n'))
                         app.lines.put(None)
                     threading.Thread(target=collect,daemon=True).start()
-                    assert app.lines.get(timeout=10)=='READY'
+                    ready=app.lines.get(timeout=10)
+                    assert ready=='READY',(ready,app.poll(),application_env.get('DISPLAY'))
                     info=viewer.until(lambda k,v:k=='control' and v['type']=='window' and v.get('title')==('X11' if mode.startswith('x11') else 'Wayland')+' runtime icon fixture')
                     assert pixel(viewer.icon(info['id'],info['icon_revision']))==((0,255,0,255) if mode.startswith('x11-') else (255,0,0,255))
                     return app,info['id'],info['icon_revision']

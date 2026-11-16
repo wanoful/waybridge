@@ -17,6 +17,7 @@ from drag_out_smoke import wait_for
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', required=True)
+    parser.add_argument('--backend',choices=('wayland','xcb'),default='wayland')
     args = parser.parse_args()
     key = 'Waybridge-data-drag-' + uuid.uuid4().hex[:12]
     def remote(code):
@@ -29,6 +30,8 @@ def main():
     output = ROOT / 'build/tests/windows-data-drag-probe.exe'
     subprocess.run(['x86_64-w64-mingw32-g++', '-std=c++17', '-D_WIN32_WINNT=0x0A00', '-municode', '-static', '-O1',
         'tests/windows_data_drag_probe.cpp', '-o', str(output), '-lole32', '-lshell32', '-luuid'], cwd=ROOT, check=True)
+    executable=ROOT / ('build/tests/windows-drag-widgets-'+args.backend)
+    subprocess.run(['c++','-std=c++17','-fPIC','-DWAYBRIDGE_DND_XCB_TRACE','tests/drag_widgets.cpp','-o',str(executable),*subprocess.check_output(['pkg-config','--cflags','--libs','Qt6Widgets','xcb'],text=True).split()],cwd=ROOT,check=True)
     remote_root = remote('[IO.Path]::GetTempPath()').rstrip('\\') + '\\' + key
     remote("New-Item -ItemType Directory -Path '" + remote_root + "' | Out-Null")
     with tempfile.TemporaryDirectory(prefix='waybridge-physical-data-') as directory:
@@ -37,18 +40,18 @@ def main():
         token.write_text('physical-data-' + uuid.uuid4().hex)
         token.chmod(0o600)
         env = {**os.environ, 'XDG_RUNTIME_DIR': directory, 'WAYLAND_DISPLAY': 'physical-0',
-            'QT_QPA_PLATFORM': 'wayland', 'QT_WAYLAND_DISABLE_WINDOWDECORATION': '1', 'GVFS_DISABLE_FUSE': '1'}
+            'QT_QPA_PLATFORM': args.backend, 'QT_WAYLAND_DISABLE_WINDOWDECORATION': '1', 'GVFS_DISABLE_FUSE': '1', 'RUST_LOG':'waybridge=debug,smithay::xwayland::xwm::dnd=trace'}
         with socket.socket() as free:
             free.bind(('127.0.0.1', 0)); port = free.getsockname()[1]
         children = []
-        logpath = ROOT / 'build/tests/data-drag-laptop.log'
+        logpath = ROOT / ('build/tests/data-drag-laptop-'+args.backend+'.log')
         with logpath.open('w+') as log, (root / 'app.log').open('w+') as app_log:
             try:
                 server = subprocess.Popen([str(ROOT / 'target/debug/waybridge'), '--socket', 'physical-0', '--listen',
-                    f'127.0.0.1:{port}', '--token-file', str(token), '--codec', 'png', '--no-audio', '--no-xwayland'],
+                    f'127.0.0.1:{port}', '--token-file', str(token), '--codec', 'png', '--no-audio'] + (['--no-xwayland'] if args.backend=='wayland' else []),
                     env=env, stdout=log, stderr=log); children.append(server)
-                wait_for(lambda: (root / 'physical-0').exists())
-                app = subprocess.Popen([str(ROOT / 'build/tests/drag-widgets')], env=env, stdout=app_log, stderr=app_log); children.append(app)
+                wait_for(lambda: (root / 'physical-0.session.json').exists())
+                app = subprocess.Popen([str(ROOT/'target/debug/waybridge'),'--socket','physical-0','--launch','--',str(executable)], env=env, stdout=app_log, stderr=app_log); children.append(app)
                 for source, name in [(ROOT / 'build/windows/waybridge-client.exe', 'viewer.exe'), (output, 'driver.exe')]:
                     subprocess.run(['scp', '-q', str(source), args.host + ':' + remote_root.replace('\\', '/') + '/' + name], check=True, timeout=30)
                 remote_port = int(remote('$l=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$l.Start();$p=$l.LocalEndpoint.Port;$l.Stop();$p'))
@@ -95,8 +98,12 @@ Start-ScheduledTask -TaskName $name
                 assert result and result.splitlines()[0] == '0', result + '\nQT events:\n' + (root / 'app.log').read_text()
                 text = (root / 'app.log').read_text()
                 assert text.count('OTHER ') >= 3 and 'Windows 你好' in text, text
-                assert text.count('TEXT_DRAG_ENDED 2') >= 2 and text.count('TEXT_DRAG_ENDED 1') >= 1, text
+                if args.backend=='wayland':
+                    assert text.count('TEXT_DRAG_ENDED 2') >= 2 and text.count('TEXT_DRAG_ENDED 1') >= 1, text
+                else:
+                    assert text.count('XFINISHED 1 ') >= 3 and 'XFINISHED 1 1' in text, text
                 log.write('\nQt source/target events:\n' + text); log.flush()
+                print('BACKEND:',args.backend)
                 print('PASS: physical Windows production viewer, Qt cross-window capture, OLE-return, native Unicode out/in; owned fixture only')
                 print('Transcript:', logpath)
             finally:

@@ -1033,7 +1033,9 @@ public:
       return running && textTarget == target && TextDrag::currentTarget(target) && findWindow() &&
              !hostedReadOnly;
     };
-    if (dataDragNegotiated && current() && FileDrag::returnToRemote(data, position(point))) {
+    auto actualTarget = windowDragTarget({point.x, point.y});
+    if (dataDragNegotiated && current() && actualTarget && actualTarget->id == windowId &&
+        FileDrag::returnToRemote(data, position(point))) {
       *effect = DROPEFFECT_NONE;
       return S_OK;
     }
@@ -1089,6 +1091,17 @@ public:
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL point, DWORD *effect) override {
+    AddRef();
+    VirtualFiles::Com<IDropTarget> self(this);
+    // OLE can enter an owned window's nonclient/transparent area first and
+    // then move into its image without issuing a second DragEnter.
+    auto actualTarget = windowDragTarget({point.x, point.y});
+    if (dataDragNegotiated && !hostedReadOnly && findWindow() && actualTarget &&
+        actualTarget->id == windowId && FileDrag::ownObject &&
+        FileDrag::returnToRemote(FileDrag::ownObject, position(point))) {
+      *effect = DROPEFFECT_NONE;
+      return S_OK;
+    }
     if (textDrag) {
       if (!TextDrag::currentTarget(textTarget) || !findWindow() || hostedReadOnly ||
           !hostedDragText) {
@@ -1504,7 +1517,19 @@ void pointer(RemoteWindow *w, LPARAM param) {
             {"origin_x", w->originX},
             {"origin_y", w->originY}});
 }
+bool acceptsInput(RemoteWindow *w, LPARAM point);
 RemoteWindow *windowDragTarget(POINT point) {
+  // Use Windows' input hit test before inspecting visual stacking. Native OLE
+  // can create transparent tracking windows that EnumWindows also reports.
+  HWND hit = GetAncestor(WindowFromPoint(point), GA_ROOT);
+  for (auto &[id, window] : windows) {
+    if (window->hwnd != hit || id == windowDrag.attached) continue;
+    POINT local = point;
+    ScreenToClient(hit, &local);
+    RECT image = imageRect(window.get());
+    if (PtInRect(&image, local) && (!semanticsNegotiated || acceptsInput(window.get(), MAKELPARAM(point.x, point.y))))
+      return window.get();
+  }
   struct Search { POINT point; RemoteWindow *target = nullptr; } search{point};
   EnumWindows([](HWND hwnd, LPARAM data) -> BOOL {
     auto &s = *reinterpret_cast<Search *>(data);
@@ -1521,6 +1546,10 @@ RemoteWindow *windowDragTarget(POINT point) {
       POINT local = s.point;
       ScreenToClient(hwnd, &local);
       RECT image = imageRect(window.get());
+      // The same input region applies to ordinary hit testing and DND.
+      // Transparent source visuals must not occlude the window underneath.
+      bool accepts = !semanticsNegotiated || acceptsInput(window.get(), MAKELPARAM(s.point.x, s.point.y));
+      if (!accepts) return TRUE;
       if (PtInRect(&image, local)) s.target = window.get();
       break;
     }
