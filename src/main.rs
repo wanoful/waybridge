@@ -1053,6 +1053,8 @@ impl App {
             "ping" => self.control(json!({"type":"pong","nonce":value["nonce"]})),
             "hello" => {
                 if let Some(enabled) = value["data_drag_v1"].as_bool() {
+                    let enabled =
+                        enabled && self.peer.as_ref().is_some_and(|p| p.data_drag_enabled());
                     if !enabled {
                         self.stop_drag_visual();
                     }
