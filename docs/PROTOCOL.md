@@ -729,3 +729,36 @@ or icon destruction, connection failure and feature reset remove it and stop
 the timer; older generations/revisions cannot resurrect a closed image.
 Drag-end controls also replace a pending bitmap with a coalesced reset marker,
 so a stale image waiting in the UI inbox cannot reappear after that end.
+
+### Generic MIME drag negotiation (`data_drag_v1`)
+
+A viewer opts in in its initial authenticated hello; the server echoes the
+capability. This enables pure UTF-8 text export, capture/routing of all ordinary
+Wayland data drags between independent native windows, return from OLE to the
+original Wayland source, and bounded `drag_visual` feedback. Legacy peers retain
+their previous file and toplevel-drag paths.
+
+- A text `drag_offer` uses the existing `drag`, source `id`, `action:"copy"`
+  fields, `files:[]`, `mime` and base64 `text` (at most 1 MiB UTF-8, no NUL).
+  It becomes native `CF_UNICODETEXT`, without modifying the clipboard.
+- `text_drag_enter {drag,id,x,y,origin_x,origin_y,data}` offers bounded base64
+  UTF-8 to a remote target. `text_drag_motion`, `text_drag_drop` and
+  `text_drag_cancel` reference the viewer's positive gesture ID. The target
+  answers `text_drag_status {drag,accepted}` only for current negotiation;
+  acceptance requires a supported MIME and COPY action. Coordinates follow
+  ordinary pointer geometry/origin rules. Read-only, disconnect and target
+  closure invalidate the gesture. X11 targets are routed through private XDND.
+- `drag_return {drag,return_token,id,x,y,origin_x,origin_y}` returns an active
+  native OLE drag to the original Wayland source. The monotonic token scopes
+  `drag_return_ready {drag,return_token,accepted}`; stale replies cannot release
+  a later handoff. The client cancels only that OLE attempt, invalidates its old
+  IDataObject/IStream leases and resumes pointer capture. It defers release
+  briefly for target negotiation, rather than reporting a cancelled source as
+  a newly uploaded successful drop.
+
+Compositor-owned offers carry internal source cookies: a dropped offer may read
+its own immutable payload after a newer gesture begins, and its late Finish
+cannot clear that newer gesture. Selection pipe writers have bounded concurrency
+and write deadlines. These internal identities are not filenames or application
+compatibility rules. See [DESKTOP_INTERACTIONS.md](DESKTOP_INTERACTIONS.md) for the
+precise direction, MIME, action and hover coverage.
