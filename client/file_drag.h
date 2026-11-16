@@ -594,20 +594,21 @@ inline void releasedBeforeStart() {
   if (cancel)
     transfer->finish(false);
 }
-inline void start(HWND controllerWindow) {
+// True only after a native gesture ends; returning to Wayland keeps its visual.
+inline bool start(HWND controllerWindow) {
   trace("start");
   auto transfer = current();
   if (!transfer)
-    return;
+    return false;
   {
     std::lock_guard<std::mutex> lock(transfer->mutex);
     if (!transfer->claimed || !transfer->ready || transfer->inOle || transfer->oleDone ||
         transfer->done || transfer->cancelled)
-      return;
+      return false;
   }
   if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
     transfer->finish(false);
-    return;
+    return false;
   }
   { std::lock_guard<std::mutex> lock(transfer->mutex);++transfer->attempt; }
   auto data = new DataObject(transfer);
@@ -634,7 +635,7 @@ inline void start(HWND controllerWindow) {
       transfer->operation=transfer->asyncEnded=transfer->asyncSuccess=false;++transfer->attempt;transfer->requests.clear();
     }
   }
-  if(returned){transfer->wake.notify_all();data->Release();PostMessageW(controllerWindow,ResumeMessage,0,0);return;}
+  if(returned){transfer->wake.notify_all();data->Release();PostMessageW(controllerWindow,ResumeMessage,0,0);return false;}
   bool finish, success;
   {
     std::lock_guard<std::mutex> lock(transfer->mutex);
@@ -648,6 +649,7 @@ inline void start(HWND controllerWindow) {
     transfer->finish(success);
   data->Release();
   PostMessageW(controllerWindow, WM_NULL, 0, 0);
+  return true;
 }
 inline bool control(const Json &message, HWND controllerWindow, HWND sourceWindow = nullptr) {
   auto type = message.value("type", "");

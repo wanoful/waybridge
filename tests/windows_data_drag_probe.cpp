@@ -67,24 +67,40 @@ public:
 static LRESULT CALLBACK proc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp){
   if(message==WM_CLOSE || message==WM_TIMER){PostQuitMessage(0);return 0;}return DefWindowProcW(hwnd,message,wp,lp);
 }
-static POINT point(HWND hwnd,int x,int y){POINT p{x,y};ClientToScreen(hwnd,&p);return p;}
+static POINT point(HWND hwnd,int x,int y){auto dpi=GetDpiForWindow(hwnd);POINT p{MulDiv(x,int(dpi),96),MulDiv(y,int(dpi),96)};ClientToScreen(hwnd,&p);return p;}
 static void move(POINT a,POINT b){for(int i=1;i<=16;++i){SetCursorPos(a.x+(b.x-a.x)*i/16,a.y+(b.y-a.y)*i/16);Sleep(30);}}
 int wmain(int argc,wchar_t **argv){
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   if(argc!=2)return 2;std::wstring mode=argv[1];
   HWND source=FindWindowW(L"WaybridgeRemote",L"Waybridge drag source");
   HWND remoteTarget=FindWindowW(L"WaybridgeRemote",L"Waybridge drag target");
   if(!source || !remoteTarget)return 3;
+  struct RestoreOrder {
+    HWND a,b;bool aTop,bTop;
+    ~RestoreOrder(){for(auto pair:{std::pair<HWND,bool>{a,aTop},{b,bTop}})if(IsWindow(pair.first))SetWindowPos(pair.first,pair.second?HWND_TOPMOST:HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);}
+  } order{source,remoteTarget,(GetWindowLongPtrW(source,GWL_EXSTYLE)&WS_EX_TOPMOST)!=0,(GetWindowLongPtrW(remoteTarget,GWL_EXSTYLE)&WS_EX_TOPMOST)!=0};
+  bool isolate=GetEnvironmentVariableW(L"WAYBRIDGE_PROBE_ISOLATE",nullptr,0)!=0;
+  HWND level=isolate?HWND_TOPMOST:HWND_TOP;
   POINT original{};GetCursorPos(&original);HWND foreground=GetForegroundWindow();
   OleInitialize(nullptr);
   WNDCLASSW wc{};wc.lpfnWndProc=proc;wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=L"WaybridgeTextTest";RegisterClassW(&wc);
   targetWindow=CreateWindowExW(0,wc.lpszClassName,L"Waybridge native text test",WS_OVERLAPPEDWINDOW|WS_VISIBLE,1050,500,400,250,nullptr,nullptr,wc.hInstance,nullptr);
   auto target=new Target;RegisterDragDrop(targetWindow,target);target->Release();
   SetTimer(targetWindow,1,18000,nullptr);
-  SetWindowPos(source,nullptr,80,80,600,430,SWP_NOZORDER|SWP_NOACTIVATE);
-  SetWindowPos(remoteTarget,nullptr,750,80,600,380,SWP_NOZORDER|SWP_NOACTIVATE);
+  SetWindowPos(source,level,80,80,600,430,SWP_NOACTIVATE);
+  SetWindowPos(remoteTarget,level,750,80,600,380,SWP_NOACTIVATE);
+  SetWindowPos(targetWindow,level,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
   SetForegroundWindow(mode==L"in"?targetWindow:source);Sleep(400);
   std::thread driver([&]{
     POINT start=mode==L"in"?point(targetWindow,50,50):point(source,60,40);
+    HWND expectedSource=mode==L"in"?targetWindow:source;
+    HWND expectedTarget=mode==L"out"?targetWindow:remoteTarget;
+    auto destinationCheck=point(expectedTarget,100,120);
+    if(GetAncestor(WindowFromPoint(start),GA_ROOT)!=expectedSource || GetAncestor(WindowFromPoint(destinationCheck),GA_ROOT)!=expectedTarget){
+      wchar_t a[100]{},b[100]{};GetClassNameW(GetAncestor(WindowFromPoint(start),GA_ROOT),a,100);GetClassNameW(GetAncestor(WindowFromPoint(destinationCheck),GA_ROOT),b,100);
+      std::wcout<<L"OCCLUDED "<<a<<L" -> "<<b<<L" START "<<start.x<<L","<<start.y<<L" DEST "<<destinationCheck.x<<L","<<destinationCheck.y<<std::endl;
+      outcome=4;oleStarted=true;PostMessageW(targetWindow,WM_CLOSE,0,0);return;
+    }
     SetCursorPos(start.x,start.y);mouse_event(MOUSEEVENTF_LEFTDOWN,0,0,0,0);Sleep(150);
     if(mode==L"in"){while(!oleStarted)Sleep(10);Sleep(100);}
     if(mode!=L"in"){
@@ -106,6 +122,7 @@ int wmain(int argc,wchar_t **argv){
     for(int i=0;i<200 && !(GetKeyState(VK_LBUTTON)&0x8000);++i){
       MSG pending{};while(PeekMessageW(&pending,nullptr,0,0,PM_REMOVE)){TranslateMessage(&pending);DispatchMessageW(&pending);}Sleep(5);
     }
+    if(outcome==4){driver.join();RevokeDragDrop(targetWindow);DestroyWindow(targetWindow);OleUninitialize();return 4;}
     oleStarted=true;TextData *data=new TextData;Source input;DWORD effect=0;
     auto hr=DoDragDrop(data,&input,DROPEFFECT_COPY,&effect);data->Release();
     if(hr==DRAGDROP_S_DROP && effect==DROPEFFECT_COPY)outcome=0;

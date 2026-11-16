@@ -2945,7 +2945,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         releasePointer();
         suspendImeForOle();
       }
-      FileDrag::start(hwnd);
+      if (FileDrag::start(hwnd)) dragVisual.reset();
       updateIme();
       return 0;
     }

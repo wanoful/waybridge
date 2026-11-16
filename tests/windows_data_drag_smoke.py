@@ -13,7 +13,7 @@ from drag_out_smoke import wait_for
 def main():
     output = ROOT / 'build/tests/windows-data-drag-probe.exe'
     subprocess.run(['x86_64-w64-mingw32-g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
-        '-Wno-misleading-indentation', '-municode', '-static', '-O1', 'tests/windows_data_drag_probe.cpp',
+        '-Wno-misleading-indentation', '-D_WIN32_WINNT=0x0A00', '-municode', '-static', '-O1', 'tests/windows_data_drag_probe.cpp',
         '-o', str(output), '-lole32', '-lshell32', '-luuid'], cwd=ROOT, check=True)
     executable = ROOT / 'build/tests/drag-widgets'
     subprocess.run(['c++', '-std=c++17', '-fPIC', str(ROOT / 'tests/drag_widgets.cpp'), '-o', str(executable),

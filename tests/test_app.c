@@ -88,9 +88,9 @@ static void drag_enter(void *d, struct wl_data_device *device, uint32_t serial,
   (void)x;
   (void)y;
   drop_offer = offer;
-  // This fixture is also the outbound source. Accept a local drop only
-  // when a destination was configured; otherwise it must reject its own drag.
-  if (offer && (!drag_source || getenv("WAYBRIDGE_TEST_DROP"))) {
+  // This fixture also exports files. Its target models an external receiver,
+  // so releasing over the source must reject a self-drop in both test modes.
+  if (offer && !drag_source) {
     wl_data_offer_accept(offer, serial, "text/uri-list");
     wl_data_offer_set_actions(offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
                               WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);

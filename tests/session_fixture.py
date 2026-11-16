@@ -59,6 +59,16 @@ class SessionFixture:
             (catalog / 'org.freedesktop.portal.Documents.service').write_text(
                 '[D-BUS Service]\nName=org.freedesktop.portal.Documents\nExec=/usr/bin/python3 "' + quoted + '"\n')
 
+        # Per-test display runtimes are shorter-lived than this shared bus.
+        # GVFS URI APIs remain real; only its optional filesystem mirror is
+        # disabled on the disposable test bus, so it cannot pin those runtimes.
+        gvfs = next((Path(p) for p in ('/usr/lib/gvfsd', '/usr/libexec/gvfsd') if Path(p).is_file()), None)
+        if gvfs:
+            catalog = Path(self.env['XDG_DATA_HOME']) / 'dbus-1/services'
+            catalog.mkdir(parents=True, exist_ok=True)
+            (catalog / 'org.gtk.vfs.Daemon.service').write_text(
+                '[D-BUS Service]\nName=org.gtk.vfs.Daemon\nExec=' + str(gvfs) + ' --no-fuse\n')
+
     def __enter__(self):
         self.log = (self.root / 'bus.log').open('w')
         self.bus = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address=1'],
