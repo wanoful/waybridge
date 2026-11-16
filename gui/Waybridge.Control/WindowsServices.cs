@@ -94,7 +94,8 @@ internal sealed class TrayIcon : IDisposable
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr CreateWindowExW(uint ex, string name, string title, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
     [DllImport("user32.dll")] private static extern IntPtr DefWindowProcW(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")] private static extern bool DestroyWindow(IntPtr hwnd);
-    [DllImport("user32.dll")] private static extern IntPtr LoadIconW(IntPtr instance, IntPtr name);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr LoadImageW(IntPtr instance, string name, uint type, int width, int height, uint flags);
+    [DllImport("user32.dll")] private static extern bool DestroyIcon(IntPtr icon);
     [DllImport("user32.dll")] private static extern IntPtr CreatePopupMenu();
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool AppendMenuW(IntPtr menu, uint flags, nuint id, string text);
     [DllImport("user32.dll")] private static extern uint TrackPopupMenu(IntPtr menu, uint flags, int x, int y, int reserved, IntPtr owner, IntPtr rect);
@@ -118,7 +119,7 @@ internal sealed class TrayIcon : IDisposable
         hwnd = CreateWindowExW(0x80, ClassName, "", 0, 0, 0, 0, 0, IntPtr.Zero, IntPtr.Zero, wc.Instance, IntPtr.Zero);
         if (hwnd == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
         data = new NotifyData { Size = (uint)Marshal.SizeOf<NotifyData>(), Window = hwnd, Id = 1,
-            Flags = 1 | 2 | 4, Message = Callback, Icon = LoadIconW(IntPtr.Zero, (IntPtr)32512),
+            Flags = 1 | 2 | 4, Message = Callback, Icon = LoadImageW(IntPtr.Zero, Path.Combine(AppContext.BaseDirectory, "Assets", "waybridge.ico"), 1, 0, 0, 0x10 | 0x40),
             Tip = "Waybridge · 未连接", Info = "", InfoTitle = "" };
         if (!Shell_NotifyIconW(0, ref data)) throw new IOException("无法创建系统托盘图标");
     }
@@ -162,5 +163,5 @@ internal sealed class TrayIcon : IDisposable
         }
         return DefWindowProcW(window, message, wp, lp);
     }
-    public void Dispose() { Shell_NotifyIconW(2, ref data); DestroyWindow(hwnd); GC.KeepAlive(callback); }
+    public void Dispose() { Shell_NotifyIconW(2, ref data); DestroyWindow(hwnd); if (data.Icon != IntPtr.Zero) DestroyIcon(data.Icon); GC.KeepAlive(callback); }
 }

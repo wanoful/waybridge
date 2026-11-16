@@ -2710,7 +2710,15 @@ void applyHostedSettings(const Json &settings, bool live) {
       (codec!="auto" && codec!="png" && codec!="h264" && codec!="hevc" && codec!="av1") ||
       (clipboard!="both" && clipboard!="send" && clipboard!="receive" && clipboard!="off"))
     throw std::runtime_error("Invalid settings range");
+  std::string badge = settings.value("badge_png", "");
+  if (badge.size() > 32768) throw std::runtime_error("Custom badge is too large");
+  auto badgeBytes = unbase64(badge);
+  if (!badge.empty() && badgeBytes.empty()) throw std::runtime_error("Invalid custom badge encoding");
+  ImageDecoder badgeDecoder;
+  if (!IconBadge::configure(badgeBytes, badgeDecoder))
+    throw std::runtime_error("Custom badge must be a 64x64 PNG (at most 24 KiB)");
   if (live) {
+    for (auto &[id, window] : windows) window->icon.apply(window->hwnd, window->dpi);
     for (const char *key : {"hdr", "udp", "udp_host", "audio_device"})
       if (hostedSettings.value(key, Json()) != settings.value(key, Json())) {
         hostControl.emit({{"type","settings_warning"},{"message","HDR、UDP 或声音设备已保存；请断开并重新连接使其生效"}});

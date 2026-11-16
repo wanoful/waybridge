@@ -20,10 +20,17 @@ public sealed record ClientSettings
     public string Clipboard { get; set; } = "both";
     public bool ClipboardImages { get; set; } = true;
     public bool Files { get; set; } = true;
+    public string BadgePng { get; set; } = "";
     public int Volume { get; set; } = 100;
     public string GpuInput { get; set; } = "cpu";
     public void Validate()
     {
+        if (BadgePng is null || BadgePng.Length > 32768) throw new ArgumentException("自定义角标过大");
+        if (BadgePng.Length > 0)
+        {
+            try { if (Convert.FromBase64String(BadgePng).Length > 24 * 1024) throw new ArgumentException("自定义角标过大"); }
+            catch (FormatException) { throw new ArgumentException("自定义角标编码无效"); }
+        }
         if (Codec is not ("auto" or "png" or "h264" or "hevc" or "av1")) throw new ArgumentException("不支持的视频编码");
         if (Fps is < 1 or > 120 || Bitrate is < 1000 or > 200000) throw new ArgumentException("帧率范围 1–120，码率范围 1000–200000 kbps");
         if (Dpi != 0 && Dpi is < 96 or > 384) throw new ArgumentException("缩放范围 100%–400%");

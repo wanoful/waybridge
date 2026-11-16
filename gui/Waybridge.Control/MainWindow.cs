@@ -44,6 +44,8 @@ internal sealed class MainWindow : Window
     private readonly Slider volume = new() { Minimum = 0, Maximum = 100, Value = 100, StepFrequency = 1, MinWidth = 200 };
     private readonly Button connect = Button("连接", true), end = Button("结束远端会话"), save = Button("保存连接");
     private readonly Button addProfile = Button("新建"), deleteProfile = Button("删除");
+    private string badgePng = "";
+    private readonly Image badgePreview = new() { Width = 32, Height = 32 };
     private readonly TextBlock actual = new() { Text = "实际编码／解码／呈现：等待连接", TextWrapping = TextWrapping.Wrap };
     private readonly TextBox applicationSearch = new() { PlaceholderText = "搜索已安装应用" };
     private readonly ListView applicationList = new() { SelectionMode = ListViewSelectionMode.Single, MaxHeight = 430 };
@@ -65,6 +67,7 @@ internal sealed class MainWindow : Window
         Title = "Waybridge";
         hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         var appWindow = AppWindow.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(hwnd));
+        appWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "waybridge.ico"));
         double density = GetDpiForWindow(hwnd) / 96.0;
         var work = DisplayArea.GetFromWindowId(appWindow.Id, DisplayAreaFallback.Nearest).WorkArea;
         appWindow.Resize(new Windows.Graphics.SizeInt32(Math.Min(work.Width - 40, (int)(1050*density)), Math.Min(work.Height - 40, (int)(780*density))));
@@ -278,10 +281,33 @@ internal sealed class MainWindow : Window
             Row("服务端颜色输入", "只在创建新 Linux 会话时生效", gpu),
             actual, Actions(apply, restart));
     }
+    private UIElement BadgeEditor()
+    {
+        var choose = Button("选择图片");
+        var reset = Button("使用 Waybridge 图标");
+        choose.Click += async (_, _) => await GuardAsync(async () =>
+        {
+            var picker = new FileOpenPicker();
+            foreach (string extension in new[] { ".png", ".jpg", ".jpeg", ".bmp", ".ico" }) picker.FileTypeFilter.Add(extension);
+            WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+            var file = await picker.PickSingleFileAsync();
+            if (file is null) return;
+            badgePng = await IconBranding.NormalizeAsync(file);
+            await UpdateBadgePreviewAsync();
+        });
+        reset.Click += async (_, _) => { badgePng = ""; await GuardAsync(UpdateBadgePreviewAsync); };
+        return Column(Row("远端图标角标", "保留应用图标，在右上角标记来源；随当前连接保存，可实时应用", badgePreview), Actions(choose, reset));
+    }
+    private async Task UpdateBadgePreviewAsync()
+    {
+        string current = badgePng;
+        var preview = await IconBranding.PreviewAsync(current);
+        if (current == badgePng) badgePreview.Source = preview;
+    }
     private UIElement InputPage()
     {
         var apply = Button("应用到当前连接", true); apply.Click += async (_, _) => await GuardAsync(ApplyAsync);
-        return Column(Row("剪贴板方向", "可分别限制 Windows 与 Linux 间的数据同步", clipboard),
+        return Column(BadgeEditor(), Row("剪贴板方向", "可分别限制 Windows 与 Linux 间的数据同步", clipboard),
             Row("剪贴板图片", "文本同步保持独立", images),
             Row("文件与目录共享", "控制剪贴板文件、拖入与拖出", files),
             Row("只读模式", "暂停键盘和鼠标输入，服务端同时释放按键与指针锁定", readOnly),
@@ -388,6 +414,8 @@ internal sealed class MainWindow : Window
         reconnect.IsOn = profile.AutoReconnect;
         token.Password = secrets.Read(profile.Id) ?? ""; remember.IsChecked = token.Password.Length > 0;
         var settings = profile.Settings;
+        badgePng = settings.BadgePng;
+        _ = GuardAsync(UpdateBadgePreviewAsync);
         codec.SelectedIndex = Array.IndexOf(new[] { "auto", "h264", "hevc", "av1", "png" }, settings.Codec);
         fps.Value = settings.Fps; bitrate.Value = settings.Bitrate / 1000.0;
         scale.SelectedIndex = Array.IndexOf(new[] { 0, 96, 120, 144, 168, 192, 240, 288, 384 }, settings.Dpi);
@@ -410,7 +438,7 @@ internal sealed class MainWindow : Window
             Audio = audio.IsOn, Volume = (int)volume.Value, AudioDevice = audioDevices[Math.Clamp(output.SelectedIndex, 0, audioDevices.Count - 1)].Id,
             Hdr = hdr.IsOn, Udp = udp.IsOn, UdpHost = udpHost.Text.Trim(), GpuInput = gpu.SelectedIndex == 1 ? "cuda" : "cpu",
             Clipboard = new[] { "both", "send", "receive", "off" }[Math.Max(0, clipboard.SelectedIndex)],
-            ClipboardImages = images.IsOn, Files = files.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn
+            BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn
         };
         var result = selected with
         {
