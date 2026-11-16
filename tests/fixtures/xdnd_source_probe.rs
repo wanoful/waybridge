@@ -1,5 +1,5 @@
-//! Drives the production XDND worker against an actual toolkit target.
-#[path = "../../src/xdnd/core.rs"]
+//! Drives the independent XDND conformance peer against an actual toolkit target.
+#[path = "xdnd_peer.rs"]
 mod xdnd;
 use anyhow::{bail, Result};
 use std::{

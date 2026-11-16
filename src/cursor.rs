@@ -113,7 +113,12 @@ impl App {
         }
         self.cursor.last_tick = Instant::now();
         // Pointer focus is independent of keyboard activation and release_input.
-        let focus = self.seat.get_pointer().unwrap().current_focus();
+        let focus = self
+            .seat
+            .get_pointer()
+            .unwrap()
+            .current_focus()
+            .and_then(|s| s.wl_surface().map(|s| s.into_owned()));
         let root = focus.as_ref().map(|s| self.root_for(s));
         let id = self
             .windows

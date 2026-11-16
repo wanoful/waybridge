@@ -1,6 +1,4 @@
 //! Opt-in rootless Xwayland; each X11 surface uses the existing independent window transport.
-#[path = "xdnd.rs"]
-pub mod xdnd;
 use super::*;
 use smithay::{
     reexports::calloop::LoopHandle,
@@ -18,28 +16,28 @@ static WRITERS: AtomicUsize = AtomicUsize::new(0);
 use smithay::input::keyboard::{KeyboardTarget, KeysymHandle, ModifiersState};
 use smithay::wayland::seat::WaylandFocus;
 #[derive(Clone, Debug, PartialEq)]
-pub enum KeyboardFocus {
+pub enum InputFocus {
     Wayland(WlSurface),
-    X11(X11Surface),
+    X11(Arc<X11Surface>),
 }
-impl From<WlSurface> for KeyboardFocus {
+impl From<WlSurface> for InputFocus {
     fn from(s: WlSurface) -> Self {
         Self::Wayland(s)
     }
 }
-impl From<PopupKind> for KeyboardFocus {
+impl From<PopupKind> for InputFocus {
     fn from(p: PopupKind) -> Self {
         Self::Wayland(p.wl_surface().clone())
     }
 }
-impl From<KeyboardFocus> for WlSurface {
-    fn from(f: KeyboardFocus) -> Self {
+impl From<InputFocus> for WlSurface {
+    fn from(f: InputFocus) -> Self {
         f.wl_surface()
             .expect("mapped keyboard surface")
             .into_owned()
     }
 }
-impl IsAlive for KeyboardFocus {
+impl IsAlive for InputFocus {
     fn alive(&self) -> bool {
         match self {
             Self::Wayland(s) => s.alive(),
@@ -47,7 +45,7 @@ impl IsAlive for KeyboardFocus {
         }
     }
 }
-impl WaylandFocus for KeyboardFocus {
+impl WaylandFocus for InputFocus {
     fn wl_surface(&self) -> Option<std::borrow::Cow<'_, WlSurface>> {
         match self {
             Self::Wayland(s) => Some(std::borrow::Cow::Borrowed(s)),
@@ -55,17 +53,17 @@ impl WaylandFocus for KeyboardFocus {
         }
     }
 }
-impl KeyboardTarget<App> for KeyboardFocus {
+impl KeyboardTarget<App> for InputFocus {
     fn enter(&self, seat: &Seat<App>, app: &mut App, keys: Vec<KeysymHandle<'_>>, serial: Serial) {
         match self {
             Self::Wayland(s) => KeyboardTarget::enter(s, seat, app, keys, serial),
-            Self::X11(s) => KeyboardTarget::enter(s, seat, app, keys, serial),
+            Self::X11(s) => KeyboardTarget::enter(s.as_ref(), seat, app, keys, serial),
         }
     }
     fn leave(&self, seat: &Seat<App>, app: &mut App, serial: Serial) {
         match self {
             Self::Wayland(s) => KeyboardTarget::leave(s, seat, app, serial),
-            Self::X11(s) => KeyboardTarget::leave(s, seat, app, serial),
+            Self::X11(s) => KeyboardTarget::leave(s.as_ref(), seat, app, serial),
         }
     }
     fn key(
@@ -79,18 +77,17 @@ impl KeyboardTarget<App> for KeyboardFocus {
     ) {
         match self {
             Self::Wayland(s) => KeyboardTarget::key(s, seat, app, key, state, serial, time),
-            Self::X11(s) => KeyboardTarget::key(s, seat, app, key, state, serial, time),
+            Self::X11(s) => KeyboardTarget::key(s.as_ref(), seat, app, key, state, serial, time),
         }
     }
     fn modifiers(&self, seat: &Seat<App>, app: &mut App, mods: ModifiersState, serial: Serial) {
         match self {
             Self::Wayland(s) => KeyboardTarget::modifiers(s, seat, app, mods, serial),
-            Self::X11(s) => KeyboardTarget::modifiers(s, seat, app, mods, serial),
+            Self::X11(s) => KeyboardTarget::modifiers(s.as_ref(), seat, app, mods, serial),
         }
     }
 }
 pub struct State {
-    pub xdnd: Option<xdnd::Xdnd>,
     pub shell: XWaylandShellState,
     client: Option<Client>,
     pub wm: Option<X11Wm>,
@@ -111,7 +108,6 @@ impl Drop for State {
 }
 pub fn start(dh: &DisplayHandle, handle: LoopHandle<'static, App>, enabled: bool) -> Result<State> {
     let mut state = State {
-        xdnd: None,
         shell: XWaylandShellState::new::<App>(dh),
         client: None,
         wm: None,
@@ -155,17 +151,18 @@ pub fn start(dh: &DisplayHandle, handle: LoopHandle<'static, App>, enabled: bool
     let (source, client) = spawned.context("starting Xwayland")?;
     state.client = Some(client.clone());
     let wm_handle = handle.clone();
+    let dh = dh.clone();
     state.token = Some(
         handle
             .insert_source(source, move |event, _, app| match event {
                 XWaylandEvent::Ready {
                     x11_socket,
                     display_number,
-                } => match X11Wm::start_wm(wm_handle.clone(), x11_socket, client.clone()) {
+                } => match X11Wm::start_wm(wm_handle.clone(), &dh, x11_socket, client.clone()) {
                     Ok(wm) => {
                         app.x11.wm = Some(wm);
                         app.x11.display = Some(display_number);
-                        app.x11.xdnd = Some(xdnd::Xdnd::new(display_number));
+
                         tracing::info!(
                             display = format!(":{display_number}"),
                             "private rootless Xwayland ready"
@@ -186,7 +183,22 @@ pub fn start(dh: &DisplayHandle, handle: LoopHandle<'static, App>, enabled: bool
     Ok(state)
 }
 pub(super) fn input_popup(x: &X11Surface) -> bool {
-    x.is_override_redirect()
+    // Xwayland translates SHAPE input regions to wl_surface input regions.
+    // Transparent drag images must never claim menu capture.
+    let empty_input = x.wl_surface().is_some_and(|surface| {
+        with_states(&surface, |states| {
+            states
+                .cached_state
+                .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                .current()
+                .input_region
+                .as_ref()
+                .is_some_and(|r| r.rects.is_empty())
+        })
+    });
+    !empty_input
+        && !x.input_region_empty()
+        && x.is_override_redirect()
         && !matches!(
             x.window_type(),
             Some(
@@ -296,6 +308,11 @@ impl App {
             }
         }
     }
+    pub(super) fn poll_x11_dnd(&mut self) {
+        if let Some(wm) = self.x11.wm.as_mut() {
+            wm.poll_dnd(&self.x11.handle);
+        }
+    }
     pub(super) fn x11_scale(&mut self, scale: f64) {
         tracing::debug!(scale, "setting shared Xwayland DPI");
         if let Some(client) = &self.x11.client {
@@ -318,6 +335,9 @@ impl App {
         }
     }
     fn x11_add(&mut self, surface: X11Surface) {
+        if surface.window_type() == Some(smithay::xwayland::xwm::WmWindowType::Dnd) {
+            return;
+        }
         if let Some(w) = self
             .windows
             .iter_mut()
@@ -365,7 +385,8 @@ impl App {
         let Some(root) = self.x11.grab else {
             return;
         };
-        let valid = self.window(root).is_some()
+        let valid = self.data_drop.native.is_none()
+            && self.window(root).is_some()
             && self.windows.iter().any(|w| {
                 w.mapped
                     && w.window.alive()
@@ -453,6 +474,16 @@ impl XWaylandShellHandler for App {
     }
 }
 impl XwmHandler for App {
+    fn x11_dnd_requested<S: smithay::input::dnd::Source>(
+        &mut self,
+        source: S,
+        seat: Seat<Self>,
+        serial: Serial,
+        kind: smithay::input::dnd::GrabType,
+    ) {
+        self.begin_native_drag(source, None, seat, serial, kind);
+    }
+
     fn activation_request(&mut self, _: XwmId, window: X11Surface, _: u32, _: u32) {
         self.activation_x11(window);
     }
@@ -676,12 +707,7 @@ impl XwmHandler for App {
                 .wm
                 .as_mut()
                 .unwrap()
-                .send_selection(
-                    SelectionTarget::Clipboard,
-                    mime.into(),
-                    write.into(),
-                    self.x11.handle.clone(),
-                )
+                .send_selection(SelectionTarget::Clipboard, mime.into(), write.into())
                 .is_err()
             {
                 continue;
@@ -728,7 +754,6 @@ impl XwmHandler for App {
             self.clipboard_generation += 1;
         }
         self.x11.display = None;
-        self.x11.xdnd = None;
         self.x11.failed = true;
         tracing::warn!("private Xwayland disconnected; native Wayland session continues");
     }

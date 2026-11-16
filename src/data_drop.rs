@@ -1,18 +1,18 @@
 //! Shared MIME delivery and target negotiation for Wayland and private Xwayland.
 use crate::*;
-pub(crate) struct XDrop {
-    generation: u64,
-    target: u32,
-    dropped: bool,
-}
+
 /// One incoming logical offer owns negotiation, payload snapshots and delivery.
 /// Native protocol adapters report facts; this state survives button release.
 #[derive(Default)]
 pub(crate) struct Coordinator {
     pub outbound: Option<OutboundDrag>,
+    pub cancel_outbound: Option<u64>,
     pub next_outbound: u64,
+    pub source_sequence: u64,
+    pub native: Option<dnd_lifecycle::NativeDrag>,
+    pub feedback: dnd_lifecycle::FeedbackQueue,
+    pub point: Option<(u32, f64, f64)>,
     pub payload: Option<data_offer::Offer>,
-    pub x11: Option<XDrop>,
     pub window: u32,
     pub gesture: Option<u64>,
     pub target_epoch: u64,
@@ -92,6 +92,9 @@ impl App {
         if self.read_only || !self.input_allowed(id) || !x.is_finite() || !y.is_finite() {
             return false;
         }
+        if self.data_drop.native.is_some() {
+            self.cancel_window_drag();
+        }
         self.data_drop
             .snapshots
             .retain(|_, (_, created)| created.elapsed() < Duration::from_secs(120));
@@ -101,7 +104,6 @@ impl App {
         if self.data_drop.phase != Phase::Delivering {
             self.cancel_data_drop();
         }
-        self.cancel_x11_drop();
         self.data_drop.gesture = None;
         self.data_drop.window = id;
         let pointer = self.seat.get_pointer().unwrap();
@@ -118,7 +120,7 @@ impl App {
         );
         pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), self.time());
         self.release_input();
-        self.data_drop.generation = self.data_drop.generation.wrapping_add(1).max(1);
+        self.data_drop.generation = self.next_source();
         self.data_drop
             .snapshots
             .insert(self.data_drop.generation, (payload.clone(), Instant::now()));
@@ -126,26 +128,6 @@ impl App {
         self.data_drop.negotiate(false, false);
         self.data_drop.phase = if drop { Phase::Dropping } else { Phase::Hover };
         self.data_drop.deadline = drop.then(|| Instant::now() + Duration::from_secs(5));
-        if let Some(queued) =
-            self.xdnd_begin_data_drop(id, x, y, payload.snapshot(), self.data_drop.generation)
-        {
-            if queued {
-                let target = self
-                    .window(id)
-                    .and_then(|w| w.x11_surface().map(|s| s.window_id()))
-                    .unwrap();
-                self.data_drop.x11 = Some(XDrop {
-                    generation: self.data_drop.generation,
-                    target,
-                    dropped: false,
-                });
-            } else {
-                self.data_drop.snapshots.remove(&self.data_drop.generation);
-                self.data_drop.payload = None;
-                self.data_drop.deadline = None;
-            }
-            return queued;
-        }
         let serial = SERIAL_COUNTER.next_serial();
         pointer.button(
             self,
@@ -162,21 +144,14 @@ impl App {
             button: 0x110,
             location: pointer.current_location(),
         };
-        let mimes = payload.mime_types();
         let dh = self.dh.clone();
         let seat = self.seat.clone();
-        start_dnd_with_id(
-            &dh,
-            &seat,
+        let source = self.mime_source(self.data_drop.generation, payload);
+        pointer.set_grab(
             self,
+            smithay::input::dnd::DnDGrab::new_pointer(&dh, start, source, seat),
             serial,
-            Some(start),
-            None,
-            SourceMetadata {
-                mime_types: mimes,
-                dnd_action: DndAction::Copy,
-            },
-            self.data_drop.generation,
+            smithay::input::pointer::Focus::Keep,
         );
         self.pointer_motion(id, x, y);
         true
@@ -203,7 +178,6 @@ impl App {
         } else if let Some(done) = self.data_drop.complete(generation, false) {
             self.control(done);
         }
-        self.cancel_x11_drop();
         let pointer = self.seat.get_pointer().unwrap();
         if self.data_drop.synthetic_pressed {
             self.data_drop.synthetic_pressed = false;
@@ -280,19 +254,8 @@ impl App {
         {
             self.data_drop.target_epoch = value["target_epoch"].as_u64().unwrap();
             self.data_drop.negotiate(false, false);
-            if self.data_drop.x11.is_some() {
-                let epoch = self.data_drop.target_epoch;
-                if let Some(payload) = self.data_drop.payload.clone() {
-                    self.data_drop.gesture = None;
-                    let (x, y) = self.message_position(id, value);
-                    if self.begin_data_drop(id, x, y, payload, false) {
-                        self.data_drop.gesture = Some(drag);
-                        self.data_drop.target_epoch = epoch;
-                    }
-                }
-                return;
-            }
-            if self.data_drop.x11.is_none() {
+
+            {
                 let pointer = self.seat.get_pointer().unwrap();
                 pointer.motion(
                     self,
@@ -326,28 +289,7 @@ impl App {
             self.cancel_data_drop();
             return;
         }
-        self.poll_x11_drop();
-        if self.data_drop.x11.is_some() {
-            if self
-                .data_drop
-                .deadline
-                .is_some_and(|deadline| self.data_drop.accepted() || Instant::now() >= deadline)
-            {
-                self.data_drop.deadline = None;
-                let accepted = self.data_drop.accepted();
-                if let Some(active) = self.data_drop.x11.as_mut() {
-                    if accepted && !active.dropped {
-                        active.dropped = true;
-                        self.data_drop.phase = Phase::Delivering;
-                        let generation = active.generation;
-                        self.xdnd_drop(generation);
-                    } else if !self.data_drop.accepted() {
-                        self.cancel_x11_drop();
-                    }
-                }
-            }
-            return;
-        }
+
         if self
             .data_drop
             .deadline
@@ -370,31 +312,7 @@ impl App {
         }
     }
 
-    pub(crate) fn cancel_x11_drop(&mut self) {
-        if let Some(active) = self.data_drop.x11.take() {
-            self.xdnd_cancel(active.generation);
-            if let Some(done) = self.data_drop.complete(active.generation, false) {
-                self.control(done);
-            }
-        }
-    }
     fn motion_data_drop(&mut self, id: u32, x: f64, y: f64) {
-        let target = self
-            .window(id)
-            .and_then(|w| w.x11_surface().map(|s| s.window_id()));
-        if target.is_some() != self.data_drop.x11.is_some() {
-            if let Some(payload) = self.data_drop.payload.clone() {
-                let text = self.data_drop.gesture.take();
-                let epoch = self.data_drop.target_epoch;
-                let deadline = self.data_drop.deadline;
-                if self.begin_data_drop(id, x, y, payload, false) {
-                    self.data_drop.gesture = text;
-                    self.data_drop.target_epoch = epoch;
-                    self.data_drop.deadline = deadline;
-                }
-            }
-            return;
-        }
         if self.data_drop.window != id {
             self.data_drop.negotiate(false, false);
             if let Some(status) = self.data_drop.status() {
@@ -402,56 +320,6 @@ impl App {
             }
         }
         self.data_drop.window = id;
-        if let Some(active) = self.data_drop.x11.as_mut() {
-            active.target = target.unwrap();
-            let generation = active.generation;
-            if self.xdnd_motion(id, x, y, generation) == Some(false) {
-                self.cancel_x11_drop();
-            }
-        } else {
-            self.pointer_motion(id, x, y);
-        }
-    }
-    fn poll_x11_drop(&mut self) {
-        use x11::xdnd::OutcomeKind;
-        let target_alive = self.window(self.data_drop.window).is_some();
-        if self.data_drop.x11.is_some() && (!target_alive || self.read_only) {
-            self.cancel_data_drop();
-        }
-        for outcome in self.xdnd_poll() {
-            if !self
-                .data_drop
-                .x11
-                .as_ref()
-                .is_some_and(|d| d.generation == outcome.generation && d.target == outcome.target)
-            {
-                continue;
-            }
-            match outcome.kind {
-                OutcomeKind::Accepted(accepted) => {
-                    self.data_drop.negotiate(accepted, true);
-                    if let Some(status) = self.data_drop.status() {
-                        self.control(status);
-                    }
-                }
-                OutcomeKind::Dropped => {}
-                OutcomeKind::Finished(success) => {
-                    if !success {
-                        tracing::debug!("X11 target rejected or abandoned data drop");
-                    }
-                    if let Some(done) = self.data_drop.complete(outcome.generation, success) {
-                        self.control(done);
-                    }
-                    self.cancel_x11_drop();
-                }
-                OutcomeKind::Error(error) => {
-                    tracing::debug!(%error,"X11 data drop failed");
-                    if let Some(done) = self.data_drop.complete(outcome.generation, false) {
-                        self.control(done);
-                    }
-                    self.cancel_x11_drop();
-                }
-            }
-        }
+        self.pointer_motion(id, x, y);
     }
 }

@@ -1,5 +1,5 @@
-//! Real-X-server protocol adversarial fixture, using the production source worker.
-#[path = "../../src/xdnd/core.rs"]
+//! Real-X-server protocol adversarial fixture, using the independent source peer.
+#[path = "xdnd_peer.rs"]
 mod worker;
 use anyhow::{bail, Result};
 use std::{

@@ -11,13 +11,23 @@ use crate::{
         Seat, SeatHandler,
     },
     utils::{user_data::UserDataMap, Client, IsAlive, Logical, Rectangle, Serial, Size},
-    wayland::compositor,
+    wayland::{compositor, seat::WaylandFocus},
 };
+#[cfg(feature = "desktop")]
+use crate::{
+    desktop::{utils::under_from_surface_tree, WindowSurfaceType},
+    utils::Point,
+};
+
 use atomic_float::AtomicF64;
 use encoding_rs::WINDOWS_1252;
 use std::{
+    borrow::Cow,
     collections::HashSet,
-    sync::{atomic::Ordering, Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
 };
 use tracing::warn;
 use wayland_server::protocol::wl_surface::WlSurface;
@@ -44,9 +54,11 @@ pub struct X11Surface {
     xwm: Option<XwmId>,
     client_scale: Option<Arc<AtomicF64>>,
     window: X11Window,
-    conn: Weak<RustConnection>,
-    atoms: super::Atoms,
+    pub(super) conn: Weak<RustConnection>,
+    pub(super) atoms: super::Atoms,
     pub(crate) state: Arc<Mutex<SharedSurfaceState>>,
+    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    pub(super) xdnd_active: Arc<AtomicBool>,
     user_data: Arc<UserDataMap>,
 }
 
@@ -78,6 +90,8 @@ pub(crate) struct SharedSurfaceState {
     net_state: HashSet<Atom>,
     motif_hints: Vec<u32>,
     window_type: Vec<Atom>,
+    input_shape_empty: bool,
+    pub(crate) opacity: Option<u32>,
 }
 
 pub(super) type Protocols = Vec<WMProtocol>;
@@ -121,6 +135,7 @@ pub enum X11SurfaceError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(missing_docs)]
 pub enum WmWindowType {
+    Dnd,
     DropdownMenu,
     Dialog,
     Menu,
@@ -137,6 +152,10 @@ pub enum WmWindowType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(missing_docs)]
 pub enum WmWindowProperty {
+    /// X SHAPE input region changed.
+    InputRegion,
+    /// Runtime EWMH window icon changed.
+    Icon,
     Title,
     Class,
     Protocols,
@@ -147,7 +166,7 @@ pub enum WmWindowProperty {
     MotifHints,
     StartupId,
     Pid,
-    Icon,
+    Opacity,
 }
 
 impl X11Surface {
@@ -167,6 +186,7 @@ impl X11Surface {
         conn: Weak<RustConnection>,
         atoms: super::Atoms,
         geometry: Rectangle<i32, Logical>,
+        xdnd_active: Arc<AtomicBool>,
     ) -> X11Surface {
         X11Surface {
             xwm: xwm.map(|wm| wm.id),
@@ -194,7 +214,10 @@ impl X11Surface {
                 net_state: HashSet::new(),
                 motif_hints: vec![0; 5],
                 window_type: Vec::new(),
+                input_shape_empty: false,
+                opacity: None,
             })),
+            xdnd_active,
             user_data: Arc::new(UserDataMap::new()),
         }
     }
@@ -344,6 +367,10 @@ impl X11Surface {
         self.state.lock().unwrap().wl_surface_serial
     }
 
+    pub(crate) fn set_wl_surface<D: SeatHandler + 'static>(&self, _data: &mut D, surface: Option<WlSurface>) {
+        self.state.lock().unwrap().wl_surface = surface;
+    }
+
     /// Returns the current geometry of the underlying X11 window
     pub fn geometry(&self) -> Rectangle<i32, Logical> {
         self.state.lock().unwrap().geometry
@@ -372,6 +399,11 @@ impl X11Surface {
     /// Returns the PID of the underlying X11 window
     pub fn pid(&self) -> Option<u32> {
         self.state.lock().unwrap().pid
+    }
+
+    /// Returns the opacity of the underlying X11 window
+    pub fn opacity(&self) -> Option<u32> {
+        self.state.lock().unwrap().opacity
     }
 
     /// Returns if the window is considered to be a popup.
@@ -564,6 +596,7 @@ impl X11Surface {
             .iter()
             .find_map(|atom| match atom {
                 x if *x == self.atoms._NET_WM_WINDOW_TYPE_DROPDOWN_MENU => Some(WmWindowType::DropdownMenu),
+                x if *x == self.atoms._NET_WM_WINDOW_TYPE_DND => Some(WmWindowType::Dnd),
                 x if *x == self.atoms._NET_WM_WINDOW_TYPE_DIALOG => Some(WmWindowType::Dialog),
                 x if *x == self.atoms._NET_WM_WINDOW_TYPE_MENU => Some(WmWindowType::Menu),
                 x if *x == self.atoms._NET_WM_WINDOW_TYPE_NOTIFICATION => Some(WmWindowType::Notification),
@@ -623,7 +656,23 @@ impl X11Surface {
         }
     }
 
+    /// Whether X SHAPE explicitly excludes all pointer input.
+    pub fn input_region_empty(&self) -> bool {
+        self.state.lock().unwrap().input_shape_empty
+    }
+    pub(super) fn update_input_shape(&self) -> Result<(), ConnectionError> {
+        use x11rb::protocol::shape::{ConnectionExt as _, SK};
+        let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
+        if let Some(reply) = conn
+            .shape_get_rectangles(self.window, SK::INPUT)?
+            .reply_unchecked()?
+        {
+            self.state.lock().unwrap().input_shape_empty = reply.rectangles.is_empty();
+        }
+        Ok(())
+    }
     pub(super) fn update_properties(&self) -> Result<(), ConnectionError> {
+        self.update_input_shape()?;
         self.update_title()?;
         self.update_class()?;
         self.update_protocols()?;
@@ -635,12 +684,12 @@ impl X11Surface {
         self.update_motif_hints()?;
         self.update_startup_id()?;
         self.update_pid()?;
+        self.update_opacity()?;
         Ok(())
     }
 
     pub(super) fn update_property(&self, atom: Atom) -> Result<Option<WmWindowProperty>, ConnectionError> {
         match atom {
-            atom if atom == self.atoms._NET_WM_ICON => Ok(Some(WmWindowProperty::Icon)),
             atom if atom == self.atoms._NET_WM_NAME || atom == AtomEnum::WM_NAME.into() => {
                 self.update_title()?;
                 Ok(Some(WmWindowProperty::Title))
@@ -649,6 +698,7 @@ impl X11Surface {
                 self.update_class()?;
                 Ok(Some(WmWindowProperty::Class))
             }
+            atom if atom == self.atoms._NET_WM_ICON => Ok(Some(WmWindowProperty::Icon)),
             atom if atom == self.atoms.WM_PROTOCOLS => {
                 self.update_protocols()?;
                 Ok(Some(WmWindowProperty::Protocols))
@@ -680,6 +730,10 @@ impl X11Surface {
             atom if atom == self.atoms._NET_WM_PID => {
                 self.update_pid()?;
                 Ok(Some(WmWindowProperty::Pid))
+            }
+            atom if atom == self.atoms._NET_WM_WINDOW_OPACITY => {
+                self.update_opacity()?;
+                Ok(Some(WmWindowProperty::Opacity))
             }
 
             _ => Ok(None), // unknown
@@ -767,6 +821,14 @@ impl X11Surface {
         if let Some(pid) = self.read_window_property_u32(self.atoms._NET_WM_PID)? {
             let mut state = self.state.lock().unwrap();
             state.pid = Some(pid);
+        }
+        Ok(())
+    }
+
+    fn update_opacity(&self) -> Result<(), ConnectionError> {
+        if let Some(opacity) = self.read_window_property_u32(self.atoms._NET_WM_WINDOW_OPACITY)? {
+            let mut state = self.state.lock().unwrap();
+            state.opacity = Some(opacity);
         }
         Ok(())
     }
@@ -966,6 +1028,33 @@ impl X11Surface {
         }
         Ok(0)
     }
+
+    /// Returns the topmost (sub-)surface under a given position of the surface.
+    ///
+    /// In case the window is not mapped or is unmanaged while an XDND operation is ongoing [`None`] is returned.
+    ///
+    /// - `point` has to be the position to query, relative to (0, 0) of the given surface + `location`.
+    /// - `location` can be used to offset the returned point.
+    /// - `surface_type` can be used to filter the underlying surface tree
+    #[cfg(feature = "desktop")]
+    pub fn surface_under(
+        &self,
+        point: Point<f64, Logical>,
+        location: impl Into<Point<i32, Logical>>,
+        surface_type: WindowSurfaceType,
+    ) -> Option<(WlSurface, Point<i32, Logical>)> {
+        if !surface_type.contains(WindowSurfaceType::TOPLEVEL) {
+            return None;
+        }
+        if self.xdnd_active.load(Ordering::Acquire) && self.is_override_redirect() {
+            return None;
+        }
+        if let Some(surface) = X11Surface::wl_surface(self).as_ref() {
+            return under_from_surface_tree(surface, point, location, surface_type);
+        }
+
+        None
+    }
 }
 
 /// Trait for objects, that represent an x11 window in some shape or form
@@ -998,7 +1087,7 @@ impl X11Relatable for WlSurface {
 impl IsAlive for X11Surface {
     #[inline]
     fn alive(&self) -> bool {
-        self.state.lock().unwrap().alive
+        X11Surface::alive(self)
     }
 }
 
@@ -1090,6 +1179,10 @@ impl<D: SeatHandler + 'static> PointerTarget<D> for X11Surface {
     fn enter(&self, seat: &Seat<D>, data: &mut D, event: &MotionEvent) {
         if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
             PointerTarget::enter(surface, seat, data, event);
+            // Independent remote windows do not share the X root placement.
+            // Reassert the position on enter before a following button can use
+            // the previous surface's X sprite location.
+            PointerTarget::motion(surface, seat, data, event);
         }
     }
 
@@ -1225,5 +1318,11 @@ impl<D: SeatHandler + 'static> TouchTarget<D> for X11Surface {
         if let Some(surface) = self.state.lock().unwrap().wl_surface.as_ref() {
             TouchTarget::orientation(surface, seat, data, event, seq)
         }
+    }
+}
+
+impl WaylandFocus for X11Surface {
+    fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
+        X11Surface::wl_surface(self).map(Cow::Owned)
     }
 }

@@ -10,7 +10,7 @@ use wayland_server::{
 };
 
 use crate::{
-    input::{pointer::Focus, Seat, SeatHandler},
+    input::{dnd::DndFocus, Seat, SeatHandler},
     utils::Serial,
     wayland::{
         compositor,
@@ -25,7 +25,7 @@ use crate::{
     },
 };
 
-use super::{dnd_grab, DataDeviceHandler, DataDeviceState};
+use super::{DataDeviceHandler, DataDeviceState, GrabType};
 
 /// WlSurface role of drag and drop icon
 pub const DND_ICON_ROLE: &str = "dnd_icon";
@@ -41,8 +41,8 @@ where
     D: Dispatch<WlDataDevice, DataDeviceUserData>,
     D: DataDeviceHandler,
     D: SeatHandler,
-    <D as SeatHandler>::PointerFocus: WaylandFocus,
-    <D as SeatHandler>::TouchFocus: WaylandFocus,
+    <D as SeatHandler>::PointerFocus: DndFocus<D>,
+    <D as SeatHandler>::TouchFocus: DndFocus<D>,
     <D as SeatHandler>::KeyboardFocus: WaylandFocus,
     D: 'static,
 {
@@ -67,9 +67,25 @@ where
                 icon,
                 serial,
             } => {
+                // NOTE: While protocol states that selection shouldn't be used more than once,
+                // no-one enforces it, thus we have clients around that do so and crashing them
+                // doesn't worth it at this point.
+                if let Some(source) = source.as_ref() {
+                    handler
+                        .data_device_state()
+                        .used_sources
+                        .insert(source.clone(), data.wl_seat.clone());
+                }
+
                 let serial = Serial::from(serial);
                 if let Some(pointer) = seat.get_pointer() {
-                    if pointer.has_grab(serial) {
+                    if pointer.has_grab(serial)
+                        && pointer
+                            .grab_start_data()
+                            .and_then(|s| s.focus)
+                            .and_then(|(f, _)| f.wl_surface().map(|s| s.into_owned()))
+                            .is_some_and(|s| s.id().same_client_as(&origin.id()))
+                    {
                         if let Some(ref icon) = icon {
                             if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
                                 resource.post_error(
@@ -80,19 +96,35 @@ where
                             }
                         }
                         // The StartDrag is in response to a pointer implicit grab, all is good
-                        handler.started(source.clone(), icon.clone(), seat.clone());
-                        let start_data = pointer.grab_start_data().unwrap();
-                        pointer.set_grab(
-                            handler,
-                            dnd_grab::DnDGrab::new_pointer(dh, start_data, source, origin, seat, icon),
-                            serial,
-                            Focus::Clear,
-                        );
+                        if let Some(source) = source {
+                            handler.dnd_requested(
+                                source,
+                                icon.clone(),
+                                seat.clone(),
+                                serial,
+                                GrabType::Pointer,
+                            );
+                        } else {
+                            handler.dnd_requested(
+                                origin,
+                                icon.clone(),
+                                seat.clone(),
+                                serial,
+                                GrabType::Pointer,
+                            );
+                        }
+
                         return;
                     }
                 }
                 if let Some(touch) = seat.get_touch() {
-                    if touch.has_grab(serial) {
+                    if touch.has_grab(serial)
+                        && touch
+                            .grab_start_data()
+                            .and_then(|s| s.focus)
+                            .and_then(|(f, _)| f.wl_surface().map(|s| s.into_owned()))
+                            .is_some_and(|s| s.id().same_client_as(&origin.id()))
+                    {
                         if let Some(ref icon) = icon {
                             if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
                                 resource.post_error(
@@ -103,13 +135,23 @@ where
                             }
                         }
                         // The StartDrag is in response to a touch implicit grab, all is good
-                        handler.started(source.clone(), icon.clone(), seat.clone());
-                        let start_data = touch.grab_start_data().unwrap();
-                        touch.set_grab(
-                            handler,
-                            dnd_grab::DnDGrab::new_touch(dh, start_data, source, origin, seat, icon),
-                            serial,
-                        );
+                        if let Some(source) = source {
+                            handler.dnd_requested(
+                                source,
+                                icon.clone(),
+                                seat.clone(),
+                                serial,
+                                GrabType::Touch,
+                            );
+                        } else {
+                            handler.dnd_requested(
+                                origin,
+                                icon.clone(),
+                                seat.clone(),
+                                serial,
+                                GrabType::Touch,
+                            );
+                        }
                         return;
                     }
                 }
@@ -129,6 +171,17 @@ where
                         return;
                     }
                 };
+
+                // NOTE: While protocol states that selection shouldn't be used more than once,
+                // no-one enforces it, thus we have clients around that do so and crashing them
+                // doesn't worth it at this point.
+                if let Some(source) = source.as_ref() {
+                    handler
+                        .data_device_state()
+                        .used_sources
+                        .insert(source.clone(), data.wl_seat.clone());
+                }
+
                 let source = source.map(SelectionSourceProvider::DataDevice);
 
                 handler.new_selection(
@@ -153,6 +206,22 @@ where
                 }),
 
             _ => unreachable!(),
+        }
+    }
+
+    fn destroyed(
+        _state: &mut D,
+        _client: wayland_server::backend::ClientId,
+        resource: &WlDataDevice,
+        data: &DataDeviceUserData,
+    ) {
+        if let Some(seat) = Seat::<D>::from_resource(&data.wl_seat) {
+            if let Some(seat_data) = seat.user_data().get::<RefCell<SeatData<D::SelectionUserData>>>() {
+                seat_data.borrow_mut().retain_devices(|ndd| match ndd {
+                    SelectionDevice::DataDevice(ndd) => ndd != resource,
+                    _ => true,
+                });
+            }
         }
     }
 }

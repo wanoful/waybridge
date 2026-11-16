@@ -58,7 +58,11 @@ impl App {
         pointer.frame(self);
         if lock.active
             && lock.surface.is_alive()
-            && pointer.current_focus().as_ref() == Some(&lock.surface)
+            && pointer
+                .current_focus()
+                .and_then(|s| s.wl_surface().map(|s| s.into_owned()))
+                .as_ref()
+                == Some(&lock.surface)
         {
             // WlSurface::leave deactivates the constraint in Smithay. Let that
             // path send the sole unlocked event instead of deactivating twice.
@@ -101,7 +105,9 @@ impl App {
     // unmapping and changes made without a viewer message also release the lock.
     pub fn sync_pointer_lock(&mut self) {
         let pointer = self.seat.get_pointer().unwrap();
-        let focus = pointer.current_focus();
+        let focus = pointer
+            .current_focus()
+            .and_then(|s| s.wl_surface().map(|s| s.into_owned()));
         if focus
             .as_ref()
             .is_some_and(|focus| self.relative.blocked.as_ref() != Some(focus))
@@ -231,7 +237,7 @@ impl App {
         // Raw Input mouse counts are passed through without Windows acceleration.
         pointer.relative_motion(
             self,
-            focus,
+            focus.map(|(s, p)| (self.pointer_focus(s), p)),
             &RelativeMotionEvent {
                 delta: (dx, dy).into(),
                 delta_unaccel: (dx, dy).into(),

@@ -9,10 +9,12 @@ mod data_drop;
 mod data_offer;
 mod desktop_notifications;
 mod desktop_tray;
+mod dnd_lifecycle;
 mod drag;
 mod drag_visual;
 mod file_tree;
 mod ime;
+mod input_focus;
 mod launch;
 mod metrics;
 mod network;
@@ -69,10 +71,7 @@ use smithay::{
         },
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
-            protocol::{
-                wl_buffer, wl_data_device_manager::DndAction, wl_data_source::WlDataSource,
-                wl_seat, wl_surface::WlSurface,
-            },
+            protocol::{wl_buffer, wl_data_source::WlDataSource, wl_seat, wl_surface::WlSurface},
             Client, Display, DisplayHandle, ListeningSocket, Resource,
         },
     },
@@ -94,9 +93,7 @@ use smithay::{
         selection::{
             data_device::{
                 request_data_device_client_selection, set_data_device_focus,
-                set_data_device_selection, start_dnd_with_id, with_source_metadata,
-                ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-                SourceMetadata,
+                set_data_device_selection, DataDeviceHandler, DataDeviceState,
             },
             wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler, SelectionSource, SelectionTarget,
@@ -116,7 +113,7 @@ use std::{
     io::{Read, Write},
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt},
-        io::{AsFd, OwnedFd},
+        io::OwnedFd,
         net::UnixStream,
     },
     path::PathBuf,
@@ -301,7 +298,7 @@ type Clipboard = data_offer::Payload;
 pub(crate) struct OutboundDrag {
     id: u64,
     window: u32,
-    source: WlDataSource,
+    source: Arc<dnd_lifecycle::TrackedSource>,
     cancelled: Arc<AtomicBool>,
     files: Option<drag::Export>,
     external: bool,
@@ -500,11 +497,11 @@ impl App {
             .and_then(|id| self.windows.iter().find(|w| w.id == id && w.mapped))
             .and_then(|w| {
                 if let Some(x) = w.window.x11_surface() {
-                    Some(x11::KeyboardFocus::X11(x.clone()))
+                    Some(x11::InputFocus::X11(Arc::new(x.clone())))
                 } else {
                     w.window
                         .wl_surface()
-                        .map(|s| x11::KeyboardFocus::Wayland(s.into_owned()))
+                        .map(|s| x11::InputFocus::Wayland(s.into_owned()))
                 }
             });
         let keyboard = self.seat.get_keyboard().unwrap();
@@ -577,6 +574,7 @@ impl App {
     }
 
     fn pointer_motion(&mut self, id: u32, x: f64, y: f64) {
+        self.data_drop.point = Some((id, x, y));
         self.sync_pointer_lock();
         if self.pointer_locked() {
             return;
@@ -652,6 +650,7 @@ impl App {
         self.relative_hit(hit.clone());
         self.pointer_window = Some(id);
         let pointer = self.seat.get_pointer().unwrap();
+        let hit = hit.map(|(s, p)| (self.pointer_focus(s), p));
         pointer.motion(
             self,
             hit,
@@ -781,7 +780,7 @@ impl App {
                 let location = pointer.current_location();
                 pointer.motion(
                     self,
-                    Some((surface, location)),
+                    Some((surface.into(), location)),
                     &MotionEvent {
                         location,
                         serial,
@@ -860,6 +859,9 @@ impl App {
     }
 
     fn pump_outbound(&mut self) -> Result<()> {
+        self.poll_x11_dnd();
+        self.poll_dnd_feedback();
+        self.prepare_native_export();
         if let Some(sink) = &mut self.drag_sink {
             sink.pump()?;
         }
@@ -1033,12 +1035,11 @@ impl App {
                 self.text_drag_enabled = value["enabled"].as_bool().unwrap_or(true);
                 if !self.text_drag_enabled {
                     self.cancel_text_drag();
-                    let text = self.data_drop.outbound.as_ref().is_some_and(|d| {
-                        with_source_metadata(&d.source, |m| {
-                            !m.mime_types.iter().any(|t| t == "text/uri-list")
-                        })
-                        .unwrap_or(false)
-                    });
+                    let text = self
+                        .data_drop
+                        .outbound
+                        .as_ref()
+                        .is_some_and(|d| !d.source.is_files());
                     if text {
                         self.end_outbound(false);
                     }
@@ -1558,8 +1559,21 @@ impl App {
                     "decoration":if native_decoration {"server"}else{"client"}})
                 })
             };
+            if info["type"] == "popup" && self.data_drop.native.is_some() {
+                // A native drag owns capture. A newly mapped override-redirect
+                // visual (including untyped drag images) cannot start a menu grab.
+                info["input_popup"] = json!(false);
+            }
             if semantics {
-                remote.state.input = window_semantics::input_region(&surface, bbox);
+                remote.state.input = if remote
+                    .window
+                    .x11_surface()
+                    .is_some_and(|x| x.input_region_empty())
+                {
+                    json!({"origin_x":bbox.loc.x,"origin_y":bbox.loc.y,"width":bbox.size.w,"height":bbox.size.h,"layers":[]})
+                } else {
+                    window_semantics::input_region(&surface, bbox)
+                };
                 if let Some(top) = remote.window.toplevel() {
                     let (min, max) = window_semantics::limits(top.wl_surface());
                     info["min_size"] = json!(min);
@@ -2018,6 +2032,7 @@ impl App {
             && self.seat.get_pointer().is_some_and(|p| {
                 p.has_grab(serial)
                     && p.current_focus()
+                        .and_then(|focus| focus.wl_surface().map(|s| s.into_owned()))
                         .is_some_and(|focus| focus.id().same_client_as(&surface.wl_surface().id()))
             })
     }
@@ -2436,9 +2451,9 @@ impl XdgShellHandler for App {
     }
 }
 impl SeatHandler for App {
-    type KeyboardFocus = x11::KeyboardFocus;
-    type PointerFocus = WlSurface;
-    type TouchFocus = WlSurface;
+    type KeyboardFocus = x11::InputFocus;
+    type PointerFocus = x11::InputFocus;
+    type TouchFocus = x11::InputFocus;
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seats
     }
@@ -2521,162 +2536,13 @@ impl SelectionHandler for App {
     }
 }
 impl DataDeviceHandler for App {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device
+    fn data_device_state(&mut self) -> &mut DataDeviceState {
+        &mut self.data_device
     }
 }
 impl DataControlHandler for App {
     fn data_control_state(&self) -> &DataControlState {
         &self.data_control
-    }
-}
-impl ClientDndGrabHandler for App {
-    fn client_offer_status(&mut self, source: &WlDataSource, accepted: bool, action: DndAction) {
-        if let Some(drag) = self
-            .data_drop
-            .outbound
-            .as_ref()
-            .filter(|d| d.returned && !d.external && &d.source == source)
-        {
-            self.control(json!({"type":"drag_return_ready","drag":drag.id,"return_token":drag.return_token,"accepted":accepted && !action.is_empty()}));
-        }
-    }
-
-    fn send_drop_performed(&mut self, source: &WlDataSource, validated: bool) -> bool {
-        validated || self.window_drag.completes_move(source)
-    }
-    fn started(&mut self, source: Option<WlDataSource>, icon: Option<WlSurface>, _: Seat<Self>) {
-        self.start_drag_visual(source.as_ref(), icon);
-        let modern = self.peer.as_ref().is_some_and(|p| p.data_drag_enabled());
-        let attached = source
-            .as_ref()
-            .is_some_and(|s| self.window_drag.is_toplevel_source(s));
-        let uri = source.as_ref().is_some_and(|s| {
-            with_source_metadata(s, |m| m.mime_types.iter().any(|s| s == "text/uri-list"))
-                .unwrap_or(false)
-        });
-        if modern || attached || (source.is_some() && !uri) {
-            self.start_window_drag(source.clone());
-        }
-        if attached {
-            return;
-        }
-        if (uri && !self.drag_enabled)
-            || (!uri && !self.text_drag_enabled)
-            || self.data_drop.outbound.is_some()
-            || self.drag_surface.is_none()
-            || self.pressed_buttons.len() != 1
-            || !self.pressed_buttons.contains(&0x110)
-        {
-            return;
-        }
-        let Some(source) = source.filter(|s| s.version() >= 3) else {
-            return;
-        };
-        let mime = with_source_metadata(&source, |m| {
-            if !m.dnd_action.contains(DndAction::Copy) {
-                return None;
-            }
-            if uri {
-                return Some("text/uri-list".to_owned());
-            }
-            if modern {
-                for name in ["text/plain;charset=utf-8", "text/plain"] {
-                    if m.mime_types.iter().any(|m| m == name) {
-                        return Some(name.to_owned());
-                    }
-                }
-            }
-            None
-        })
-        .ok()
-        .flatten();
-        let Some(mime) = mime else {
-            return;
-        };
-        let Some(peer) = self.peer.clone() else {
-            return;
-        };
-        let Ok((read, write)) = UnixStream::pair() else {
-            return;
-        };
-        self.data_drop.next_outbound += 1;
-        let id = self.data_drop.next_outbound;
-        let window = self.focused_window.unwrap_or(0);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let scheduled = if uri {
-            drag::prepare(id, read, peer, self.events.clone(), cancelled.clone())
-        } else {
-            drag::prepare_text(
-                id,
-                read,
-                mime.clone(),
-                peer,
-                self.events.clone(),
-                cancelled.clone(),
-            )
-        };
-        if !scheduled {
-            return;
-        }
-        source.send(mime, write.as_fd());
-        self.data_drop.outbound = Some(OutboundDrag {
-            id,
-            window,
-            source,
-            cancelled,
-            files: None,
-            external: false,
-            returned: false,
-            return_token: 0,
-            ready: false,
-            dropped: false,
-            deferred_focus: None,
-            activity: Instant::now(),
-        });
-    }
-    fn dropped(&mut self, _: Option<WlSurface>, validated: bool, _: Seat<Self>) {
-        self.stop_drag_visual();
-        self.window_drag.ended();
-        if let Some(drag) = &self.data_drop.outbound {
-            if !drag.dropped && (!drag.external || !validated) {
-                self.end_outbound(false);
-            }
-        }
-    }
-}
-impl ServerDndGrabHandler for App {
-    fn offer_negotiation(
-        &mut self,
-        source_id: u64,
-        accepted: bool,
-        action: DndAction,
-        settled: bool,
-        _: Seat<Self>,
-    ) {
-        if source_id != self.data_drop.generation {
-            return;
-        }
-        self.data_drop
-            .negotiate(accepted && action == DndAction::Copy, settled);
-        if let Some(status) = self.data_drop.status() {
-            self.control(status);
-        }
-    }
-    fn send_for_source(&mut self, source_id: u64, mime: String, fd: OwnedFd, _: Seat<Self>) {
-        if let Some((data, _)) = self.data_drop.snapshots.get(&source_id) {
-            drag::send_payload(fd, data.snapshot(), mime);
-        }
-    }
-    fn finished_for_source(&mut self, source_id: u64, _: Seat<Self>) {
-        if let Some(done) = self.data_drop.complete(source_id, true) {
-            self.control(done);
-        }
-    }
-    fn cancelled_for_source(&mut self, source_id: u64, _: Seat<Self>) {
-        if let Some(done) = self.data_drop.complete(source_id, false) {
-            self.control(done);
-        }
     }
 }
 

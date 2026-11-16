@@ -71,12 +71,6 @@ impl State {
     pub fn is_toplevel_source(&self, source: &WlDataSource) -> bool {
         self.entries.iter().any(|e| &e.source == source && !e.ended)
     }
-    pub fn completes_move(&self, source: &WlDataSource) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|a| !a.cancelled && a.source.as_ref() == Some(source))
-            && self.is_toplevel_source(source)
-    }
     pub fn ended(&mut self) {
         if let Some(active) = &mut self.active {
             active.finishing = true;
@@ -102,10 +96,34 @@ impl App {
         });
     }
     pub fn cancel_window_drag(&mut self) {
-        if !self.window_drag.active() {
+        if !self.window_drag.active() && self.data_drop.native.is_none() {
             return;
         }
-        self.window_drag.active.as_mut().unwrap().cancelled = true;
+        if let Some(active) = self.window_drag.active.as_mut() {
+            active.cancelled = true;
+        }
+        // XDND has no target-to-source cancel request. End a confirmed native
+        // X11 drag through its normal Escape input path before revoking the grab.
+        let x11_source = self
+            .data_drop
+            .native
+            .as_ref()
+            .and_then(|n| self.window(n.window))
+            .is_some_and(|w| w.x11_surface().is_some());
+        if x11_source {
+            self.release_keys();
+            let keyboard = self.seat.get_keyboard().unwrap();
+            for state in [KeyState::Pressed, KeyState::Released] {
+                keyboard.input::<(), _>(
+                    self,
+                    9u32.into(),
+                    state,
+                    SERIAL_COUNTER.next_serial(),
+                    self.time(),
+                    |_, _, _| FilterResult::Forward,
+                );
+            }
+        }
         let pointer = self.seat.get_pointer().unwrap();
         // Clearing the DnD target before releasing the grab produces cancelled,
         // rather than accidentally dropping into the last accepted target.
@@ -118,9 +136,11 @@ impl App {
                 time: self.time(),
             },
         );
-        pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), self.time());
         self.release_input();
+        pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), self.time());
         self.window_drag.ended();
+        self.data_drop.native = None;
+        self.stop_drag_visual();
     }
     pub fn poll_window_drag(&mut self) {
         if self
