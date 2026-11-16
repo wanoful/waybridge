@@ -90,6 +90,20 @@ impl App {
     // The SNI worker integration is delivered independently of this module.
     #[allow(dead_code)]
     pub(crate) fn activation_for_owner(&mut self, request: &str, pid: u32) -> bool {
+        let replaced: Vec<_> = self
+            .activation
+            .launches
+            .iter()
+            .filter(|(_, launch)| {
+                launch.intent.created.elapsed() >= LIFETIME
+                    || (launch.requests_only && launch.pid == Some(pid))
+            })
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in replaced {
+            self.activation.launches.remove(&token);
+            self.activation.xdg.remove_token(&token.into());
+        }
         if !self.activation.negotiated
             || self.read_only
             || !request_id(request)

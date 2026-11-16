@@ -38,7 +38,7 @@ public:
   bool enabled() const { return negotiated; }
   bool prepare(const std::string &request, bool allowed) {
     for (auto it = grants.begin(); it != grants.end();) {
-      if (it->second.expires <= GetTickCount64()) it = grants.erase(it); else ++it;
+      if (it->second.expires <= GetTickCount64() || it->second.input != inputTime()) it = grants.erase(it); else ++it;
     }
     if (!negotiated || request.size()!=32 || grants.size()>=32) return false;
     grants[request] = {GetForegroundWindow(), inputTime(), GetTickCount64()+15000, allowed}; return true;
