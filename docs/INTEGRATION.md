@@ -108,3 +108,48 @@ journalctl --user -u example-waybridge-agent.service
 ```
 
 应用目录的启动方案与环境覆写诊断见 [配置与应用启动](CONFIGURATION.md)。实际验证范围和未完成项见 [验证记录](VALIDATION.md)。
+
+## 明确选用通知服务
+
+远端桌面通知使用标准 `org.freedesktop.Notifications` provider，不会通过监听
+其他服务的 Notify 调用猜测通知，也不会抢占已有 owner、停止其他 DE 服务或
+修改其他通知组件的配置。同一用户总线只选择一个通知服务；如果需要 Waybridge
+转发，应在自己的会话组件配置中选择它，并避免同时启动另一套通知服务。
+
+可选 unit 不默认安装、启用。安装已经构建的二进制时显式选择：
+
+```sh
+python3 service/install-user-service.py --notification-provider
+systemctl --user daemon-reload
+systemctl --user enable waybridge-notifications.service
+```
+
+`enable` 将它接入 `waybridge-session.target`，供下一次 Waybridge 会话启动。
+在已运行的 Waybridge 会话中，明确完成通知服务选择后，也可用
+`systemctl --user start waybridge-notifications.service` 启动这个已选 unit。
+无需修改 D-Bus 激活文件或设置全局替代别名。unit 通过
+`waybridge --notification-provider` 运行标准服务，并通过 `PartOf` 随会话结束。
+它要求当前会话发布的 `WAYBRIDGE_SESSION_ID` 私有运行目录与用户总线；不能
+作为脱离 Waybridge 会话的常驻通知服务启动。
+
+已有 owner 时 provider 申请名称使用 DoNotQueue，不允许替换，不会排队等待接管。
+如果系统已有相同 BusName 的原生 systemd unit，也应检查其 unit/激活配置，
+由用户明确选择服务，不能只复制包装 unit 来制造名称分配冲突。诊断：
+
+```sh
+systemctl --user status waybridge-notifications.service
+journalctl --user -u waybridge-notifications.service
+busctl --user status org.freedesktop.Notifications
+```
+
+Windows 控制中心也会显示“未选用”“总线已有通知服务”“通知服务已断开”等状态。
+“输入与共享 → 桌面通知”控制当前连接的显示及动作，配置字段为
+`settings.notifications`，默认 true；这个开关不改变 Linux 的组件选择。
+Windows 原生通知不可用、通知权限被关闭、未连接或共享被关闭时，Notify 返回
+明确不可用错误，不积累离线存档。关闭/断开/服务失联会清除旧通知，旧动作失效。
+只读模式保留通知展示与关闭，点击不会执行应用动作。
+
+Windows 使用原生 AppNotifications；免打扰、横幅与通知中心策略遵循系统设置。
+未提供 inline reply、通知音效/动画、正文富文本或持久通知存档。每条最多四个
+按钮及默认点击动作，超过限制明确拒绝。通知来源图标使用统一右上角角标；
+没有图标时使用带角标的应用占位图。正文不会进入诊断日志。

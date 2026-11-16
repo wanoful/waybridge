@@ -27,6 +27,25 @@ try
             incoming.CopyTo(output);
         Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
             "Published matching merged WinUI resources.pri ({0} bytes)", resources.Length);
+        // Windows App SDK 1.8's self-contained payload omits this signed
+        // resource DLL, but notification registration/cleanup load it. Keep it
+        // version-bound to the runtime validated above, just like resources.pri.
+        const string notificationName = "Microsoft.WindowsAppRuntime.Insights.Resource.dll";
+        var notificationResource = archive.GetEntry(notificationName);
+        if (notificationResource == null || notificationResource.Length == 0)
+            throw new InvalidDataException("The matching framework MSIX has no " + notificationName);
+        var notificationPath = Path.Combine(PublishDirectory, notificationName);
+        using (var incoming = notificationResource.Open())
+        using (var expected = new MemoryStream())
+        {
+            incoming.CopyTo(expected);
+            var bytes = expected.ToArray();
+            if (File.Exists(notificationPath) && !bytes.SequenceEqual(File.ReadAllBytes(notificationPath)))
+                throw new InvalidDataException("Notification registration resource/runtime version mismatch");
+            File.WriteAllBytes(notificationPath, bytes);
+        }
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+            "Published matching notification registration resource DLL ({0} bytes)", notificationResource.Length);
     }
 }
 catch (Exception error)

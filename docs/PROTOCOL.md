@@ -543,3 +543,70 @@ normal snapshots and icon deltas are automatic. Action payload fields and sizes
 are bounded before entering the 64-slot worker queue. Session lifecycle state
 uses a separate latest state/revision, so reconnect/disconnect cannot be dropped
 behind a full action queue.
+
+## Desktop notifications (`notifications_v1`)
+
+Both v3 hellos negotiate the boolean `notifications_v1`. The hosted Windows
+worker initially sends `notifications_enabled:false`; forwarding opens only
+after its GUI has registered native Windows AppNotifications, processed the
+current connection and returned `notification_available {available:true}` over
+the private host pipe. Standalone workers do not negotiate this capability.
+`notifications_enabled {enabled}` changes the live connection's sharing policy;
+it never starts or replaces a Linux notification service. The profile setting
+`notifications` defaults to true and is independent of the Linux provider choice.
+
+The Linux session emits:
+
+- `notification_status {available,reason,message}`: provider selected, not
+  selected, conflicting existing server, diagnostic failure or lost provider.
+  A bus owner alone is never treated as a forwardable source.
+- `notification {instance,binding,id,revision,app_name,summary,body,actions,
+  timeout_ms,png}`: actions are `{key,label}` pairs; `png` is a base64 PNG or
+  null. A nonzero `replaces_id` uses the same ID with a new revision. Windows
+  uses the same native Tag/Group to replace it without first removing it.
+- `notification_close {instance,binding,id,revision}` and `notification_reset`:
+  remove the matching native item or all items from that worker connection.
+
+The GUI returns `notification_feedback {instance,binding,id,revision,action}`
+or the same identity with `reason:2|4`. The native worker and Linux bridge both
+validate current identity. The provider additionally checks the original unique
+D-Bus owner, allowed action and unexpired revision before emitting the standard
+`ActionInvoked`. Read-only mode permits display/dismissal but converts an action
+to dismissal at both the native and Linux boundaries. A valid action is followed
+by `NotificationClosed(id,2)`; application close is reason 3, expiry reason 1,
+and lost/disabled connection or failed platform presentation reason 4. Signals
+are addressed to the originating unique bus owner. Unknown CloseNotification
+IDs return a D-Bus error. Previous revisions, owners, provider instances and
+connection bindings cannot invoke current applications.
+
+The explicit Linux provider implements `org.freedesktop.Notifications` at its
+standard object path, including Notify, CloseNotification, GetCapabilities,
+GetServerInformation and the two signals. Advertised capabilities are `body`,
+`actions`, and `icon-static`; body markup, inline replies, persistence, sound,
+action icons and animation are not advertised. At most four buttons plus the
+default click action are accepted. Default expiry is 10 seconds; explicit zero
+has no provider expiry, while positive expiry is capped at 24 hours. Windows
+notification policy can still remove such an item.
+
+There are at most 64 active items, 16 Notify updates per second, 32 hints and
+60 KiB per private provider packet. Text limits are 256 UTF-8 bytes for app name
+and each action key/label, 1024 for summary and 8192 for body. Invalid/oversized
+requests fail explicitly. Icons use standard image-data/image-path, app icon or
+desktop-entry lookup; only local files/theme entries are read, never remote
+image URLs. Raw images are bounded to 256×256; normalized PNGs to 128×128 and
+32 KiB. The native worker adds the configured remote-source badge and supplies
+a badged placeholder when needed before passing a 64×64 PNG to the GUI.
+
+The provider's 0700 session directory holds 0600 Unix datagram sockets. A random
+provider instance and per-viewer binding prevent stale IPC actions. Heartbeats
+expire after three seconds, clearing old items. No disconnected notification
+history is replayed. GUI notification work enters a bounded queue before UI
+dispatch; an overflowing GUI/worker pipe fails closed instead of silently losing
+interactive lifecycle edges. Notification text and activation arguments are not
+written to diagnostic logs.
+
+Windows uses AppNotificationManager and the native notification center, retaining
+OS notification settings and Do Not Disturb behavior. AppNotifications has no
+Dismissed event; disappearance is checked with GetAllAsync every two seconds,
+with a further two-second activation grace period before sending dismissal.
+Expiry/application close and disconnect cleanup do not depend on that polling.

@@ -51,14 +51,17 @@ internal sealed class DesktopNotifications : IAsyncDisposable
             available = manager.Setting == AppNotificationSetting.Enabled;
             if (!available) status("Windows 已关闭此应用的通知，桌面通知转发暂停；请在系统通知设置中启用 Waybridge。");
         }
-        catch
+        catch (Exception error)
         {
             if (manager is not null)
+            {
                 try { manager.NotificationInvoked -= Invoked; } catch (COMException) { }
+                if (registered) try { manager.Unregister(); } catch (COMException) { }
+            }
             manager = null;
             registered = false;
             available = false;
-            status("Windows 原生通知不可用；桌面通知转发已关闭。请检查 Windows 通知设置与 Windows App Runtime。");
+            status($"Windows 原生通知不可用（0x{error.HResult:X8}）；桌面通知转发已关闭。请检查 Windows 通知设置与 Windows App Runtime。");
         }
         worker = Task.Run(LoopAsync);
         polling = Task.Run(PollAsync);

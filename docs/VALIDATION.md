@@ -472,3 +472,72 @@ The standalone Windows probe uses its own Temp directory and may be run directly
 on Windows. On Wine, pass `--expect-unsupported` to require the error/cleanup path.
 `windows_tree_probe.exe --expect-unsupported` additionally asserts that neither
 synchronous nor worker receive publication leaks CF_HDROP or staging.
+
+## M2 standard notifications (2026-11-16)
+
+The notification branch was checked with isolated buses/runtimes and a separately
+registered Windows probe; no real wallet, application profile, notification
+provider or installed Waybridge process was replaced for these tests.
+
+- `cargo check/build --bin waybridge` and Windows x64 native worker / WinUI GUI
+  builds passed. The standalone Windows notification probe cross-published for
+  x64 and ARM64; ARM64 publication is compilation evidence only.
+- `/usr/bin/python3 tests/notifications_smoke.py` passed standard D-Bus methods,
+  introspectable signals, Chinese text, raw icon data, text/action limits,
+  replacement, stale-revision rejection, originating owner isolation, expiry,
+  application close, nonexistent-ID error, disconnect reset/offline refusal,
+  non-replacing provider conflict and absence of notification text in logs.
+- `/usr/bin/python3 tests/notifications_bridge_smoke.py` passed a real compositor
+  with a disposable user bus: notifications_v1 transport/action, explicit
+  provider status, live sharing switch, server-side read-only action rejection,
+  disconnect reset, provider heartbeat loss and shared-bus owner conflict without
+  takeover. No host desktop activation environment was modified.
+- `/usr/bin/python3 tests/native_notifications_smoke.py` exercised the real PE
+  worker under a private Wine/Xvfb prefix: GUI-readiness handshake, host-pipe
+  notification/action round trip, Chinese metadata, native badged placeholder
+  PNG, replacement revision rejection, native read-only gating, live opt-out,
+  no body logging and clean worker teardown. This is IPC/protocol evidence,
+  not Wine execution of Windows AppNotifications.
+- `tests/windows_host_control_probe.cpp` includes an actual unread pipe and
+  blocked native writer: filling the 128-event queue must post WM_CLOSE to its
+  owner, and stop must cancel the outstanding read/write within two seconds.
+- The isolated `Waybridge.Notifications.Probe` ran on **laptop, Windows x64**, in
+  the logged-in user's limited interactive scheduled task and exited 0. Actual
+  AppNotificationManager Show/GetAll confirmed native notification-center items;
+  the same Tag/Group replacement left exactly one item. It exercised the native
+  INotificationActivationCallback interface → NotificationInvoked → production
+  DesktopNotifications helper → bound IPC feedback, rejected a replaced token,
+  and verified application close, notification-center removal feedback and
+  disconnect cleanup. The callback test directly queries the registered native
+  manager interface; it does **not** claim an automated Windows Shell banner
+  click/COM cold-start test. The probe uses a random AppID, its own executable
+  identity, no profile store, and removes its own registration/toasts.
+
+Real registration testing exposed the SDK's omitted
+`Microsoft.WindowsAppRuntime.Insights.Resource.dll`, matching upstream
+[WindowsAppSDK #6071](https://github.com/microsoft/WindowsAppSDK/issues/6071).
+The shared publish task now copies that signed DLL from the exact 1.8.260921001
+framework MSIX after byte-validating the existing runtime components, rejects
+an inconsistent pre-existing DLL and leaves the NuGet cache untouched. The
+probe passed with registration required after that packaging repair; successful
+Show/GetAll with failed registration is not accepted as notification availability.
+
+Reproduce the Windows probe after publishing it (choose x64/ARM64 for the target):
+
+```sh
+dotnet publish gui/Waybridge.Notifications.Probe/Waybridge.Notifications.Probe.csproj \
+  -c Release -r win-x64 --self-contained true \
+  -p:MicrosoftWindowsAppSDKPackageDir= \
+  -p:ManifestTool="$PWD/scripts/merge-windows-manifest.py" \
+  -o build/notifications-probe-x64
+python3 scripts/test-notifications-laptop.py --host laptop
+```
+
+The runner uploads to a unique temporary directory, creates a unique limited
+interactive task and removes its own task/files/processes afterwards. It must
+run with a logged-in Windows desktop; elevated SSH sessions themselves cannot
+exercise AppNotifications. Current Windows policy/DND settings are not changed.
+Physical banner click/foreground routing, Do Not Disturb visual behavior,
+multi-monitor/DPI icon appearance, broader application compatibility and real
+Windows ARM64 runtime coverage remain device checks. Windows center-dismissal
+feedback is intentionally delayed by the two-second polling/activation grace.

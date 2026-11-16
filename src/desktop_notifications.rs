@@ -204,10 +204,9 @@ impl Bridge {
                     message["type"].as_str(),
                     Some("notification" | "notification_close")
                 )
+                && self.enabled
             {
-                if self.enabled {
-                    publish(message);
-                }
+                publish(message);
             }
         }
     }
@@ -370,7 +369,7 @@ impl Notifications {
             || !text(body, 8192)
             || !text(app_icon, 4096)
             || actions.len() > 10
-            || actions.len() % 2 != 0
+            || !actions.len().is_multiple_of(2)
             || actions.iter().any(|a| !text(a, 256))
             || hints.len() > 32
         {

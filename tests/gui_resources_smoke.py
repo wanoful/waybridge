@@ -20,11 +20,11 @@ def main():
         framework = cache/f"microsoft.windowsappsdk.runtime/{version}/tools/MSIX/win10-{arch}/Microsoft.WindowsAppRuntime.1.8.msix"
         with zipfile.ZipFile(framework) as package:
             assert (output/"resources.pri").read_bytes() == package.read("resources.pri"), "default application PRI missing or changed"
-            for name in ("Microsoft.ui.xaml.dll", "Microsoft.UI.Xaml.Controls.pri", "Microsoft.WindowsAppRuntime.dll", "MRM.dll"):
+            for name in ("Microsoft.ui.xaml.dll", "Microsoft.UI.Xaml.Controls.pri", "Microsoft.WindowsAppRuntime.dll", "MRM.dll", "Microsoft.WindowsAppRuntime.Insights.Resource.dll"):
                 entry = next(n for n in package.namelist() if n.lower() == name.lower())
                 local = next(p for p in output.iterdir() if p.name.lower() == name.lower())
                 assert local.read_bytes() == package.read(entry), f"{arch} resource/runtime version mismatch: {name}"
-        print(f"PASS: {arch} default resource index and exact matching WinUI/AppRuntime/MRT binaries")
+        print(f"PASS: {arch} default resource index and exact matching WinUI/AppRuntime/MRT/notification-registration binaries")
     if "--wine" not in sys.argv:
         return
     probe = ROOT/"build/tests/windows-resources-probe.exe"

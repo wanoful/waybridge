@@ -18,6 +18,9 @@ static void require(bool condition, const char *message) {
 static void duplexAndCancel() {
   WindowsPipeFixture pipe(1024);
   HostControl control;
+  HWND owner = CreateWindowExW(0, L"STATIC", L"Waybridge pipe probe", 0,
+                              0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+  require(owner != nullptr, "Cannot create pipe owner message window");
   HANDLE drained = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   std::exception_ptr peerError;
@@ -43,7 +46,7 @@ static void duplexAndCancel() {
   });
   try {
     require(control.connect(pipe.name).value("version", 0) == 1, "Invalid bootstrap");
-    control.start(nullptr);
+    control.start(owner);
     Sleep(100); // The reader is now waiting for a new GUI command.
     control.emit({{"type", "connected"}});
     for (int i = 0; i < 80; ++i) control.emit({{"type", "status"}, {"n", i}});
@@ -61,15 +64,25 @@ static void duplexAndCancel() {
     ULONGLONG before = GetTickCount64();
     control.flush(std::chrono::milliseconds(150));
     require(GetTickCount64() - before >= 100, "Test did not create a pending write");
+    // The peer is still not reading. Interactive lifecycle updates must not be
+    // dropped to make space in this blocked queue: its owner must close instead.
+    for (unsigned i = 0; i < 130; ++i)
+      control.emit({{"type", "notification_close"}, {"id", i}});
+    MSG close{};
+    deadline = GetTickCount64() + 1000;
+    while (!PeekMessageW(&close, owner, WM_CLOSE, WM_CLOSE, PM_REMOVE) && GetTickCount64() < deadline) Sleep(5);
+    require(close.hwnd == owner && close.message == WM_CLOSE, "Queue overflow did not notify its owner with WM_CLOSE");
     before = GetTickCount64();
     control.stop();
     require(GetTickCount64() - before < 2000, "Stop did not cancel pending read/write");
     control.stop(); // Shutdown remains idempotent.
   } catch (...) {
     control.stop(); SetEvent(release); pipe.cancel(); peer.join();
+    DestroyWindow(owner);
     CloseHandle(drained); CloseHandle(release); throw;
   }
   SetEvent(release); pipe.cancel(); peer.join();
+  DestroyWindow(owner);
   CloseHandle(drained); CloseHandle(release);
   if (peerError) std::rethrow_exception(peerError);
 }
@@ -98,7 +111,7 @@ int main() {
     duplexAndCancel();
     failedBootstrap(false);
     failedBootstrap(true);
-    std::cout << "PASS: pending reader permits ordered connected/status writes, buffered/fragmented commands survive bootstrap, stop cancels pending read/write, invalid bootstrap cleans up and incomplete bootstrap expires\n";
+    std::cout << "PASS: ordered duplex IPC, buffered/fragmented commands, blocked writer queue overflow posts owner WM_CLOSE, stop cancels blocked read/write, invalid/partial bootstrap cleanup and deadline\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n'; return 1;
