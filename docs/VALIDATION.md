@@ -1,5 +1,67 @@
 # Validation
 
+## Chrome text drag negotiation and source lifetime — 2026-11-16
+
+The original physical-Windows Chrome reproduction passed with a 700 ms hover
+but failed Windows → streamed Chrome with immediate release. The OLE target
+returned NONE before the asynchronous Wayland acceptance arrived. Previous Qt
+coverage did not establish Chrome compatibility. The preserved baseline is
+`build/tests/browser-dnd/baseline-results.json` and its viewer trace.
+
+The production path now separates immutable text representations, negotiation
+state, native callback leases, target revisions and completion. OLE waits with
+STA message dispatch for at most 750 ms of acceptance and 2 seconds of target
+completion; it does not automatically retry uncertain delivery. Native source
+wrappers can change across HWNDs, so a dedicated, short-lived mouse observer
+tracks press boundaries independently and preserves one source snapshot across
+targets. It performs no payload work or input suppression on the hook thread.
+A separate “文字拖放” setting defaults on independently of file/clipboard sharing.
+The design and exact limits are in [DRAG_AND_DROP.md](DRAG_AND_DROP.md).
+
+The accepted version was deployed to both existing installations. Linux Release
+hashes match `~/.local/bin/waybridge` and `waybridge-service`; the user service
+restarted at 23:28 UTC+8. Configuration checks, local administration readiness,
+its configured executable path/start time and a real pinned TLS handshake pass;
+the 49092 listener and certificate are unchanged. No compositor session was
+active during replacement. Windows x64 GUI, worker and runtime were replaced
+at the existing `%LOCALAPPDATA%\\Waybridge-Test\\m0-m1-20261114\\app\\Waybridge`;
+all 538 inventory hashes match and the profiles hash is unchanged. Service
+configuration and pairing identity were retained, with no old-version backups.
+Deployment evidence is `build/drag-deployment.json` and the corresponding
+`build/drag-{linux,windows}-deployment.log` files.
+
+`windows_browser_drag_laptop.py --host laptop --extended` uses actual Windows
+Chrome selection, physical SendInput/OLE, the production PE worker and actual
+native Wayland Chrome inputs in a private Linux session. CDP only prepares and
+inspects disposable test pages; it never synthesizes DOM drag events. Eleven
+cases cover both directions with 700 ms and zero hover, Escape, both directions
+with 120 ms added DND delay per direction, a rejecting area, bounded cancellation
+at 500 ms per direction, two streamed Chrome windows, and one Windows source
+switching streamed targets while held. Assertions require exact target text,
+original source text, one real source dragstart and COPY/NONE at dragend. The
+handoff also requires the same gesture and reuse of the immutable source.
+Only test-owned windows are raised; previous cursor/foreground are restored.
+This is not evidence for production foreground policy or physical ARM64.
+
+Linux and Wine full suites pass. Targeted fixtures additionally verify stale
+revision rejection, delayed old Receive/Finish, immutable retarget data, one
+Drop and actual completion acknowledgment, native Query/GetData/medium-release
+reentry, text enabled with file sharing off, explicit text opt-out, and a rapid
+release/new press with no intervening STA timer. Private Xwayland target
+Unicode/INCR and read-only URI copy regressions pass; this does not implement
+X11-origin or complete mixed-backend dragging. HTML/RTF/images and pre-transfer
+file hover remain open.
+
+Logs: `build/drag-full-linux.log`, `build/drag-final-windows-suite.log`,
+`build/drag-final-chrome-laptop.log`, `build/drag-revision-protocol.log`,
+`build/drag-final-gesture-probe.log`, `build/drag-final-xdnd.log`,
+`build/drag-core-tests.log`, `build/drag-final-clippy.log` and
+`build/drag-final-control-packages.log`. Real browser event/metadata records are
+under `build/tests/browser-dnd/`; those files contain only disposable fixture
+page data. Core tests verify setting defaults and independent persistence;
+x64/ARM64 package checks verify matching PE/resources/checksums, separately
+from physical device acceptance.
+
 ## Desktop interaction follow-up — 2026-11-16
 
 Delivery status: both installed programs were updated after acceptance. Linux

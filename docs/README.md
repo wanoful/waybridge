@@ -10,6 +10,8 @@ M2 首轮已接入只读文件交付、SNI 应用托盘/后台入口、原生通
 
 现有能力与目标范围见 [功能规格](FEATURES.md)，技术边界见 [架构](ARCHITECTURE.md)，里程碑见 [Roadmap](ROADMAP.md)。默认采用[共享用户数据与单向会话检查](SESSION_POLICY.md)：先注销同一用户的本地桌面，再创建 Waybridge；已有会话可以重连。M0/M1 设备验证与本次策略变更分开记录，见 [VALIDATION.md](VALIDATION.md)。
 
+窗口、托盘、焦点及拖放的支持矩阵见 [桌面交互](DESKTOP_INTERACTIONS.md)；纯文本拖放的状态、协议适配、超时边界与 Chrome 实机测试入口见 [拖放设计](DRAG_AND_DROP.md)。
+
 仓库同级的 `sunshine/` 和 `moonlight/` 是未修改的本地参考源码，不纳入本仓库；参考版本见 [upstreams.json](../upstreams.json)。完整 Git 历史与功能来源分支保留，早期提交使用 `waybridge/` 路径前缀。协议为独立 v3，普通 Moonlight 不能直接连接。
 
 每个顶层窗口对应一个 Windows 窗口，标题栏只由一端拥有；越界/嵌套菜单映射为独立 owned popup，不改变父窗口尺寸。绘制跟随 Windows DPI，Qt 分数缩放、透明 alpha、父子对话框与原生输入分别处理。断线保留应用，重连恢复窗口；旧焦点的按键、组合和指针锁定不会继续作用于新目标。

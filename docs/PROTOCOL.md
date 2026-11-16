@@ -748,6 +748,29 @@ their previous file and toplevel-drag paths.
   acceptance requires a supported MIME and COPY action. Coordinates follow
   ordinary pointer geometry/origin rules. Read-only, disconnect and target
   closure invalidate the gesture. X11 targets are routed through private XDND.
+- Server hello `data_drag_result_v1:true` extends this exchange. Enter, motion,
+  drop and cancel carry `target_epoch`; status echoes it and adds
+  `status:"pending"|"accepted"|"rejected"`. Pending is distinct from a completed
+  rejection; acceptance requires the target's supported MIME and COPY action.
+  `text_drag_retarget {drag,target_epoch,id,x,y,origin_x,origin_y}` uses a strictly
+  newer revision to invalidate the previous native target offer and renegotiate
+  the current point without retransmitting text. It is valid only during hover.
+  Other messages must match the current gesture and revision. Native HWND
+  callbacks have a separate local lease, so a reentrant callback cannot cancel
+  the same source gesture after it has moved to another target.
+- With that server capability, `text_drag_finished {drag,target_epoch,success}`
+  reports the target protocol Finish/cancellation, rather than merely receipt
+  of a drop command. The Windows adapter pumps its STA while negotiating for
+  at most 750 ms, and waits at most 2 seconds after drop for completion before
+  returning COPY. It reports NONE on timeout and does not retry an uncertain
+  delivery. These deadlines do not guarantee arbitrary-latency completion or
+  rollback of text already accepted by an application. Old servers retain the
+  original exchange; clients send retarget only with the advertised capability.
+- Client hello `drag_text` and live `text_drag_enabled {enabled}` independently
+  enable cross-device plain-text drags (default true). File sharing and clipboard
+  direction do not gate text dragging. Read-only policy overrides the setting;
+  disabling it cancels active external text drags. Native drags wholly inside
+  the Linux session retain their original source, MIME types and actions.
 - `drag_return {drag,return_token,id,x,y,origin_x,origin_y}` returns an active
   native OLE drag to the original Wayland source. The monotonic token scopes
   `drag_return_ready {drag,return_token,accepted}`; stale replies cannot release

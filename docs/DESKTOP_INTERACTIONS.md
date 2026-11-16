@@ -9,6 +9,8 @@
 - **激活和焦点**：用户在控制中心或托盘发起操作时建立短期激活上下文，经实际启动 PID 或标准 `xdg-activation-v1` token 关联到窗口，再请求 Windows 前台。过期、重复和后台请求不能无限继承这次输入。对话框隐藏/销毁前，先恢复父窗的可用状态与焦点。应用窗口不设置永久 TOPMOST；后台请求可提示用户。
 - **拖放**：原来主要桥接文件字节，遗漏文本 OLE 格式、跨 HWND 鼠标捕获、返回原会话的交接、X11 XDND 目标和 DND icon。现在将原 Wayland 拖拽、外部 MIME 交付、原生 OLE 读取和 XDND 目标分别管理，通过连接、source/offer、拖拽代际和 OLE attempt 约束生命周期，不使用应用名规则。
 
+Chrome 实机复测还发现“立即松手”会早于远端接受，Qt 成功并不能证明该场景。当前补齐 Pending/Accepted/Rejected、目标 revision、可重入的有界 OLE 等待和目标完成回执，具体职责、750 ms／2 秒边界及测试入口见 [拖放设计](DRAG_AND_DROP.md)。文字拖放已从文件共享中分离，在控制中心有独立开关。
+
 ## 当前支持矩阵
 
 | 方向/场景 | 当前行为 | 边界 |
@@ -27,7 +29,7 @@
 
 ## 状态归属
 
-- `src/data_drop.rs`：外部 MIME 交付、Wayland/Xwayland 目标选择、接受状态、drop 截止时间与取消。
+- `src/data_offer.rs`：不可变 MIME 数据快照；`src/data_drop.rs`：会话协调、Wayland/Xwayland 目标选择、接受状态、drop 截止时间与取消、源导出租约。
 - `src/drag.rs`：Wayland 源读取、受限文件导出和私有协议 sink；数据源的完成与取消由原协议处理。
 - `src/xdnd/`：独立工作线程与私有 Xwayland 连接；COPY selection、XDND 状态与 INCR，不在合成器主线程执行 X11 往返。
 - `client/file_drag.h`、`client/text_drag.h`：原生 OLE 数据表示、虚拟文件流、外部文本及原会话返回；窗口销毁、COM 重入和旧异步结果不得复活已取消手势。
@@ -37,5 +39,7 @@
 ## 验证和后续
 
 通用真实 Qt 控件回归覆盖输入框、不同窗口、文件管理模型 MOVE 和外部文字；真实生产 Windows worker 回归覆盖 OLE 出入及离开后返回；私有 Xwayland 回归覆盖 Unicode、INCR 和只读 URI 文件复制。托盘回归使用真实 SNI/QAction，图标测试使用真实 Wayland/X11 协议对象。设备测试及其限制见 [VALIDATION.md](VALIDATION.md)。
+
+真实 Windows Chrome 与原生 Wayland Chrome 的专用页面另外覆盖双向文字、立即松手、延迟、取消、拒绝、跨窗口与换目标，源端完成结果和目标文字同时验收。此结果限定于纯文本和该应用组合。
 
 下一步优先补完整 Wayland/X11 源目标互通与应用矩阵，再补文件 hover/进度/取消、CF_HDROP-only 消费者及更多拖放格式。`XEmbed` 托盘、全局菜单等独立协议仍按 [ROADMAP.md](ROADMAP.md) 分项推进。用户反馈的 HMCL、QQ、Dolphin、Blender 应分别记录版本、后端和实际操作结果，不能以名称特判替代协议支持。
