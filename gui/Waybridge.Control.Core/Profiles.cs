@@ -20,6 +20,7 @@ public sealed record ClientSettings
     public string Clipboard { get; set; } = "both";
     public bool ClipboardImages { get; set; } = true;
     public bool Files { get; set; } = true;
+    public bool DragText { get; set; } = true;
     public string BadgePng { get; set; } = "";
     public bool Notifications { get; set; } = true;
     public bool Tray { get; set; } = true;

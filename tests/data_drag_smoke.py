@@ -38,8 +38,8 @@ def main():
             app = viewer = None
             try:
                 wait_for(lambda: (root / 'dnd-0').exists())
-                viewer = Viewer(port, token.read_text(), file_drop_out=True, data_drag_v1=True)
-                viewer.send(type='hello', file_drop_out=True, toplevel_drag_v1=True)
+                viewer = Viewer(port, token.read_text(), file_drop_out=False, data_drag_v1=True)
+                viewer.send(type='hello', file_drop_out=False, toplevel_drag_v1=True)
                 app = subprocess.Popen([str(executable), str(root / 'files')], env=env, stdout=log, stderr=log)
                 ids = {}
                 for _ in range(2):

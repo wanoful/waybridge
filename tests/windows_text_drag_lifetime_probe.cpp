@@ -212,6 +212,109 @@ int main() {
       source->Release();
     }
     fresh();
+    TextDrag::configure(true);
+    source = new Source(L"coordinated");
+    target = TextDrag::enterTarget();
+    id = begin(source, target);
+    source->Release();
+    auto oldRevision = TextDrag::state.target;
+    require(TextDrag::refresh(id, position, true), "offer refresh not issued");
+    auto revision = TextDrag::state.target;
+    TextDrag::control({{"type", "text_drag_status"},
+                       {"drag", id},
+                       {"target_epoch", oldRevision},
+                       {"accepted", true}});
+    require(!TextDrag::allowed(id), "old target revision accepted the new offer");
+    unsigned pumps = 0;
+    require(TextDrag::awaitAcceptance(
+                id, target, [] { return true; },
+                [&] {
+                  ++pumps;
+                  TextDrag::control({{"type", "text_drag_status"},
+                                     {"drag", id},
+                                     {"target_epoch", revision},
+                                     {"accepted", pumps > 1},
+                                     {"status", pumps > 1 ? "accepted" : "rejected"}});
+                }),
+            "transient asynchronous rejection prevented later acceptance");
+    require(TextDrag::drop(id, position) && TextDrag::active == id,
+            "source finished before target completion");
+    TextDrag::control({{"type", "text_drag_finished"},
+                       {"drag", id},
+                       {"target_epoch", oldRevision},
+                       {"success", true}});
+    require(!TextDrag::state.terminal(), "stale completion finished current offer");
+    require(TextDrag::awaitCompletion(
+                id, target, [] { return true; },
+                [&] {
+                  TextDrag::control({{"type", "text_drag_finished"},
+                                     {"drag", id},
+                                     {"target_epoch", revision},
+                                     {"success", true}});
+                }),
+            "target completion failed");
+    fresh();
+    source = new Source(L"cancel during wait");
+    target = TextDrag::enterTarget();
+    id = begin(source, target);
+    source->Release();
+    require(!TextDrag::awaitAcceptance(
+                id, target, [] { return true; }, [] { TextDrag::reset(); }),
+            "cancelled nested wait resurrected a session");
+    require(!TextDrag::active, "cancelled session retained active ID");
+    TextDrag::configure(false);
+    // Different OLE wrappers still belong to the same physical press. A new
+    // release/press must retire the snapshot even if the UI timer never ran.
+    HWND owner = CreateWindowExW(0, L"STATIC", L"gesture probe", 0, 0, 0, 1, 1, HWND_MESSAGE,
+                                 nullptr, GetModuleHandleW(nullptr), nullptr);
+    require(owner != nullptr, "gesture owner creation failed");
+    TextDrag::attach(owner);
+    NativeDragGesture::observer.start();
+    auto mouse = [](DWORD flags) {
+      INPUT input{};
+      input.type = INPUT_MOUSE;
+      input.mi.dwFlags = flags;
+      require(SendInput(1, &input, sizeof(input)) == 1, "gesture input failed");
+    };
+    auto waitPress = [](uint64_t previous) {
+      auto until = GetTickCount64() + 2000;
+      uint64_t press = 0;
+      while (GetTickCount64() < until) {
+        press = NativeDragGesture::observer.press();
+        if (press && press != previous)
+          return press;
+        Sleep(10);
+      }
+      throw std::runtime_error("physical press was not observed independently of STA");
+    };
+    mouse(MOUSEEVENTF_LEFTDOWN);
+    auto press = waitPress(0);
+    target = TextDrag::enterTarget();
+    source = new Source(L"immutable source");
+    id = begin(source, target);
+    require(id && source->reads == 1, "initial provider not read once");
+    source->Release();
+    TextDrag::leaveTarget(target);
+    target = TextDrag::enterTarget();
+    source = new Source(L"different native wrapper");
+    require(begin(source, target) == id && source->reads == 0 &&
+                TextDrag::source->text == "immutable source",
+            "target handoff replaced the gesture snapshot");
+    mouse(MOUSEEVENTF_LEFTUP);
+    mouse(MOUSEEVENTF_LEFTDOWN);
+    waitPress(press);
+    TextDrag::leaveTarget(target);
+    target = TextDrag::enterTarget();
+    require(begin(source, target) != id && source->reads == 1 &&
+                TextDrag::source->text == "different native wrapper",
+            "new press reused old gesture data");
+    source->Release();
+    mouse(MOUSEEVENTF_LEFTUP);
+    TextDrag::reset();
+    NativeDragGesture::observer.stop();
+    TextDrag::attach(nullptr);
+    DestroyWindow(owner);
+    fresh();
     OleUninitialize();
     std::cout << "PASS: native text target leases survive QueryGetData/GetData/ReleaseStgMedium "
                  "reentry; leave/policy/drop revoke old work, newer targets remain active, Unicode "

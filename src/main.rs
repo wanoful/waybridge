@@ -6,6 +6,7 @@ mod color;
 mod color_management;
 mod cursor;
 mod data_drop;
+mod data_offer;
 mod desktop_notifications;
 mod desktop_tray;
 mod drag;
@@ -295,9 +296,9 @@ struct RemotePopup {
     target_size: (i32, i32),
 }
 
-type Clipboard = Arc<BTreeMap<String, Vec<u8>>>;
+type Clipboard = data_offer::Payload;
 
-struct OutboundDrag {
+pub(crate) struct OutboundDrag {
     id: u64,
     window: u32,
     source: WlDataSource,
@@ -337,8 +338,7 @@ struct App {
     drag_visual: drag_visual::DragVisual,
     drag_surface: Option<WlSurface>,
     drag_enabled: bool,
-    next_drag: u64,
-    outbound: Option<OutboundDrag>,
+    text_drag_enabled: bool,
     window_drag: toplevel_drag::State,
     dh: DisplayHandle,
     compositor: CompositorState,
@@ -370,14 +370,7 @@ struct App {
     clipboard: BTreeMap<String, Vec<u8>>,
     clipboard_reads: Vec<(u64, String)>,
     transfers: transfer_worker::Worker,
-    drop_data: Option<Clipboard>,
-    x11_drop: Option<data_drop::XDrop>,
-    drop_window: u32,
-    incoming_text_drag: Option<u64>,
-    server_drop_generation: u64,
-    server_drop_payloads: BTreeMap<u64, (Clipboard, Instant)>,
-    drop_deadline: Option<Instant>,
-    drop_accepted: bool,
+    data_drop: data_drop::Coordinator,
     pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u32>,
     pointer_window: Option<u32>,
@@ -439,7 +432,7 @@ impl App {
         }
         // Native OLE capture/focus changes must not cancel the Wayland source.
         if self.external_drag_input() {
-            if let Some(drag) = &mut self.outbound {
+            if let Some(drag) = &mut self.data_drop.outbound {
                 drag.deferred_focus = Some(id);
             }
             self.release_keys();
@@ -702,13 +695,14 @@ impl App {
     }
 
     fn external_drag_input(&self) -> bool {
-        self.outbound
+        self.data_drop
+            .outbound
             .as_ref()
             .is_some_and(|d| d.external && !d.dropped)
     }
 
     fn end_outbound(&mut self, success: bool) {
-        let Some(drag) = self.outbound.take() else {
+        let Some(drag) = self.data_drop.outbound.take() else {
             return;
         };
         drag.cancelled.store(true, Ordering::Relaxed);
@@ -754,7 +748,7 @@ impl App {
         let Some(id) = message["drag"].as_u64() else {
             return;
         };
-        let Some(drag) = self.outbound.as_mut().filter(|d| d.id == id) else {
+        let Some(drag) = self.data_drop.outbound.as_mut().filter(|d| d.id == id) else {
             return;
         };
         drag.activity = Instant::now();
@@ -869,10 +863,10 @@ impl App {
         if let Some(sink) = &mut self.drag_sink {
             sink.pump()?;
         }
-        let source_window_gone = self.outbound.as_ref().is_some_and(|drag| {
+        let source_window_gone = self.data_drop.outbound.as_ref().is_some_and(|drag| {
             !drag.dropped && !self.windows.iter().any(|w| w.id == drag.window && w.mapped)
         });
-        if let Some(drag) = &mut self.outbound {
+        if let Some(drag) = &mut self.data_drop.outbound {
             if source_window_gone
                 || !drag.source.alive()
                 || drag.activity.elapsed() > Duration::from_secs(120)
@@ -956,8 +950,6 @@ impl App {
         self.unlock_pointer(true);
         self.pointer_window = None;
         self.cursor.dirty = true;
-        self.drop_deadline = None;
-        self.drop_accepted = false;
     }
 
     fn publish_uploaded_files(&mut self, value: &Value, uris: Vec<u8>) {
@@ -1037,11 +1029,25 @@ impl App {
                     self.end_outbound(false);
                 }
             }
+            "text_drag_enabled" => {
+                self.text_drag_enabled = value["enabled"].as_bool().unwrap_or(true);
+                if !self.text_drag_enabled {
+                    self.cancel_text_drag();
+                    let text = self.data_drop.outbound.as_ref().is_some_and(|d| {
+                        with_source_metadata(&d.source, |m| {
+                            !m.mime_types.iter().any(|t| t == "text/uri-list")
+                        })
+                        .unwrap_or(false)
+                    });
+                    if text {
+                        self.end_outbound(false);
+                    }
+                }
+            }
             "window_state" => self.native_window_state(id, &value),
             "ime" => self.ime_message(&value),
-            "text_drag_enter" | "text_drag_motion" | "text_drag_drop" | "text_drag_cancel" => {
-                self.text_drag_message(&value)
-            }
+            "text_drag_enter" | "text_drag_motion" | "text_drag_drop" | "text_drag_cancel"
+            | "text_drag_retarget" => self.text_drag_message(&value),
             "drag_claim" | "drag_return" | "drag_drop" | "drag_result" | "drag_read" => {
                 self.drag_message(&value);
             }
@@ -1064,6 +1070,7 @@ impl App {
                 self.window_drag.available = value["toplevel_drag_v1"].as_bool().unwrap_or(false);
                 self.relative_available(value["pointer_lock"].as_bool().unwrap_or(false));
                 self.drag_enabled = value["file_drop_out"].as_bool().unwrap_or(false);
+                self.text_drag_enabled = value["drag_text"].as_bool().unwrap_or(true);
                 self.default_scale = dpi_scale(&value);
                 self.x11_scale(self.default_scale);
                 let mode = monitor_mode(&value, self.output.current_mode().unwrap().refresh);
@@ -2526,6 +2533,7 @@ impl DataControlHandler for App {
 impl ClientDndGrabHandler for App {
     fn client_offer_status(&mut self, source: &WlDataSource, accepted: bool, action: DndAction) {
         if let Some(drag) = self
+            .data_drop
             .outbound
             .as_ref()
             .filter(|d| d.returned && !d.external && &d.source == source)
@@ -2553,8 +2561,9 @@ impl ClientDndGrabHandler for App {
         if attached {
             return;
         }
-        if !self.drag_enabled
-            || self.outbound.is_some()
+        if (uri && !self.drag_enabled)
+            || (!uri && !self.text_drag_enabled)
+            || self.data_drop.outbound.is_some()
             || self.drag_surface.is_none()
             || self.pressed_buttons.len() != 1
             || !self.pressed_buttons.contains(&0x110)
@@ -2591,8 +2600,8 @@ impl ClientDndGrabHandler for App {
         let Ok((read, write)) = UnixStream::pair() else {
             return;
         };
-        self.next_drag += 1;
-        let id = self.next_drag;
+        self.data_drop.next_outbound += 1;
+        let id = self.data_drop.next_outbound;
         let window = self.focused_window.unwrap_or(0);
         let cancelled = Arc::new(AtomicBool::new(false));
         let scheduled = if uri {
@@ -2611,7 +2620,7 @@ impl ClientDndGrabHandler for App {
             return;
         }
         source.send(mime, write.as_fd());
-        self.outbound = Some(OutboundDrag {
+        self.data_drop.outbound = Some(OutboundDrag {
             id,
             window,
             source,
@@ -2629,7 +2638,7 @@ impl ClientDndGrabHandler for App {
     fn dropped(&mut self, _: Option<WlSurface>, validated: bool, _: Seat<Self>) {
         self.stop_drag_visual();
         self.window_drag.ended();
-        if let Some(drag) = &self.outbound {
+        if let Some(drag) = &self.data_drop.outbound {
             if !drag.dropped && (!drag.external || !validated) {
                 self.end_outbound(false);
             }
@@ -2637,31 +2646,37 @@ impl ClientDndGrabHandler for App {
     }
 }
 impl ServerDndGrabHandler for App {
-    fn offer_status(&mut self, source_id: u64, accepted: bool, action: DndAction, _: Seat<Self>) {
-        if source_id != self.server_drop_generation {
+    fn offer_negotiation(
+        &mut self,
+        source_id: u64,
+        accepted: bool,
+        action: DndAction,
+        settled: bool,
+        _: Seat<Self>,
+    ) {
+        if source_id != self.data_drop.generation {
             return;
         }
-        self.drop_accepted = accepted && action == DndAction::Copy;
-        if let Some(id) = self.incoming_text_drag {
-            self.control(
-                json!({"type":"text_drag_status","drag":id,"accepted":self.drop_accepted}),
-            );
+        self.data_drop
+            .negotiate(accepted && action == DndAction::Copy, settled);
+        if let Some(status) = self.data_drop.status() {
+            self.control(status);
         }
     }
     fn send_for_source(&mut self, source_id: u64, mime: String, fd: OwnedFd, _: Seat<Self>) {
-        if let Some((data, _)) = self.server_drop_payloads.get(&source_id) {
-            drag::send_payload(fd, data.clone(), mime);
+        if let Some((data, _)) = self.data_drop.snapshots.get(&source_id) {
+            drag::send_payload(fd, data.snapshot(), mime);
         }
     }
     fn finished_for_source(&mut self, source_id: u64, _: Seat<Self>) {
-        self.server_drop_payloads.remove(&source_id);
-        if source_id == self.server_drop_generation {
-            self.drop_data = None;
-            self.incoming_text_drag = None;
+        if let Some(done) = self.data_drop.complete(source_id, true) {
+            self.control(done);
         }
     }
-    fn cancelled_for_source(&mut self, source_id: u64, seat: Seat<Self>) {
-        self.finished_for_source(source_id, seat);
+    fn cancelled_for_source(&mut self, source_id: u64, _: Seat<Self>) {
+        if let Some(done) = self.data_drop.complete(source_id, false) {
+            self.control(done);
+        }
     }
 }
 
@@ -2955,8 +2970,7 @@ fn main() -> Result<()> {
         drag_visual: drag_visual::DragVisual::default(),
         drag_surface: None,
         drag_enabled: false,
-        next_drag: 0,
-        outbound: None,
+        text_drag_enabled: true,
         window_drag: toplevel_drag::State::default(),
         data_device: DataDeviceState::new::<App>(&dh),
         data_control: DataControlState::new::<App, _>(&dh, None, |_| true),
@@ -2987,14 +3001,7 @@ fn main() -> Result<()> {
         clipboard: BTreeMap::new(),
         clipboard_reads: vec![],
         transfers,
-        drop_data: None,
-        x11_drop: None,
-        drop_window: 0,
-        incoming_text_drag: None,
-        server_drop_generation: 0,
-        server_drop_payloads: BTreeMap::new(),
-        drop_deadline: None,
-        drop_accepted: false,
+        data_drop: data_drop::Coordinator::default(),
         pressed_keys: HashSet::new(),
         pressed_buttons: HashSet::new(),
         pointer_window: None,
@@ -3230,7 +3237,7 @@ fn main() -> Result<()> {
                         }
                     }
                     Event::DragFiles { id, result } => {
-                        if let Some(drag) = app.outbound.as_mut().filter(|d| d.id == id) {
+                        if let Some(drag) = app.data_drop.outbound.as_mut().filter(|d| d.id == id) {
                             match result {
                                 Ok(files) => {
                                     let manifest = files.manifest.clone();
@@ -3249,8 +3256,7 @@ fn main() -> Result<()> {
                         }
                     }
                     Event::Disconnected => {
-                        app.cancel_text_drag();
-                        app.cancel_x11_drop();
+                        app.cancel_data_drop();
                         app.stop_drag_visual();
                         app.drag_visual.enabled = false;
                         app.activation.connection();

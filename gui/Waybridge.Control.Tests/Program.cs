@@ -223,6 +223,10 @@ try
     await Reject<ArgumentException>(() => { _ = new DirectAgent(directProfile with { CertificateSha256 = "" }, new string('b',64)); return Task.CompletedTask; });
     Console.WriteLine("PASS: profile validation rejects option, shell and session-path injection");
 
+    var legacySettings = JsonSerializer.Deserialize<ClientSettings>("{\"files\":false}", ProfileStore.Json)!;
+    Check(!legacySettings.Files && legacySettings.DragText, "legacy file sharing must not disable text drags");
+    var textDisabled = JsonSerializer.Deserialize<ClientSettings>(JsonSerializer.Serialize(new ClientSettings { DragText = false }, ProfileStore.Json), ProfileStore.Json)!;
+    Check(!textDisabled.DragText && textDisabled.Files, "independent text drag policy failed to persist");
     var store = new ProfileStore(directory);
     await store.SaveAsync([profile]);
     var loaded = await store.LoadAsync();

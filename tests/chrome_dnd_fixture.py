@@ -62,3 +62,64 @@ class Cdp:
             self.process.stdin.close()
             try:self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:self.process.kill();self.process.wait()
+
+class DragDelayProxy:
+    """FIFO packet proxy with adjustable DND delay; media keeps normal scheduling."""
+    def __init__(self,upstream):
+        self.upstream=upstream;self.delay=0.;self.stopped=threading.Event();self.sockets=[];self.threads=[]
+        self.listener=__import__('socket').socket();self.listener.bind(('127.0.0.1',0));self.listener.listen();self.listener.settimeout(.2)
+        self.port=self.listener.getsockname()[1]
+        thread=threading.Thread(target=self.accept,daemon=True);self.threads.append(thread);thread.start()
+    def accept(self):
+        import socket
+        while not self.stopped.is_set():
+            try:local,_=self.listener.accept()
+            except socket.timeout:continue
+            except OSError:return
+            remote=socket.create_connection(('127.0.0.1',self.upstream),timeout=5);remote.settimeout(None);self.sockets.extend((local,remote))
+            for source,target in ((local,remote),(remote,local)):
+                thread=threading.Thread(target=self.relay,args=(source,target),daemon=True);self.threads.append(thread);thread.start()
+    def relay(self,source,target):
+        import collections,struct
+        queue=collections.deque();condition=threading.Condition();finished=False
+        def exact(count):
+            result=b''
+            while len(result)<count:
+                part=source.recv(count-len(result))
+                if not part:raise EOFError()
+                result+=part
+            return result
+        def writer():
+            try:
+                while not self.stopped.is_set():
+                    with condition:
+                        while not queue and not finished and not self.stopped.is_set():condition.wait(.1)
+                        if not queue:return
+                        due,packet=queue[0];remaining=due-time.monotonic()
+                        if remaining>0:condition.wait(min(.1,remaining));continue
+                        queue.popleft()
+                    target.sendall(packet)
+            except OSError:pass
+        thread=threading.Thread(target=writer,daemon=True);self.threads.append(thread);thread.start()
+        due=0.
+        try:
+            while not self.stopped.is_set():
+                header=exact(4);size,=struct.unpack('>I',header)
+                if not 0<size<=72*1024*1024:raise ValueError('invalid proxy frame')
+                body=exact(size);delay=0.
+                if body[0]==0:
+                    kind=json.loads(body[1:]).get('type','')
+                    if kind.startswith(('text_drag_','drag_')):delay=self.delay
+                due=max(due,time.monotonic()+delay)
+                with condition:queue.append((due,header+body));condition.notify_all()
+        except (OSError,EOFError,ValueError):pass
+        finally:
+            with condition:finished=True;condition.notify_all()
+    def close(self):
+        import socket
+        self.stopped.set();self.listener.close()
+        for sock in self.sockets:
+            try:sock.shutdown(socket.SHUT_RDWR)
+            except OSError:pass
+            sock.close()
+        for thread in self.threads:thread.join(timeout=1)

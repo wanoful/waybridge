@@ -153,7 +153,9 @@ where
                 let offer_data = Arc::new(Mutex::new(ServerDndOfferData {
                     active: true,
                     dropped: false,
-                    accepted: true,
+                    accepted: false,
+                    mime_seen: false,
+                    action_seen: false,
                     chosen_action: DndAction::empty(),
                 }));
                 for device in seat_data
@@ -484,6 +486,8 @@ struct ServerDndOfferData {
     active: bool,
     dropped: bool,
     accepted: bool,
+    mime_seen: bool,
+    action_seen: bool,
     chosen_action: DndAction,
 }
 
@@ -549,16 +553,24 @@ fn handle_server_dnd<D>(
     let mut data = offer_data.lock().unwrap();
     match request {
         Request::Accept { mime_type, .. } => {
+            data.mime_seen = true;
             if let Some(mtype) = &mime_type {
                 data.accepted = metadata.mime_types.contains(mtype);
             } else {
                 data.accepted = false;
             }
             if offer.version() < 3 {
+                data.action_seen = true;
                 data.chosen_action = metadata.dnd_action & DndAction::Copy;
             }
             if data.active {
-                handler.offer_status(source_id, data.accepted, data.chosen_action, seat.clone());
+                handler.offer_negotiation(
+                    source_id,
+                    data.accepted,
+                    data.chosen_action,
+                    data.mime_seen && (!data.accepted || data.action_seen),
+                    seat.clone(),
+                );
             }
             handler.accept(mime_type, seat)
         }
@@ -623,12 +635,19 @@ fn handle_server_dnd<D>(
                 [DndAction::None, DndAction::Move, DndAction::Copy, DndAction::Ask].contains(&chosen_action),
                 "Only one precise action should be chosen"
             );
+            data.action_seen = true;
+            if data.active {
+                handler.offer_negotiation(
+                    source_id,
+                    data.accepted,
+                    chosen_action,
+                    data.mime_seen,
+                    seat.clone(),
+                );
+            }
             if chosen_action != data.chosen_action {
                 data.chosen_action = chosen_action;
                 offer.action(chosen_action);
-                if data.active {
-                    handler.offer_status(source_id, data.accepted, chosen_action, seat.clone());
-                }
                 handler.action(chosen_action, seat);
             }
         }

@@ -136,6 +136,11 @@ public:
 };
 }
 
+static LRESULT CALLBACK policyProc(HWND hwnd,UINT message,WPARAM wp,LPARAM lp){
+  if(message==WM_APP+99){TextDrag::control({{"type","text_drag_status"},{"drag",TextDrag::active},{"accepted",true}});return 0;}
+  return windowProc(hwnd,message,wp,lp);
+}
+
 int wmain() {
   HRESULT initialized = OleInitialize(nullptr);
   if (FAILED(initialized)) return 1;
@@ -144,7 +149,7 @@ int wmain() {
     WNDCLASSW type{};
     type.hInstance = GetModuleHandleW(nullptr);
     type.lpszClassName = L"DropLifetimeProbe";
-    type.lpfnWndProc = windowProc;
+    type.lpfnWndProc = policyProc;
     require(RegisterClassW(&type) != 0, "RegisterClass failed");
     FileTree::supported = true;
     for (bool replacement : {false, true}) {
@@ -153,7 +158,7 @@ int wmain() {
                               CloseAt::ReleaseMedium, CloseAt::AsyncMode, CloseAt::AsyncStart}) {
         createTarget();
         HWND original = windows.at(Id)->hwnd;
-        auto target = new FileDropTarget(windows.at(Id).get());
+        auto target = new RemoteDropTarget(windows.at(Id).get());
         require(SUCCEEDED(RegisterDragDrop(original, target)), "RegisterDragDrop failed");
         auto data = new ClosingData(closeAt);
         DWORD effect = DROPEFFECT_COPY;
@@ -185,6 +190,22 @@ int wmain() {
         replaceWindow = replacement;
       }
     }
+    // Text and files have independent policy, through the actual target adapter.
+    createTarget();auto *window=windows.at(Id).get();window->width=400;window->height=300;window->clientDecorated=true;
+    ShowWindow(window->hwnd,SW_SHOW);POINT cursor{20,20};ClientToScreen(window->hwnd,&cursor);SetCursorPos(cursor.x,cursor.y);
+    hostedFiles=false;dataDragNegotiated=true;
+    auto adapter=new RemoteDropTarget(window);
+    auto textState=std::make_shared<FileDrag::Transfer>();textState->text=L"text with files disabled";
+    auto textData=new FileDrag::DataObject(textState);
+    PostMessageW(window->hwnd,WM_APP+99,0,0);
+    DWORD effect=DROPEFFECT_COPY;POINTL point{cursor.x,cursor.y};
+    adapter->DragEnter(textData,0,point,&effect);require(effect==DROPEFFECT_COPY,"file sharing switch blocked plain text");
+    effect=DROPEFFECT_COPY;adapter->Drop(textData,0,point,&effect);require(effect==DROPEFFECT_COPY,"text drop blocked with files disabled");textData->Release();
+    hostedDragText=false;TextDrag::reset();
+    auto blockedState=std::make_shared<FileDrag::Transfer>();blockedState->text=L"blocked text";auto blockedData=new FileDrag::DataObject(blockedState);
+    effect=DROPEFFECT_COPY;adapter->DragEnter(blockedData,0,point,&effect);require(effect==DROPEFFECT_NONE,"disabled text drag policy was bypassed");adapter->DragLeave();blockedData->Release();hostedDragText=true;
+    auto fileState=std::make_shared<FileDrag::Transfer>();fileState->files.push_back({L"blocked.txt",0,false});auto fileData=new FileDrag::DataObject(fileState);
+    effect=DROPEFFECT_COPY;adapter->DragEnter(fileData,0,point,&effect);require(effect==DROPEFFECT_NONE,"file disabled policy was bypassed");adapter->DragLeave();fileData->Release();adapter->Release();destroyRemote(Id);hostedFiles=true;
     require(operationsEnded == 2, "async operation was not ended after target closure");
     std::cout << "PASS: OLE target closure/replacement during query, data read, medium release, async setup; cancelled without scheduling uploads\n";
   } catch (const std::exception &error) {

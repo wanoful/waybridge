@@ -162,6 +162,18 @@ pub trait ServerDndGrabHandler: SeatHandler {
     /// Combined negotiation state for a compositor-owned source. The opaque
     /// source ID survives pointer-grab teardown and delayed offer requests.
     fn offer_status(&mut self, source_id: u64, accepted: bool, action: DndAction, seat: Seat<Self>) {}
+    /// Negotiation completeness: MIME and action have both been considered.
+    /// A pending offer must not be reported as a target rejection.
+    fn offer_negotiation(
+        &mut self,
+        source_id: u64,
+        accepted: bool,
+        action: DndAction,
+        settled: bool,
+        seat: Seat<Self>,
+    ) {
+        self.offer_status(source_id, accepted, action, seat);
+    }
     /// Receive data for the particular compositor-owned source, not the newest drag.
     fn send_for_source(&mut self, source_id: u64, mime: String, fd: OwnedFd, seat: Seat<Self>) {
         self.send(mime, fd, seat);

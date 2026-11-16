@@ -35,7 +35,7 @@ internal sealed class MainWindow : Window
     private readonly ComboBox connectionMode = Combo(["认证加密直连", "内置 SSH", "已有 SSH 隧道"]);
     private readonly ComboBox sessionMode = Combo(["已有会话优先，未运行时启动", "仅接入已有会话", "创建独立会话"]);
     private readonly NumberBox sshPort = Number(22, 1, 65535), remotePort = Number(49090, 0, 65535);
-    private readonly ToggleSwitch reconnect = Toggle(true), audio = Toggle(true), files = Toggle(true), images = Toggle(true), readOnly = Toggle(false), ime = Toggle(true), udp = Toggle(false), hdr = Toggle(false);
+    private readonly ToggleSwitch reconnect = Toggle(true), audio = Toggle(true), files = Toggle(true), dragText = Toggle(true), images = Toggle(true), readOnly = Toggle(false), ime = Toggle(true), udp = Toggle(false), hdr = Toggle(false);
     private readonly ToggleSwitch notifications = Toggle(true);
     private readonly ComboBox codec = Combo(["自动", "H.264", "HEVC", "AV1", "PNG 无损"]);
     private readonly ComboBox scale = Combo(["跟随 Windows", "100%", "125%", "150%", "175%", "200%", "250%", "300%", "400%"]);
@@ -317,7 +317,8 @@ internal sealed class MainWindow : Window
         var apply = Button("应用到当前连接", true); apply.Click += async (_, _) => await GuardAsync(ApplyAsync);
         return Column(BadgeEditor(), Row("剪贴板方向", "可分别限制 Windows 与 Linux 间的数据同步", clipboard),
             Row("剪贴板图片", "文本同步保持独立", images),
-            Row("文件与目录共享", "控制剪贴板文件、拖入与拖出", files),
+            Row("文字拖放", "双向文字拖放，独立于剪贴板与文件共享", dragText),
+            Row("文件与目录共享", "控制文件与目录的剪贴板、拖入与拖出", files),
             Row("桌面通知", "Linux 应用通知与动作，遵循 Windows 通知设置及免打扰", notifications),
             Row("远端应用托盘", "在 Windows 通知区域显示应用托盘，关闭主窗口后仍可从后台列表恢复", remoteTray),
             Row("只读模式", "暂停键盘和鼠标输入，服务端同时释放按键与指针锁定", readOnly),
@@ -437,7 +438,7 @@ internal sealed class MainWindow : Window
         gpu.SelectedIndex = settings.GpuInput == "cuda" ? 1 : 0;
         clipboard.SelectedIndex = Array.IndexOf(new[] { "both", "send", "receive", "off" }, settings.Clipboard);
         remoteTray.IsOn = settings.Tray;
-        images.IsOn = settings.ClipboardImages; files.IsOn = settings.Files; readOnly.IsOn = settings.ReadOnly; ime.IsOn = settings.Ime;
+        images.IsOn = settings.ClipboardImages; files.IsOn = settings.Files; dragText.IsOn = settings.DragText; readOnly.IsOn = settings.ReadOnly; ime.IsOn = settings.Ime;
         notifications.IsOn = settings.Notifications;
         desktopNotifications.SharingChanged(settings.Notifications);
         loading = false; UpdateMode();
@@ -452,7 +453,7 @@ internal sealed class MainWindow : Window
             Audio = audio.IsOn, Volume = (int)volume.Value, AudioDevice = audioDevices[Math.Clamp(output.SelectedIndex, 0, audioDevices.Count - 1)].Id,
             Hdr = hdr.IsOn, Udp = udp.IsOn, UdpHost = udpHost.Text.Trim(), GpuInput = gpu.SelectedIndex == 1 ? "cuda" : "cpu",
             Clipboard = new[] { "both", "send", "receive", "off" }[Math.Max(0, clipboard.SelectedIndex)],
-            BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn,
+            BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, DragText = dragText.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn,
             Notifications = notifications.IsOn, Tray = remoteTray.IsOn
         };
         var result = selected with

@@ -30,9 +30,10 @@ def main():
                 wait_for(lambda:(root/'delayed-offer-0').exists())
                 viewer=Viewer(port,token.read_text(),file_drop_out=True,data_drag_v1=True)
                 app=subprocess.Popen([str(executable)],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=log,text=True)
-                lines=queue.Queue()
+                lines=queue.Queue();observed=[]
                 def collect():
-                    for line in app.stdout:lines.put(line.rstrip('\n'))
+                    for line in app.stdout:
+                        observed.append(line.rstrip('\n'));lines.put(observed[-1])
                     lines.put(None)
                 threading.Thread(target=collect,daemon=True).start()
                 def line(prefix):
@@ -46,8 +47,8 @@ def main():
                     info=viewer.until(lambda k,v:k=='control' and v.get('type')=='window' and v.get('title','').startswith('Delayed offer') and v['title'] not in ids)
                     ids[info['title']]=info['id']
                 first,second=ids['Delayed offer A'],ids['Delayed offer B']
-                def status(drag,accepted):
-                    viewer.until(lambda k,v:k=='control' and v.get('type')=='text_drag_status' and v.get('drag')==drag and v.get('accepted')==accepted)
+                def status(drag,accepted,epoch=None):
+                    viewer.until(lambda k,v:k=='control' and v.get('type')=='text_drag_status' and v.get('drag')==drag and v.get('accepted')==accepted and (epoch is None or v.get('target_epoch')==epoch))
                 def command(value):
                     app.stdin.write(value+'\n');app.stdin.flush()
                     return line('ACK '+value)
@@ -82,8 +83,28 @@ def main():
                 app.stdin.write('receive 4\n');app.stdin.flush()
                 assert line('READ 4 ')=='READ 4 '+new.hex()
                 line('ACK receive 4');command('finish 4')
+                # Target revision changes invalidate the old native offer while
+                # retaining one gesture and its immutable representation.
+                viewer.send(type='text_drag_enter',drag=300,target_epoch=10,id=first,x=20,y=20,data=base64.b64encode(new).decode())
+                line('ENTER 5 1');status(300,True,10)
+                viewer.send(type='text_drag_retarget',drag=300,target_epoch=11,id=second,x=20,y=20)
+                line('ENTER 6 2');status(300,False,11)
+                command('accept 5');unchanged(300,False)
+                command('accept 6');status(300,True,11)
+                viewer.send(type='text_drag_motion',drag=300,target_epoch=10,id=first,x=20,y=20)
+                unchanged(300,True)
+                viewer.send(type='text_drag_drop',drag=300,target_epoch=11,id=second,x=20,y=20)
+                line('DROP 6')
+                viewer.send(type='text_drag_drop',drag=300,target_epoch=11,id=second,x=20,y=20)
+                viewer.send(type='ping',nonce='duplicate-drop')
+                viewer.until(lambda k,v:k=='control' and v.get('nonce')=='duplicate-drop')
+                app.stdin.write('receive 6\n');app.stdin.flush()
+                assert line('READ 6 ')=='READ 6 '+new.hex()
+                line('ACK receive 6');command('finish 6')
+                viewer.until(lambda k,v:k=='control' and v.get('type')=='text_drag_finished' and v.get('drag')==300 and v.get('target_epoch')==11 and v.get('success') is True)
+                assert observed.count('DROP 6')==1,'duplicate drop redelivered the gesture'
                 assert host.poll() is None and app.poll() is None
-                print('PASS: inactive same-source offer Accept/SetActions cannot alter new target; dropped old offer receives old Unicode bytes after new offer starts; old Finish preserves new Drop/Receive/Finish')
+                print('PASS: inactive offer Accept/SetActions cannot alter new target; delayed old Receive/Finish preserves snapshots and new gesture; retarget keeps payload, ignores stale revision and acknowledges actual Finish')
             except BaseException:
                 print((root/'host.log').read_text());raise
             finally:
