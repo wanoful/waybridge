@@ -64,7 +64,7 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 
 ## 当前已有的功能
 
-“已有”表示源码已具备相应实现。Linux 集成测试、Wine 下 Windows API 测试和真实 Windows/WoA 验收分别记录，不能互相替代。WinUI 控制中心启动及所选连接、应用、文件与会话流程已在 Windows 11 x64 实机通过；更新版 WoA、物理 HDR、托盘菜单退出和完整应用/设备矩阵仍待补验收。详细证据见 [VALIDATION.md](VALIDATION.md)。
+“已有”表示源码已具备相应实现。Linux 集成测试、Wine 下 Windows API 测试和真实 Windows/WoA 验收分别记录，不能互相替代。WinUI 控制中心启动及所选连接、应用、文件与会话流程已在 Windows 11 x64 实机通过；更新版 WoA、物理 HDR 和完整应用/设备矩阵仍待补验收；SNI 原生菜单操作及 Qt QAction 退出已有 Windows x64 实测。详细证据见 [VALIDATION.md](VALIDATION.md)。
 
 | 功能 | 当前已有内容 | 当前边界 |
 |---|---|---|
@@ -76,7 +76,8 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | 键鼠与输入法 | 键盘、鼠标、滚轮、本地光标、微软拼音桥接 Wayland text-input-v3 | Qt 基础微软拼音场景有 WoA 实机记录；更多输入法、切换组合和 X11/XIM 未覆盖 |
 | 游戏鼠标 | Raw Input 相对位移、指针锁定、隐藏与裁剪、失焦释放、紧急解锁 | 尚无 confined-pointer、通用手柄及震动；实际游戏兼容性须按游戏验收 |
 | 剪贴板 | 双向文本、PNG、文件和目录；方向与图片、文件共享开关 | HTML/RTF 等富文本未实现；应用私有剪贴板格式不跨平台转换 |
-| 文件传输与拖放 | 双向文件和目录、Windows 虚拟文件导入、Linux 按需虚拟文件拖出、完成活动与接收目录入口 | 只 Copy；只读输入与可写独立副本已实现；GUI 无逐文件进度、暂停、续传和统一取消；第三方 OLE 应用仍需实机验收 |
+| 文件传输与拖放 | 双向文件和目录、Windows 虚拟文件导入、Linux 按需虚拟文件拖出、完成活动与接收目录入口；外部只读 URI 可交付至 Xwayland 目标 | 跨设备只 COPY，原 Wayland 会话内保留 COPY/MOVE；只读输入与可写独立副本已实现；GUI 无逐文件进度、暂停、续传和统一取消；完整 X11 源目标互通仍缺 |
+| 文字拖放及反馈 | Windows Unicode 与 Wayland UTF-8 双向 COPY、原会话跨 HWND 拖放与 OLE 返回、源提供的透明动画虚影 | HTML/RTF/图像拖放、完整 X11 源端和文件 hover 尚未覆盖；具体方向与限制见 DESKTOP_INTERACTIONS.md |
 | 声音播放 | 私有会话音频、Windows WASAPI、音量、静音和输出设备选择 | 当前立体声 PCM；无麦克风、压缩音频、严格音画同步和设备热切换，切换输出设备需重连 |
 | 基础画面 | PNG、H.264、独立无损 alpha、Windows GPU 解码和 PNG 回退 | SDR 视频为 4:2:0；PNG 已支持无损，但尚无自动为办公文字选择清晰策略的完整产品模式 |
 | 可选画面能力 | HEVC、AV1、CUDA 颜色输入、实验 scRGB HDR | auto/HDR 启动与实时策略已统一，真实 NVENC 回归通过；新 codec、Main10 和物理 HDR 的 WoA 验收待完成 |
