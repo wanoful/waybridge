@@ -61,7 +61,9 @@ private X server and the same production worker. It checks v3/v5 completion,
 verified proxy delivery with INCR, refusal of MOVE, target destruction, old
 source/generation/Finished isolation, incorrect target Status rejection, final
 position delivery after 10,000 coalesced motions, polymorphic TEXT encoding,
-Latin-1 aliases, opaque text/plain data, and unchanged CLIPBOARD ownership.
+Latin-1 aliases, opaque text/plain data, cancellation during INCR with no further
+chunks, and unchanged CLIPBOARD ownership. Generation guards run before each
+INCR chunk and after blocking X-server requestor setup.
 
 For Wayland-origin integration, the common data-drop handler can use the same
 worker after capturing original MIME bytes through the compositor's private

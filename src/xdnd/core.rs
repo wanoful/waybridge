@@ -587,6 +587,7 @@ fn selection(
     atoms: &Atoms,
     active: &mut Active,
     request: SelectionRequestEvent,
+    shared: &Shared,
 ) -> Result<()> {
     if request.owner != active.source
         || request.selection != atoms.XdndSelection
@@ -650,6 +651,11 @@ fn selection(
                     .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
             )?
             .check()?;
+            // The X server roundtrip may overlap a disconnect/read-only
+            // transition. Recheck immediately before exposing payload data.
+            if !generation_current(shared, active.request.generation) {
+                bail!("XDND generation superseded");
+            }
             bus.change_property32(
                 PropMode::REPLACE,
                 request.requestor,
@@ -672,7 +678,12 @@ fn selection(
     active.touched = Instant::now();
     reply(bus, &request, output)
 }
-fn increment(bus: &Bus, active: &mut Active, event: PropertyNotifyEvent) -> Result<()> {
+fn increment(
+    bus: &Bus,
+    active: &mut Active,
+    event: PropertyNotifyEvent,
+    shared: &Shared,
+) -> Result<()> {
     if event.state != Property::DELETE {
         return Ok(());
     }
@@ -681,6 +692,11 @@ fn increment(bus: &Bus, active: &mut Active, event: PropertyNotifyEvent) -> Resu
         .iter()
         .position(|i| i.requestor == event.window && i.property == event.atom)
     {
+        // Several PropertyDelete events can already be queued in this batch.
+        // Cancellation must stop each individual chunk, not just the next loop.
+        if !generation_current(shared, active.request.generation) {
+            bail!("XDND generation superseded");
+        }
         let transfer = &mut active.increments[index];
         let end = (transfer.offset + CHUNK).min(transfer.bytes.len());
         bus.change_property8(
@@ -871,7 +887,7 @@ fn run(display: u32, shared: &Shared) -> Result<()> {
                             terminal = Some(OutcomeKind::Finished(false));
                             break;
                         }
-                        if let Err(error) = selection(&bus, &atoms, current, event) {
+                        if let Err(error) = selection(&bus, &atoms, current, event, shared) {
                             terminal = Some(OutcomeKind::Error(error.to_string()));
                             break;
                         }
@@ -883,7 +899,7 @@ fn run(display: u32, shared: &Shared) -> Result<()> {
                         {
                             current.drop_time = Some(event.time);
                         }
-                        if let Err(error) = increment(&bus, current, event) {
+                        if let Err(error) = increment(&bus, current, event, shared) {
                             terminal = Some(OutcomeKind::Error(error.to_string()));
                             break;
                         }

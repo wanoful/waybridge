@@ -97,6 +97,7 @@ fn main() -> Result<()> {
         ("text-polymorphic", 5, false, false, false, false),
         ("latin1-plain", 5, false, false, false, false),
         ("opaque-plain", 5, false, false, false, false),
+        ("cancel-incr", 5, false, false, false, true),
     ]
     .into_iter()
     .enumerate()
@@ -302,7 +303,14 @@ fn main() -> Result<()> {
                             && event.state == Property::NEW_VALUE =>
                     {
                         let reply = bus
-                            .get_property(true, target, data_atom, AtomEnum::ANY, 0, 2_000_000)?
+                            .get_property(
+                                case != "cancel-incr",
+                                target,
+                                data_atom,
+                                AtomEnum::ANY,
+                                0,
+                                2_000_000,
+                            )?
                             .reply()?;
                         assert_eq!(reply.type_, returned_type);
                         if reply.value.is_empty() {
@@ -317,6 +325,11 @@ fn main() -> Result<()> {
                         } else {
                             received.extend(reply.value);
                             assert!(received.len() <= expected.len());
+                            if case == "cancel-incr" {
+                                assert_eq!(received.len(), 32 * 1024);
+                                source.cancel(generation);
+                                bus.delete_property(target, data_atom)?;
+                            }
                         }
                         bus.flush()?;
                     }
@@ -346,12 +359,32 @@ fn main() -> Result<()> {
                         );
                         complete = true;
                     }
+                    worker::OutcomeKind::Finished(false) if case == "cancel-incr" => {
+                        assert!(got_drop);
+                        assert_eq!(received.len(), 32 * 1024);
+                        complete = true;
+                    }
+                    worker::OutcomeKind::Error(error) if case == "cancel-incr" => {
+                        assert!(error.contains("superseded"), "{error}");
+                        assert_eq!(received.len(), 32 * 1024);
+                        complete = true;
+                    }
                     worker::OutcomeKind::Finished(false) => bail!("{case}: unexpected failure"),
                     worker::OutcomeKind::Error(error) => bail!("{case}: {error}"),
                     _ => (),
                 }
             }
             std::thread::sleep(Duration::from_millis(2));
+        }
+        if case == "cancel-incr" {
+            // GetProperty is an X-server barrier after cancellation/deletion:
+            // the source must not refill the receiver property with another chunk.
+            assert_eq!(
+                bus.get_property(false, target, data_atom, AtomEnum::ANY, 0, 2_000_000)?
+                    .reply()?
+                    .type_,
+                NONE
+            );
         }
         assert_eq!(
             bus.get_selection_owner(clipboard)?.reply()?.owner,
