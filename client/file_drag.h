@@ -7,6 +7,7 @@
 #include <optional>
 
 namespace FileDrag {
+inline void trace(const char *event) { if (GetEnvironmentVariableW(L"WAYBRIDGE_DND_TRACE",nullptr,0)) std::cerr << "DND " << event << std::endl; }
 constexpr UINT StartMessage = WM_APP + 17;
 constexpr UINT ResumeMessage = WM_APP + 23;
 inline std::function<bool(POINT)> remoteHitTest;
@@ -578,6 +579,7 @@ inline void maybeClaim() {
     std::lock_guard<std::mutex> lock(transfer->mutex);
     transfer->claimed = true;
   }
+  trace("claim");
   sendJson({{"type", "drag_claim"}, {"drag", transfer->id}});
 }
 inline void releasedBeforeStart() {
@@ -593,6 +595,7 @@ inline void releasedBeforeStart() {
     transfer->finish(false);
 }
 inline void start(HWND controllerWindow) {
+  trace("start");
   auto transfer = current();
   if (!transfer)
     return;
@@ -614,18 +617,21 @@ inline void start(HWND controllerWindow) {
     std::lock_guard<std::mutex> lock(transfer->mutex);
     transfer->inOle = true;
   }
+  trace("release-capture");
   ReleaseCapture();
+  trace("enter-ole");
   DWORD effect = 0;
   ownObject = data;
   HRESULT result = DoDragDrop(data, source, DROPEFFECT_COPY, &effect);
   ownObject = nullptr;
+  trace("leave-ole");
   source->Release();
   bool returned=false;
   { std::lock_guard<std::mutex> lock(transfer->mutex);
     if (transfer->returnRemote && !transfer->cancelled && !transfer->done) {
       returned=true;transfer->returnRemote=false;transfer->waitingReturn=!transfer->returnAccepted;transfer->returnDeadline=GetTickCount64()+1500;
       transfer->claimed=transfer->ready=transfer->inOle=transfer->oleDone=transfer->dropSent=false;
-      transfer->operation=transfer->asyncEnded=transfer->asyncSuccess=false;++transfer->attempt;
+      transfer->operation=transfer->asyncEnded=transfer->asyncSuccess=false;++transfer->attempt;transfer->requests.clear();
     }
   }
   if(returned){transfer->wake.notify_all();data->Release();PostMessageW(controllerWindow,ResumeMessage,0,0);return;}
@@ -720,6 +726,7 @@ inline bool control(const Json &message, HWND controllerWindow, HWND sourceWindo
   if (!transfer || message.value("drag", uint64_t(0)) != transfer->id)
     return true;
   if (type == "drag_ready") {
+    trace("ready");
     {
       std::lock_guard<std::mutex> lock(transfer->mutex);
       transfer->ready = true;

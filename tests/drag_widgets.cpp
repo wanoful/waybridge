@@ -58,5 +58,6 @@ int main(int argc,char **argv) {
       }});
     });
   }
+  if(argc<=1)tree.hide();
   first.show();second.show();return app.exec();
 }

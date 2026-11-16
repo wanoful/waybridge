@@ -2898,7 +2898,10 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       if (message == WM_MOUSEMOVE) { sendWindowDragMotion(); return 0; }
       if (message == WM_LBUTTONUP) { sendWindowDragMotion(true); return 0; }
       if (message == WM_CANCELMODE || (message == WM_CAPTURECHANGED && reinterpret_cast<HWND>(lp) != hwnd)) {
-        cancelWindowDrag(); return 0;
+        // OLE deliberately releases capture while retaining the original
+        // Wayland source. Its QueryContinueDrag/result owns cancellation now.
+        if (!FileDrag::ownsInput()) cancelWindowDrag();
+        return 0;
       }
       if (message == WM_TIMER && wp == WindowDragTimer) {
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) cancelWindowDrag();
