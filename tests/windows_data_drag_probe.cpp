@@ -8,7 +8,7 @@
 #include <string>
 #include <thread>
 
-static std::atomic<bool> entered{false};
+static std::atomic<bool> entered{false}, oleStarted{false};
 static std::atomic<int> outcome{1};
 static HWND targetWindow;
 static const wchar_t Text[] = L"Windows \x4f60\x597d";
@@ -23,7 +23,7 @@ public:
   ULONG STDMETHODCALLTYPE Release() override {auto n=InterlockedDecrement(&refs);if(!n)delete this;return n;}
   HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC *f) override {return f && f->cfFormat==CF_UNICODETEXT && f->dwAspect==DVASPECT_CONTENT && (f->tymed&TYMED_HGLOBAL) ? S_OK : DV_E_FORMATETC;}
   HRESULT STDMETHODCALLTYPE GetData(FORMATETC *f,STGMEDIUM *m) override {
-    *m={};auto hr=QueryGetData(f);if(FAILED(hr))return hr;
+    std::cout<<"GET_TEXT"<<std::endl;*m={};auto hr=QueryGetData(f);if(FAILED(hr))return hr;
     m->hGlobal=GlobalAlloc(GMEM_MOVEABLE,sizeof(Text));if(!m->hGlobal)return E_OUTOFMEMORY;
     auto p=GlobalLock(m->hGlobal);memcpy(p,Text,sizeof(Text));GlobalUnlock(m->hGlobal);m->tymed=TYMED_HGLOBAL;return S_OK;
   }
@@ -86,6 +86,7 @@ int wmain(int argc,wchar_t **argv){
   std::thread driver([&]{
     POINT start=mode==L"in"?point(targetWindow,50,50):point(source,60,40);
     SetCursorPos(start.x,start.y);mouse_event(MOUSEEVENTF_LEFTDOWN,0,0,0,0);Sleep(150);
+    if(mode==L"in"){while(!oleStarted)Sleep(10);Sleep(100);}
     if(mode!=L"in"){
       auto next=point(source,100,40);move(start,next);start=next;Sleep(350);
     }
@@ -96,11 +97,16 @@ int wmain(int argc,wchar_t **argv){
       if(!entered){mouse_event(MOUSEEVENTF_LEFTUP,0,0,0,0);PostMessageW(targetWindow,WM_CLOSE,0,0);return;}
       start=gap;Sleep(200);
     }
-    move(start,destination);Sleep(700);mouse_event(MOUSEEVENTF_LEFTUP,0,0,0,0);
+    move(start,destination);wchar_t hit[128]{};GetClassNameW(WindowFromPoint(destination),hit,128);std::wcout<<L"DEST "<<destination.x<<L" "<<destination.y<<L" "<<hit<<std::endl;Sleep(700);mouse_event(MOUSEEVENTF_LEFTUP,0,0,0,0);
     if(mode==L"internal" || mode==L"return"){outcome=0;Sleep(400);PostMessageW(targetWindow,WM_CLOSE,0,0);}
   });
   if(mode==L"in"){
-    Sleep(220);TextData *data=new TextData;Source input;DWORD effect=0;
+    // OLE consults this STA's key state. Dispatch the real injected press
+    // before entering its modal loop, then allow the driver to leave the source.
+    for(int i=0;i<200 && !(GetKeyState(VK_LBUTTON)&0x8000);++i){
+      MSG pending{};while(PeekMessageW(&pending,nullptr,0,0,PM_REMOVE)){TranslateMessage(&pending);DispatchMessageW(&pending);}Sleep(5);
+    }
+    oleStarted=true;TextData *data=new TextData;Source input;DWORD effect=0;
     auto hr=DoDragDrop(data,&input,DROPEFFECT_COPY,&effect);data->Release();
     if(hr==DRAGDROP_S_DROP && effect==DROPEFFECT_COPY)outcome=0;
     std::cout<<"IN_RESULT "<<std::hex<<hr<<" "<<effect<<std::endl;PostMessageW(targetWindow,WM_CLOSE,0,0);
