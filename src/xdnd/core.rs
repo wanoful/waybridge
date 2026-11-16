@@ -170,13 +170,18 @@ impl Xdnd {
         self.shared.wake.notify_one();
     }
     pub fn poll(&self) -> Vec<Outcome> {
-        self.shared
+        let outcomes: Vec<Outcome> = self
+            .shared
             .jobs
             .lock()
             .unwrap()
             .outcomes
             .drain(..)
-            .collect()
+            .collect();
+        for event in &outcomes {
+            tracing::trace!(generation=event.generation,target=event.target,kind=?event.kind,"XDND outcome");
+        }
+        outcomes
     }
 }
 impl Drop for Xdnd {

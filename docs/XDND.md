@@ -44,6 +44,11 @@ Protocol handshakes time out after 5 idle seconds; complete drop lifetime is
 bounded at 120 seconds. The shared handler must retain file leases until its
 existing delivery policy allows release.
 
-This initial adapter checkpoint passes compilation; protocol, Qt and integrated
-application acceptance is being added separately. It is not a claim of a complete
-XDND bridge or successful QQ acceptance.
+`python3 tests/xdnd_smoke.py` compiles a driver against the production worker
+and an actual Qt/X11 QWidget target. Against isolated Xvfb it verifies Unicode
+text, a large text drop transported by INCR, a read-only file URI copied by the
+application, exact payload bytes, root/local coordinates, COPY action and final
+XdndFinished. It does not merely acknowledge a fabricated drop callback.
+
+Full compositor/Windows and application acceptance is checked separately. This
+is not a claim of a complete XDND bridge or successful QQ acceptance.
