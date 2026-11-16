@@ -54,6 +54,7 @@ impl App {
         self.hdr_requested = hdr;
         let read_only = value["read_only"].as_bool().unwrap_or(false);
         if read_only && !self.read_only {
+            self.cancel_text_drag();
             self.cancel_window_drag();
             self.release_input();
         }

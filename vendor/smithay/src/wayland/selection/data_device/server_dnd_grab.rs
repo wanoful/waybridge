@@ -40,6 +40,7 @@ pub struct ServerDnDGrab<D: SeatHandler> {
     pointer_start_data: Option<PointerGrabStartData<D>>,
     touch_start_data: Option<TouchGrabStartData<D>>,
     metadata: super::SourceMetadata,
+    source_id: u64,
     current_focus: Option<WlSurface>,
     pending_offers: Vec<wl_data_offer::WlDataOffer>,
     offer_data: Option<Arc<Mutex<ServerDndOfferData>>>,
@@ -67,12 +68,14 @@ impl<D: SeatHandler> ServerDnDGrab<D> {
         start_data: PointerGrabStartData<D>,
         metadata: super::SourceMetadata,
         seat: Seat<D>,
+        source_id: u64,
     ) -> Self {
         Self {
             dh: dh.clone(),
             pointer_start_data: Some(start_data),
             touch_start_data: None,
             metadata,
+            source_id,
             current_focus: None,
             pending_offers: Vec::with_capacity(1),
             offer_data: None,
@@ -85,12 +88,14 @@ impl<D: SeatHandler> ServerDnDGrab<D> {
         start_data: TouchGrabStartData<D>,
         metadata: super::SourceMetadata,
         seat: Seat<D>,
+        source_id: u64,
     ) -> Self {
         Self {
             dh: dh.clone(),
             pointer_start_data: None,
             touch_start_data: Some(start_data),
             metadata,
+            source_id,
             current_focus: None,
             pending_offers: Vec::with_capacity(1),
             offer_data: None,
@@ -168,6 +173,7 @@ where
                             device.version(),
                             Arc::new(ServerDndData {
                                 metadata: self.metadata.clone(),
+                                source_id: self.source_id,
                                 offer_data: offer_data.clone(),
                                 wl_seat,
                             }),
@@ -229,7 +235,7 @@ where
 
         ServerDndGrabHandler::dropped(data, self.seat.clone());
         if !validated {
-            data.cancelled(self.seat.clone());
+            data.cancelled_for_source(self.source_id, self.seat.clone());
         }
         // in all cases abandon the drop
         // no more buttons are pressed, release the grab
@@ -483,6 +489,7 @@ struct ServerDndOfferData {
 
 struct ServerDndData {
     metadata: SourceMetadata,
+    source_id: u64,
     offer_data: Arc<Mutex<ServerDndOfferData>>,
     wl_seat: WlSeat,
 }
@@ -526,6 +533,7 @@ fn handle_server_dnd<D>(
 {
     use self::wl_data_offer::Request;
 
+    let source_id = data.source_id;
     let metadata = &data.metadata;
     let offer_data = &data.offer_data;
     let wl_seat = &data.wl_seat;
@@ -546,12 +554,16 @@ fn handle_server_dnd<D>(
             } else {
                 data.accepted = false;
             }
+            if offer.version() < 3 {
+                data.chosen_action = metadata.dnd_action & DndAction::Copy;
+            }
+            handler.offer_status(source_id, data.accepted, data.chosen_action, seat.clone());
             handler.accept(mime_type, seat)
         }
         Request::Receive { mime_type, fd } => {
             // check if the source and associated mime type is still valid
             if metadata.mime_types.contains(&mime_type) && data.active {
-                handler.send(mime_type, fd, seat);
+                handler.send_for_source(source_id, mime_type, fd, seat);
             }
         }
         Request::Destroy => {}
@@ -585,7 +597,7 @@ fn handle_server_dnd<D>(
                 return;
             }
 
-            handler.finished(seat);
+            handler.finished_for_source(source_id, seat);
             data.active = false;
         }
         Request::SetActions {
@@ -612,6 +624,7 @@ fn handle_server_dnd<D>(
             if chosen_action != data.chosen_action {
                 data.chosen_action = chosen_action;
                 offer.action(chosen_action);
+                handler.offer_status(source_id, data.accepted, chosen_action, seat.clone());
                 handler.action(chosen_action, seat);
             }
         }

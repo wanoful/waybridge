@@ -563,6 +563,9 @@ where
             } else {
                 data.accepted = false;
             }
+            if data.active {
+                handler.client_offer_status(source, data.accepted, data.chosen_action);
+            }
         }
         Request::Receive { mime_type, fd } => {
             // check if the source and associated mime type is still valid
@@ -640,6 +643,9 @@ where
                 data.chosen_action = chosen_action;
                 offer.action(chosen_action);
                 source.action(chosen_action);
+                if data.active {
+                    handler.client_offer_status(source, data.accepted, chosen_action);
+                }
             }
         }
         _ => unreachable!(),

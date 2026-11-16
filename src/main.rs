@@ -89,8 +89,9 @@ use smithay::{
         selection::{
             data_device::{
                 request_data_device_client_selection, set_data_device_focus,
-                set_data_device_selection, start_dnd, with_source_metadata, ClientDndGrabHandler,
-                DataDeviceHandler, DataDeviceState, ServerDndGrabHandler, SourceMetadata,
+                set_data_device_selection, start_dnd_with_id, with_source_metadata,
+                ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+                SourceMetadata,
             },
             wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler, SelectionSource, SelectionTarget,
@@ -299,6 +300,8 @@ struct OutboundDrag {
     cancelled: Arc<AtomicBool>,
     files: Option<drag::Export>,
     external: bool,
+    returned: bool,
+    return_token: u64,
     ready: bool,
     dropped: bool,
     deferred_focus: Option<Option<u32>>,
@@ -360,7 +363,10 @@ struct App {
     clipboard: BTreeMap<String, Vec<u8>>,
     clipboard_reads: Vec<(u64, String)>,
     transfers: transfer_worker::Worker,
-    drop_data: Option<Arc<Vec<u8>>>,
+    drop_data: Option<Clipboard>,
+    incoming_text_drag: Option<u64>,
+    server_drop_generation: u64,
+    server_drop_payloads: BTreeMap<u64, (Clipboard, Instant)>,
     drop_deadline: Option<Instant>,
     drop_accepted: bool,
     pressed_keys: HashSet<u32>,
@@ -683,13 +689,37 @@ impl App {
     }
 
     fn begin_file_drop(&mut self, id: u32, x: f64, y: f64, uris: Vec<u8>) {
-        if !self.input_allowed(id) {
-            return;
+        self.begin_data_drop(
+            id,
+            x,
+            y,
+            Arc::new(BTreeMap::from([("text/uri-list".into(), uris)])),
+            true,
+        );
+    }
+    fn begin_data_drop(&mut self, id: u32, x: f64, y: f64, payload: Clipboard, drop: bool) -> bool {
+        if !self.input_allowed(id) || !x.is_finite() || !y.is_finite() {
+            return false;
         }
-        self.release_input();
-        self.focus(Some(id));
-        self.pointer_motion(id, x, y);
+        self.server_drop_payloads
+            .retain(|_, (_, created)| created.elapsed() < Duration::from_secs(120));
+        if self.server_drop_payloads.len() >= 16 {
+            return false;
+        }
         let pointer = self.seat.get_pointer().unwrap();
+        // Discard old offers before releasing buttons; never turn cancellation
+        // into a drop on the previous target. Synthetic setup must not click an app.
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location: pointer.current_location(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time: self.time(),
+            },
+        );
+        pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), self.time());
+        self.release_input();
         let serial = SERIAL_COUNTER.next_serial();
         pointer.button(
             self,
@@ -701,17 +731,106 @@ impl App {
             },
         );
         self.pressed_buttons.insert(0x110);
-        let Some(start) = pointer.grab_start_data() else {
-            self.release_input();
-            return;
+        let start = smithay::input::pointer::GrabStartData {
+            focus: None,
+            button: 0x110,
+            location: pointer.current_location(),
         };
-        self.drop_data = Some(Arc::new(uris));
+        let mimes = payload.keys().cloned().collect();
+        self.server_drop_generation = self.server_drop_generation.wrapping_add(1).max(1);
+        self.server_drop_payloads.insert(
+            self.server_drop_generation,
+            (payload.clone(), Instant::now()),
+        );
+        self.drop_data = Some(payload);
         self.drop_accepted = false;
-        self.drop_deadline = Some(Instant::now() + Duration::from_secs(5));
+        self.drop_deadline = drop.then(|| Instant::now() + Duration::from_secs(5));
         let dh = self.dh.clone();
         let seat = self.seat.clone();
-        start_dnd(&dh,&seat,self,serial,Some(start),None,SourceMetadata{mime_types:vec!["text/uri-list".into()],dnd_action:smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction::Copy});
+        start_dnd_with_id(
+            &dh,
+            &seat,
+            self,
+            serial,
+            Some(start),
+            None,
+            SourceMetadata {
+                mime_types: mimes,
+                dnd_action: DndAction::Copy,
+            },
+            self.server_drop_generation,
+        );
         self.pointer_motion(id, x, y);
+        true
+    }
+
+    fn cancel_text_drag(&mut self) {
+        if self.incoming_text_drag.take().is_none() {
+            return;
+        }
+        let pointer = self.seat.get_pointer().unwrap();
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location: pointer.current_location(),
+                serial: SERIAL_COUNTER.next_serial(),
+                time: self.time(),
+            },
+        );
+        self.release_input();
+        self.drop_data = None;
+    }
+    fn text_drag_message(&mut self, value: &Value) {
+        if !self.peer.as_ref().is_some_and(|p| p.data_drag_enabled()) {
+            return;
+        }
+        let Some(drag) = value["drag"].as_u64().filter(|id| *id > 0) else {
+            return;
+        };
+        let kind = value["type"].as_str().unwrap_or("");
+        if kind == "text_drag_cancel" {
+            if self.incoming_text_drag == Some(drag) {
+                self.cancel_text_drag();
+            }
+            return;
+        }
+        let Some(id) = value["id"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+            return;
+        };
+        if self.read_only || !self.input_allowed(id) {
+            self.cancel_text_drag();
+            return;
+        }
+        if kind == "text_drag_enter" {
+            self.cancel_text_drag();
+            let Some(data) = value["data"]
+                .as_str()
+                .filter(|s| s.len() <= 1_400_000)
+                .and_then(|s| B64.decode(s).ok())
+            else {
+                return;
+            };
+            if data.len() > drag::MAX_TEXT
+                || data.contains(&0)
+                || std::str::from_utf8(&data).is_err()
+            {
+                return;
+            }
+            let (x, y) = self.message_position(id, value);
+            let payload = Arc::new(BTreeMap::from([
+                ("text/plain;charset=utf-8".into(), data.clone()),
+                ("text/plain".into(), data),
+            ]));
+            if self.begin_data_drop(id, x, y, payload, false) {
+                self.incoming_text_drag = Some(drag);
+            }
+        } else if self.incoming_text_drag == Some(drag) {
+            self.pointer_message(id, value);
+            if kind == "text_drag_drop" {
+                self.drop_deadline = Some(Instant::now() + Duration::from_secs(2));
+            }
+        }
     }
 
     fn finish_file_drop(&mut self) {
@@ -807,10 +926,15 @@ impl App {
                     return;
                 }
                 drag.external = true;
+                let mime = drag
+                    .files
+                    .as_ref()
+                    .map(|f| f.mime.clone())
+                    .unwrap_or_else(|| "text/uri-list".into());
                 self.release_keys();
                 let serial = SERIAL_COUNTER.next_serial();
                 if let Some(sink) = &mut self.drag_sink {
-                    sink.arm(serial.into());
+                    sink.arm_mime(serial.into(), &mime);
                 }
                 let pointer = self.seat.get_pointer().unwrap();
                 let location = pointer.current_location();
@@ -824,6 +948,26 @@ impl App {
                     },
                 );
                 pointer.frame(self);
+            }
+            "drag_return" if drag.external && drag.ready && !drag.dropped => {
+                let Some(target) = message["id"].as_u64().and_then(|n| u32::try_from(n).ok())
+                else {
+                    return;
+                };
+                let Some(token) = message["return_token"]
+                    .as_u64()
+                    .filter(|t| *t > drag.return_token)
+                else {
+                    return;
+                };
+                drag.return_token = token;
+                drag.external = false;
+                drag.returned = true;
+                drag.ready = false;
+                if let Some(sink) = &mut self.drag_sink {
+                    sink.finish(false);
+                }
+                self.pointer_message(target, message);
             }
             "drag_drop" if drag.external && drag.ready && !drag.dropped => {
                 drag.dropped = true;
@@ -1045,7 +1189,10 @@ impl App {
             }
             "window_state" => self.native_window_state(id, &value),
             "ime" => self.ime_message(&value),
-            "drag_claim" | "drag_drop" | "drag_result" | "drag_read" => {
+            "text_drag_enter" | "text_drag_motion" | "text_drag_drop" | "text_drag_cancel" => {
+                self.text_drag_message(&value)
+            }
+            "drag_claim" | "drag_return" | "drag_drop" | "drag_result" | "drag_read" => {
                 self.drag_message(&value);
             }
             "frame_ack" => {
@@ -2486,17 +2633,32 @@ impl DataControlHandler for App {
     }
 }
 impl ClientDndGrabHandler for App {
+    fn client_offer_status(&mut self, source: &WlDataSource, accepted: bool, action: DndAction) {
+        if let Some(drag) = self
+            .outbound
+            .as_ref()
+            .filter(|d| d.returned && !d.external && &d.source == source)
+        {
+            self.control(json!({"type":"drag_return_ready","drag":drag.id,"return_token":drag.return_token,"accepted":accepted && !action.is_empty()}));
+        }
+    }
+
     fn send_drop_performed(&mut self, source: &WlDataSource, validated: bool) -> bool {
         validated || self.window_drag.completes_move(source)
     }
     fn started(&mut self, source: Option<WlDataSource>, _: Option<WlSurface>, _: Seat<Self>) {
-        let internal = source.as_ref().is_some_and(|s| {
-            self.window_drag.is_toplevel_source(s)
-                || with_source_metadata(s, |m| !m.mime_types.iter().any(|s| s == "text/uri-list"))
-                    .unwrap_or(false)
+        let modern = self.peer.as_ref().is_some_and(|p| p.data_drag_enabled());
+        let attached = source
+            .as_ref()
+            .is_some_and(|s| self.window_drag.is_toplevel_source(s));
+        let uri = source.as_ref().is_some_and(|s| {
+            with_source_metadata(s, |m| m.mime_types.iter().any(|s| s == "text/uri-list"))
+                .unwrap_or(false)
         });
-        if internal {
-            self.start_window_drag(source);
+        if modern || attached || (source.is_some() && !uri) {
+            self.start_window_drag(source.clone());
+        }
+        if attached {
             return;
         }
         if !self.drag_enabled
@@ -2510,14 +2672,27 @@ impl ClientDndGrabHandler for App {
         let Some(source) = source.filter(|s| s.version() >= 3) else {
             return;
         };
-        let supported = with_source_metadata(&source, |m| {
-            m.mime_types.iter().any(|s| s == "text/uri-list")
-                && m.dnd_action.contains(DndAction::Copy)
+        let mime = with_source_metadata(&source, |m| {
+            if !m.dnd_action.contains(DndAction::Copy) {
+                return None;
+            }
+            if uri {
+                return Some("text/uri-list".to_owned());
+            }
+            if modern {
+                for name in ["text/plain;charset=utf-8", "text/plain"] {
+                    if m.mime_types.iter().any(|m| m == name) {
+                        return Some(name.to_owned());
+                    }
+                }
+            }
+            None
         })
-        .unwrap_or(false);
-        if !supported {
+        .ok()
+        .flatten();
+        let Some(mime) = mime else {
             return;
-        }
+        };
         let Some(peer) = self.peer.clone() else {
             return;
         };
@@ -2528,10 +2703,22 @@ impl ClientDndGrabHandler for App {
         let id = self.next_drag;
         let window = self.focused_window.unwrap_or(0);
         let cancelled = Arc::new(AtomicBool::new(false));
-        if !drag::prepare(id, read, peer, self.events.clone(), cancelled.clone()) {
+        let scheduled = if uri {
+            drag::prepare(id, read, peer, self.events.clone(), cancelled.clone())
+        } else {
+            drag::prepare_text(
+                id,
+                read,
+                mime.clone(),
+                peer,
+                self.events.clone(),
+                cancelled.clone(),
+            )
+        };
+        if !scheduled {
             return;
         }
-        source.send("text/uri-list".into(), write.as_fd());
+        source.send(mime, write.as_fd());
         self.outbound = Some(OutboundDrag {
             id,
             window,
@@ -2539,6 +2726,8 @@ impl ClientDndGrabHandler for App {
             cancelled,
             files: None,
             external: false,
+            returned: false,
+            return_token: 0,
             ready: false,
             dropped: false,
             deferred_focus: None,
@@ -2555,23 +2744,31 @@ impl ClientDndGrabHandler for App {
     }
 }
 impl ServerDndGrabHandler for App {
-    fn accept(&mut self, mime: Option<String>, _: Seat<Self>) {
-        self.drop_accepted = mime.as_deref() == Some("text/uri-list");
-    }
-    fn send(&mut self, mime: String, fd: OwnedFd, _: Seat<Self>) {
-        if mime == "text/uri-list" {
-            if let Some(bytes) = self.drop_data.clone() {
-                std::thread::spawn(move || {
-                    let _ = fs::File::from(fd).write_all(&bytes);
-                });
-            }
+    fn offer_status(&mut self, source_id: u64, accepted: bool, action: DndAction, _: Seat<Self>) {
+        if source_id != self.server_drop_generation {
+            return;
+        }
+        self.drop_accepted = accepted && action == DndAction::Copy;
+        if let Some(id) = self.incoming_text_drag {
+            self.control(
+                json!({"type":"text_drag_status","drag":id,"accepted":self.drop_accepted}),
+            );
         }
     }
-    fn finished(&mut self, _: Seat<Self>) {
-        self.drop_data = None;
+    fn send_for_source(&mut self, source_id: u64, mime: String, fd: OwnedFd, _: Seat<Self>) {
+        if let Some((data, _)) = self.server_drop_payloads.get(&source_id) {
+            drag::send_payload(fd, data.clone(), mime);
+        }
     }
-    fn cancelled(&mut self, _: Seat<Self>) {
-        self.drop_data = None;
+    fn finished_for_source(&mut self, source_id: u64, _: Seat<Self>) {
+        self.server_drop_payloads.remove(&source_id);
+        if source_id == self.server_drop_generation {
+            self.drop_data = None;
+            self.incoming_text_drag = None;
+        }
+    }
+    fn cancelled_for_source(&mut self, source_id: u64, seat: Seat<Self>) {
+        self.finished_for_source(source_id, seat);
     }
 }
 
@@ -2883,6 +3080,9 @@ fn main() -> Result<()> {
         clipboard_reads: vec![],
         transfers,
         drop_data: None,
+        incoming_text_drag: None,
+        server_drop_generation: 0,
+        server_drop_payloads: BTreeMap::new(),
         drop_deadline: None,
         drop_accepted: false,
         pressed_keys: HashSet::new(),
@@ -3109,8 +3309,10 @@ fn main() -> Result<()> {
                                     let manifest = files.manifest.clone();
                                     let tree = files.tree;
                                     let window = drag.window;
+                                    let text = files.text.as_ref().map(|b| B64.encode(b));
+                                    let mime = files.mime.clone();
                                     drag.files = Some(files);
-                                    app.control(json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"tree":tree,"action":"copy"}));
+                                    app.control(json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"tree":tree,"text":text,"mime":mime,"action":"copy"}));
                                 }
                                 Err(error) => {
                                     tracing::debug!(%error, "outbound drag not supported");
@@ -3120,6 +3322,7 @@ fn main() -> Result<()> {
                         }
                     }
                     Event::Disconnected => {
+                        app.cancel_text_drag();
                         notifications.connection(false);
                         if let Some(tray) = &app.tray {
                             tray.set_peer(None);

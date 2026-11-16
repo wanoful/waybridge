@@ -9,7 +9,8 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 use std::{
-    io::Read,
+    io::{Read, Write},
+    os::fd::{AsRawFd, OwnedFd},
     os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -28,12 +29,66 @@ use wayland_client::{
 };
 
 pub const MAX_READ: usize = 65536;
+pub const MAX_TEXT: usize = 1024 * 1024;
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 struct Worker;
 impl Drop for Worker {
     fn drop(&mut self) {
         WORKERS.fetch_sub(1, Ordering::Relaxed);
     }
+}
+// Receivers may keep a pipe open without reading it. Bound both worker count
+// and write time, and retain the immutable offer snapshot for this request only.
+static SENDERS: AtomicUsize = AtomicUsize::new(0);
+pub fn send_payload(fd: OwnedFd, data: crate::Clipboard, mime: String) {
+    if !data.contains_key(&mime)
+        || SENDERS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < 8).then_some(n + 1)
+            })
+            .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        struct Sender;
+        impl Drop for Sender {
+            fn drop(&mut self) {
+                SENDERS.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let _sender = Sender;
+        let mut file = std::fs::File::from(fd);
+        // SAFETY: file owns a live descriptor for the duration of both calls.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            return;
+        }
+        let bytes = &data[&mime];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut offset = 0;
+        while offset < bytes.len() && std::time::Instant::now() < deadline {
+            match file.write(&bytes[offset..]) {
+                Ok(0) => break,
+                Ok(n) => offset += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut poll = libc::pollfd {
+                        fd: file.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: poll points to one initialized pollfd; timeout is bounded.
+                    unsafe {
+                        libc::poll(&mut poll, 1, 100);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 pub struct ReadRequest {
     pub request: u64,
@@ -44,6 +99,8 @@ pub struct ReadRequest {
 pub struct Export {
     pub manifest: Vec<Value>,
     pub tree: bool,
+    pub text: Option<Vec<u8>>,
+    pub mime: String,
     requests: SyncSender<ReadRequest>,
     cancelled: Arc<AtomicBool>,
 }
@@ -147,6 +204,8 @@ pub fn prepare(
                 files.legacy_metadata()
             },
             tree,
+            text: None,
+            mime: "text/uri-list".into(),
             requests,
             cancelled: cancelled.clone(),
         };
@@ -182,6 +241,77 @@ pub fn prepare(
     true
 }
 
+/// Plain text is bounded data, not a temporary file. The private offer still
+/// owns COPY negotiation and the original source's single terminal event.
+pub fn prepare_text(
+    id: u64,
+    mut input: UnixStream,
+    mime: String,
+    peer: Arc<Peer>,
+    events: SyncSender<Event>,
+    cancelled: Arc<AtomicBool>,
+) -> bool {
+    if WORKERS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n < 4).then_some(n + 1)
+        })
+        .is_err()
+    {
+        return false;
+    }
+    std::thread::spawn(move || {
+        let _worker = Worker;
+        let mut read = || -> Result<Vec<u8>> {
+            input.set_read_timeout(Some(Duration::from_millis(100)))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 16384];
+            loop {
+                if cancelled.load(Ordering::Relaxed) || peer.is_closed() {
+                    bail!("text drag cancelled");
+                }
+                if std::time::Instant::now() >= deadline {
+                    bail!("text drag source timeout");
+                }
+                match input.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) if bytes.len() + n <= MAX_TEXT => bytes.extend_from_slice(&buffer[..n]),
+                    Ok(_) => bail!("text drag exceeds limit"),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            std::str::from_utf8(&bytes).context("text drag requires UTF-8")?;
+            if bytes.contains(&0) {
+                bail!("text drag contains embedded NUL");
+            }
+            Ok(bytes)
+        };
+        let result = read()
+            .map(|text| {
+                let (requests, _) = sync_channel(1);
+                Export {
+                    manifest: vec![],
+                    tree: false,
+                    text: Some(text),
+                    mime,
+                    requests,
+                    cancelled,
+                }
+            })
+            .map_err(|e| e.to_string());
+        let _ = events.send(Event::DragFiles { id, result });
+    });
+    true
+}
+
 /// A private client over a socket pair, never connected to the host desktop.
 /// It has one roleless surface, no buffers and no xdg_toplevel.
 pub struct Sink {
@@ -195,6 +325,7 @@ struct SinkState {
     device: Option<wl_data_device::WlDataDevice>,
     offer: Option<wl_data_offer::WlDataOffer>,
     expected_serial: Option<u32>,
+    mime: String,
     accepted: bool,
     dropped: bool,
     result: Option<bool>,
@@ -210,8 +341,9 @@ impl Sink {
             state: SinkState::default(),
         })
     }
-    pub fn arm(&mut self, serial: u32) {
+    pub fn arm_mime(&mut self, serial: u32, mime: &str) {
         self.state.expected_serial = Some(serial);
+        self.state.mime = mime.into();
     }
     pub fn accepted(&self) -> bool {
         self.state.accepted
@@ -327,7 +459,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for SinkState {
                 state.accepted = false;
                 state.dropped = false;
                 state.result = None;
-                offer.accept(serial, Some("text/uri-list".into()));
+                offer.accept(serial, Some(state.mime.clone()));
                 offer.set_actions(
                     wl_data_device_manager::DndAction::Copy,
                     wl_data_device_manager::DndAction::Copy,

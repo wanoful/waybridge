@@ -189,6 +189,7 @@ void updateIme();
 uint32_t grabbedRoot = 0;
 std::string remoteApplicationSource;
 bool iconsNegotiated = false;
+bool dataDragNegotiated = false;
 std::unique_ptr<ImageDecoder> iconDecoder;
 bool semanticsNegotiated = false;
 void reconcileWindows();
@@ -307,6 +308,7 @@ void cancelIncomingFiles();
 void cancelIncomingFilesExcept(uint64_t generation);
 #include "file_tree.h"
 #include "file_drag.h"
+#include "text_drag.h"
 #include "virtual_files.h"
 
 bool readAll(SOCKET socket, void *bytes, size_t n) {
@@ -939,7 +941,17 @@ class FileDropTarget final : public IDropTarget {
   uint32_t windowId;
   std::weak_ptr<void> lifetime;
   bool accepted = false;
+  uint64_t textDrag = 0;
 
+  Json position(POINTL point) const {
+    auto *window = findWindow(); if (!window) return Json::object();
+    POINT local{point.x, point.y}; ScreenToClient(window->hwnd, &local);
+    RECT image = imageRect(window);
+    if (image.right <= image.left || image.bottom <= image.top) return Json::object();
+    return {{"id",window->id},{"origin_x",window->originX},{"origin_y",window->originY},
+      {"x",double(local.x-image.left)*window->width/(image.right-image.left)},
+      {"y",double(local.y-image.top)*window->height/(image.bottom-image.top)}};
+  }
   RemoteWindow *findWindow() const {
     if (lifetime.expired())
       return nullptr;
@@ -951,6 +963,7 @@ class FileDropTarget final : public IDropTarget {
 
 public:
   explicit FileDropTarget(RemoteWindow *w) : windowId(w->id), lifetime(w->dropLifetime) {}
+  ~FileDropTarget() { TextDrag::cancel(textDrag); }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
     if (iid == IID_IUnknown || iid == IID_IDropTarget) {
       *out = static_cast<IDropTarget *>(this);
@@ -967,22 +980,37 @@ public:
       delete this;
     return count;
   }
-  HRESULT STDMETHODCALLTYPE DragEnter(IDataObject *data, DWORD, POINTL, DWORD *effect) override {
+  HRESULT STDMETHODCALLTYPE DragEnter(IDataObject *data, DWORD, POINTL point, DWORD *effect) override {
     // Reentrant OLE calls can close the window and revoke its registration.
     AddRef();
     VirtualFiles::Com<IDropTarget> self(this);
+    if (dataDragNegotiated && FileDrag::returnToRemote(data, position(point))) {
+      *effect=DROPEFFECT_NONE;return S_OK;
+    }
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     accepted = findWindow() && hostedFiles && (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
                (SUCCEEDED(data->QueryGetData(&format)) || VirtualFiles::supports(data));
     accepted = accepted && findWindow();
-    *effect = accepted ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    if (!accepted && findWindow() && hostedFiles && !hostedReadOnly && dataDragNegotiated &&
+        (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) && TextDrag::supports(data)) {
+      auto location = position(point);
+      if (location.contains("id")) textDrag = TextDrag::begin(data, location, [this] { return findWindow()!=nullptr; });
+    }
+    *effect = accepted || TextDrag::allowed(textDrag) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
-  HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD *effect) override {
+  HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL point, DWORD *effect) override {
+    if (textDrag) {
+      if (!findWindow() || hostedReadOnly || !hostedFiles) { TextDrag::cancel(textDrag);textDrag=0; }
+      else { auto location=position(point);if(location.contains("id"))TextDrag::motion(textDrag,location); }
+      *effect=TextDrag::allowed(textDrag) && (*effect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+      return S_OK;
+    }
     *effect = accepted && findWindow() && (*effect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragLeave() override {
+    TextDrag::cancel(textDrag);textDrag=0;
     accepted = false;
     return S_OK;
   }
@@ -992,6 +1020,12 @@ public:
     bool copyAllowed = (*effect & DROPEFFECT_COPY) != 0;
     *effect = DROPEFFECT_NONE;
     accepted = false;
+    if (textDrag) {
+      auto location=position(point);
+      if (copyAllowed && hostedFiles && !hostedReadOnly && findWindow() && location.contains("id") && TextDrag::drop(textDrag,location)) *effect=DROPEFFECT_COPY;
+      else TextDrag::cancel(textDrag);
+      textDrag=0;return S_OK;
+    }
     if (!copyAllowed || !hostedFiles || !findWindow() || FileDrag::isOwn(data))
       return S_OK;
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
@@ -1390,6 +1424,10 @@ void moveDraggedWindow() {
 }
 void sendWindowDragMotion(bool release = false) {
   if (!windowDrag.active || windowDrag.released) return;
+  if (dataDragNegotiated) {
+    FileDrag::maybeClaim();
+    if (FileDrag::ownsInput()) return;
+  }
   moveDraggedWindow();
   POINT point{};
   if (!GetCursorPos(&point)) return;
@@ -1406,6 +1444,7 @@ void sendWindowDragMotion(bool release = false) {
     motion["origin_y"] = target->originY;
   }
   sendJson(motion);
+  if (release && FileDrag::waitForReturn()) return;
   if (release) {
     motion["type"] = "button";
     motion["button"] = 0x110;
@@ -2315,7 +2354,7 @@ void dispatchNetwork() {
                          type == "tree_begin" || type == "tree_entry" || type == "tree_chunk" ||
                          type == "tree_done")) || (!hostedFiles && type=="drag_offer")) continue;
     if (FileTree::receive(m) || FileDrag::control(m, controller, sourceWindow)) continue;
-    if (remoteNotifications.receive(m)) continue;
+    if (TextDrag::control(m) || remoteNotifications.receive(m)) continue;
     if (type.rfind("tray_",0)==0) {
       if (!iconDecoder) iconDecoder=std::make_unique<ImageDecoder>();
       if (remoteTray.receive(m,*iconDecoder)) continue;
@@ -2334,6 +2373,7 @@ void dispatchNetwork() {
       semanticsNegotiated = m.value("window_semantics_v1", false);
       cursorNegotiated = m.value("cursor_v1", false);
       iconsNegotiated = m.value("window_icon_v1", false);
+      dataDragNegotiated = m.value("data_drag_v1", false);
       trayNegotiated = m.value("tray_v1", false);
       remoteTray.configure(trayNegotiated,hostedSettings.value("tray",true),hostedReadOnly);
       if (!trayNegotiated) hostControl.emit({{"type","tray_status"},{"available",false},{"message","Linux 服务端未协商 tray_v1，请更新服务端"},{"xembed",false}});
@@ -2761,6 +2801,7 @@ void applyHostedSettings(const Json &settings, bool live) {
   hostedReadOnly=settings.value("read_only",false); hostedIme=settings.value("ime",true);
   remoteNotifications.inputReadOnly(hostedReadOnly);
   hostedFiles=settings.value("files",true); hostedImages=settings.value("clipboard_images",true);
+  if (hostedReadOnly || !hostedFiles) TextDrag::cancel(TextDrag::active);
   hostedClipboard=clipboard;
   FileTree::setDownloadsEnabled(hostedFiles && hostedClipboard != "off" && hostedClipboard != "send");
   std::wstring scale=dpi?std::to_wstring(dpi):L"";
@@ -2842,6 +2883,12 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     if (message == VirtualFiles::CompletedMessage) {
       VirtualFiles::drain();
+      return 0;
+    }
+    if (message == FileDrag::ResumeMessage) {
+      if (windowDrag.active && !windowDrag.released) {
+        SetCapture(controller);sendWindowDragMotion(!(GetAsyncKeyState(VK_LBUTTON)&0x8000));
+      }
       return 0;
     }
     if (message == FileDrag::StartMessage) {
@@ -3025,6 +3072,7 @@ int wmain(int argc, wchar_t **argv) {
                                nullptr, instance, nullptr);
   hostControl.start(controller);
   FileTree::activity = [](const Json &event) { hostControl.emit(event); };
+  FileDrag::remoteHitTest = [](POINT point) { return windowDragTarget(point)!=nullptr; };
   remoteNotifications.decorate = [](Json &message) {
     NativeIcon icon;
     if (message.contains("png") && message["png"].is_string()) {
@@ -3112,6 +3160,7 @@ int wmain(int argc, wchar_t **argv) {
             {"notifications_enabled", false},
             {"pointer_lock", true},
             {"toplevel_drag_v1", true},
+            {"data_drag_v1", true},
             {"file_drop_out", hostedFiles},
             {"file_tree", true},
             {"codecs", codecs},

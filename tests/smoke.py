@@ -17,10 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class Viewer:
-    def __init__(self, port, token, dpi=96, file_tree=False, file_drop_out=False):
+    def __init__(self, port, token, dpi=96, file_tree=False, file_drop_out=False, data_drag_v1=False):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
         self.geometry = {}
-        self.send(type="hello", version=3, token=token, dpi=dpi, file_tree=file_tree, file_drop_out=file_drop_out)
+        self.send(type="hello", version=3, token=token, dpi=dpi, file_tree=file_tree, file_drop_out=file_drop_out, data_drag_v1=data_drag_v1)
         assert self.receive()[1]["type"] == "hello"
 
     def send(self, **message):

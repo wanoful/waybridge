@@ -4,9 +4,12 @@
 #include <shldisp.h>
 #include <functional>
 #include <limits>
+#include <optional>
 
 namespace FileDrag {
 constexpr UINT StartMessage = WM_APP + 17;
+constexpr UINT ResumeMessage = WM_APP + 23;
+inline std::function<bool(POINT)> remoteHitTest;
 constexpr size_t Chunk = 65536;
 struct File {
   std::wstring name;
@@ -21,6 +24,11 @@ struct Transfer {
   uint64_t id = 0, nextRequest = 0;
   HWND source = nullptr;
   std::vector<File> files;
+  std::optional<std::wstring> text;
+  bool returnRemote = false, waitingReturn = false, returnAccepted = false;
+  uint64_t returnToken = 0;
+  ULONGLONG returnDeadline = 0;
+  uint64_t attempt = 0;
   std::mutex mutex;
   std::condition_variable wake;
   std::map<uint64_t, std::shared_ptr<Response>> requests;
@@ -49,12 +57,12 @@ struct Transfer {
     }
     wake.notify_all();
   }
-  HRESULT read(size_t file, uint64_t offset, size_t length, std::vector<uint8_t> &bytes) {
+  HRESULT read(size_t file, uint64_t offset, size_t length, std::vector<uint8_t> &bytes, uint64_t lease) {
     auto response = std::make_shared<Response>();
     uint64_t request;
     {
       std::lock_guard<std::mutex> lock(mutex);
-      if (cancelled || done)
+      if (cancelled || done || lease != attempt)
         return STG_E_REVERTED;
       if (requests.size() >= 8)
         return STG_E_INSUFFICIENTMEMORY;
@@ -69,8 +77,9 @@ struct Transfer {
               {"length", length}});
     std::unique_lock<std::mutex> lock(mutex);
     bool ready = wake.wait_for(lock, std::chrono::seconds(30),
-                               [&] { return cancelled || done || response->ready; });
+                               [&] { return cancelled || done || lease != attempt || response->ready; });
     requests.erase(request);
+    if (lease != attempt) return STG_E_REVERTED;
     if (!ready || cancelled || done || response->failed || response->bytes.size() != length) {
       lock.unlock();
       finish(false);
@@ -106,6 +115,21 @@ inline bool ownsInput() {
     return false;
   std::lock_guard<std::mutex> lock(transfer->mutex);
   return transfer->claimed && !transfer->oleDone && !transfer->done;
+}
+inline bool returnToRemote(IDataObject *object, const Json &position) {
+  if (!isOwn(object) || !position.contains("id")) return false;
+  auto transfer=current();if(!transfer)return false;
+  { std::lock_guard<std::mutex> lock(transfer->mutex);
+    if(!transfer->inOle || transfer->dropSent || transfer->cancelled || transfer->done)return false;
+    if(transfer->returnRemote)return true;
+    transfer->returnRemote=true;transfer->returnAccepted=false;++transfer->returnToken;
+  }
+  Json message=position;message["type"]="drag_return";message["drag"]=transfer->id;message["return_token"]=transfer->returnToken;sendJson(message);return true;
+}
+inline bool waitForReturn() {
+  auto transfer=current();if(!transfer)return false;
+  std::lock_guard<std::mutex> lock(transfer->mutex);
+  return transfer->waitingReturn && !transfer->done && !transfer->cancelled && GetTickCount64()<transfer->returnDeadline;
 }
 inline void disconnect() {
   if (auto transfer = current())
@@ -153,12 +177,13 @@ class Stream final : public IStream {
   std::shared_ptr<Transfer> transfer;
   size_t file;
   uint64_t position;
+  uint64_t lease;
   std::mutex positionMutex;
   IUnknown *marshaler = nullptr;
 
 public:
-  Stream(std::shared_ptr<Transfer> state, size_t index, uint64_t offset = 0)
-      : transfer(std::move(state)), file(index), position(offset) {
+  Stream(std::shared_ptr<Transfer> state, size_t index, uint64_t offset = 0, uint64_t attempt = 0)
+      : transfer(std::move(state)), file(index), position(offset), lease(attempt) {
     CoCreateFreeThreadedMarshaler(static_cast<IStream *>(this), &marshaler);
   }
   ~Stream() {
@@ -196,7 +221,7 @@ public:
       auto n = static_cast<size_t>(std::min<uint64_t>(std::min<size_t>(length - total, Chunk),
                                                       transfer->files[file].size - position));
       std::vector<uint8_t> bytes;
-      HRESULT hr = transfer->read(file, position, n, bytes);
+      HRESULT hr = transfer->read(file, position, n, bytes, lease);
       if (FAILED(hr)) {
         if (count)
           *count = total;
@@ -292,7 +317,7 @@ public:
     if (!out)
       return E_POINTER;
     std::lock_guard<std::mutex> lock(positionMutex);
-    *out = new Stream(transfer, file, position);
+    *out = new Stream(transfer, file, position, lease);
     return S_OK;
   }
 };
@@ -307,8 +332,10 @@ class DataObject final : public IDataObject, public IDataObjectAsyncCapability {
   CLIPFORMAT preferred =
       static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT));
 
+  uint64_t lease = 0;
+  bool currentAttempt() const {std::lock_guard<std::mutex> lock(transfer->mutex);return lease==transfer->attempt;}
 public:
-  explicit DataObject(std::shared_ptr<Transfer> state) : transfer(std::move(state)) {
+  explicit DataObject(std::shared_ptr<Transfer> state) : transfer(std::move(state)), lease(transfer->attempt) {
     CoCreateFreeThreadedMarshaler(static_cast<IDataObject *>(this), &marshaler);
   }
   ~DataObject() {
@@ -338,12 +365,18 @@ public:
     return count;
   }
   HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC *format) override {
+    if (!currentAttempt()) return STG_E_REVERTED;
     if (!format)
       return E_POINTER;
     if (format->dwAspect != DVASPECT_CONTENT)
       return DV_E_DVASPECT;
     if (format->ptd)
       return DV_E_DVTARGETDEVICE;
+    if (transfer->text) {
+      if (format->cfFormat != CF_UNICODETEXT && format->cfFormat != preferred) return DV_E_FORMATETC;
+      if (format->lindex != -1) return DV_E_LINDEX;
+      return format->tymed & TYMED_HGLOBAL ? S_OK : DV_E_TYMED;
+    }
     if (format->cfFormat == contents) {
       if (format->lindex < 0 || size_t(format->lindex) >= transfer->files.size())
         return DV_E_LINDEX;
@@ -366,10 +399,12 @@ public:
       return hr;
     if (format->cfFormat == contents) {
       medium->tymed = TYMED_ISTREAM;
-      medium->pstm = new Stream(transfer, size_t(format->lindex));
+      medium->pstm = new Stream(transfer, size_t(format->lindex), 0, lease);
       return S_OK;
     }
-    size_t size = format->cfFormat == descriptor
+    size_t size = format->cfFormat == CF_UNICODETEXT
+                      ? (transfer->text->size() + 1) * sizeof(wchar_t)
+                      : format->cfFormat == descriptor
                       ? sizeof(UINT) + transfer->files.size() * sizeof(FILEDESCRIPTORW)
                       : sizeof(DWORD);
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size);
@@ -380,7 +415,9 @@ public:
       GlobalFree(memory);
       return E_OUTOFMEMORY;
     }
-    if (format->cfFormat == descriptor) {
+    if (format->cfFormat == CF_UNICODETEXT) {
+      memcpy(bytes, transfer->text->c_str(), size);
+    } else if (format->cfFormat == descriptor) {
       auto group = static_cast<FILEGROUPDESCRIPTORW *>(bytes);
       group->cItems = static_cast<UINT>(transfer->files.size());
       for (size_t i = 0; i < transfer->files.size(); ++i) {
@@ -411,6 +448,11 @@ public:
   HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD direction, IEnumFORMATETC **out) override {
     if (direction != DATADIR_GET)
       return E_NOTIMPL;
+    if (transfer->text) {
+      FORMATETC formats[] = {{CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL},
+                              {preferred, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL}};
+      return SHCreateStdEnumFmtEtc(2, formats, out);
+    }
     FORMATETC formats[] = {{descriptor, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL},
                            {contents, nullptr, DVASPECT_CONTENT, -1, TYMED_ISTREAM},
                            {preferred, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL}};
@@ -435,7 +477,7 @@ public:
   }
   HRESULT STDMETHODCALLTYPE StartOperation(IBindCtx *) override {
     std::lock_guard<std::mutex> lock(transfer->mutex);
-    if (!asyncMode || transfer->cancelled || transfer->done || transfer->operation ||
+    if (lease!=transfer->attempt || !asyncMode || transfer->cancelled || transfer->done || transfer->operation ||
         transfer->asyncEnded)
       return E_UNEXPECTED;
     transfer->operation = true;
@@ -452,6 +494,8 @@ public:
     bool finish = false, success = false;
     {
       std::lock_guard<std::mutex> lock(transfer->mutex);
+      if (lease!=transfer->attempt) return STG_E_REVERTED;
+      if (transfer->returnRemote) return S_OK;
       if (!transfer->operation)
         return E_UNEXPECTED;
       transfer->operation = false;
@@ -493,7 +537,7 @@ public:
     bool drop = false;
     {
       std::lock_guard<std::mutex> lock(transfer->mutex);
-      if (escape || transfer->cancelled || transfer->done)
+      if (escape || transfer->cancelled || transfer->done || transfer->returnRemote)
         return DRAGDROP_S_CANCEL;
       if (!(keys & MK_LBUTTON) && !transfer->dropSent) {
         transfer->dropSent = true;
@@ -508,6 +552,7 @@ public:
 };
 
 inline bool remoteAt(POINT point) {
+  if (remoteHitTest) return remoteHitTest(point);
   HWND window = GetAncestor(WindowFromPoint(point), GA_ROOT);
   wchar_t name[64]{};
   GetClassNameW(window, name, 64);
@@ -524,12 +569,11 @@ inline void maybeClaim() {
     if (transfer->claimed || transfer->done || transfer->cancelled)
       return;
   }
+  if (remoteAt(point)) return;
   if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) {
     transfer->finish(false);
     return;
   }
-  if (remoteAt(point))
-    return;
   {
     std::lock_guard<std::mutex> lock(transfer->mutex);
     transfer->claimed = true;
@@ -562,6 +606,7 @@ inline void start(HWND controllerWindow) {
     transfer->finish(false);
     return;
   }
+  { std::lock_guard<std::mutex> lock(transfer->mutex);++transfer->attempt; }
   auto data = new DataObject(transfer);
   data->SetAsyncMode(TRUE);
   auto source = new DropSource(transfer);
@@ -575,6 +620,15 @@ inline void start(HWND controllerWindow) {
   HRESULT result = DoDragDrop(data, source, DROPEFFECT_COPY, &effect);
   ownObject = nullptr;
   source->Release();
+  bool returned=false;
+  { std::lock_guard<std::mutex> lock(transfer->mutex);
+    if (transfer->returnRemote && !transfer->cancelled && !transfer->done) {
+      returned=true;transfer->returnRemote=false;transfer->waitingReturn=!transfer->returnAccepted;transfer->returnDeadline=GetTickCount64()+1500;
+      transfer->claimed=transfer->ready=transfer->inOle=transfer->oleDone=transfer->dropSent=false;
+      transfer->operation=transfer->asyncEnded=transfer->asyncSuccess=false;++transfer->attempt;
+    }
+  }
+  if(returned){transfer->wake.notify_all();data->Release();PostMessageW(controllerWindow,ResumeMessage,0,0);return;}
   bool finish, success;
   {
     std::lock_guard<std::mutex> lock(transfer->mutex);
@@ -602,12 +656,22 @@ inline bool control(const Json &message, HWND controllerWindow, HWND sourceWindo
         return true;
       }
     }
-    if (!sourceWindow || !message.at("files").is_array() || message["files"].empty() ||
+    bool text = message.contains("text") && message["text"].is_string();
+    if (!sourceWindow || !message.at("files").is_array() || (!text && message["files"].empty()) ||
         message["files"].size() > (message.value("tree", false) ? FileTree::MaxEntries : 128)) {
       state->finish(false);
       return true;
     }
-    if (message.value("tree", false)) {
+    if (text) {
+      const auto &encoded = message["text"].get_ref<const std::string &>();
+      if (encoded.size() > 1400000) { state->finish(false); return true; }
+      auto bytes = unbase64(encoded);
+      int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, reinterpret_cast<const char *>(bytes.data()), int(bytes.size()), nullptr, 0);
+      if (bytes.size() > 1024 * 1024 || (!bytes.empty() && !n) || std::find(bytes.begin(), bytes.end(), 0) != bytes.end()) { state->finish(false); return true; }
+      std::wstring value(size_t(n), L'\0');
+      if (n) MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, reinterpret_cast<const char *>(bytes.data()), int(bytes.size()), value.data(), n);
+      state->text = std::move(value);
+    } else if (message.value("tree", false)) {
       try {
         FileTree::require(FileTree::supported, "file_tree capability required");
         auto entries = FileTree::parse(message["files"]);
@@ -641,6 +705,13 @@ inline bool control(const Json &message, HWND controllerWindow, HWND sourceWindo
       active = state;
     }
     maybeClaim();
+    return true;
+  }
+  if (type == "drag_return_ready") {
+    auto state=current();if(state && state->id==message.value("drag",uint64_t(0))) {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if(message.value("return_token",uint64_t(0))==state->returnToken && message.value("accepted",false)) {state->returnAccepted=true;state->waitingReturn=false;}
+    }
     return true;
   }
   if (type != "drag_ready" && type != "drag_end")
