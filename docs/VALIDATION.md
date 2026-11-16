@@ -1,5 +1,50 @@
 # Validation
 
+## Desktop interaction follow-up — 2026-11-16
+
+The tray callback/activation, runtime window-icon, foreground/modal-owner,
+generic Unicode DND/capture/return and DND-icon fixes are integrated. Direction,
+format and remaining interoperability limits are recorded in
+[DESKTOP_INTERACTIONS.md](DESKTOP_INTERACTIONS.md); these results do not establish
+complete X11-origin or mixed Wayland/X11 drag support.
+
+- Physical Windows x64 `laptop`: the shared production WinUI UI performs actual
+  Connect and Launch clicks, GIO launches two different Linux Qt processes,
+  and exact HWND/worker PID readback proves each new process receives foreground.
+  A standard owned modal closes back to its exact parent. See the complete GUI
+  acceptance below and `build/tests/gui-focus-laptop.log`.
+- Physical Windows x64 DND: `windows_data_drag_laptop.py --host laptop` runs the
+  actual production worker against a private Linux compositor and real Qt
+  widgets. Cross-window text and OLE departure/return finish as native MOVE;
+  successful outbound Unicode OLE finishes as COPY at both the Windows target
+  and original Qt source; inbound Windows Chinese text reaches the Qt editor.
+  The transcript is `build/tests/data-drag-laptop.log`. Only disposable probe
+  windows are temporarily raised above existing topmost user windows to isolate
+  mouse input; their order, cursor and previous foreground are restored. This
+  DND test is not used as evidence for production foreground activation.
+- Real protocol fixtures cover runtime Wayland/X11 icons, immutable delayed
+  server offers, inactive target rejection, standard source MIME acceptance and
+  exact finish/cancel behavior. Native COM fixtures cover reentrant target
+  closure/replacement, text-target handoff and strict Unicode size/encoding.
+- The private Xwayland integration accepts Unicode and INCR text, and receives
+  read-only URI files into a writable independent QFileSystemModel copy. Eleven
+  lower-level X11 cases cover proxy/version/selection/chunk/identity/cancel
+  behavior. No application name appears in the transfer dispatch.
+- Source acceptance feedback was previously missing in vendored Smithay:
+  Windows could receive bytes while Qt reported Ignore. The standard
+  `wl_data_source.target` feedback is now present; real Qt/Wine and physical
+  source/target completion assertions agree on MOVE/MOVE/COPY.
+- The complete GUI test also found and fixed Windows SSH management bootstrap
+  command-line overflow. A bounded stdin bootstrap replaces the long argv;
+  Core and real private OpenSSH management regressions pass. Direct TLS profiles
+  retain their normal transport.
+
+HMCL/QQ installed desktop associations are covered by generic StartupWMClass,
+class/instance and runtime-icon fixtures; their actual icon appearance in every
+application version still needs the application matrix. ARM64 compilation is
+separate from physical ARM64 acceptance. Cross-device file hover, richer drag
+formats and full X11 source/target bridging remain open work.
+
 ## Linux server deployment — 2026-11-16
 
 The M2 Release compositor and TLS entry point were atomically installed as
