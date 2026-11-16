@@ -43,10 +43,12 @@ public sealed class ControlApplication : Application, IXamlMetadataProvider
 {
     private MainWindow? window;
     private XamlControlsXamlMetaDataProvider? metadata;
+    private readonly string? stateDirectory;
     private readonly HashSet<string> observedTypes = [];
     private XamlControlsXamlMetaDataProvider Metadata => metadata ??= new();
-    public ControlApplication()
+    public ControlApplication(string? stateDirectory = null)
     {
+        this.stateDirectory = stateDirectory;
         StartupDiagnostics.Write("WinUI Application constructed");
         UnhandledException += (_, args) => StartupDiagnostics.Fatal("WinUI unhandled exception", args.Exception);
     }
@@ -62,7 +64,7 @@ public sealed class ControlApplication : Application, IXamlMetadataProvider
         Resources.MergedDictionaries.Add(new Microsoft.UI.Xaml.Controls.XamlControlsResources());
         StartupDiagnostics.Write("XamlControlsResources loaded and merged");
         StartupDiagnostics.Write("creating MainWindow");
-        window = new MainWindow();
+        window = new MainWindow(stateDirectory);
         StartupDiagnostics.Write("activating MainWindow");
         window.Activate();
         StartupDiagnostics.Write("MainWindow activated");

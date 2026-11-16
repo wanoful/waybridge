@@ -67,7 +67,7 @@ internal sealed class MainWindow : Window
     private readonly IntPtr hwnd;
     private readonly List<(string Id, string Name)> audioDevices = [("", "跟随系统默认输出")];
 
-    public MainWindow()
+    public MainWindow(string? stateDirectory = null)
     {
         Title = "Waybridge";
         hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
@@ -78,7 +78,7 @@ internal sealed class MainWindow : Window
         appWindow.Resize(new Windows.Graphics.SizeInt32(Math.Min(work.Width - 40, (int)(1050*density)), Math.Min(work.Height - 40, (int)(780*density))));
         appWindow.Closing += (_, args) => { if (!quitting) { args.Cancel = true; TrayIcon.ShowWindow(hwnd, 0); } };
         try { SystemBackdrop = new MicaBackdrop(); } catch (COMException) { }
-        string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Waybridge");
+        string directory = stateDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Waybridge");
         store = new(directory);
         controller = new(directory, Path.Combine(AppContext.BaseDirectory, "waybridge-client.exe"), ConfirmHostAsync);
         desktopNotifications = new(request => controller.SendEngineAsync(request), message => UI(() => Inform(message)));

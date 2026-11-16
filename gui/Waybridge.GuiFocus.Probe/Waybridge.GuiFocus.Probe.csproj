@@ -1,0 +1,64 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <StartupObject>Waybridge.Control.GuiFocusProbe</StartupObject>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>false</WindowsAppSDKSelfContained>
+    <WindowsAppSdkVersion>1.8.260921001</WindowsAppSdkVersion>
+    <!-- The publish target supplies the matching framework's complete PRI.
+         Programmatic UI still needs the compiled WinUI themes and strings. -->
+    <AppxGeneratePriEnabled>false</AppxGeneratePriEnabled>
+    <EnablePriGenTooling>false</EnablePriGenTooling>
+    <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+    <EnableDefaultPageItems>false</EnableDefaultPageItems>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <Platforms>x64;ARM64</Platforms>
+    <Platform Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU'">x64</Platform>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <ApplicationManifest>../Waybridge.Control/app.manifest</ApplicationManifest>
+    <ApplicationIcon>../../assets/branding/waybridge.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Waybridge.Control/*.cs" Link="Production/%(Filename)%(Extension)" />
+    <Content Include="../../assets/branding/waybridge.ico" Link="Assets/waybridge.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="../../assets/branding/waybridge.png" Link="Assets/waybridge.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="../../assets/branding/waybridge-badge.png" Link="Assets/waybridge-badge.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <ProjectReference Include="../Waybridge.Control.Core/Waybridge.Control.Core.csproj" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="$(WindowsAppSdkVersion)" />
+  </ItemGroup>
+  <UsingTask TaskName="WaybridgeExtractResourceIndex" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <FrameworkPackage ParameterType="System.String" Required="true" />
+      <PublishDirectory ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.IO.Compression" />
+      <Using Namespace="System.Linq" />
+      <Code Type="Fragment" Language="cs" Source="$(MSBuildThisFileDirectory)../../scripts/extract-runtime-resources.cs" />
+    </Task>
+  </UsingTask>
+  <Target Name="PopulateWaybridgeRuntimeResources" AfterTargets="Publish"
+          Condition="'$(WindowsAppSDKSelfContained)' == 'true'">
+    <PropertyGroup>
+      <_WaybridgeFrameworkRid>$([System.String]::Copy('$(RuntimeIdentifier)').Replace('win-', 'win10-'))</_WaybridgeFrameworkRid>
+      <_WaybridgeFrameworkPackage>$(NuGetPackageRoot)microsoft.windowsappsdk.runtime/$(WindowsAppSdkVersion)/tools/MSIX/$(_WaybridgeFrameworkRid)/Microsoft.WindowsAppRuntime.1.8.msix</_WaybridgeFrameworkPackage>
+    </PropertyGroup>
+    <WaybridgeExtractResourceIndex FrameworkPackage="$(_WaybridgeFrameworkPackage)" PublishDirectory="$(PublishDir)" />
+  </Target>
+  <Target Name="TrackCrossHostManifestTool" BeforeTargets="CreateWinRTRegistration"
+          Condition="'$(OS)' != 'Windows_NT' And Exists('$(ManifestTool)')">
+    <PropertyGroup>
+      <MSBuildAllProjects>$(MSBuildAllProjects);$(MSBuildProjectFullPath);$(ManifestTool)</MSBuildAllProjects>
+    </PropertyGroup>
+  </Target>
+</Project>

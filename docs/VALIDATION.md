@@ -469,10 +469,35 @@ This physical evidence applies to that earlier H.264/PNG/resize baseline. It doe
 - Rust Clippy with warnings denied, the x64 native viewer, WinUI GUI and Core
   controller tests passed. The native hosted IPC regression also exercises
   activation negotiation, prepare/token response and launch/PID forwarding.
+- `tests/windows_gui_focus_laptop.py --host laptop` passed as a limited
+  interactive user with `Waybridge.GuiFocus.Probe`. This separately named
+  executable compiles the production `MainWindow`, application bootstrap and
+  controller sources, injecting only a temporary state directory. Actual mouse
+  clicks on Connect and Launch drive the real SSH management/GIO and native
+  worker path. `GetForegroundWindow`, the exact worker PID and distinct Linux
+  application PIDs verify two new launches (including an already running app of
+  the same desktop ID), the standard Qt owned modal and return to its exact
+  parent after Escape while another application window remains alive.
+  Only the test GUI is temporarily topmost around its own verified click to
+  avoid an unrelated topmost terminal; remote application HWNDs use the normal
+  product activation policy. The private SSH daemon, disposable bus/HOME,
+  profile/key/known-hosts, scheduled task and notification registration are
+  isolated from the installed GUI and removed afterwards. Cursor/foreground are
+  restored. Build/run:
 
-These are isolated protocol/application/API checks; they do not certify every
-application's activation implementation. Full real GUI user launch across its
-worker process, legacy toolkit startup metadata, delayed/daemonized application
+  ```sh
+  dotnet publish gui/Waybridge.GuiFocus.Probe -c Release -r win-x64 -p:Platform=x64 --self-contained true -p:WindowsAppSDKSelfContained=true -p:MicrosoftWindowsAppSDKPackageDir= -p:ManifestTool="$PWD/scripts/merge-windows-manifest.py" -o build/gui-focus-probe-x64
+  python3 tests/windows_gui_focus_laptop.py --host laptop
+  ```
+
+  This test found that embedding the growing management script in `ssh.exe`
+  argv exceeded Windows' 32,767-character process command-line limit. The
+  production agent now uses a constant-size Python loader and a bounded base64
+  stdin bootstrap before the existing JSON RPC frames. Core and real private
+  OpenSSH regressions passed, then the complete physical GUI test passed.
+
+These fixture checks do not certify every application's activation
+implementation. Legacy toolkit startup metadata, delayed/daemonized application
 launches and additional Windows foreground-lock policies remain compatibility
 checks. Background requests intentionally may flash instead of taking focus.
 
