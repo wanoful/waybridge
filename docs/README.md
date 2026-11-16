@@ -2,6 +2,8 @@
 
 Linux TOML、配置检查、Waybridge 专用 `.desktop` 追加/覆写与工作目录规则见 [配置与应用启动](CONFIGURATION.md)；钱包、Portal 和 systemd 生命周期的安装与接入见 [桌面组件](INTEGRATION.md)。设计依据见 [配置决策](CONFIGURATION_POLICY.md)。
 
+M2 首轮已接入只读文件交付、SNI 应用托盘/后台入口、原生通知和来源角标。通知需按 [桌面集成](INTEGRATION.md#明确选用通知服务) 显式选择 provider；托盘范围见 [DESKTOP-TRAY.md](DESKTOP-TRAY.md)。两端更新后使用，现有部署和完整设备验收与源码进度分别记录。
+
 这是 Linux → Windows 独立应用窗口原型。服务端是私有无头 Smithay Wayland 合成器，可选择启动 rootless Xwayland；不接入 KWin，不迁移已有桌面窗口。Windows 客户端为 Win32，提供 x64 和原生 ARM64 构建。功能来源见 [整合清单](PARALLEL_FEATURES.md)，实际验收范围见 [VALIDATION.md](VALIDATION.md)。
 
 本文档位于 `docs/`，文中的构建和运行命令均在 Git 仓库根目录执行。根目录的 `src/` 是 Linux 合成器，`native/` 是编解码与 GPU 适配，`client/` 是 Windows 原生内核，`gui/` 是控制中心，`scripts/` 和 `tests/` 分别提供构建与验证入口。构建产物写入已忽略的 `target/`、`build/` 和 .NET `bin/`、`obj/`。

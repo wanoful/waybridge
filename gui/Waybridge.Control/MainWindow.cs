@@ -341,7 +341,7 @@ internal sealed class MainWindow : Window
     {
         var send = Button("发送文件", true);
         var folder = Button("发送目录");
-        var receive = Button("打开接收文件夹");
+        var receive = Button("打开只读接收文件夹");
         send.Click += async (_, _) => await GuardAsync(async () =>
         {
             var picker = new FileOpenPicker(); picker.FileTypeFilter.Add("*");
@@ -363,7 +363,7 @@ internal sealed class MainWindow : Window
             Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
             return Task.CompletedTask;
         });
-        return Column(Text("也可以直接在 Windows 与远端窗口之间拖放文件或目录。"), Actions(send, folder, receive), transfers);
+        return Column(Text("也可以直接在 Windows 与远端窗口之间拖放文件或目录。接收项为只读输入；需要编辑并保存时，先复制到自己选择的文件夹。"), Actions(send, folder, receive), transfers);
     }
     private UIElement DiagnosticsPage()
     {
@@ -609,8 +609,8 @@ internal sealed class MainWindow : Window
                 "upload_ready" => "文件发送完成",
                 "files_begin" or "tree_begin" => "正在接收…",
                 "files_done" or "tree_done" => "数据接收完成",
-                "download_complete" => "已保存到本地接收文件夹",
-                "files_error" or "tree_error" or "tree_upload_error" or "upload_rejected" => "传输失败",
+                "download_complete" => "只读输入已就绪，可复制到自己选择的文件夹",
+                "files_error" or "tree_error" or "tree_upload_error" or "upload_rejected" or "download_error" => "传输失败",
                 _ => "文件传输状态已更新"
             };
             if (message.TryGetProperty("message", out var detail) && detail.GetString() is { Length: > 0 } reason) text += " · " + reason;

@@ -436,10 +436,11 @@ but only file slots provide streams. The existing real-button handoff, COPY-only
 and asynchronous completion rules apply. Native targets own and clean up any
 destination files they create; Waybridge only removes its own private staging.
 
-Completed clipboard/drop trees remain at
-`$XDG_RUNTIME_DIR/waybridge-inbox/tree-<batch>/` or `%TEMP%\Waybridge-tree-*` so
-applications can read them later. They may be manually removed once consumers no
-longer need them. Copy/cancellation never deletes source files. Virtual directory
+Completed Linux clipboard/drop trees are published under the read-only view
+`$XDG_RUNTIME_DIR/waybridge-inbox/readonly/<unique-batch>/`; Windows materialized
+inputs remain in protected `%TEMP%\Waybridge-tree-*` caches. Applications can
+read them later. Managed writable staging is not a public editing destination;
+caches are retained across viewer disconnect and need lifecycle-aware cleanup. Copy/cancellation never deletes source files. Virtual directory
 descriptors and all four directions are tested with real Wayland and native OLE
 probes under Wine/Xvfb; Windows Explorer/third-party compatibility still needs
 Windows 10/11 device validation.
@@ -462,10 +463,19 @@ an active outbound operation when disabled.
 The optional Windows launch form `waybridge-client.exe --control-pipe NAME`
 connects to a randomly named, current-user-only pipe owned by the GUI. It accepts
 UTF-8 newline-delimited JSON, at most 64 KiB per request. The first request is
-`{type:"start",version:1,host,port,token,settings,transport?}`. Optional `transport` is `{type:"tls",fingerprint,client_id,client_token,session}`; `host`/`port` then identify the TLS entry and `token` remains the backend v3 credential. Without it the worker uses the legacy socket transport. Authentication stays inside
+`{type:"start",version:1,host,port,token,settings,transport?,source_id?}`. Optional `transport` is `{type:"tls",fingerprint,client_id,client_token,session}`; `host`/`port` then identify the TLS entry and `token` remains the backend v3 credential. Without it the worker uses the legacy socket transport. Authentication stays inside
 the pipe; it is absent from the worker command line. Subsequent commands are
 `settings {settings}`, `status`, `send_files {paths}`, `focus_window {id}` and
 `disconnect`. Pipe EOF stops the local worker without terminating remote apps.
+
+The optional local `source_id` is the GUI's persistent connection-profile ID;
+without it the worker namespaces application taskbar identities by host/port.
+It is never an authentication credential or sent to Linux. Local settings include
+`tray` and `notifications` (default true), plus `badge_png` (empty for the brand
+badge, otherwise a normalized 64×64 PNG, at most 24 KiB / 32768 base64 characters).
+Badge bytes stay in the Windows profile/worker; per-application masters are kept
+separate from composed window and tray icons. Notification logos are composed
+when created/replaced, without re-alerting old notifications on appearance edits.
 
 Worker events include sanitized `connected` capabilities (never media keys),
 `stream_config` acknowledgements, `local_settings_applied`, `settings_warning`,
@@ -486,7 +496,7 @@ old CLI launch compatibility. Descriptors and tokens must be same-user private
 regular files. A pidfd plus `/proc` start identity pins an explicit shutdown to
 the expected server. Detaching the SSH helper leaves daemonized sessions alive.
 
-Managed application launch in both TLS and SSH modes uses the same helper. Recognized native Chrome/Chromium launches receive a persistent session-specific user-data directory and scoped Secret Service backend unless explicitly configured. Derived browser desktop entries preserve GIO field expansion; other desktop entries retain normal GIO behavior. Detected host Steam instances fail with an actionable conflict rather than forwarding silently. Low-level compositor `--launch` retains literal argv behavior.
+Managed application launch in both TLS and SSH modes uses the same helper and shared user HOME/data/user bus. Session admission rejects a second graphical desktop for the same user before creating Waybridge. Browser/wallet backend choices are explicit user configuration; no Chrome profile or password-store arguments are inserted automatically and no application-name conflict scanner is used. GIO desktop launch applies the explicit Waybridge desktop append/override configuration while preserving field expansion; low-level compositor `--launch` retains literal argv behavior. See SESSION_POLICY.md and CONFIGURATION.md for the current contract.
 
 ## Remote application trays (`tray_v1`)
 

@@ -1,5 +1,51 @@
 # Validation
 
+## M2 integrated desktop delivery — 2026-11-16
+
+The first M2 batch is integrated: shared branding and connection badges,
+read-only file inputs, SNI/DBusMenu trays and background actions, and explicitly
+selected native desktop notifications. Current installed programs were not
+replaced; device probes used their own temporary objects and registrations.
+
+- Workspace formatting, strict Clippy, workspace unit tests and the explicit real
+  FUSE acceptance pass. After the final descriptor-budget fix, tree transfer,
+  stalled-worker/reconnect and actual Dolphin/KIO writable-copy tests pass again.
+  Debug and Release workspace builds pass.
+- The M0/M1 Linux phase passes, including real systemd startup/error shutdown,
+  native desktop services, admission/launch/configuration, Chrome/Qt/Dolphin/X11,
+  pinned TLS/OpenSSH, actual NVENC codecs and HDR protocol regressions. These
+  are software/host checks, not physical Windows HDR validation.
+- Windows x64/ARM64 workers and self-contained WinUI packages build. Packaging
+  checks the matching notification resource DLL's PE architecture, required brand
+  assets, manifests, runtime resources and SHA-256 inventory.
+- Wine native icons, tray/menu/input gating, notification IPC, drop-target
+  lifetime, ordered sending, TLS/Schannel/direct control/media/audio, hosted
+  startup/live settings/Unicode upload, and file/directory virtual-stream drags
+  pass. Windows cases were completed in focused reruns after correcting Wine's
+  unsupported taskbar property assertion and awaiting compositor/FUSE shutdown
+  before a GUI fixture removes its temporary directory.
+- Icon self-tests cover default/custom/reset badges, unmodified master pixels,
+  generic fallback, 100/125/175/400% DPI and 300 HICON replacements. `laptop`
+  passed native WM_GETICON and strict window AppUserModelID readback: same-app
+  grouping labels, distinct profile/app labels and separate unknown windows.
+  Wine's window property store is explicitly reported as a limitation, not a
+  Windows identity pass. Properties are removed during window destruction.
+- Native Explorer tray/menu acceptance is recorded in [DESKTOP-TRAY.md](DESKTOP-TRAY.md).
+  Notification registration/center/activation-interface checks and the repaired
+  runtime packaging are recorded in the M2 notification section below. Actual
+  Shell banner clicking/cold start, DND visuals, full taskbar interaction, mixed
+  monitor DPI and ARM64 device operation remain separate acceptance work.
+
+Reproduction entrypoints are `scripts/test.sh`, `scripts/test-windows.sh`, and
+`scripts/test-m0-m1.sh --with-wine`; Windows-only regressions still use a private
+Linux session fixture plus Wine/Xvfb. Latest integration logs are
+`build/m2-full-regression.log` (Linux phase), `build/m2-windows-regression.log`,
+`build/m2-gui-native-regression.log`, `build/m2-windows-drag-regression.log`,
+`build/m2-final-files.log`, `build/m2-release-build.log` and
+`build/m2-control-packages.log`. Native icon/tray reports were retained under
+`build/tests/m2-*-laptop.log`. Source feature branches are retained for history;
+temporary parallel worktrees can be removed after integration.
+
 ## Error shutdown and Windows drop-target lifetime — 2026-11-15
 
 Desktop-service status reporting is now best-effort. A failed status write or

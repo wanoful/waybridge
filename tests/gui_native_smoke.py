@@ -9,7 +9,7 @@ import signal
 import subprocess
 import tempfile
 import threading
-from gui_session_smoke import Rpc, wait
+from gui_session_smoke import Rpc, wait, stop_process
 from smoke import ROOT
 
 
@@ -17,6 +17,8 @@ def main():
     subprocess.run(["bash", "tests/build-fixture.sh"], cwd=ROOT, check=True)
     subprocess.run(["x86_64-w64-mingw32-g++", "-municode", "-static", "-O2", "tests/windows_control_probe.cpp",
                     "-o", "build/tests/windows-control-probe.exe"], cwd=ROOT, check=True)
+    subprocess.run(["x86_64-w64-mingw32-g++", "-std=c++17", "-static", "-O2", "-Iclient",
+                    "tests/windows_host_control_probe.cpp", "-o", "build/tests/windows-host-control-probe.exe"], cwd=ROOT, check=True)
     processes = []
     with tempfile.TemporaryDirectory(prefix="waybridge-gui-native-") as directory, open(ROOT/"build/tests/gui-native.log", "w+") as log:
         root = Path(directory)
@@ -33,6 +35,10 @@ def main():
         server_pid = app_pid = None
         try:
             subprocess.run(["wineboot", "-u"], env=wine_env, stdout=log, stderr=log, check=True, timeout=60)
+            pipe_probe = subprocess.run(["wine", str(ROOT/"build/tests/windows-host-control-probe.exe")],
+                                        env=wine_env, capture_output=True, text=True, timeout=35)
+            assert pipe_probe.returncode == 0, (pipe_probe.stdout, pipe_probe.stderr)
+            print(pipe_probe.stdout.strip())
             session = rpc.ok(op="ensure", session="gui-native-0", binary=str(ROOT/"target/debug/waybridge"), port=0, codec="png", audio=False, xwayland=False)
             server_pid = session["pid"]
             app = rpc.ok(op="launch", session="gui-native-0", binary=str(ROOT/"target/debug/waybridge"), argv=[str(ROOT/"build/tests/test-app")])
@@ -80,7 +86,7 @@ def main():
             os.kill(server_pid, 0)
             assert rpc.ok(op="ensure", session="gui-native-0", mode="attach")["pid"] == server_pid
             assert session["token"] not in native_log.read_text()
-            rpc.ok(op="end", session="gui-native-0"); server_pid = None
+            rpc.ok(op="end", session="gui-native-0"); stop_process(server_pid); server_pid = None
             print("PASS: real Windows worker custom-badge startup/reset, named-pipe startup, sanitized capabilities/status, live FPS/bitrate/read-only/DPI, actual Unicode file upload, graceful disconnect and retained remote session")
         finally:
             rpc.close()
@@ -91,8 +97,7 @@ def main():
                     except subprocess.TimeoutExpired: child.kill(); child.wait()
             for pid in (app_pid, server_pid):
                 if pid:
-                    try: os.kill(pid, signal.SIGTERM)
-                    except ProcessLookupError: pass
+                    stop_process(pid)
 
 
 if __name__ == "__main__":
