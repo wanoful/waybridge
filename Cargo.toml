@@ -24,6 +24,7 @@ wayland-client = "0.31"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zbus = "5.19"
+x11rb = "0.13.2"
 
 
 [profile.release]

@@ -1,4 +1,6 @@
 //! Opt-in rootless Xwayland; each X11 surface uses the existing independent window transport.
+#[path = "xdnd.rs"]
+pub mod xdnd;
 use super::*;
 use smithay::{
     reexports::calloop::LoopHandle,
@@ -88,6 +90,7 @@ impl KeyboardTarget<App> for KeyboardFocus {
     }
 }
 pub struct State {
+    pub xdnd: Option<xdnd::Xdnd>,
     pub shell: XWaylandShellState,
     client: Option<Client>,
     pub wm: Option<X11Wm>,
@@ -108,6 +111,7 @@ impl Drop for State {
 }
 pub fn start(dh: &DisplayHandle, handle: LoopHandle<'static, App>, enabled: bool) -> Result<State> {
     let mut state = State {
+        xdnd: None,
         shell: XWaylandShellState::new::<App>(dh),
         client: None,
         wm: None,
@@ -161,6 +165,7 @@ pub fn start(dh: &DisplayHandle, handle: LoopHandle<'static, App>, enabled: bool
                     Ok(wm) => {
                         app.x11.wm = Some(wm);
                         app.x11.display = Some(display_number);
+                        app.x11.xdnd = Some(xdnd::Xdnd::new(display_number));
                         tracing::info!(
                             display = format!(":{display_number}"),
                             "private rootless Xwayland ready"
@@ -723,6 +728,7 @@ impl XwmHandler for App {
             self.clipboard_generation += 1;
         }
         self.x11.display = None;
+        self.x11.xdnd = None;
         self.x11.failed = true;
         tracing::warn!("private Xwayland disconnected; native Wayland session continues");
     }
