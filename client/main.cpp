@@ -25,6 +25,7 @@
 #include "remote_tray.h"
 #include "window_semantics.h"
 #include "window_activation.h"
+#include "drag_visual.h"
 #include "relative_input.h"
 #include "ime.h"
 #include "third_party/json.hpp"
@@ -50,6 +51,7 @@
 using Json = nlohmann::json;
 HostControl hostControl;
 NativeActivation nativeActivation;
+DragVisual dragVisual;
 Json hostedSettings = Json::object();
 bool hostedReadOnly = false, hostedIme = true, hostedFiles = true, hostedImages = true;
 std::string hostedClipboard = "both";
@@ -72,6 +74,7 @@ DWORD uiThread = 0;
 std::condition_variable inboxWake, frameWake;
 std::deque<Json> controls;
 Json pendingCursor;
+Json pendingDragVisual;
 NativeCursor nativeCursor;
 RemoteTray remoteTray;
 bool trayNegotiated = false;
@@ -382,6 +385,7 @@ void receiveLoop(SOCKET socket) {
         }
       }
       bool control = packet[0] == 0;
+      bool notifyUI = control;
       Json incoming;
       if (control) {
         incoming = Json::parse(packet.begin() + 1, packet.end());
@@ -399,18 +403,25 @@ void receiveLoop(SOCKET socket) {
           if (controls.size() >= 128) throw std::runtime_error("Control inbox full");
           if (!running) break;
           auto message = std::move(incoming);
+          if ((message.value("type", "") == "data_drag" || message.value("type", "") == "toplevel_drag") &&
+              !message.value("active", true))
+            pendingDragVisual = {{"type","drag_visual_reset"}};
           if (message.value("type", "") == "window_closed") {
             decoderGarbage.push_back(message.at("id").get<uint32_t>());
             frameWake.notify_all();
           }
-          if (message.value("type", "") == "cursor")
+          if (message.value("type", "") == "drag_visual") {
+            if (size > 352 * 1024) throw std::runtime_error("DND visual exceeds limit");
+            notifyUI = pendingDragVisual.is_null();
+            pendingDragVisual = std::move(message);
+          } else if (message.value("type", "") == "cursor")
             pendingCursor = std::move(message); // bounded latest-only animation state
           else
             controls.push_back(std::move(message));
         } else
           break;
       }
-      if (control)
+      if (control && notifyUI)
         PostMessageW(controller, NetworkReady, 0, 0);
     }
   } catch (const std::exception &e) {
@@ -1389,7 +1400,7 @@ RemoteWindow *windowDragTarget(POINT point) {
   struct Search { POINT point; RemoteWindow *target = nullptr; } search{point};
   EnumWindows([](HWND hwnd, LPARAM data) -> BOOL {
     auto &s = *reinterpret_cast<Search *>(data);
-    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || hwnd == controller)
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || hwnd == controller || dragVisual.owns(hwnd))
       return TRUE;
     auto dragged = windows.find(windowDrag.attached);
     if (dragged != windows.end() && hwnd == dragged->second->hwnd)
@@ -2328,11 +2339,13 @@ void destroyRemote(uint32_t id) {
 void dispatchNetwork() {
   std::deque<Json> pending;
   Json cursor;
+  Json visual;
   std::map<uint32_t, std::shared_ptr<DecodedFrame>> pendingFrames;
   {
     std::lock_guard<std::mutex> guard(inboxMutex);
     pending.swap(controls);
     cursor.swap(pendingCursor);
+    visual.swap(pendingDragVisual);
     pendingFrames.swap(decodedFrames);
   }
   inboxWake.notify_all();
@@ -2362,6 +2375,7 @@ void dispatchNetwork() {
       if (remoteTray.receive(m,*iconDecoder)) continue;
     }
     if (type == "hello") {
+      dragVisual.configure(m.value("data_drag_v1", false));
       nativeActivation.hello(m.value("activation_v1", false));
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
       if (m.value("version", 0) != 3 || m.value("codec", "") != "mixed") {
@@ -2707,6 +2721,10 @@ void dispatchNetwork() {
   }
   if (cursorNegotiated && !cursor.is_null() && nativeCursor.update(cursor))
     refreshCursor();
+  if (!visual.is_null()) {
+    if (visual.value("type", "") == "drag_visual_reset") dragVisual.reset();
+    else dragVisual.receive(visual);
+  }
   for (auto &[id, frame] : pendingFrames) {
     auto it = windows.find(id);
     if (it == windows.end())
@@ -2854,6 +2872,7 @@ void publishHostedStatus() {
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
+    if (message == WM_TIMER && wp == DragVisual::Timer) { dragVisual.tick(); return 0; }
     if (remoteTray.message(message,wp,lp)) return 0;
     if (message == HostControl::Message) {
       for (const auto &request : hostControl.take()) {
@@ -2953,6 +2972,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_CLOSE) {
+      dragVisual.reset();
       remoteTray.clear();
       windowDrag.cancelled = true;
       endWindowDrag();
@@ -3099,6 +3119,7 @@ int wmain(int argc, wchar_t **argv) {
   controller = CreateWindowExW(0, wc.lpszClassName, L"Waybridge", 0, 0, 0, 0, 0, HWND_MESSAGE,
                                nullptr, instance, nullptr);
   hostControl.start(controller);
+  dragVisual.attach(controller);
   FileTree::activity = [](const Json &event) { hostControl.emit(event); };
   FileDrag::remoteHitTest = [](POINT point) { return windowDragTarget(point)!=nullptr; };
   remoteNotifications.decorate = [](Json &message) {
@@ -3191,6 +3212,7 @@ int wmain(int argc, wchar_t **argv) {
             {"tray_v1", true},
             {"window_semantics_v1", true},
             {"activation_v1", true},
+            {"data_drag_v1", true},
             {"notifications_v1", hostControl.active()},
             {"notifications_enabled", false},
             {"pointer_lock", true},

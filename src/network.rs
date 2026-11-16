@@ -51,6 +51,7 @@ struct Queue {
     repairs: VecDeque<Vec<u8>>,
     controls: VecDeque<Vec<u8>>,
     cursor: Option<Vec<u8>>,
+    drag_visual: Option<Vec<u8>>,
     icons: BTreeMap<u32, Vec<u8>>,
     tray_icons: BTreeMap<String, Vec<u8>>,
     frames: BTreeMap<u32, VecDeque<QueuedFrame>>,
@@ -126,6 +127,17 @@ pub struct Peer {
 }
 
 impl Peer {
+    pub fn drag_visual(&self, message: Value) {
+        let bytes = serde_json::to_vec(&message).unwrap();
+        if bytes.len() > 352 * 1024 {
+            return;
+        }
+        let mut q = self.queue.lock().unwrap();
+        if !q.closed {
+            q.drag_visual = Some(bytes);
+        }
+        self.wake.notify_all();
+    }
     pub fn notifications_enabled(&self) -> bool {
         self.notifications_v1
     }
@@ -445,6 +457,7 @@ impl Peer {
                         && (!q.controls.is_empty()
                             || !q.bulk.is_empty()
                             || q.cursor.is_some()
+                            || q.drag_visual.is_some()
                             || !q.icons.is_empty()
                             || !q.tray_icons.is_empty()))
                         || (frames_allowed && (!q.repairs.is_empty() || frame_ready));
@@ -462,6 +475,8 @@ impl Peer {
                     (udp::REPAIR, q.repairs.pop_front().unwrap(), None)
                 } else if !media && q.cursor.is_some() {
                     (protocol::JSON, q.cursor.take().unwrap(), None)
+                } else if !media && q.drag_visual.is_some() {
+                    (protocol::JSON, q.drag_visual.take().unwrap(), None)
                 } else if !media && !q.icons.is_empty() {
                     (protocol::JSON, q.icons.pop_first().unwrap().1, None)
                 } else if !media && !q.tray_icons.is_empty() {

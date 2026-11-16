@@ -8,6 +8,7 @@ mod cursor;
 mod desktop_notifications;
 mod desktop_tray;
 mod drag;
+mod drag_visual;
 mod file_tree;
 mod ime;
 mod launch;
@@ -332,6 +333,7 @@ struct App {
     _constraints: PointerConstraintsState,
     ime: ime::Ime,
     drag_sink: Option<drag::Sink>,
+    drag_visual: drag_visual::DragVisual,
     drag_surface: Option<WlSurface>,
     drag_enabled: bool,
     next_drag: u64,
@@ -1213,6 +1215,12 @@ impl App {
             }
             "ping" => self.control(json!({"type":"pong","nonce":value["nonce"]})),
             "hello" => {
+                if let Some(enabled) = value["data_drag_v1"].as_bool() {
+                    if !enabled {
+                        self.stop_drag_visual();
+                    }
+                    self.drag_visual.enabled = enabled;
+                }
                 self.activation.negotiated = value["activation_v1"] == true;
                 self.window_drag.available = value["toplevel_drag_v1"].as_bool().unwrap_or(false);
                 self.relative_available(value["pointer_lock"].as_bool().unwrap_or(false));
@@ -2206,6 +2214,7 @@ impl CompositorHandler for App {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         let icon_changed = window_icon::commit(surface);
+        self.commit_drag_visual(surface);
         if let smithay::input::pointer::CursorImageStatus::Surface(cursor) = &self.cursor.image {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
@@ -2689,7 +2698,8 @@ impl ClientDndGrabHandler for App {
     fn send_drop_performed(&mut self, source: &WlDataSource, validated: bool) -> bool {
         validated || self.window_drag.completes_move(source)
     }
-    fn started(&mut self, source: Option<WlDataSource>, _: Option<WlSurface>, _: Seat<Self>) {
+    fn started(&mut self, source: Option<WlDataSource>, icon: Option<WlSurface>, _: Seat<Self>) {
+        self.start_drag_visual(source.as_ref(), icon);
         let modern = self.peer.as_ref().is_some_and(|p| p.data_drag_enabled());
         let attached = source
             .as_ref()
@@ -2778,6 +2788,7 @@ impl ClientDndGrabHandler for App {
         });
     }
     fn dropped(&mut self, _: Option<WlSurface>, validated: bool, _: Seat<Self>) {
+        self.stop_drag_visual();
         self.window_drag.ended();
         if let Some(drag) = &self.outbound {
             if !drag.dropped && (!drag.external || !validated) {
@@ -3102,6 +3113,7 @@ fn main() -> Result<()> {
         _constraints: PointerConstraintsState::new::<App>(&dh),
         ime: ime::Ime::new(&dh),
         drag_sink: None,
+        drag_visual: drag_visual::DragVisual::default(),
         drag_surface: None,
         drag_enabled: false,
         next_drag: 0,
@@ -3397,6 +3409,8 @@ fn main() -> Result<()> {
                     }
                     Event::Disconnected => {
                         app.cancel_text_drag();
+                        app.stop_drag_visual();
+                        app.drag_visual.enabled = false;
                         app.activation.connection();
                         notifications.connection(false);
                         if let Some(tray) = &app.tray {
@@ -3471,6 +3485,7 @@ fn main() -> Result<()> {
             ) {
                 app.publish_ime();
             }
+            app.render_drag_visual();
             if Instant::now() >= next_frame {
                 app.render()?;
                 app.activation_flush();

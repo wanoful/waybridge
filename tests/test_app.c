@@ -22,6 +22,7 @@ static int alpha_fixture;
 static struct wl_data_device_manager *data_manager;
 static struct wl_data_device *data_device;
 static struct wl_data_source *drag_source;
+static void visual_cancel(void);
 static void source_target(void *d, struct wl_data_source *source, const char *mime) {
   (void)d; (void)source;
   printf("SOURCE_TARGET %s\n", mime ? mime : "none"); fflush(stdout);
@@ -41,6 +42,7 @@ static void source_send(void *d, struct wl_data_source *source, const char *mime
   close(fd); printf("SOURCE_SEND\n"); fflush(stdout);
 }
 static void source_cancelled(void *d, struct wl_data_source *source) {
+  visual_cancel();
   (void)d; wl_data_source_destroy(source); drag_source = NULL;
   printf("SOURCE_CANCELLED\n"); fflush(stdout);
 }
@@ -48,6 +50,7 @@ static void source_dropped(void *d, struct wl_data_source *source) {
   (void)d; (void)source; printf("SOURCE_DROPPED\n"); fflush(stdout);
 }
 static void source_finished(void *d, struct wl_data_source *source) {
+  visual_cancel();
   (void)d; wl_data_source_destroy(source); drag_source = NULL;
   printf("SOURCE_FINISHED\n"); fflush(stdout);
 }
@@ -161,6 +164,7 @@ static void released(void *data, struct wl_buffer *buffer) {
 }
 static const struct wl_buffer_listener buffer_listener = {.release = released};
 #include "cursor_fixture.h"
+#include "drag_visual_fixture.h"
 static void draw(struct window *w) {
   int shadow = client_decorated ? 12 : 0;
   int width = w->width + shadow * 2, height = w->height + shadow * 2;
@@ -318,6 +322,13 @@ static void button(void *d, struct wl_pointer *p, uint32_t s, uint32_t t, uint32
   }
   printf("BUTTON %u %u\n", b, state);
   const char *drag_enabled = getenv("WAYBRIDGE_TEST_DRAG_ENABLED");
+  if (getenv("WAYBRIDGE_TEST_DRAG_ICON") && !drag_source && pointer_window && b == 272 && state == WL_POINTER_BUTTON_STATE_PRESSED) {
+    drag_source = wl_data_device_manager_create_data_source(data_manager);
+    wl_data_source_add_listener(drag_source, &source_listener, NULL);
+    wl_data_source_offer(drag_source, "text/plain");
+    wl_data_source_set_actions(drag_source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+    wl_data_device_start_drag(data_device, drag_source, pointer_window->surface, visual_start(), s);
+  }
   if (getenv("WAYBRIDGE_TEST_DRAG_URIS") && (!drag_enabled || access(drag_enabled, F_OK) == 0) && !drag_source && pointer_window &&
       b == 272 && state == WL_POINTER_BUTTON_STATE_PRESSED) {
     drag_source = wl_data_device_manager_create_data_source(data_manager);

@@ -685,3 +685,27 @@ The new protocol test, existing `app_icon_smoke.py`, and accelerated GLX
 association results; no user application profile, wallet or real desktop service
 was modified, and HMCL/QQ visual acceptance on Windows remains an integration
 check after installing the fix.
+
+## Generic DND icon feedback (2026-11-16)
+
+- `tests/drag_visual_smoke.py` passed a real Wayland `dnd_icon` surface and SHM
+  animation against an isolated compositor/user bus. It checks exact premultiplied
+  RGBA/transparent pixels, attach offsets, increasing commit revisions, animated
+  frame callbacks while the application stream is limited to 1 FPS, drop/icon
+  destruction cleanup, oversized-source rejection without starving callbacks,
+  and absence of visual messages when data_drag_v1 is not negotiated.
+- The production `client/drag_visual.h` passed the isolated
+  `tests/windows_drag_visual_probe.cpp` under Wine and on laptop Windows x64.
+  A separate child-process test window receives actual clicks through the
+  topmost ghost; foreground remains on that underlay, the ghost follows pointer
+  movement, ended/old generations are rejected and reset destroys it. On laptop,
+  screen pixel readback also confirms 50% premultiplied red correctly composited
+  over the probe's blue underlay. No user application/data is involved.
+- The Windows probe runner creates a unique temporary executable/task, restores
+  the previous cursor/foreground and removes its own files/processes. Compile
+  the probe with `-municode -Iclient -lgdi32`, then run
+  `python3 tests/run_windows_focus_probe.py --host laptop --visual`.
+- Native x64 compilation and strict Rust Clippy passed. DPI/bounds unit coverage
+  includes asymmetric edge/area limits and their rounding margin. This does not
+  claim every toolkit supplies a DND icon, nor physical ARM64/mixed-DPI monitor
+  testing of the new ghost; clients without an icon simply show the normal cursor.

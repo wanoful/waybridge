@@ -699,3 +699,33 @@ OS notification settings and Do Not Disturb behavior. AppNotifications has no
 Dismissed event; disappearance is checked with GetAllAsync every two seconds,
 with a further two-second activation grace period before sending dismissal.
 Expiry/application close and disconnect cleanup do not depend on that polling.
+
+## Generic drag visual (`data_drag_v1`)
+
+A client can provide a standard `wl_surface` icon to `wl_data_device.start_drag`.
+With data_drag_v1 negotiated, this separate surface is captured as visual state,
+not as another application window and not by application-specific adapters.
+`drag_visual {generation,revision,active,visible?,format?,width?,height?,scale?,
+offset_x?,offset_y?,pixels?}` is latest-only/coalesced on both network endpoints.
+The bitmap format is base64 `rgba8-premultiplied`; offsets are surface-local
+logical coordinates relative to the pointer, including attach/offset deltas and
+the subsurface bounding-box origin. `scale` describes the captured pixels per
+logical unit. `active:false` ends that generation permanently; visible:false
+hides an empty/unsupported icon while retaining its normal source DND lifecycle.
+
+Capture source buffers and the logical bbox are limited to 512 per edge,
+65536 pixels and 16 surfaces; DPI-scaled capture and native display are also
+bounded to 65536 pixels. A private packet is at most 352 KiB. Oversized/malformed
+icons are hidden, without changing the offer or making a drag invalid. Bitmap
+capture happens only after surface commits and at most 30 times per second;
+source frame callbacks advance independently of the application stream FPS, so
+an animated drag icon continues even with a static/slow application window.
+
+The native viewer uses one temporary layered, mouse-transparent, NOACTIVATE
+tool window, positioned by a controller-owned timer. Only this ephemeral ghost
+is topmost. It never changes application foreground/input focus or creates a
+taskbar entry. Native hit testing ignores the ghost itself. End/cancel, source
+or icon destruction, connection failure and feature reset remove it and stop
+the timer; older generations/revisions cannot resurrect a closed image.
+Drag-end controls also replace a pending bitmap with a coalesced reset marker,
+so a stale image waiting in the UI inbox cannot reappear after that end.
