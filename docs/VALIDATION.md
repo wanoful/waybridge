@@ -734,3 +734,27 @@ check after installing the fix.
   includes asymmetric edge/area limits and their rounding margin. This does not
   claim every toolkit supplies a DND icon, nor physical ARM64/mixed-DPI monitor
   testing of the new ghost; clients without an icon simply show the normal cursor.
+
+## DND offer identity and text-target reentry — 2026-11-16
+
+`tests/data_drag_offer_smoke.py` uses two real Wayland targets which deliberately
+retain offers. An inactive offer from target A cannot change target B's current
+acceptance through late Accept or SetActions. A separate source is dropped but
+not read/finished until another source starts: the old Receive returns the old
+Unicode payload, and its Finish leaves the newer source able to Drop, Receive
+and Finish its own payload. This verifies source cookies through the wire and
+checks active-offer status independently of the per-source cookie.
+
+Native text targets now acquire a generation before calling external OLE
+providers. Window lifetime, policy and generation are rechecked after GetData
+and ReleaseStgMedium. Older DragEnter completion cannot overwrite state created
+by a nested enter; an old leave cannot cancel the new target. Sharing/read-only
+reset invalidates pending calls even when the window stays alive or the setting
+is later reenabled. Drop revokes the target lease.
+
+`tests/windows_text_drag_lifetime_smoke.py` passes a standalone PE probe through
+actual IDataObject QueryGetData/GetData and STGMEDIUM release callbacks which
+reenter the adapter. It verifies replacement survives all three callback points,
+leave/policy/drop rejection, valid Unicode delivery, malformed UTF-16,
+unterminated HGLOBAL and UTF-8 expansion limits. The probe uses disposable Wine
+state, creates no windows and touches no clipboard or user data.

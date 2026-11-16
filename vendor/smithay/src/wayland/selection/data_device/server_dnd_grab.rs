@@ -557,7 +557,9 @@ fn handle_server_dnd<D>(
             if offer.version() < 3 {
                 data.chosen_action = metadata.dnd_action & DndAction::Copy;
             }
-            handler.offer_status(source_id, data.accepted, data.chosen_action, seat.clone());
+            if data.active {
+                handler.offer_status(source_id, data.accepted, data.chosen_action, seat.clone());
+            }
             handler.accept(mime_type, seat)
         }
         Request::Receive { mime_type, fd } => {
@@ -624,7 +626,9 @@ fn handle_server_dnd<D>(
             if chosen_action != data.chosen_action {
                 data.chosen_action = chosen_action;
                 offer.action(chosen_action);
-                handler.offer_status(source_id, data.accepted, chosen_action, seat.clone());
+                if data.active {
+                    handler.offer_status(source_id, data.accepted, chosen_action, seat.clone());
+                }
                 handler.action(chosen_action, seat);
             }
         }

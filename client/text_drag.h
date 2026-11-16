@@ -2,7 +2,7 @@
 // Bounded OLE Unicode text <-> Wayland MIME data. Never creates a file or
 // changes the clipboard. All state belongs to the controller STA.
 namespace TextDrag {
-inline uint64_t sequence = 0, active = 0;
+inline uint64_t sequence = 0, active = 0, targetEpoch = 0;
 inline bool accepted = false;
 inline bool supports(IDataObject *data) {
   FORMATETC format{CF_UNICODETEXT, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
@@ -12,7 +12,14 @@ inline void cancel(uint64_t id) {
   if (!id || active != id) return;
   sendJson({{"type","text_drag_cancel"},{"drag",id}}); active=0;accepted=false;
 }
-inline uint64_t begin(IDataObject *data, Json position, const std::function<bool()> &current) {
+// A target lease starts before any external QueryGetData/GetData call. Older
+// target callbacks cannot cancel a newer target, or resurrect a pending begin.
+inline bool currentTarget(uint64_t token) { return token && token == targetEpoch; }
+inline uint64_t enterTarget() { cancel(active); return ++targetEpoch; }
+inline void leaveTarget(uint64_t token) { if (currentTarget(token)) { cancel(active); ++targetEpoch; } }
+inline void reset() { cancel(active); ++targetEpoch; }
+inline uint64_t begin(IDataObject *data, Json position, uint64_t target, const std::function<bool()> &current) {
+  if (!currentTarget(target) || !current()) return 0;
   FORMATETC format{CF_UNICODETEXT,nullptr,DVASPECT_CONTENT,-1,TYMED_HGLOBAL};
   STGMEDIUM medium{};
   if (FAILED(data->GetData(&format,&medium))) return 0;
@@ -36,7 +43,7 @@ inline uint64_t begin(IDataObject *data, Json position, const std::function<bool
     }
   }
   ReleaseStgMedium(&medium);
-  if (!current() || text.empty()) return 0;
+  if (!currentTarget(target) || !current() || text.empty()) return 0;
   cancel(active);active=++sequence;accepted=false;
   position["type"]="text_drag_enter";position["drag"]=active;
   position["data"]=base64(reinterpret_cast<const uint8_t *>(text.data()),text.size());
@@ -50,7 +57,7 @@ inline bool allowed(uint64_t id) {return id && active==id && accepted;}
 inline bool drop(uint64_t id, Json position) {
   if(!allowed(id)){cancel(id);return false;}
   position["type"]="text_drag_drop";position["drag"]=id;sendJson(position);
-  active=0;accepted=false;return true;
+  active=0;accepted=false;++targetEpoch;return true;
 }
 inline bool control(const Json &message) {
   if(message.value("type","")!="text_drag_status")return false;

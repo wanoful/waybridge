@@ -954,7 +954,7 @@ class FileDropTarget final : public IDropTarget {
   uint32_t windowId;
   std::weak_ptr<void> lifetime;
   bool accepted = false;
-  uint64_t textDrag = 0;
+  uint64_t textDrag = 0, textTarget = 0;
 
   Json position(POINTL point) const {
     auto *window = findWindow(); if (!window) return Json::object();
@@ -976,7 +976,7 @@ class FileDropTarget final : public IDropTarget {
 
 public:
   explicit FileDropTarget(RemoteWindow *w) : windowId(w->id), lifetime(w->dropLifetime) {}
-  ~FileDropTarget() { TextDrag::cancel(textDrag); }
+  ~FileDropTarget() { TextDrag::leaveTarget(textTarget); }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
     if (iid == IID_IUnknown || iid == IID_IDropTarget) {
       *out = static_cast<IDropTarget *>(this);
@@ -997,33 +997,44 @@ public:
     // Reentrant OLE calls can close the window and revoke its registration.
     AddRef();
     VirtualFiles::Com<IDropTarget> self(this);
-    if (dataDragNegotiated && FileDrag::returnToRemote(data, position(point))) {
+    const uint64_t target = TextDrag::enterTarget();
+    textTarget = target; textDrag = 0; accepted = false;
+    const auto current = [this, target] {
+      return running && textTarget == target && TextDrag::currentTarget(target) &&
+             findWindow() && hostedFiles && !hostedReadOnly;
+    };
+    if (dataDragNegotiated && current() && FileDrag::returnToRemote(data, position(point))) {
       *effect=DROPEFFECT_NONE;return S_OK;
     }
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-    accepted = findWindow() && hostedFiles && (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
-               (SUCCEEDED(data->QueryGetData(&format)) || VirtualFiles::supports(data));
-    accepted = accepted && findWindow();
-    if (!accepted && findWindow() && hostedFiles && !hostedReadOnly && dataDragNegotiated &&
+    bool files = current() && (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) &&
+                 (SUCCEEDED(data->QueryGetData(&format)) || VirtualFiles::supports(data));
+    uint64_t candidate = 0;
+    if (!files && current() && dataDragNegotiated &&
         (*effect & DROPEFFECT_COPY) && !FileDrag::isOwn(data) && TextDrag::supports(data)) {
       auto location = position(point);
-      if (location.contains("id")) textDrag = TextDrag::begin(data, location, [this] { return findWindow()!=nullptr; });
+      if (location.contains("id")) candidate = TextDrag::begin(data, location, target,
+          [&current] { return current() && dataDragNegotiated; });
     }
+    // External providers can pump DragLeave/DragEnter, close a window or apply
+    // new sharing settings. Do not overwrite state committed by that reentry.
+    if (!current()) { TextDrag::cancel(candidate); *effect = DROPEFFECT_NONE; return S_OK; }
+    accepted = files; textDrag = candidate;
     *effect = accepted || TextDrag::allowed(textDrag) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL point, DWORD *effect) override {
     if (textDrag) {
-      if (!findWindow() || hostedReadOnly || !hostedFiles) { TextDrag::cancel(textDrag);textDrag=0; }
+      if (!TextDrag::currentTarget(textTarget) || !findWindow() || hostedReadOnly || !hostedFiles) { TextDrag::leaveTarget(textTarget);textDrag=textTarget=0; }
       else { auto location=position(point);if(location.contains("id"))TextDrag::motion(textDrag,location); }
       *effect=TextDrag::allowed(textDrag) && (*effect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
       return S_OK;
     }
-    *effect = accepted && findWindow() && (*effect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+    *effect = accepted && TextDrag::currentTarget(textTarget) && findWindow() && (*effect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE DragLeave() override {
-    TextDrag::cancel(textDrag);textDrag=0;
+    TextDrag::leaveTarget(textTarget);textDrag=textTarget=0;
     accepted = false;
     return S_OK;
   }
@@ -1035,10 +1046,11 @@ public:
     accepted = false;
     if (textDrag) {
       auto location=position(point);
-      if (copyAllowed && hostedFiles && !hostedReadOnly && findWindow() && location.contains("id") && TextDrag::drop(textDrag,location)) *effect=DROPEFFECT_COPY;
-      else TextDrag::cancel(textDrag);
-      textDrag=0;return S_OK;
+      if (copyAllowed && TextDrag::currentTarget(textTarget) && hostedFiles && !hostedReadOnly && findWindow() && location.contains("id") && TextDrag::drop(textDrag,location)) *effect=DROPEFFECT_COPY;
+      else TextDrag::leaveTarget(textTarget);
+      textDrag=textTarget=0;return S_OK;
     }
+    TextDrag::leaveTarget(textTarget); textTarget=0;
     if (!copyAllowed || !hostedFiles || !findWindow() || FileDrag::isOwn(data))
       return S_OK;
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
@@ -2838,7 +2850,7 @@ void applyHostedSettings(const Json &settings, bool live) {
   hostedReadOnly=settings.value("read_only",false); hostedIme=settings.value("ime",true);
   remoteNotifications.inputReadOnly(hostedReadOnly);
   hostedFiles=settings.value("files",true); hostedImages=settings.value("clipboard_images",true);
-  if (hostedReadOnly || !hostedFiles) TextDrag::cancel(TextDrag::active);
+  if (hostedReadOnly || !hostedFiles) TextDrag::reset();
   hostedClipboard=clipboard;
   FileTree::setDownloadsEnabled(hostedFiles && hostedClipboard != "off" && hostedClipboard != "send");
   std::wstring scale=dpi?std::to_wstring(dpi):L"";
