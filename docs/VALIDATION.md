@@ -1,5 +1,60 @@
 # Validation
 
+## Native X11/Wayland DND interoperability — 2026-11-17
+
+The production compositor now routes both native backends through the selectively
+backported Smithay Source/DndFocus/OfferData subsystem. The old COPY-only source
+worker is test-only. Provenance and the remaining synchronous XWM boundary are
+recorded in [XDND.md](XDND.md) and `vendor/smithay/PATCHES.md`.
+
+Real Qt Wayland/XCB source/target tests cover all four text combinations,
+260,000-byte Unicode data with exact SHA-256, actual filesystem MOVE between
+backends and inside one X11 window, Escape/read-only/disconnect followed by a
+fresh successful gesture, and target closure without delivery. Native X11
+visuals are checked for empty input metadata. The incoming X11 test includes
+INCR-sized text and read-only URI copies into a MOVE-preferring real file model;
+external delivery remains COPY. These tests do not certify arbitrary application
+workflows or every XDND version, custom action and incoming INCR source.
+
+The physical `laptop` test uses the production x64 PE worker and a real X11 Qt
+application: native cross-window capture, leaving for OLE and returning to the
+original source, and Unicode Windows/Linux out/in. It verifies target content
+and the source's real XdndFinished, separately from Qt's provisional exec result.
+The equivalent Wine test runs for both Qt backends. Empty X SHAPE regions,
+Windows input hit testing and OLE nonclient-to-image motion prevent transparent
+source/OS drag visuals from forcing false returns. The physical regression
+manipulates disposable fixtures only; it does not establish a QQ workflow or
+physical ARM64 acceptance.
+
+The existing eleven physical Chrome cases also pass: both directions, immediate
+release, Escape, added protocol delay, rejection/timeout, two streamed targets
+and one Windows source switching targets. CDP only prepares/reads test pages;
+actual SendInput/OLE supplies the drag. Linux Chrome tab detach/merge remains a
+separate regression; an attached tab may lose its origin window on a successful
+merge and must not be cancelled as a closed ordinary data source.
+
+Late Wayland Receive/Finish, stale revisions, MIME/action feedback and visual
+regressions remain in the full suite. A payload-lease regression verifies that
+a retained protocol offer cannot pin a retired bounded snapshot. All application
+fixtures use a private HOME/session bus and disposable profile. Logs are under
+`build/xdnd-*`, including `xdnd-final-linux.log`, `xdnd-final-windows.log`,
+`xdnd-laptop.log`, `xdnd-browser-laptop.log`, `xdnd-copy-policy.log`,
+`xdnd-control-tests.log`, and `xdnd-payload-lease.log`. A tray test readiness race
+was corrected to wait for its actual asynchronous icon registration before its
+single fixture click; no production tray behavior changed.
+
+The Release server/compositor were installed in `~/.local/bin` with no active
+user compositor session. `waybridge.service` restarted at 02:16 UTC+8; executable
+path/start time, installed hashes, configuration checks, administration readiness
+and a real pinned TLS handshake pass. The 49092 listener, service configuration
+and pairing certificate were preserved. The x64 GUI/worker/runtime bundle at the
+existing `laptop` installation was replaced and its full SHA-256 inventory
+verified; user profiles were preserved. No old-version backups were created.
+ARM64 is cross-built/packaged, not physically accepted. Evidence:
+`build/xdnd-deployment.json`, `xdnd-linux-deployment.log`,
+`xdnd-windows-deployment.log`, `xdnd-control-packages.log` and
+`xdnd-release-build.log`. Linux and Windows/Wine full suites and Core tests pass.
+
 ## Chrome text drag negotiation and source lifetime — 2026-11-16
 
 The original physical-Windows Chrome reproduction passed with a 700 ms hover

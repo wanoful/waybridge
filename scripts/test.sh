@@ -29,6 +29,10 @@ python tests/data_drag_smoke.py
 python tests/drag_visual_smoke.py
 if command -v Xwayland >/dev/null; then
   python tests/xdnd_bridge_smoke.py
+  if pkg-config --exists Qt6Widgets xcb; then
+    python tests/mixed_drag_smoke.py
+    python tests/mixed_drag_smoke.py --large
+  fi
 fi
 python tests/data_drag_offer_smoke.py
 python tests/tree_smoke.py

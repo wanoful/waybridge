@@ -19,7 +19,7 @@
 
 后续已完成 HMCL 按钮与启动游戏、Minecraft 窗口/最大化/全屏主菜单坐标复测；本机 Chrome 在解锁原钱包后由用户确认恢复登录。异常退出、状态写入失败及 Windows 拖放关闭竞态已有回归，修复已部署。上述结果不扩大到完整游戏操作、Blender 工程流程、任意旧钱包迁移或全部 Windows 外设验收。
 
-纯文本拖放已用真实 Windows Chrome ↔ 原生 Wayland Chrome 验证，覆盖立即松手、附加延迟、拒绝/取消、串流窗口互拖和源跨目标。新两端使用目标 revision 和完成回执，协商/完成等待有界；独立「文字拖放」开关不依赖文件共享。设计与网络边界见 [DRAG_AND_DROP.md](DRAG_AND_DROP.md)，完整 X11 源桥接及富格式仍待实现。
+纯文本拖放已用真实 Windows Chrome ↔ 原生 Wayland Chrome 验证，覆盖立即松手、附加延迟、拒绝/取消、串流窗口互拖和源跨目标。新两端使用目标 revision 和完成回执，协商/完成等待有界；独立「文字拖放」开关不依赖文件共享。设计与网络边界见 [DRAG_AND_DROP.md](DRAG_AND_DROP.md)，X11 源／目标和混合后端已接通通用路径，富格式跨端及真实应用矩阵仍待完善。
 
 ## 本机应用与游戏清单
 
@@ -78,8 +78,8 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | 键鼠与输入法 | 键盘、鼠标、滚轮、本地光标、微软拼音桥接 Wayland text-input-v3 | Qt 基础微软拼音场景有 WoA 实机记录；更多输入法、切换组合和 X11/XIM 未覆盖 |
 | 游戏鼠标 | Raw Input 相对位移、指针锁定、隐藏与裁剪、失焦释放、紧急解锁 | 尚无 confined-pointer、通用手柄及震动；实际游戏兼容性须按游戏验收 |
 | 剪贴板 | 双向文本、PNG、文件和目录；方向与图片、文件共享开关 | HTML/RTF 等富文本未实现；应用私有剪贴板格式不跨平台转换 |
-| 文件传输与拖放 | 双向文件和目录、Windows 虚拟文件导入、Linux 按需虚拟文件拖出、完成活动与接收目录入口；外部只读 URI 可交付至 Xwayland 目标 | 跨设备只 COPY，原 Wayland 会话内保留 COPY/MOVE；只读输入与可写独立副本已实现；GUI 无逐文件进度、暂停、续传和统一取消；完整 X11 源目标互通仍缺 |
-| 文字拖放及反馈 | Windows Unicode 与 Wayland UTF-8 双向 COPY、原会话跨 HWND 拖放与 OLE 返回、源提供的透明动画虚影 | HTML/RTF/图像拖放、完整 X11 源端和文件 hover 尚未覆盖；具体方向与限制见 DESKTOP_INTERACTIONS.md |
+| 文件传输与拖放 | 双向文件和目录、Windows 虚拟文件导入、Linux 按需虚拟文件拖出、完成活动与接收目录入口；外部只读 URI 可交付至 Xwayland 目标 | 跨设备只 COPY，原 Linux 会话内保留 COPY/MOVE；只读输入与可写独立副本已实现；GUI 无逐文件进度、暂停、续传和统一取消；Wayland/X11 混合后端已接入，真实应用矩阵仍待扩展 |
+| 文字拖放及反馈 | Windows Unicode 与 Wayland/X11 UTF-8 双向 COPY、原会话跨 HWND 拖放与 OLE 返回、源提供的透明动画虚影 | HTML/RTF/图像拖放、X11 专用虚影和文件 hover 尚未覆盖；具体方向与限制见 DESKTOP_INTERACTIONS.md |
 | 声音播放 | 私有会话音频、Windows WASAPI、音量、静音和输出设备选择 | 当前立体声 PCM；无麦克风、压缩音频、严格音画同步和设备热切换，切换输出设备需重连 |
 | 基础画面 | PNG、H.264、独立无损 alpha、Windows GPU 解码和 PNG 回退 | SDR 视频为 4:2:0；PNG 已支持无损，但尚无自动为办公文字选择清晰策略的完整产品模式 |
 | 可选画面能力 | HEVC、AV1、CUDA 颜色输入、实验 scRGB HDR | auto/HDR 启动与实时策略已统一，真实 NVENC 回归通过；新 codec、Main10 和物理 HDR 的 WoA 验收待完成 |
@@ -88,7 +88,7 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | 控制与诊断 | 控制中心及远端 SNI 托盘、原生通知、只读键鼠、共享开关、实时帧率和码率配置、实际画面路径及阶段计时、导出日志 | XEmbed 及更广应用矩阵待验；没有游戏内状态浮层；阶段时间和 RTT 不等于物理输入到显示延迟 |
 | 配置与应用启动 | Linux TOML 默认值/限额/来源查询，按完整 desktop ID 的独立覆写，GIO 字段与动作，HOME/Path/cwd 规则 | 无配置 UI；action 与 URI 不能同请求；应用单实例转交不保证覆写作用于既有进程 |
 | 桌面服务 | 共享用户 D-Bus 与数据、激活环境、独立 systemd target；原生钱包/GTK Portal 可按标准配置接入 | 组件由用户选择，集成文件需明确安装；旧隔离钱包迁移、Flatpak 文档授权未验证；ScreenCast 属于 M4 |
-| 应用与平台 | 原生 Wayland、私有 Xwayland，Windows x64 与原生 ARM64 构建；桌面密钥服务在本会话原生运行 | X11 无 PRIMARY、XDND、XIM 和完整 EWMH；构建成功不代表所有应用、设备组合可用 |
+| 应用与平台 | 原生 Wayland、私有 Xwayland，Windows x64 与原生 ARM64 构建；桌面密钥服务在本会话原生运行 | X11 无 PRIMARY、XIM 和完整 EWMH；XDND 仅覆盖文档列出的动作与验证范围；构建成功不代表所有应用、设备组合可用 |
 
 七项已确认的新能力目前均未交付：富文本、麦克风安排在 M2，手柄、触控、触控笔安排在 M3，摄像头和打印安排在 M4。声音播放不等于麦克风转发；已有文件选择 Portal 不等于窗口共享；已有视频编码、UDP 和文件队列也不等于完整清晰策略、网络自适应或传输任务管理。
 

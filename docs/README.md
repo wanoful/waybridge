@@ -107,7 +107,7 @@ Chrome 会按桌面身份选择密码后端。原来使用 KDE/KWallet 6 的用�
 
 已实现真正的 xdg-dialog 模态提示、动态 owner、最小/最大尺寸、全屏恢复、unmap/remap 与隐藏/最小化后的 suspended/低频回调。仅有 parent 关系不代表模态。输入区域与视觉透明度分别映射；排除的客户区像素使用 `HTTRANSPARENT`，只保证同一 UI 线程中的 Waybridge 窗口间穿透，不能点穿到其他进程或桌面。未实现 KDE 毛玻璃。
 
-尊重 `xdg-decoration` 的客户端/服务端请求，Chrome 自绘标签栏时不再叠加 Windows 标题栏。原生 Wayland Chrome 支持 `xdg-toplevel-drag-v1`：标签可拖出成独立 Windows 窗口、拖回另一个窗口合并，Esc 取消。拖拽期间保持 Wayland data-device grab，按本地窗口遮挡和实际画面坐标选择目标；拖动中的窗口不参与目标命中。需要更新并重启两端，应用启动时发现新的 Wayland 接口；显式 X11 Chrome 的 XDND 路径尚未实现。
+尊重 `xdg-decoration` 的客户端/服务端请求，Chrome 自绘标签栏时不再叠加 Windows 标题栏。原生 Wayland Chrome 支持 `xdg-toplevel-drag-v1`：标签可拖出成独立 Windows 窗口、拖回另一个窗口合并，Esc 取消。拖拽期间保持 Wayland data-device grab，按本地窗口遮挡和实际画面坐标选择目标；拖动中的窗口不参与目标命中。需要更新并重启两端，应用启动时发现新的 Wayland 接口；通用 X11 XDND 源／目标路径已接入；X11 Chrome 的标签行为不属于这个 Wayland toplevel 协议，尚未单独验收，范围见 [XDND](XDND.md)。
 
 ## 相对鼠标与指针锁定
 
