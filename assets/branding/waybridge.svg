@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Waybridge</title>
+  <desc id="desc">A white arch bridge on a blue rounded square.</desc>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#2563eb"/>
+  <path d="M22 40h84v14h-8v38H84V78a20 20 0 0 0-40 0v14H30V54h-8z" fill="#fff"/>
+</svg>

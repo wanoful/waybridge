@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Waybridge remote badge</title>
+  <desc id="desc">A compact white bridge on blue for the upper-right corner of a remote application icon.</desc>
+  <circle cx="64" cy="64" r="64" fill="#2563eb"/>
+  <path d="M20 36h88v16H98v40H82V78a18 18 0 0 0-36 0v14H30V52H20z" fill="#fff"/>
+</svg>

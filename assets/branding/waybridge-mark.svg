@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Waybridge monochrome mark</title>
+  <desc id="desc">A single-color arch bridge, with no background.</desc>
+  <path d="M22 40h84v14h-8v38H84V78a20 20 0 0 0-40 0v14H30V54h-8z" fill="currentColor"/>
+</svg>
