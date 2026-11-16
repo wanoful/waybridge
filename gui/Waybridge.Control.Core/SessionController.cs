@@ -99,7 +99,7 @@ public sealed class SessionController(string directory, string enginePath, Func<
                     else { host = profile.Host; port = profile.Port; currentToken = manualToken; }
                     Status?.Invoke("正在连接串流内核…");
                     engine = await EngineChannel.StartAsync(enginePath, host, port, currentToken, profile.Settings,
-                        message => Message?.Invoke(message), WriteLog, token, transport: direct?.Transport(currentSession!));
+                        message => Message?.Invoke(message), WriteLog, token, transport: direct?.Transport(currentSession!), sourceId: profile.Id.ToString("N"));
                     Connected = true; ConnectionChanged?.Invoke(true); Status?.Invoke("已连接");
                     hadConnection = true; attempt = 0; ready.TrySetResult();
                     Task cancelled = Task.Delay(Timeout.Infinite, token);

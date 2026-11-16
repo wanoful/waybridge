@@ -21,6 +21,7 @@
 #include "audio.h"
 #include "native_cursor.h"
 #include "native_icon.h"
+#include "application_identity.h"
 #include "window_semantics.h"
 #include "relative_input.h"
 #include "ime.h"
@@ -148,6 +149,7 @@ struct RemoteWindow {
   // the RemoteWindow alive merely to finish a transfer to a closed window.
   std::shared_ptr<void> dropLifetime = std::make_shared<char>();
   NativeIcon icon;
+  std::wstring taskbarIdentity;
   std::string appId;
   uint64_t iconRevision = 0;
   NativeWindowState state;
@@ -178,6 +180,7 @@ std::map<uint32_t, std::unique_ptr<RemoteWindow>> windows;
 Json imeStatus;
 void updateIme();
 uint32_t grabbedRoot = 0;
+std::string remoteApplicationSource;
 bool iconsNegotiated = false;
 std::unique_ptr<ImageDecoder> iconDecoder;
 bool semanticsNegotiated = false;
@@ -1902,6 +1905,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_DESTROY:
+    ApplicationIdentity::clear(hwnd);
     w->dropLifetime.reset();
     if (relativeInput.active(hwnd))
       releasePointer();
@@ -2459,6 +2463,11 @@ void dispatchNetwork() {
         iconWindow->appId = std::move(appId); iconWindow->iconRevision = revision;
         iconWindow->icon.clear();
       }
+      if (!iconWindow->popup) {
+        auto identity = ApplicationIdentity::id(remoteApplicationSource, iconWindow->appId, id);
+        if (iconWindow->taskbarIdentity != identity && ApplicationIdentity::apply(iconWindow->hwnd, remoteApplicationSource, iconWindow->appId, id))
+          iconWindow->taskbarIdentity = std::move(identity);
+      }
       iconWindow->icon.apply(iconWindow->hwnd, iconWindow->dpi);
       auto *updated = windows.at(id).get();
       auto parent = m.find("parent");
@@ -2877,6 +2886,8 @@ int wmain(int argc, wchar_t **argv) {
       int port=start.at("port").get<int>();
       if (host.empty() || host.size()>255 || port<1 || port>65535 || token.size()<16 || token.size()>4096 ||
           token.find_first_of(" \r\n\t")!=std::string::npos) throw std::runtime_error("Invalid GUI connection parameters");
+      remoteApplicationSource = start.value("source_id", "");
+      if (remoteApplicationSource.size() > 128) throw std::runtime_error("Invalid application source identity");
       hostedHost=wide(host); hostedPort=std::to_wstring(port); hostedToken=wide(token);
       hostedArguments[0]=argv[0]; hostedArguments[1]=hostedHost.data();
       hostedArguments[2]=hostedPort.data(); hostedArguments[3]=hostedToken.data();
@@ -2926,6 +2937,7 @@ int wmain(int argc, wchar_t **argv) {
                  "tunnel to the Linux loopback listener.\n";
     return 1;
   }
+  if (remoteApplicationSource.empty()) remoteApplicationSource = utf8(argv[1]) + ":" + utf8(argv[2]);
   if (!SetProcessDpiAwarenessContext(reinterpret_cast<DPI_AWARENESS_CONTEXT>(-4)))
     SetProcessDPIAware();
   WSADATA ws;

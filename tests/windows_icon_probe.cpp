@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <objbase.h>
 #include "native_icon.h"
+#include "application_identity.h"
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -41,6 +42,22 @@ int main(int argc, char **argv) {
       HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"probe", WS_OVERLAPPEDWINDOW, 0, 0, 300,
                                   200, nullptr, nullptr, wc.hInstance, nullptr);
       require(hwnd != nullptr, "probe window");
+      auto firstApp = ApplicationIdentity::id("profile-A", "org.example.Editor", 1);
+      require(firstApp == ApplicationIdentity::id("profile-A", "org.example.Editor", 2), "same app must group");
+      require(firstApp != ApplicationIdentity::id("profile-B", "org.example.Editor", 1), "different sources must not group");
+      require(firstApp != ApplicationIdentity::id("profile-A", "org.example.Browser", 1), "different apps must not group");
+      require(ApplicationIdentity::id("profile-A", "", 1) != ApplicationIdentity::id("profile-A", "", 2), "unknown apps must not share a group");
+      require(ApplicationIdentity::apply(hwnd, "profile-A", "org.example.Editor", 1), "set native taskbar identity");
+      Microsoft::WRL::ComPtr<IPropertyStore> properties;
+      require(SUCCEEDED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&properties))), "read native taskbar identity");
+      PROPVARIANT property{};
+      require(SUCCEEDED(properties->GetValue(PKEY_AppUserModel_ID, &property)), "read taskbar property");
+      bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
+      if (wine && property.vt == VT_EMPTY)
+        std::cout << "LIMIT: Wine does not persist window property stores; native Windows identity readback is tested separately\n";
+      else
+        require(property.vt == VT_LPWSTR && firstApp == property.pwszVal, "native taskbar identity readback");
+      PropVariantClear(&property);
       require(icon.update(png, decoder), "valid PNG rejected");
       for (UINT dpi : {96u, 168u, 120u, 384u}) {
         icon.apply(hwnd, dpi);
@@ -116,6 +133,9 @@ int main(int argc, char **argv) {
       require(NativeIcon::appId("../../app").empty() &&
                   NativeIcon::appId("org.example.App") == "org.example.App",
               "app-id normalization");
+      ApplicationIdentity::clear(hwnd);
+      require(SUCCEEDED(properties->GetValue(PKEY_AppUserModel_ID, &property)) && property.vt == VT_EMPTY, "taskbar property cleanup");
+      PropVariantClear(&property);
       DestroyWindow(hwnd);
       std::cout << "PASS: native WM_SETICON/WM_GETICON large/small, 100/125/175/400% DPI, invalid "
                    "PNG/size rejection, default/custom/reset badges, generic fallback and 300 resource replacements\n";

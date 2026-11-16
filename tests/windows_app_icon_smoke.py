@@ -56,7 +56,7 @@ def color(icon):
 
 def main():
     subprocess.run(["bash","tests/build-fixture.sh"],cwd=ROOT,check=True)
-    subprocess.run(["x86_64-w64-mingw32-g++","-std=c++17","-static","-O2","-DUNICODE","-D_UNICODE","-DWINVER=0x0A00","-D_WIN32_WINNT=0x0A00","-Iclient","tests/windows_icon_probe.cpp","-o","build/tests/windows-icon-probe.exe","-lole32","-lwindowscodecs","-luuid","-lgdi32"],cwd=ROOT,check=True)
+    subprocess.run(["x86_64-w64-mingw32-g++","-std=c++17","-static","-O2","-DUNICODE","-D_UNICODE","-DWINVER=0x0A00","-D_WIN32_WINNT=0x0A00","-Iclient","tests/windows_icon_probe.cpp","-o","build/tests/windows-icon-probe.exe","-lole32","-lwindowscodecs","-luuid","-lgdi32","-lshell32"],cwd=ROOT,check=True)
     prefix=ROOT/"build/wine-app-icons";prefix.mkdir(mode=0o700,parents=True,exist_ok=True)
     processes=[]
     with tempfile.TemporaryDirectory(prefix="waybridge-native-icons-") as runtime,open(ROOT/"build/tests/windows-app-icons.log","w+") as log:

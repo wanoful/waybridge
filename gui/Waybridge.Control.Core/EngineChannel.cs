@@ -45,7 +45,7 @@ public sealed class EngineChannel : IAsyncDisposable
     }
     public static async Task<EngineChannel> StartAsync(string executable, string host, int port, string token,
         ClientSettings settings, Action<JsonElement> message, Action<string> log,
-        CancellationToken cancellationToken, IReadOnlyList<string>? prefixArguments = null, DirectTransport? transport = null)
+        CancellationToken cancellationToken, IReadOnlyList<string>? prefixArguments = null, DirectTransport? transport = null, string sourceId = "")
     {
         if (token.Length is < 16 or > 4096 || token.Any(char.IsWhiteSpace)) throw new ArgumentException("请输入有效的会话令牌");
         string name = "waybridge-" + Guid.NewGuid().ToString("N");
@@ -70,7 +70,7 @@ public sealed class EngineChannel : IAsyncDisposable
             await connected;
             channel = new EngineChannel(pipe, process, token, transport?.ClientToken ?? "");
             channel.Message += message; channel.Log += log;
-            await channel.SendAsync(new { type = "start", version = 1, host, port, token, settings, transport }, timeout.Token);
+            await channel.SendAsync(new { type = "start", version = 1, host, port, token, settings, transport, source_id = sourceId }, timeout.Token);
             var engineReady = channel.ready.Task;
             if (await Task.WhenAny(engineReady, exited) == exited)
             {
