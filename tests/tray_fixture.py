@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import gi
@@ -64,6 +65,10 @@ def main():
         elif name=='BumpRevision':state['revision']+=1;invocation.return_value(None)
         elif name=='SetLayoutDelay':state['layout_delay']=values[0];invocation.return_value(None)
         elif name=='Stop':invocation.return_value(None);loop.quit()
+        elif name=='RegisterStatusNotifierHost':
+            if not re.fullmatch(r'org\.kde\.StatusNotifierHost-[0-9]+',values[0]):
+                invocation.return_dbus_error('org.freedesktop.DBus.Error.InvalidArgs','non-standard host service name')
+            else:invocation.return_value(None)
         elif name=='RegisterStatusNotifierItem':
             key=sender+values[0] if values[0].startswith('/') else values[0]+'/StatusNotifierItem';items.append(key)
             invocation.return_value(None)

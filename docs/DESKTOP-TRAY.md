@@ -1,5 +1,7 @@
 # Application trays and background applications
 
+The adapter follows the [StatusNotifierWatcher specification](https://specifications.freedesktop.org/status-notifier-item/latest/status-notifier-watcher.html) and the common KDE SNI/DBusMenu interfaces.
+
 Waybridge presents Linux StatusNotifierItem applications as independent native
 Windows notification-area icons. The control center's “远端应用 → 后台应用” list
 keeps the same entries accessible when an application has closed its main
@@ -21,7 +23,7 @@ old clicks, old background buttons and menus.
 On Linux, a dedicated worker hosts and polls standard D-Bus interfaces; no D-Bus,
 icon lookup, SVG decoding or filesystem work occurs on the compositor loop. It
 joins an existing `org.kde.StatusNotifierWatcher` (or the freedesktop variant)
-and registers a StatusNotifierHost name. If neither has an owner, it requests the
+and registers a `org.kde.StatusNotifierHost-PID` name (or freedesktop equivalent). If neither has an owner, it requests the
 standard KDE watcher name with DoNotQueue and no ReplaceExisting, and supplies
 the standard watcher object. It validates registration ownership, removes dead
 registrations and emits the standard item registered/unregistered signals.

@@ -35,6 +35,7 @@ def main():
             subprocess.run(['gdbus','call','--session','--dest','org.waybridge.TrayFixture','--object-path','/Control','--method','org.waybridge.TrayFixture.'+method,*args],env=env,stdout=subprocess.DEVNULL,check=True)
         try:
             existing=source('--watcher')
+            watcher_owner_before=subprocess.check_output(['gdbus','call','--session','--dest','org.freedesktop.DBus','--object-path','/org/freedesktop/DBus','--method','org.freedesktop.DBus.GetNameOwner','org.kde.StatusNotifierWatcher'],env=env,text=True)
             host=subprocess.Popen([str(ROOT/'target/debug/waybridge'),'--listen',f'127.0.0.1:{port}','--socket','tray-0','--token-file',str(token_path),'--no-audio','--codec','png'],env=env,stdout=log,stderr=log);children.append(host)
             deadline=time.monotonic()+20
             while not (Path(env['XDG_RUNTIME_DIR'])/'tray-0').exists():
@@ -90,7 +91,7 @@ def main():
             viewer.send(type='tray_action',id=item['id'],epoch=old_epoch,generation=item['generation'],action='activate');assert 'stale' in viewer.control('tray_error')['message']
             # Existing watcher owner remains untouched. Then remove it and exercise our standard watcher.
             owner=subprocess.check_output(['gdbus','call','--session','--dest','org.freedesktop.DBus','--object-path','/org/freedesktop/DBus','--method','org.freedesktop.DBus.GetNameOwner','org.kde.StatusNotifierWatcher'],env=env,text=True)
-            assert str(existing.pid) not in owner # owner is an ordinary unique name, not a compositor token
+            assert owner==watcher_owner_before,'existing watcher owner was replaced'
             existing.terminate();existing.wait(timeout=3);time.sleep(1)
             viewer.send(type='tray_refresh');status=viewer.control('tray_status',lambda s:s.get('mode')=='watcher_host');assert status['available']
             app2=source('--replace');viewer.control('tray_snapshot',lambda s:len(s['items'])==1)

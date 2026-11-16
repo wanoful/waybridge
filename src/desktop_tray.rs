@@ -554,8 +554,10 @@ fn run(address: &str, receiver: &Receiver<Command>, desired: &DesiredPeer) -> Re
     let bus = connect_bus(address, Duration::from_millis(500))?;
     let registry = Watcher::default();
     bus.object_server().at(WATCHER_PATH, registry.clone())?;
-    let host = format!("org.kde.StatusNotifierHost.waybridge{}", std::process::id());
+    let host = format!("org.kde.StatusNotifierHost-{}", std::process::id());
+    let freedesktop_host = format!("org.freedesktop.StatusNotifierHost-{}", std::process::id());
     bus.request_name(host.clone())?;
+    bus.request_name(freedesktop_host.clone())?;
     let mut watcher_owner = String::new();
     let mut watcher_name = WATCHER.to_owned();
     let mut own_watcher = false;
@@ -649,7 +651,13 @@ fn run(address: &str, receiver: &Receiver<Command>, desired: &DesiredPeer) -> Re
             items.clear();
             previous = Value::Null;
             let watcher = Proxy::new(&bus, &*watcher_owner, WATCHER_PATH, &*watcher_name)?;
-            let registered: Result<(), _> = watcher.call("RegisterStatusNotifierHost", &(&host,));
+            let host_name = if watcher_name == WATCHER {
+                &host
+            } else {
+                &freedesktop_host
+            };
+            let registered: Result<(), _> =
+                watcher.call("RegisterStatusNotifierHost", &(host_name,));
             if let Some(p) = peer.as_ref().filter(|p| !p.is_closed()) {
                 p.control(json!({"type":"tray_status","available":registered.is_ok(),
                 "mode":if own_watcher {"watcher_host"}else{"existing_watcher_host"},"xembed":false,
