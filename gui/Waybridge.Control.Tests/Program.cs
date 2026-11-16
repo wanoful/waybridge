@@ -248,6 +248,17 @@ try
     Check(quoted == "'a'\"'\"'b\nc'", "remote quoting");
     Console.WriteLine("PASS: SSH argv preserves host verification and literal remote command quoting");
 
+    string bootstrap = (string)typeof(SshAgent).GetField("BootstrapCommand", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+    Check(bootstrap.Length < 1024 && !bootstrap.Contains("import configparser", StringComparison.Ordinal), "SSH loader grew into Windows argv payload");
+    using (var embedded = typeof(SshAgent).Assembly.GetManifestResourceStream("Waybridge.SessionControl")!)
+    using (var source = new StreamReader(embedded))
+    {
+        string management = Convert.ToBase64String(Encoding.UTF8.GetBytes(await source.ReadToEndAsync()));
+        Check(!bootstrap.Contains(management, StringComparison.Ordinal), "management payload leaked into argv");
+        Check(management.Length <= 1024 * 1024, "management script exceeds bounded bootstrap frame");
+    }
+    Console.WriteLine("PASS: constant-size SSH loader keeps management script outside Windows command line");
+
     var observed = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
     await using (var engine = await EngineChannel.StartAsync("dotnet", "127.0.0.1", 49090, "test-secret-" + new string('a', 40),
         new(), message => { if (message.GetProperty("type").GetString() == "observed") observed.TrySetResult(message); },

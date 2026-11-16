@@ -44,6 +44,10 @@ public static class Processes
 
 public sealed class SshAgent : IAsyncDisposable
 {
+    private static readonly string BootstrapCommand = "python3 -u -c " + PosixQuote(
+        "import base64,sys;source=sys.stdin.buffer.readline(1048578);" +
+        "(source.endswith(b'\\n') and len(source)<=1048577) or sys.exit('invalid bootstrap size');" +
+        "exec(compile(base64.b64decode(source[:-1],validate=True),'<waybridge-session-control>','exec'))");
     private readonly Process process;
     private readonly Task<string> errors;
     private readonly SemaphoreSlim writer = new(1, 1);
@@ -85,13 +89,19 @@ public sealed class SshAgent : IAsyncDisposable
             ?? throw new IOException("会话控制组件缺失");
         using var reader = new StreamReader(resource, Encoding.UTF8);
         string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(await reader.ReadToEndAsync(token)));
+        // Windows limits the whole CreateProcess command line to 32,767 UTF-16
+        // characters. Keep the bootstrap constant-sized as the management
+        // script grows; its first stdin line precedes normal JSON RPC framing.
+        if (encoded.Length > 1024 * 1024) throw new IOException("会话控制组件过大");
         var args = Arguments(profile, known);
-        args.Add("python3 -u -c " + PosixQuote("import base64;exec(base64.b64decode('" + encoded + "'))"));
+        args.Add(BootstrapCommand);
         var agent = new SshAgent(Processes.Start(Executable("ssh"), args));
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
             timeout.CancelAfter(TimeSpan.FromSeconds(20));
+            await agent.process.StandardInput.BaseStream.WriteAsync(Encoding.ASCII.GetBytes(encoded + "\n"), timeout.Token);
+            await agent.process.StandardInput.BaseStream.FlushAsync(timeout.Token);
             var hello = await agent.CallAsync(new { op = "hello" }, timeout.Token);
             if (hello.GetProperty("version").GetInt32() != 1) throw new IOException("会话控制版本不兼容");
             return agent;
