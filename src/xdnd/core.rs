@@ -344,6 +344,8 @@ struct Active {
     waiting: bool,
     accepted: bool,
     sent_drop: bool,
+    drop_clock_armed: bool,
+    drop_time: Option<u32>,
     touched: Instant,
     created: Instant,
     increments: Vec<Increment>,
@@ -355,7 +357,7 @@ fn property(bus: &Bus, window: u32, name: Atom, kind: Atom) -> Result<Vec<u32>> 
     let reply = bus
         .get_property(false, window, name, kind, 0, 16)?
         .reply()?;
-    if reply.bytes_after != 0 || reply.format != 32 {
+    if reply.format != 32 {
         return Ok(vec![]);
     }
     Ok(reply.value32().into_iter().flatten().collect())
@@ -412,6 +414,19 @@ fn message(bus: &Bus, target: u32, window: u32, kind: Atom, data: [u32; 5]) -> R
     bus.flush()?;
     Ok(())
 }
+struct StartingWindow<'a> {
+    bus: &'a Bus,
+    id: Window,
+    armed: bool,
+}
+impl Drop for StartingWindow<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.bus.destroy_window(self.id);
+            let _ = self.bus.flush();
+        }
+    }
+}
 fn start(bus: &Bus, atoms: &Atoms, request: Desired, shared: &Shared) -> Result<Active> {
     if !generation_current(shared, request.generation) {
         bail!("XDND generation superseded");
@@ -433,8 +448,16 @@ fn start(bus: &Bus, atoms: &Atoms, request: Desired, shared: &Shared) -> Result<
             .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
     )?
     .check()?;
+    let mut guard = StartingWindow {
+        bus,
+        id: source,
+        armed: true,
+    };
     let mut types = Vec::new();
     for (name, bytes) in request.payload.iter() {
+        if name == "text/plain" {
+            continue;
+        }
         types.push((atom(bus, name)?, Arc::new(bytes.clone())));
     }
     let text = request
@@ -442,14 +465,27 @@ fn start(bus: &Bus, atoms: &Atoms, request: Desired, shared: &Shared) -> Result<
         .get("text/plain;charset=utf-8")
         .or_else(|| request.payload.get("text/plain"));
     if let Some(text) = text {
-        types.push((atoms.UTF8_STRING, Arc::new(text.clone())));
-        types.push((atoms.TEXT, Arc::new(text.clone())));
-        if let Ok(text) = std::str::from_utf8(text) {
-            if text.chars().all(|c| (c as u32) <= 255) {
-                types.push((
-                    AtomEnum::STRING.into(),
-                    Arc::new(text.chars().map(|c| c as u8).collect()),
-                ));
+        match std::str::from_utf8(text) {
+            Ok(value) => {
+                let bytes = Arc::new(text.clone());
+                types.push((atom(bus, "text/plain;charset=utf-8")?, bytes.clone()));
+                types.push((atoms.UTF8_STRING, bytes.clone()));
+                types.push((atoms.TEXT, bytes));
+                // XDND's legacy text/plain target defaults to Latin-1. Never
+                // label non-Latin UTF-8 bytes as that old encoding.
+                if value.chars().all(|c| (c as u32) <= 255) {
+                    let latin = Arc::new(value.chars().map(|c| c as u8).collect::<Vec<_>>());
+                    types.push((atom(bus, "text/plain")?, latin.clone()));
+                    types.push((AtomEnum::STRING.into(), latin));
+                }
+            }
+            Err(error) => {
+                if request.payload.contains_key("text/plain;charset=utf-8") {
+                    bail!("invalid UTF-8 plain text payload: {error}");
+                }
+                // A generic Wayland MIME offer may contain an unqualified
+                // legacy encoding. Preserve it without inventing UTF-8 aliases.
+                types.push((atom(bus, "text/plain")?, Arc::new(text.clone())));
             }
         }
     }
@@ -479,21 +515,19 @@ fn start(bus: &Bus, atoms: &Atoms, request: Desired, shared: &Shared) -> Result<
             }
         }
         if Instant::now() >= deadline {
-            let _ = bus.destroy_window(source);
             bail!("X server timestamp deadline");
         }
         thread::sleep(Duration::from_millis(1));
     };
     if !generation_current(shared, request.generation) {
-        let _ = bus.destroy_window(source);
         bail!("XDND generation superseded");
     }
     bus.set_selection_owner(source, atoms.XdndSelection, time)?
         .check()?;
     if bus.get_selection_owner(atoms.XdndSelection)?.reply()?.owner != source {
-        let _ = bus.destroy_window(source);
         bail!("XdndSelection ownership was superseded");
     }
+    guard.armed = false;
     Ok(Active {
         request,
         source,
@@ -504,6 +538,8 @@ fn start(bus: &Bus, atoms: &Atoms, request: Desired, shared: &Shared) -> Result<
         waiting: false,
         accepted: false,
         sent_drop: false,
+        drop_clock_armed: false,
+        drop_time: None,
         touched: Instant::now(),
         created: Instant::now(),
         increments: vec![],
@@ -585,12 +621,18 @@ fn selection(
             &[active.time],
         )?;
     } else if let Some((_, bytes)) = active.types.iter().find(|(a, _)| *a == request.target) {
+        // ICCCM TEXT is a polymorphic target, never a property encoding.
+        let encoding = if request.target == atoms.TEXT {
+            atoms.UTF8_STRING
+        } else {
+            request.target
+        };
         if bytes.len() <= CHUNK {
             bus.change_property8(
                 PropMode::REPLACE,
                 request.requestor,
                 output,
-                request.target,
+                encoding,
                 bytes,
             )?;
         } else {
@@ -618,7 +660,7 @@ fn selection(
             active.increments.push(Increment {
                 requestor: request.requestor,
                 property: output,
-                target: request.target,
+                target: encoding,
                 bytes: bytes.clone(),
                 offset: 0,
                 deadline: Instant::now() + IDLE,
@@ -726,12 +768,28 @@ fn pump(
         if !active.accepted {
             bail!("X11 drop target rejected COPY");
         }
+        if !active.drop_clock_armed {
+            bus.change_property32(
+                PropMode::REPLACE,
+                active.source,
+                atoms._WAYBRIDGE_XDND_TIME,
+                AtomEnum::CARDINAL,
+                &[2],
+            )?;
+            bus.flush()?;
+            active.drop_clock_armed = true;
+            active.touched = Instant::now();
+            return Ok(());
+        }
+        let Some(time) = active.drop_time else {
+            return Ok(());
+        };
         message(
             bus,
             target.recipient,
             target.window,
             atoms.XdndDrop,
-            [active.source, 0, active.time, 0, 0],
+            [active.source, 0, time, 0, 0],
         )?;
         active.sent_drop = true;
         active.touched = Instant::now();
@@ -819,6 +877,12 @@ fn run(display: u32, shared: &Shared) -> Result<()> {
                         }
                     }
                     Event::PropertyNotify(event) => {
+                        if event.window == current.source
+                            && event.atom == atoms._WAYBRIDGE_XDND_TIME
+                            && current.drop_clock_armed
+                        {
+                            current.drop_time = Some(event.time);
+                        }
                         if let Err(error) = increment(&bus, current, event) {
                             terminal = Some(OutcomeKind::Error(error.to_string()));
                             break;

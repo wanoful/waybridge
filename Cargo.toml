@@ -40,4 +40,8 @@ smithay = { path = "vendor/smithay" }
 
 [[example]]
 name = "xdnd-source-probe"
-path = "tests/xdnd_source_probe.rs"
+path = "tests/fixtures/xdnd_source_probe.rs"
+
+[[example]]
+name = "xdnd-protocol-probe"
+path = "tests/fixtures/xdnd_protocol_probe.rs"

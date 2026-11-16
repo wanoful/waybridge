@@ -1,5 +1,5 @@
 //! Drives the production XDND worker against an actual toolkit target.
-#[path = "../src/xdnd/core.rs"]
+#[path = "../../src/xdnd/core.rs"]
 mod xdnd;
 use anyhow::{bail, Result};
 use std::{
