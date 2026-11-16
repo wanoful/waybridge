@@ -111,6 +111,13 @@ class RemoteTray {
             {"generation", item.generation},
             {"action", verb}};
   }
+  void stampActivation(Json &message) {
+    if (userActivation) {
+      std::string request = userActivation();
+      if (!request.empty())
+        message["activation_request"] = request;
+    }
+  }
   static std::wstring label(const std::string &source) {
     // DBusMenu uses '_' mnemonics; native Windows menus use '&'.
     std::wstring result;
@@ -216,6 +223,7 @@ class RemoteTray {
     event["menu_token"] = message.value("menu_token", uint64_t(0));
     // The Linux adapter owns its event clock; Windows uptime cannot be used.
     event["timestamp"] = 0u;
+    stampActivation(event);
     if (GetEnvironmentVariableW(L"WAYBRIDGE_TRAY_TRACE", nullptr, 0))
       std::fprintf(stderr, "Tray menu select node=%d token=%llu revision=%u\n", actions[selected],
                    (unsigned long long)message.value("menu_token", uint64_t(0)),
@@ -249,6 +257,7 @@ class RemoteTray {
   }
 
 public:
+  std::function<std::string()> userActivation;
   static constexpr UINT CallbackMessage = WM_APP + 91;
   RemoteTray() = default;
   RemoteTray(const RemoteTray &) = delete;
@@ -326,7 +335,11 @@ public:
       std::fprintf(stderr, "Tray request epoch=%llu generation=%llu action=%s\n",
                    (unsigned long long)epoch, (unsigned long long)found->second->generation,
                    effective.c_str());
-    send(action(id, *found->second, effective));
+    Json message = action(id, *found->second, effective);
+    if (effective == "activate" || effective == "secondary" ||
+        (effective == "menu" && !found->second->info.value("menu", false)))
+      stampActivation(message);
+    send(message);
     return true;
   }
   bool receive(const Json &message, ImageDecoder &decoder) {

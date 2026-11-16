@@ -548,6 +548,14 @@ that menu through its own remote window. Otherwise a visible `tray_error`
 explains the missing path. The bridge does not manufacture a Quit operation;
 normal exit uses a menu action supplied by the application.
 
+With `activation_v1`, user tray actions may include a 32-hex
+`activation_request`. The native client records the corresponding local user
+intent; the worker resolves the SNI unique bus owner's kernel PID and asks the
+compositor to bind a one-shot owner grant before calling the application.
+Registration alone does not raise a window: a subsequent application activation,
+restore or new map must consume the grant. Menu selection creates a fresh grant
+after the native menu closes. Disconnect/read-only checks also guard this step.
+
 `tray_refresh` requests a fresh snapshot/epoch. This is a read-only operation;
 normal snapshots and icon deltas are automatic. Action payload fields and sizes
 are bounded before entering the 64-slot worker queue. Session lifecycle state

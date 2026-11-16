@@ -138,3 +138,12 @@ physical-input capture against a unique temporary icon/task. It waits for an
 auto-hidden taskbar/overflow and targets only rectangles returned for that icon,
 rejects non-tray roots (including a locked desktop), restores the mouse and
 removes its icon/task/files. It is deliberately separate from unattended tests.
+
+Tray actions now use the shared `activation_v1` user-intent mechanism. The native
+side prepares a fresh intent at activation or after menu selection; the Linux
+worker binds the SNI owner's D-Bus-verified process ID through a bounded
+compositor acknowledgement before invoking it. This does not raise an existing
+window merely for selecting a volume/quit menu action. New maps and the
+application's subsequent standard activation/restore requests may consume the
+one-shot grant. The production-client/Qt integration also checks actual Windows
+foreground ownership and the application's resulting focus event.

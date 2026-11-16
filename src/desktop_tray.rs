@@ -1,6 +1,9 @@
 //! StatusNotifierItem/DBusMenu desktop adapter. All bus and icon work stays on a
 //! bounded worker; compositor callers only enqueue commands. XEmbed is not SNI.
-use crate::{network::Peer, session_services::connect_bus};
+use crate::{
+    network::{Event, Peer},
+    session_services::connect_bus,
+};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use image::{codecs::png::PngEncoder, ImageEncoder};
@@ -130,12 +133,12 @@ pub struct Tray {
     desired: DesiredPeer,
 }
 impl Tray {
-    pub fn new(address: String) -> Self {
+    pub fn new(address: String, events: SyncSender<Event>) -> Self {
         let (sender, receiver) = sync_channel(64);
         let desired = DesiredPeer::default();
         let state = desired.clone();
         thread::spawn(move || {
-            if let Err(error) = run(&address, &receiver, &state) {
+            if let Err(error) = run(&address, &receiver, &state, &events) {
                 tracing::warn!(%error, "tray adapter unavailable");
                 let mut revision = 0;
                 loop {
@@ -182,6 +185,7 @@ impl Tray {
             "revision",
             "menu_token",
             "timestamp",
+            "activation_request",
         ];
         if !value.as_object().is_some_and(|o| {
             o.len() <= fields.len()
@@ -451,12 +455,12 @@ fn action(
     bus: &Connection,
     items: &mut BTreeMap<String, Item>,
     epoch: u64,
-    peer: &Peer,
+    peer: &Arc<Peer>,
     value: &Value,
     windows: &BTreeSet<String>,
-    lifecycle: (&DesiredPeer, u64),
+    lifecycle: (&DesiredPeer, u64, &SyncSender<Event>),
 ) -> Result<()> {
-    let (desired, desired_revision) = lifecycle;
+    let (desired, desired_revision, events) = lifecycle;
     let current = || -> Result<()> {
         if !peer.desktop_input() || desired.lock().unwrap().revision != desired_revision {
             bail!("Tray action superseded by disconnect, reconnect or read-only policy");
@@ -482,11 +486,46 @@ fn action(
         item.interface.clone(),
     )?;
     current()?;
+    let prepare_owner = |item: &Item| -> Result<()> {
+        let Some(request_id) = value["activation_request"].as_str() else {
+            return Ok(());
+        };
+        if request_id.len() != 32 || !request_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("invalid tray activation request");
+        }
+        let pid: u32 = Proxy::new(
+            bus,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )?
+        .call("GetConnectionUnixProcessID", &(&item.owner,))?;
+        current()?;
+        let (ready, response) = sync_channel(1);
+        events
+            .try_send(Event::TrayActivation {
+                peer: peer.clone(),
+                request_id: request_id.to_owned(),
+                pid,
+                ready,
+            })
+            .map_err(|_| anyhow::anyhow!("Compositor activation queue unavailable"))?;
+        if !response
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap_or(false)
+        {
+            bail!("Tray activation was superseded or is unavailable");
+        }
+        current()?;
+        Ok(())
+    };
     match value["action"].as_str().unwrap_or("") {
         "activate" => {
+            prepare_owner(item)?;
             let _: () = proxy.call("Activate", &(0i32, 0i32))?;
         }
         "secondary" => {
+            prepare_owner(item)?;
             let _: () = proxy.call("SecondaryActivate", &(0i32, 0i32))?;
         }
         "scroll" => {
@@ -508,6 +547,7 @@ fn action(
             {
                 bail!("No DBusMenu or matching remote window; application context menu cannot be displayed");
             }
+            prepare_owner(item)?;
             let _: () = proxy.call("ContextMenu", &(0i32, 0i32))?;
             peer.control(json!({"type":"tray_menu","epoch":epoch,"id":id,"generation":item.generation,"fallback":"remote_window"}));
         }
@@ -535,6 +575,7 @@ fn action(
                 bail!("Application menu changed; reopen it");
             }
             current()?;
+            prepare_owner(item)?;
             let _: () = menu.call(
                 "Event",
                 &(
@@ -552,7 +593,12 @@ fn action(
     }
     Ok(())
 }
-fn run(address: &str, receiver: &Receiver<Command>, desired: &DesiredPeer) -> Result<()> {
+fn run(
+    address: &str,
+    receiver: &Receiver<Command>,
+    desired: &DesiredPeer,
+    events: &SyncSender<Event>,
+) -> Result<()> {
     let bus = connect_bus(address, Duration::from_millis(500))?;
     let registry = Watcher::default();
     bus.object_server().at(WATCHER_PATH, registry.clone())?;
@@ -608,7 +654,7 @@ fn run(address: &str, receiver: &Receiver<Command>, desired: &DesiredPeer) -> Re
                         &source,
                         &value,
                         &windows,
-                        (desired, desired_revision),
+                        (desired, desired_revision, events),
                     ) {
                         tracing::debug!(action=value["action"].as_str().unwrap_or(""), epoch, %error, "tray action rejected");
                         source.control(json!({"type":"tray_error","id":value["id"],"message":error.to_string()}));

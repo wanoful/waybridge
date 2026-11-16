@@ -3108,6 +3108,12 @@ int wmain(int argc, wchar_t **argv) {
     message["png"] = png.empty() ? Json(nullptr) : Json(base64(png.data(), png.size()));
   };
   remoteTray.attach(controller,sendJson,[](const Json &event){hostControl.emit(event);});
+  remoteTray.userActivation=[]()->std::string {
+    GUID guid{};if(FAILED(CoCreateGuid(&guid)))return {};
+    const char hex[]="0123456789abcdef";std::string request;request.reserve(32);
+    for(size_t i=0;i<sizeof(guid);++i){uint8_t b=reinterpret_cast<const uint8_t*>(&guid)[i];request+=hex[b>>4];request+=hex[b&15];}
+    return nativeActivation.prepare(request,true)?request:std::string();
+  };
   AddClipboardFormatListener(controller);
   SetTimer(controller, 1, 2000, nullptr);
   SetConsoleCtrlHandler(consoleControl, TRUE);

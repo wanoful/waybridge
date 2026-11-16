@@ -15,6 +15,12 @@ use std::{
 };
 
 pub enum Event {
+    TrayActivation {
+        peer: Arc<Peer>,
+        request_id: String,
+        pid: u32,
+        ready: SyncSender<bool>,
+    },
     UploadedFiles(crate::transfer_worker::Completed),
     DragFiles {
         id: u64,

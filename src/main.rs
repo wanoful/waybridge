@@ -3156,6 +3156,7 @@ fn main() -> Result<()> {
     )?;
     app.tray = Some(desktop_tray::Tray::new(
         application_session.bus_address().to_owned(),
+        app.events.clone(),
     ));
     // Service shutdown must run for application-launch and event-loop errors too.
     // Keep the display alive and dispatchable until owned components have stopped.
@@ -3256,6 +3257,21 @@ fn main() -> Result<()> {
                         if !items.is_empty() {
                             app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                         }
+                    }
+                    Event::TrayActivation {
+                        peer,
+                        request_id,
+                        pid,
+                        ready,
+                    } => {
+                        let valid = !app.read_only
+                            && peer.desktop_input()
+                            && app
+                                .peer
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &peer));
+                        let allowed = valid && app.activation_for_owner(&request_id, pid);
+                        let _ = ready.try_send(allowed);
                     }
                     Event::Message(mut value) => {
                         if value["type"] == "notification_feedback" {

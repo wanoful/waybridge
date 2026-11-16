@@ -8,6 +8,19 @@
 #include <QMenu>
 #include <QSystemTrayIcon>
 #include <QTimer>
+#include <QEvent>
+#include <functional>
+class FocusRecorder : public QObject {
+  std::function<void()> record;
+
+public:
+  explicit FocusRecorder(std::function<void()> callback) : record(std::move(callback)) {}
+  bool eventFilter(QObject *, QEvent *event) override {
+    if (event->type() == QEvent::WindowActivate)
+      record();
+    return false;
+  }
+};
 int main(int argc, char **argv) {
   QApplication app(argc, argv);
   app.setDesktopFileName("org.waybridge.TrayAction");
@@ -27,6 +40,8 @@ int main(int argc, char **argv) {
               "\n");
     log.flush();
   };
+  FocusRecorder focus([&] { record("focus"); });
+  window.installEventFilter(&focus);
   QMenu menu;
   int count = 0;
   QAction *restore = menu.addAction("&Restore");

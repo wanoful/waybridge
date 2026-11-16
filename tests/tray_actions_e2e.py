@@ -37,6 +37,8 @@ def main():
    client=spawn(['wine',str(args.client),'127.0.0.1',str(port),token],wine)
    def driver(*args):return subprocess.run(['wine',str(ROOT/'build/tests/windows-tray-driver.exe'),*args],cwd=ROOT,env=wine,stdout=log,stderr=log,timeout=5).returncode==0
    wait(lambda:driver('left' if args.single_left else 'left-sequence'),45);wait(lambda:any(e['event']=='activate' and e['visible'] for e in events()))
+   wait(lambda:any(e['event']=='focus' for e in events()))
+   wait(lambda:driver('foreground'))
    time.sleep(.2);assert len([e for e in events() if e['event']=='activate'])==1,events()
    assert driver('right-sequence');wait(lambda:driver('choose','i'))
    wait(lambda:any(e['event']=='increment' and e['count']==1 for e in events()))

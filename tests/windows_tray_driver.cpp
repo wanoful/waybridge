@@ -11,6 +11,15 @@ int main(int argc, char **argv) {
     return 3;
   }
   std::string command = argv[1];
+  if (command == "foreground") {
+    HWND active = GetForegroundWindow();
+    wchar_t name[100]{}, title[200]{};
+    GetClassNameW(active, name, 100);
+    GetWindowTextW(active, title, 200);
+    return wcscmp(name, L"WaybridgeRemote") == 0 && wcsstr(title, L"Waybridge tray action fixture")
+               ? 0
+               : 6;
+  }
   if (command == "left")
     SendMessageW(controller, WM_APP + 91, 0, MAKELPARAM(NIN_SELECT, 100));
   else if (command == "left-sequence") {
