@@ -40,6 +40,10 @@ def main():
                 k,v=client.receive()
                 if k=='control' and v['type']=='window':infos[v['id']]=v
             a,b=sorted(infos)
+            client.send(type='focus',id=a,focused=True)
+            client.send(type='focus',id=999999,focused=True)
+            client.send(type='key',id=a,key=25,down=True);client.send(type='key',id=a,key=25,down=False)
+            wait(lambda:'KEY 25 1' in Path(log.name).read_text())
             client.key(a,30)
             first=client.control('window_activate');assert first['id']==b and first['origin']==a and first['request_id'] is None
             client.key(a,46);time.sleep(.12)

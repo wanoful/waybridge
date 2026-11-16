@@ -64,8 +64,14 @@ def main():
                     if item['type']==kind: return item
                 raise AssertionError('missing server feedback '+kind)
             hello=receive();assert hello['notifications_v1'] and not hello['notifications_enabled']
-            server(type='hello',version=3,codec='mixed',notifications_v1=True,features=['notifications_v1'])
-            until('connected');assert not incoming('notifications_enabled')['enabled']
+            server(type='hello',version=3,codec='mixed',notifications_v1=True,activation_v1=True,features=['notifications_v1','activation_v1'])
+            assert until('connected')['activation_v1'];assert not incoming('notifications_enabled')['enabled']
+            command(type='activation_prepare',request_id='d'*32,app='fixture.desktop',foreground=False)
+            prepared=incoming('activation_prepare');assert prepared['request_id']=='d'*32 and prepared['app']=='fixture.desktop'
+            server(type='activation_prepared',request_id='d'*32,token='T'*32)
+            assert until('activation_prepared')['token']=='T'*32
+            command(type='activation_launch',request_id='d'*32,pid=12345)
+            assert incoming('activation_launch')['pid']==12345
             command(type='notification_available',available=True)
             assert incoming('notifications_enabled')['enabled']
             record=dict(type='notification',instance='a'*32,binding='b'*32,id=17,revision=1,app_name='测试应用',summary='中文标题',body='只存在于内存的内容',timeout_ms=10000,actions=[dict(key='default',label='打开')],png=None)

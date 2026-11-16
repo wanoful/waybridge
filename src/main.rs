@@ -514,7 +514,9 @@ impl App {
         }
         if !keyboard.is_grabbed() {
             let serial = SERIAL_COUNTER.next_serial();
-            self.activation.focus_serial = id.map(|id| (serial, id, Instant::now()));
+            if keyboard.current_focus() != surface {
+                self.activation.focus_serial = id.map(|id| (serial, id, Instant::now()));
+            }
             keyboard.set_focus(self, surface, serial);
         }
         // Smithay 0.7 does not call SeatHandler::focus_changed when focus becomes None.

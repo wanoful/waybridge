@@ -446,6 +446,36 @@ That baseline full client retained hardware H.264 on static translucent and anim
 
 This physical evidence applies to that earlier H.264/PNG/resize baseline. It does not establish physical execution of the final integrated binary, the Linux cross-built ARM64 executable, HEVC/AV1/Main10 decoders, HDR displays or Microsoft Pinyin. Linux LLVM-MinGW cross-builds confirm architecture and Windows system imports, not runtime hardware compatibility.
 
+## Window activation and modal focus (2026-11-16)
+
+- `tests/activation_smoke.py` passed against a real compositor and Wayland
+  fixture on a disposable user bus: standard xdg-activation, recent serial,
+  consumed/invalid-token rejection, stale window focus rejection, explicit launch
+  binding, and connection invalidation.
+- `tests/desktop_overrides_smoke.py` passed real GIO raw argv/desktop launches
+  and D-Bus Activate/Open/ActivateAction, including token environment/platform
+  data and application PID reporting through the standard launched signal.
+- `tests/windows_semantics_smoke.py` passed the real Windows viewer and Wayland
+  modal fixture under private Wine/Xvfb, including new assertions that modal
+  unmap/remap and final destruction leave the correct parent in the foreground
+  with another independent application window present.
+- `tests/windows_activation_probe.cpp` ran on laptop as a limited interactive
+  user and exited 0: explicit first-frame activation, consumed intent rejection,
+  newer user input invalidation, background parent refusal, owner restoration
+  before modal hide/destroy and connection reset. It creates three private test
+  windows, verifies that any test click hits its own HWND, then restores the
+  previous cursor/foreground and removes its temporary task/files. Run with
+  `python3 tests/run_windows_focus_probe.py --host laptop` after compiling it.
+- Rust Clippy with warnings denied, the x64 native viewer, WinUI GUI and Core
+  controller tests passed. The native hosted IPC regression also exercises
+  activation negotiation, prepare/token response and launch/PID forwarding.
+
+These are isolated protocol/application/API checks; they do not certify every
+application's activation implementation. Full real GUI user launch across its
+worker process, legacy toolkit startup metadata, delayed/daemonized application
+launches and additional Windows foreground-lock policies remain compatibility
+checks. Background requests intentionally may flash instead of taking focus.
+
 ## Remaining device and compatibility validation
 
 - Real Windows/WoA HEVC/AV1 and Main10 MFT availability, correct GPU planes/textures, DirectComposition FP16 HDR presentation, active HDR↔SDR transitions, per-pixel alpha and multi-monitor DPI. The production HDR shader/WIC numerical checks under private software D3D11 verify arithmetic only; WARP is not advertised as HDR hardware.

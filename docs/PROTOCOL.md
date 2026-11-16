@@ -554,6 +554,56 @@ are bounded before entering the 64-slot worker queue. Session lifecycle state
 uses a separate latest state/revision, so reconnect/disconnect cannot be dropped
 behind a full action queue.
 
+## Window activation (`activation_v1`)
+
+Visibility, Linux keyboard focus and Windows foreground activation are separate.
+Both hellos negotiate `activation_v1`; the native worker also reports the actual
+negotiated boolean to the GUI. A supported new window is initially shown without
+activation. The server sends `window_activate {id,origin,request_id}` only for a
+specific intent, after window metadata exists. The worker can defer it until the
+first displayed frame. Successful Windows focus returns through the existing
+`focus` message; Linux does not preemptively move keyboard focus on a request.
+
+For a GUI launch, the foreground GUI grants foreground permission to its worker
+with AllowSetForegroundWindow, then requests `activation_prepare
+{request_id,app}` through the worker pipe. The server returns
+`activation_prepared {request_id,token}`. Management launch carries this token
+in the normal application launch context, and `activation_launch
+{request_id,pid?}` binds the resulting process to that same connection.
+The helper reports raw-spawn PID or the real application PID from GIO's standard
+`GAppLaunchContext::launched` signal, never its dispatcher PID.
+
+Wayland applications can use standard `xdg_activation_v1` tokens. Client-created
+tokens require a recent input/focus serial on the correct seat and focused
+client; tokens are consumed once. Explicit remote launch tokens are also usable
+as XDG_ACTIVATION_TOKEN/DESKTOP_STARTUP_ID. GIO launch uses a standard derived
+LaunchContext so D-Bus Activate/Open/ActivateAction receive startup platform data.
+For this one token-bearing launch, its private derived Desktop Entry enables
+StartupNotify; installed entries and persistent overrides remain unchanged.
+Process PID/descendants provide an exact fallback for exec applications without
+activation support; D-Bus launches without a reported PID can match their desktop
+application ID. A new transient of the focused parent and a child process started
+after recent input inherit only that source window's local foreground context.
+
+The SNI integration can register an owner grant with a verified D-Bus owner PID.
+Unlike GUI launch, registering that grant does not activate an existing mapped
+window: a subsequent new map, xdg activation or X11 activation/restore request
+must consume it. A mute/quit menu action therefore does not itself switch apps.
+An unrelated X11 request has only attention semantics; its EWMH source value or
+timestamp cannot grant foreground authority.
+
+Tokens/grants expire after 15 seconds, are bounded, and are invalidated by a
+connection change. The native worker additionally rejects a launch if newer
+local input changed the user's foreground context. It uses normal foreground
+APIs and taskbar flashing on denial, with no input-queue attachment, synthetic
+input or permanent topmost window. Read-only input policy still applies.
+
+A modal's mapped=false transition usually precedes its destruction. Before
+hiding/destroying a foreground modal, the viewer reconciles enabled owners and
+restores its valid owner while it still has foreground permission. Closing a
+background dialog does not disturb the foreground app. Linux also retains the
+mapped parent as its logical focus target and ignores focus events for stale IDs.
+
 ## Desktop notifications (`notifications_v1`)
 
 Both v3 hellos negotiate the boolean `notifications_v1`. The hosted Windows

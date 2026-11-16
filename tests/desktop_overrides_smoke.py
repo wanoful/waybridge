@@ -99,6 +99,7 @@ def main():
         assert result['argv'][1:5] == ['base', '--', 'https://example.invalid/a?b=1', str(home / 'file 你好')], result['argv']
         assert str(source) in result['argv'] and '%' in result['argv'] and '%k' in result['argv']
         assert response['plan']['desktop_id'] == app_id and response['plan']['derived']
+        assert response['pid'] > 1 and response['pid_role'] == 'gio-launched-process'
         assert Path(result['gio_file']).name == app_id and Path(result['gio_file']).is_file()
 
         # NBSP is part of an executable filename in GIO, not an ASCII Exec

@@ -319,6 +319,31 @@ if activation:
     context = bind(gobject, "g_object_new", C.c_void_p, C.c_size_t, C.c_void_p)(derived, None)
 else:
     context = bind(gio, "g_app_launch_context_new", C.c_void_p)()
+if plan.get("pid_fd") is not None:
+    gobject = C.CDLL(C.util.find_library("gobject-2.0") or "libgobject-2.0.so.0")
+    lookup = bind(glib, "g_variant_lookup_value", C.c_void_p, C.c_void_p, C.c_char_p, C.c_void_p)
+    kind = bind(glib, "g_variant_get_type_string", C.c_char_p, C.c_void_p)
+    unref = bind(glib, "g_variant_unref", None, C.c_void_p)
+    @C.CFUNCTYPE(None, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p)
+    def launched(context, info, platform, unused):
+        value = lookup(platform, b"pid", None)
+        if not value:
+            return
+        try:
+            # GIO's standard launched signal reports the spawned application's
+            # PID. This is not the short-lived GIO dispatcher/helper PID.
+            signature = kind(value)
+            if signature == b"i":
+                pid = bind(glib, "g_variant_get_int32", C.c_int32, C.c_void_p)(value)
+            elif signature == b"u":
+                pid = bind(glib, "g_variant_get_uint32", C.c_uint32, C.c_void_p)(value)
+            else:
+                return
+            if pid > 1:
+                os.write(plan["pid_fd"], (str(pid)+"\n").encode())
+        finally:
+            unref(value)
+    bind(gobject, "g_signal_connect_data", C.c_ulong, C.c_void_p, C.c_char_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_uint)(context, b"launched", C.cast(launched, C.c_void_p), None, None, 0)
 setenv = bind(gio, "g_app_launch_context_setenv", None, C.c_void_p, C.c_char_p, C.c_char_p)
 unsetenv = bind(gio, "g_app_launch_context_unsetenv", None, C.c_void_p, C.c_char_p)
 for key, value in plan["environment_set"].items():
@@ -629,8 +654,6 @@ def launch_plan(request, saved):
 
 def launch_application(request, saved, session, diagnostic=False):
     plan, environment, config = launch_plan(request, saved)
-    if diagnostic:
-        return plan
     activation_token = request.get("activation_token")
     if activation_token is not None:
         if not isinstance(activation_token, str) or not re.fullmatch(r"[A-Za-z0-9]{32}", activation_token):
@@ -643,6 +666,9 @@ def launch_application(request, saved, session, diagnostic=False):
             # entry and owned token; never edit the installed Desktop Entry.
             config["Desktop Entry"]["StartupNotify"] = "true"
             plan["derived"] = True
+            plan["startup_notification_context"] = True
+    if diagnostic:
+        return plan
     with owned_log(session) as log:
         if plan["kind"] == "argv":
             process = subprocess.Popen(plan["argv"], env=environment, cwd=plan["cwd"],
@@ -688,19 +714,32 @@ def launch_application(request, saved, session, diagnostic=False):
         if activation_token:
             work["activation_token"] = activation_token
             work["environment_set"].update({"XDG_ACTIVATION_TOKEN": activation_token, "DESKTOP_STARTUP_ID": activation_token})
-        process = subprocess.Popen([sys.executable, "-I", "-c", GIO_WORKER], env=session_environment(saved), cwd=plan["cwd"],
-                                   stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True, close_fds=True)
+        pid_read, pid_write = os.pipe()
+        work["pid_fd"] = pid_write
+        launched_pid = None
         try:
-            process.communicate(json.dumps(work).encode(), timeout=15)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            raise ValueError("GIO launch request timed out; application readiness is unknown") from None
+            process = subprocess.Popen([sys.executable, "-I", "-c", GIO_WORKER], env=session_environment(saved), cwd=plan["cwd"],
+                                       stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True, close_fds=True, pass_fds=(pid_write,))
+            try:
+                process.communicate(json.dumps(work).encode(), timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill(); process.wait()
+                raise ValueError("GIO launch request timed out; application readiness is unknown") from None
+            os.set_blocking(pid_read, False)
+            try:
+                reported = os.read(pid_read, 128).splitlines()
+                if reported and reported[0].isdigit(): launched_pid = int(reported[0])
+            except BlockingIOError:
+                pass
+        finally:
+            os.close(pid_read); os.close(pid_write)
         if process.returncode:
             raise ValueError(f"GIO launch failed; see {RUNTIME / 'waybridge-control-center' / (session + '.log')}")
-    return dict(status="activation-requested" if plan["activation"] == "dbus" else "dispatched",
-                readiness="not-observed", plan=plan)
+    result = dict(status="activation-requested" if plan["activation"] == "dbus" else "dispatched", readiness="not-observed", plan=plan)
+    if launched_pid is not None:
+        result.update(pid=launched_pid, pid_role="gio-launched-process")
+    return result
 
 
 def dispatch(request):

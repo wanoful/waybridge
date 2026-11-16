@@ -286,7 +286,7 @@ impl App {
                     l.bound
                         && (!l.requests_only || fresh)
                         && (startup.as_deref() == Some(token.as_str())
-                            || app_match(&app, &l.app)
+                            || (l.pid.is_none() && app_match(&app, &l.app))
                             || l.pid
                                 .zip(pid)
                                 .is_some_and(|(parent, child)| descendant(child, parent)))
