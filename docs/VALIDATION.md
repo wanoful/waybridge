@@ -642,3 +642,46 @@ Physical banner click/foreground routing, Do Not Disturb visual behavior,
 multi-monitor/DPI icon appearance, broader application compatibility and real
 Windows ARM64 runtime coverage remain device checks. Windows center-dismissal
 feedback is intentionally delayed by the two-second polling/activation grace.
+
+
+## Runtime window icon sources — 2026-11-16
+
+Window icon lookup previously treated Wayland app_id and X11 WM_CLASS as an exact
+desktop-file ID and ignored runtime window icons. Read-only inspection of the
+installed desktop entries showed `hmcl-bin.desktop` uses
+`StartupWMClass=org.jackhuang.hmcl.Launcher`, and `qq.desktop` uses
+`StartupWMClass=QQ`. These association fields were unused; a correct independent
+SNI tray icon did not repair the window icon. The implementation now uses generic
+StartupWMClass/class/instance matching and runtime image sources, with no HMCL/QQ
+name rules.
+
+`tests/window_icon_smoke.py` runs real Wayland and X11 fixture clients against an
+isolated compositor. It verifies:
+
+- Wayland pixel/name priority, straight PNG output from premultiplied SHM alpha,
+  pending versus committed state, immediate icon/buffer destruction, reset/empty
+  and oversized fallback, app_id class/case compatibility, delayed stale desktop lookup rejection and reconnect.
+- X11 `_NET_WM_ICON` initial values, updates and deletion, malformed/oversized
+  fallback, runtime icons without WM_CLASS, and class/instance/case matching.
+  A grabbed private X server cannot stall compositor ping; subsequent icon updates
+  still work. A socket-pair X11 server that never answers setup separately proves
+  the worker deadline fires. StartupWMClass wins over a
+  coincidental generic desktop ID; user desktop entries
+  retain priority and Hidden masks the same system entry.
+- Invalid buffer destruction while its icon remains alive disconnects that client
+  while the compositor survives. Legal destruction after icon destruction remains
+  valid. This caught a vendored Smithay lifetime bug: a cached icon kept userdata
+  alive and its buffer destruction hook unconditionally posted `no_buffer` after
+  the protocol icon destructor. The hook now checks resource liveness and the
+  destructor removes its hooks immediately.
+
+Runtime SHM is copied once into an owned, bounded pending snapshot before client
+objects disappear; protocol resources/SHM pools are not retained by the snapshot.
+X11 property requests and all image scaling/PNG encoding run on the bounded icon
+worker. Old source revisions and closed windows reject asynchronous results.
+
+The new protocol test, existing `app_icon_smoke.py`, and accelerated GLX
+`x11_smoke.py` pass. Rust formatting, clippy and build pass. These are protocol and
+association results; no user application profile, wallet or real desktop service
+was modified, and HMCL/QQ visual acceptance on Windows remains an integration
+check after installing the fix.

@@ -360,15 +360,21 @@ impl<D: XdgToplevelIconHandler> Dispatch<XdgToplevelIconV1, XdgToplevelIconUserD
                 data.register_buffer_destruction_hook(buffer.clone(), shm, {
                     let icon = icon.clone();
                     move || {
-                        icon.post_error(
-                            xdg_toplevel_icon_v1::Error::NoBuffer,
-                            "The provided buffer has been destroyed before the toplevel icon",
-                        )
+                        // A cached icon may keep Rust userdata alive after its
+                        // protocol destructor; its buffers may then be destroyed.
+                        if icon.is_alive() {
+                            icon.post_error(
+                                xdg_toplevel_icon_v1::Error::NoBuffer,
+                                "The provided buffer has been destroyed before the toplevel icon",
+                            );
+                        }
                     }
                 });
                 data.add_buffer(buffer.clone(), scale, shm);
             }
-            Request::Destroy => {}
+            // Cached toplevel state may keep this icon's userdata alive after
+            // the protocol destructor. Buffers may legally be destroyed now.
+            Request::Destroy => data.unregister_all_hooks(),
             _ => unreachable!(),
         }
     }

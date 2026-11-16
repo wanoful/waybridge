@@ -147,6 +147,7 @@ pub enum WmWindowProperty {
     MotifHints,
     StartupId,
     Pid,
+    Icon,
 }
 
 impl X11Surface {
@@ -639,6 +640,7 @@ impl X11Surface {
 
     pub(super) fn update_property(&self, atom: Atom) -> Result<Option<WmWindowProperty>, ConnectionError> {
         match atom {
+            atom if atom == self.atoms._NET_WM_ICON => Ok(Some(WmWindowProperty::Icon)),
             atom if atom == self.atoms._NET_WM_NAME || atom == AtomEnum::WM_NAME.into() => {
                 self.update_title()?;
                 Ok(Some(WmWindowProperty::Title))

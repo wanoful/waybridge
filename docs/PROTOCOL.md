@@ -184,11 +184,32 @@ The compositor supports both `wp_cursor_shape_manager_v1` and ordinary `wl_point
 
 The viewer opts in with `window_icon_v1:true` in its control `hello`; a supporting server lists `window_icon_v1` in `features` and echoes the negotiated boolean. This remains optional within v3: no icon messages are emitted for old/simple viewers, and a new viewer keeps generic native icons with an older server.
 
-`window` metadata carries `icon_revision` (monotonically increasing for this window's application identity). The server asynchronously resolves the application's desktop file and icon, then sends control JSON `window_icon`: `id`, `app_id`, `revision`, `width:128`, `height:128`, and `png` (base64 PNG or `null` for generic application icons). The extension uses bounded ASCII desktop-file IDs; missing/unusable IDs normalize to an empty identity. On metadata identity/revision changes, the viewer clears the old icon immediately. It applies a result only when the window is still alive and both normalized application identity and revision match. Pending old results and messages for unknown/closed IDs are ignored. Reconnection reannounces metadata before the current icon.
+`window` metadata carries `icon_revision` (monotonically increasing for this window's identity or icon source). The server asynchronously resolves its current runtime/desktop icon, then sends control JSON `window_icon`: `id`, `app_id`, `revision`, `width:128`, `height:128`, and `png` (base64 PNG or `null` for generic application icons). The extension uses bounded ASCII desktop-file IDs; missing/unusable IDs normalize to an empty identity. On metadata identity/revision changes, the viewer clears the old icon immediately. It applies a result only when the window is still alive and both normalized application identity and revision match. Pending old results and messages for unknown/closed IDs are ignored. Reconnection reannounces metadata before the current icon.
 
 PNG is straight RGBA, normalized with aspect ratio and transparent padding to 128×128, at most 96 KiB decoded PNG / 128 KiB base64. The viewer validates exact PNG dimensions before copying pixels, constructs per-DPI large/small native `HICON`s and sets both with `WM_SETICON`. Replaced/closed-window custom icons are destroyed; system fallback handles are shared. Windows DPI changes rescale from the bounded master without a round trip.
 
-Resolution runs off the compositor thread: XDG applications lookup, desktop-file `Icon`, selected GTK/KDE theme (or `WAYBRIDGE_ICON_THEME`), theme size ranking/inheritance, hicolor and unthemed/pixmaps fallbacks. Desktop `Exec` is never executed. Source files are bounded to 2 MiB; PNG dimensions to 1024×1024 / decoder allocation to 16 MiB. SVG support uses optional `rsvg-convert`, limited to 2 seconds wall/CPU, 512 MiB virtual memory and 96 KiB output, and killed if its parent exits. Failure returns generic icons. At most the first 128 live toplevels load/retain icon data, matching the viewer window limit. Worker and transport queues replace pending work per window (maximum 128); the worker has a 64-entry positive/negative LRU cache with 60-second lookup TTL. Themes/configuration are sampled at server startup; existing windows do not hot-reload icon files. XPM and client-supplied xdg-toplevel-icon hints are not supported by this first extension.
+Runtime pixels have priority: committed Wayland `xdg-toplevel-icon-v1` buffers,
+then its theme icon name, or X11 `_NET_WM_ICON`; otherwise use the desktop icon.
+Wayland `set_icon` copies one bounded SHM buffer into pending state and applies it
+only at the toplevel's surface commit. The icon object and its buffers may be
+destroyed immediately after set_icon without losing this snapshot. Clearing or
+assigning an empty icon restores the desktop/default source. SHM ARGB8888 is
+unpremultiplied on the worker; XRGB8888 is opaque. Runtime dimensions are at most
+512×512; one snapshot is at most 1 MiB, with at most 64 supplied Wayland size
+candidates considered. X11 property reads are bounded to 2 MiB and run on a private
+worker connection with bounded connect/setup/reply waits; malformed, oversized or
+missing data falls back to desktop/default. `_NET_WM_ICON` and WM_CLASS changes
+invalidate the old revision without synchronous property reads on dispatch.
+
+Wayland desktop fallback first uses its exact XDG desktop-file ID, then the
+standard StartupWMClass/desktop-ID compatibility lookup for noncanonical app_ids.
+X11 matches WM_CLASS class then instance against `StartupWMClass`, before desktop-ID
+case matching and a final case-insensitive StartupWMClass match. Equal-score
+matches honor XDG data-directory priority and stable desktop-ID ordering;
+Hidden/user entries mask the same system desktop ID. No process names, window
+titles or application-specific rules select an icon.
+
+Resolution runs off the compositor thread: XDG applications lookup, desktop-file `Icon`, selected GTK/KDE theme (or `WAYBRIDGE_ICON_THEME`), theme size ranking/inheritance, hicolor and unthemed/pixmaps fallbacks. Desktop `Exec` is never executed. Source files are bounded to 2 MiB; PNG dimensions to 1024×1024 / decoder allocation to 16 MiB. SVG support uses optional `rsvg-convert`, limited to 2 seconds wall/CPU, 512 MiB virtual memory and 96 KiB output, and killed if its parent exits. Failure returns generic icons. Desktop lookup and transmission follow the first 128 live toplevels, matching the viewer window limit. Worker and transport queues replace pending work per window (maximum 128); queued runtime pixel payloads are additionally limited to 16 MiB; the worker has a 64-entry positive/negative LRU cache with 60-second lookup TTL. Themes/configuration are sampled at server startup; existing windows do not hot-reload icon files. XPM and legacy ICCCM WM_HINTS icon pixmaps are not decoded; standard runtime/desktop fallback still applies.
 
 ## Locked relative pointer (optional v3 extension)
 

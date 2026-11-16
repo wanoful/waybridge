@@ -16,6 +16,25 @@ use std::{
 };
 
 pub const EDGE: u32 = 128;
+#[derive(Default, Clone)]
+pub struct Source {
+    pub name: Option<String>,
+    pub pixels: Option<Arc<RawIcon>>,
+    pub aliases: Vec<String>,
+    pub x11: Option<(u32, u32)>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    Rgba,
+    Argb8888,
+    Xrgb8888,
+}
+pub struct RawIcon {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+    pub format: PixelFormat,
+}
 pub const MAX_PNG: usize = 96 * 1024;
 const MAX_INPUT: u64 = 2 * 1024 * 1024;
 type Icon = Option<Arc<Vec<u8>>>;
@@ -37,10 +56,17 @@ impl WindowIcon {
             self.app_id = app_id.to_owned();
             self.revision += 1;
             self.requested = false;
-            self.ready = app_id.is_empty();
+            self.ready = false;
             self.sent = false;
             self.png = None;
         }
+    }
+    pub fn invalidate(&mut self) {
+        self.revision += 1;
+        self.requested = false;
+        self.ready = false;
+        self.sent = false;
+        self.png = None;
     }
     pub fn complete(&mut self, revision: u64, app_id: &str, png: Icon) {
         if self.revision == revision && self.app_id == app_id {
@@ -59,6 +85,7 @@ struct Request {
     id: u32,
     revision: u64,
     app_id: String,
+    source: Source,
 }
 #[derive(Default)]
 struct Jobs {
@@ -95,21 +122,46 @@ impl Icons {
                     jobs.last_id = id;
                     jobs.requests.remove(&id).unwrap()
                 };
+                let runtime = request
+                    .source
+                    .pixels
+                    .as_deref()
+                    .and_then(encode_runtime)
+                    .or_else(|| {
+                        request
+                            .source
+                            .x11
+                            .and_then(|(display, window)| crate::window_icon::x11(display, window))
+                            .as_ref()
+                            .and_then(encode_runtime)
+                    })
+                    .or_else(|| {
+                        request
+                            .source
+                            .name
+                            .as_deref()
+                            .and_then(|name| resolver.named(name))
+                            .and_then(|path| load(&path))
+                    });
+                let cache_key =
+                    format!("{}\0{}", request.app_id, request.source.aliases.join("\0"));
                 let cached = cache.iter().position(|(key, time, _)| {
-                    key == &request.app_id && time.elapsed() < Duration::from_secs(60)
+                    key == &cache_key && time.elapsed() < Duration::from_secs(60)
                 });
-                let png = if let Some(index) = cached {
+                let png = if let Some(png) = runtime {
+                    Some(Arc::new(png))
+                } else if let Some(index) = cached {
                     let entry = cache.remove(index).unwrap();
                     let png = entry.2.clone();
                     cache.push_back(entry);
                     png
                 } else {
                     let png = resolver
-                        .resolve(&request.app_id)
+                        .resolve_aliases(&request.app_id, &request.source.aliases)
                         .and_then(|path| load(&path))
                         .map(Arc::new);
-                    cache.retain(|(key, _, _)| key != &request.app_id);
-                    cache.push_back((request.app_id.clone(), Instant::now(), png.clone()));
+                    cache.retain(|(key, _, _)| key != &cache_key);
+                    cache.push_back((cache_key, Instant::now(), png.clone()));
                     while cache.len() > 64 {
                         cache.pop_front();
                     }
@@ -130,10 +182,25 @@ impl Icons {
         });
         Self { queue }
     }
-    pub fn request(&self, id: u32, revision: u64, app_id: &str) -> bool {
+    pub fn request(&self, id: u32, revision: u64, app_id: &str, source: Source) -> bool {
         let (lock, wake) = &*self.queue;
         let mut jobs = lock.lock().unwrap();
         if jobs.requests.len() >= 128 && !jobs.requests.contains_key(&id) {
+            return false;
+        }
+        let queued: usize = jobs
+            .requests
+            .values()
+            .filter_map(|job| job.source.pixels.as_ref())
+            .map(|raw| raw.bytes.len())
+            .sum();
+        let replaced = jobs
+            .requests
+            .get(&id)
+            .and_then(|job| job.source.pixels.as_ref())
+            .map_or(0, |raw| raw.bytes.len());
+        let cost = source.pixels.as_ref().map_or(0, |raw| raw.bytes.len());
+        if queued - replaced + cost > 16 * 1024 * 1024 {
             return false;
         }
         jobs.requests.insert(
@@ -142,6 +209,7 @@ impl Icons {
                 id,
                 revision,
                 app_id: app_id.to_owned(),
+                source,
             },
         );
         wake.notify_one();
@@ -370,7 +438,16 @@ impl Resolver {
         None
     }
     fn resolve(&self, app_id: &str) -> Option<PathBuf> {
-        let entry = ini(&self.desktop(app_id)?)?;
+        self.resolve_aliases(app_id, &[])
+    }
+    fn resolve_aliases(&self, app_id: &str, aliases: &[String]) -> Option<PathBuf> {
+        let path = if aliases.is_empty() {
+            self.desktop(app_id)
+                .or_else(|| self.desktop_alias(&[app_id.to_owned()]))
+        } else {
+            self.desktop_alias(aliases).or_else(|| self.desktop(app_id))
+        }?;
+        let entry = ini(&path)?;
         let entry = entry.get("Desktop Entry")?;
         if entry.get("Hidden").is_some_and(|s| s == "true") {
             return None;
@@ -385,24 +462,119 @@ impl Resolver {
         if !relative(&name) || name.contains('/') || name.contains('\\') {
             return None;
         }
+        self.named(&name)
+    }
+    fn named(&self, name: &str) -> Option<PathBuf> {
+        if !relative(name) || name.contains('/') || name.contains('\\') {
+            return None;
+        }
         let mut seen = HashSet::new();
-        if let Some(path) = self.theme_icon(&self.theme, &name, &mut seen) {
+        if let Some(path) = self.theme_icon(&self.theme, name, &mut seen) {
             return Some(path);
         }
-        if let Some(path) = self.theme_icon("hicolor", &name, &mut seen) {
+        if let Some(path) = self.theme_icon("hicolor", name, &mut seen) {
             return Some(path);
         }
         for root in &self.roots {
-            if let Some(path) = candidate(root, &name) {
+            if let Some(path) = candidate(root, name) {
                 return Some(path);
             }
         }
         for data in &self.data {
-            if let Some(path) = candidate(&data.join("pixmaps"), &name) {
+            if let Some(path) = candidate(&data.join("pixmaps"), name) {
                 return Some(path);
             }
         }
         None
+    }
+    fn desktop_alias(&self, aliases: &[String]) -> Option<PathBuf> {
+        let aliases = aliases
+            .iter()
+            .filter(|value| {
+                !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
+            })
+            .collect::<Vec<_>>();
+        if aliases.is_empty() {
+            return None;
+        }
+        let mut masked = HashSet::new();
+        let mut best: Option<(usize, usize, String, PathBuf)> = None;
+        for (priority, data) in self.data.iter().enumerate() {
+            let base = data.join("applications");
+            let mut pending = vec![(base.clone(), 0)];
+            let mut budget = 4096;
+            let mut entries = BTreeMap::new();
+            while let Some((directory, depth)) = pending.pop() {
+                let Ok(children) = fs::read_dir(directory) else {
+                    continue;
+                };
+                for child in children.flatten() {
+                    if budget == 0 {
+                        break;
+                    }
+                    budget -= 1;
+                    let path = child.path();
+                    let Ok(kind) = child.file_type() else {
+                        continue;
+                    };
+                    if kind.is_dir() && depth < 8 {
+                        pending.push((path, depth + 1));
+                    } else if kind.is_file() && path.extension().is_some_and(|s| s == "desktop") {
+                        let id = path
+                            .strip_prefix(&base)
+                            .ok()?
+                            .to_string_lossy()
+                            .replace('/', "-");
+                        entries.insert(id, path);
+                    }
+                }
+                if budget == 0 {
+                    break;
+                }
+            }
+            for (id, path) in entries {
+                if !masked.insert(id.clone()) {
+                    continue;
+                }
+                let Some(contents) = ini(&path) else {
+                    continue;
+                };
+                let Some(entry) = contents.get("Desktop Entry") else {
+                    continue;
+                };
+                if entry.get("Hidden").is_some_and(|s| s == "true") {
+                    continue;
+                }
+                let class = entry.get("StartupWMClass").map(|s| unescape(s));
+                let stem = id.strip_suffix(".desktop").unwrap_or(&id);
+                let score = aliases
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, alias)| {
+                        if class.as_deref() == Some(alias.as_str()) {
+                            Some(index)
+                        } else if stem.eq_ignore_ascii_case(alias) {
+                            Some(100 + index)
+                        } else if class
+                            .as_deref()
+                            .is_some_and(|class| class.eq_ignore_ascii_case(alias))
+                        {
+                            Some(1000 + index)
+                        } else {
+                            None
+                        }
+                    })
+                    .min();
+                if let Some(score) = score {
+                    if best.as_ref().is_none_or(|(old, old_priority, old_id, _)| {
+                        (score, priority, &id) < (*old, *old_priority, old_id)
+                    }) {
+                        best = Some((score, priority, id, path));
+                    }
+                }
+            }
+        }
+        best.map(|(_, _, _, path)| path)
     }
     fn theme_icon(&self, theme: &str, name: &str, seen: &mut HashSet<String>) -> Option<PathBuf> {
         if !identifier(theme) || seen.len() >= 16 || !seen.insert(theme.to_owned()) {
@@ -572,6 +744,50 @@ fn load(path: &Path) -> Option<Vec<u8>> {
         return None;
     }
     let resized = image
+        .resize(EDGE, EDGE, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let mut canvas = RgbaImage::new(EDGE, EDGE);
+    image::imageops::overlay(
+        &mut canvas,
+        &resized,
+        i64::from((EDGE - resized.width()) / 2),
+        i64::from((EDGE - resized.height()) / 2),
+    );
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(canvas.as_raw(), EDGE, EDGE, image::ExtendedColorType::Rgba8)
+        .ok()?;
+    (png.len() <= MAX_PNG).then_some(png)
+}
+
+fn encode_runtime(raw: &RawIcon) -> Option<Vec<u8>> {
+    if raw.width == 0
+        || raw.height == 0
+        || raw.width > crate::window_icon::MAX_EDGE
+        || raw.height > crate::window_icon::MAX_EDGE
+        || raw.bytes.len() != raw.width as usize * raw.height as usize * 4
+    {
+        return None;
+    }
+    let mut bytes = raw.bytes.clone();
+    if raw.format != PixelFormat::Rgba {
+        let alpha = raw.format == PixelFormat::Argb8888;
+        for pixel in bytes.chunks_exact_mut(4) {
+            let native = u32::from_ne_bytes(pixel.try_into().ok()?);
+            let a = if alpha { (native >> 24) as u8 } else { 255 };
+            let channel = |shift: u32| {
+                if a == 0 {
+                    0
+                } else {
+                    ((((native >> shift) & 255) * 255 + u32::from(a) / 2) / u32::from(a)).min(255)
+                        as u8
+                }
+            };
+            pixel.copy_from_slice(&[channel(16), channel(8), channel(0), a]);
+        }
+    }
+    let source = RgbaImage::from_raw(raw.width, raw.height, bytes)?;
+    let resized = image::DynamicImage::ImageRgba8(source)
         .resize(EDGE, EDGE, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
     let mut canvas = RgbaImage::new(EDGE, EDGE);

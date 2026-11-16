@@ -18,6 +18,9 @@ python tests/smoke.py
 python tests/cursor_smoke.py
 if command -v rsvg-convert >/dev/null; then
   python tests/app_icon_smoke.py
+  if command -v Xwayland >/dev/null && pkg-config --exists x11; then
+    python tests/window_icon_smoke.py
+  fi
 fi
 python tests/relative_smoke.py
 python tests/drag_out_smoke.py

@@ -529,13 +529,16 @@ impl XwmHandler for App {
             w.dirty = true;
         }
     }
-    fn property_notify(&mut self, _: XwmId, window: X11Surface, _: WmWindowProperty) {
+    fn property_notify(&mut self, _: XwmId, window: X11Surface, property: WmWindowProperty) {
         if let Some(w) = self
             .windows
             .iter_mut()
             .find(|w| w.window.x11_surface() == Some(&window))
         {
             w.dirty = true;
+            if matches!(property, WmWindowProperty::Icon | WmWindowProperty::Class) {
+                w.icon.invalidate();
+            }
         }
     }
     fn maximize_request(&mut self, _: XwmId, window: X11Surface) {

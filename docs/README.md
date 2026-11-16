@@ -101,7 +101,7 @@ Chrome 会按桌面身份选择密码后端。原来使用 KDE/KWallet 6 的用�
 
 ## 光标、图标与窗口语义
 
-光标、XDG 应用图标和窗口语义按 v3 能力自动协商。支持系统形状、隐藏、自定义/动画光标及 DPI 热点；自定义动画独立于窗口画面，最多 30 FPS。应用 PNG/SVG 图标在后台解析为 Windows 大小图标，找不到时使用默认图标；不执行 desktop 文件中的 Exec。
+光标、XDG 应用图标和窗口语义按 v3 能力自动协商。支持系统形状、隐藏、自定义/动画光标及 DPI 热点；自定义动画独立于窗口画面，最多 30 FPS。窗口优先使用应用通过 Wayland `xdg-toplevel-icon-v1` 或 X11 `_NET_WM_ICON` 提供的运行时图标；没有可用运行时图标时，Wayland 优先按 app_id 查 `.desktop`，非标准 app_id 也走 desktop ID／StartupWMClass 兼容匹配；X11 按 `StartupWMClass` 匹配 WM_CLASS 的 class/instance，并兼容 desktop ID 大小写差异。PNG/SVG 查找、X11 属性读取和缩放编码在后台执行；清除图标后回到 desktop/default，不执行 desktop 文件中的 Exec。
 
 已实现真正的 xdg-dialog 模态提示、动态 owner、最小/最大尺寸、全屏恢复、unmap/remap 与隐藏/最小化后的 suspended/低频回调。仅有 parent 关系不代表模态。输入区域与视觉透明度分别映射；排除的客户区像素使用 `HTTRANSPARENT`，只保证同一 UI 线程中的 Waybridge 窗口间穿透，不能点穿到其他进程或桌面。未实现 KDE 毛玻璃。
 
@@ -296,7 +296,7 @@ python tests/session_integration_smoke.py
 | 范围 | 测试入口（`python tests/<名称>.py`） |
 |---|---|
 | 原生 Windows 窗口/剪贴板/菜单 | `windows_smoke`，可加 `--csd` / `--terminal` / `--qt` / `--udp` |
-| 光标与图标 | `cursor_smoke`、`windows_cursor_smoke`、`app_icon_smoke`、`windows_app_icon_smoke` |
+| 光标与图标 | `cursor_smoke`、`windows_cursor_smoke`、`app_icon_smoke`、`window_icon_smoke`、`windows_app_icon_smoke` |
 | 模态/全屏/输入区域 | `window_semantics_smoke`、`windows_semantics_smoke` |
 | IME 与快捷键 | `ime_smoke`、`windows_ime_keys_smoke`、`ghostty_smoke --ime` |
 | 相对鼠标 | `relative_smoke`、`windows_relative_smoke` |

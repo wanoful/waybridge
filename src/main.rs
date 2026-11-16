@@ -25,6 +25,7 @@ mod transfer;
 mod transfer_worker;
 mod udp;
 mod video;
+mod window_icon;
 mod window_semantics;
 mod x11;
 
@@ -324,6 +325,7 @@ struct App {
     cursor: cursor::Cursor,
     _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState,
     icons: app_icon::Icons,
+    _toplevel_icons: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
     tray: Option<desktop_tray::Tray>,
     relative: relative_input::RelativeInput,
     _relative_manager: RelativePointerManagerState,
@@ -1756,6 +1758,22 @@ impl App {
                             remote.id,
                             remote.icon.revision,
                             &remote.icon.app_id,
+                            if let Some(x) = remote.window.x11_surface() {
+                                app_icon::Source {
+                                    aliases: [x.class(), x.instance()]
+                                        .into_iter()
+                                        .filter(|value| {
+                                            !value.is_empty()
+                                                && value.len() <= 255
+                                                && !value.chars().any(char::is_control)
+                                        })
+                                        .collect(),
+                                    x11: self.x11.display.map(|display| (display, x.window_id())),
+                                    ..Default::default()
+                                }
+                            } else {
+                                window_icon::source(&surface)
+                            },
                         );
                     }
                     if remote.icon.ready && !remote.icon.sent {
@@ -2187,6 +2205,7 @@ impl CompositorHandler for App {
     }
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        let icon_changed = window_icon::commit(surface);
         if let smithay::input::pointer::CursorImageStatus::Surface(cursor) = &self.cursor.image {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
@@ -2221,6 +2240,9 @@ impl CompositorHandler for App {
         for remote in &mut self.windows {
             if remote.window.wl_surface().as_deref() != Some(&root) {
                 continue;
+            }
+            if icon_changed && surface == &root {
+                remote.icon.invalidate();
             }
             remote.window.on_commit();
             remote.dirty = true;
@@ -2809,6 +2831,12 @@ smithay::delegate_shm!(App);
 smithay::delegate_dmabuf!(App);
 smithay::delegate_output!(App);
 smithay::delegate_seat!(App);
+impl smithay::wayland::xdg_toplevel_icon::XdgToplevelIconHandler for App {
+    fn set_icon(&mut self, _: xdg_toplevel::XdgToplevel, surface: WlSurface) {
+        window_icon::pending(&surface);
+    }
+}
+smithay::delegate_xdg_toplevel_icon!(App);
 smithay::delegate_xdg_shell!(App);
 smithay::delegate_xdg_decoration!(App);
 smithay::delegate_data_device!(App);
@@ -3060,6 +3088,13 @@ fn main() -> Result<()> {
         cursor: cursor::Cursor::default(),
         _cursor_shapes: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<App>(&dh),
         icons: app_icon::Icons::new(tx.clone()),
+        _toplevel_icons: {
+            let mut manager =
+                smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager::new::<App>(&dh);
+            manager.add_icon_size(128);
+            manager.add_icon_size(64);
+            manager
+        },
         tray: None,
         _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<App>(&dh),
         relative: relative_input::RelativeInput::default(),
