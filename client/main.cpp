@@ -2879,6 +2879,13 @@ int wmain(int argc, wchar_t **argv) {
       hostedArguments[0]=argv[0]; hostedArguments[1]=hostedHost.data();
       hostedArguments[2]=hostedPort.data(); hostedArguments[3]=hostedToken.data();
       argv=hostedArguments; argc=4;
+      // Bootstrap settings may decode a custom badge before the normal OLE
+      // initialization below. Balance this temporary apartment on every exit.
+      struct BootstrapOle {
+        HRESULT result = OleInitialize(nullptr);
+        ~BootstrapOle() { if (SUCCEEDED(result)) OleUninitialize(); }
+      } bootstrapOle;
+      if (FAILED(bootstrapOle.result)) throw std::runtime_error("Cannot initialize custom icon decoder");
       applyHostedSettings(start.value("settings",Json::object()),false);
       clientStats.enabled=true;
       SetEnvironmentVariableW(L"WAYBRIDGE_IME_TRACE",nullptr);

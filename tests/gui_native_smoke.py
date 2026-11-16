@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Real PE worker's hosted mode: private pipe, settings, status, files, detach."""
+import base64
 import json
 import os
 from pathlib import Path
@@ -54,13 +55,14 @@ def main():
                     if check(event):
                         return event
                 raise AssertionError("Expected native IPC event missing")
-            settings = dict(codec="png", fps=60, bitrate=30000, audio=False, files=True)
+            settings = dict(codec="png", fps=60, bitrate=30000, audio=False, files=True,
+                            badge_png=base64.b64encode((ROOT/"assets/branding/waybridge-badge.png").read_bytes()).decode())
             send(type="start", version=1, host="127.0.0.1", port=session["port"], token=session["token"], settings=settings)
             connected = until(lambda e: e["type"] == "connected")
             assert "token" not in connected and "media_key" not in connected
             status = until(lambda e: e["type"] == "status" and e["windows"])
             assert status["windows"][0]["codec"] == "PNG" and status["tcp_bytes"] > 0
-            settings.update(fps=30, bitrate=12000, read_only=True, clipboard="off", dpi=144)
+            settings.update(fps=30, bitrate=12000, read_only=True, clipboard="off", dpi=144, badge_png="")
             send(type="settings", settings=settings)
             assert until(lambda e: e["type"] == "local_settings_applied")["settings"]["dpi"] == 144
             ack = until(lambda e: e["type"] == "stream_config" and e["fps"] == 30)
@@ -79,7 +81,7 @@ def main():
             assert rpc.ok(op="ensure", session="gui-native-0", mode="attach")["pid"] == server_pid
             assert session["token"] not in native_log.read_text()
             rpc.ok(op="end", session="gui-native-0"); server_pid = None
-            print("PASS: real Windows worker named-pipe startup, sanitized capabilities/status, live FPS/bitrate/read-only/DPI, actual Unicode file upload, graceful disconnect and retained remote session")
+            print("PASS: real Windows worker custom-badge startup/reset, named-pipe startup, sanitized capabilities/status, live FPS/bitrate/read-only/DPI, actual Unicode file upload, graceful disconnect and retained remote session")
         finally:
             rpc.close()
             for child in reversed(processes):
