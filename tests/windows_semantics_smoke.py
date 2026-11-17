@@ -45,6 +45,11 @@ def main():
             wait(lambda:state(3)["owner"]==1)
             initial=state(1)["rect"];assert state(3)["owner"]==1 and not state(3)["appwindow"]
             key(30);wait(full);wait(lambda:latest()[2:4]==[1,0])
+            # Fullscreen remains anchored even when an external window manager
+            # calls SetWindowPos (for example AltSnap), or the taskbar restores it.
+            probe("move",1,80,70);probe("resize",1,600,420);wait(full)
+            probe("minimize",1);wait(lambda:state(1)["minimized"])
+            probe("sysrestore",1);wait(lambda:not state(1)["minimized"] and full())
             key(30);wait(lambda:state(1)["rect"]==initial and state(1)["caption"])
             key(50);wait(lambda:state(1)["maximized"]);wait(lambda:latest()[2:4]==[0,1])
             key(30);wait(full)

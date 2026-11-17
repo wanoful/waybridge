@@ -24,6 +24,7 @@
 #include "application_identity.h"
 #include "remote_tray.h"
 #include "window_semantics.h"
+#include "image_geometry.h"
 #include "window_activation.h"
 #include "drag_visual.h"
 #include "relative_input.h"
@@ -169,6 +170,7 @@ struct RemoteWindow {
   uint32_t id;
   HWND hwnd = nullptr;
   int width = 960, height = 640;
+  int pixelWidth = 0, pixelHeight = 0;
   std::shared_ptr<DecodedFrame> frame;
   std::unique_ptr<Presentation> presentation;
   UINT dpi = 96;
@@ -179,6 +181,9 @@ struct RemoteWindow {
   int x = 0, y = 0;
   uint64_t lastAck = 0;
   bool tracking = false;
+  bool moveOriginValid = false, movePending = false;
+  POINT movePress{};
+  RECT movePlacement{};
   bool clientDecorated = false;
   int lastResizeWidth = -1, lastResizeHeight = -1;
   bool lastMaximized = false;
@@ -1483,12 +1488,8 @@ void publishClipboard() {
 RECT imageRect(RemoteWindow *w) {
   RECT r;
   GetClientRect(w->hwnd, &r);
-  if (w->width <= 0 || w->height <= 0)
-    return r;
-  double scale = std::min(double(r.right) / w->width, double(r.bottom) / w->height);
-  int width = static_cast<int>(w->width * scale), height = static_cast<int>(w->height * scale);
-  return {(r.right - width) / 2, (r.bottom - height) / 2, (r.right + width) / 2,
-          (r.bottom + height) / 2};
+  return fitImageRect(r, w->pixelWidth ? w->pixelWidth : w->width,
+                      w->pixelHeight ? w->pixelHeight : w->height, w->state.fullscreen, w->dpi);
 }
 void refreshCursor();
 void releasePointer(bool notify = true) {
@@ -2019,12 +2020,25 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendWindowState(w);
     break;
   case WM_SYSCOMMAND:
-    if (semanticsNegotiated && w->state.fullscreen &&
-        ((wp & 0xfff0) == SC_RESTORE || (wp & 0xfff0) == SC_MAXIMIZE)) {
-      setFullscreen(w, false);
-      ShowWindow(hwnd, (wp & 0xfff0) == SC_MAXIMIZE ? SW_MAXIMIZE : SW_RESTORE);
-      sendResize(w);
-      return 0;
+    if ((wp & 0xfff0) == SC_MOVE && w->movePending) {
+      w->movePending = false;
+      if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
+        return 0;
+      POINT cursor{};
+      if (GetCursorPos(&cursor)) {
+        if (w->moveOriginValid && !w->state.fullscreen && !IsZoomed(hwnd))
+          SetWindowPos(hwnd, nullptr, w->movePlacement.left + cursor.x - w->movePress.x,
+                       w->movePlacement.top + cursor.y - w->movePress.y, 0, 0,
+                       SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        lp = MAKELPARAM(cursor.x, cursor.y);
+      }
+    }
+    if (semanticsNegotiated && w->state.fullscreen) {
+      auto command = wp & 0xfff0;
+      if (command == SC_MOVE || command == SC_SIZE || command == SC_MAXIMIZE ||
+          (command == SC_RESTORE && !IsIconic(hwnd)))
+        return 0;
+      // Restoring a minimized fullscreen window keeps its fullscreen intent.
     }
     break;
   case WM_WINDOWPOSCHANGED:
@@ -2098,6 +2112,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendJson({{"type", "cancel_input"}, {"id", w->id}});
     return 0;
   case WM_EXITSIZEMOVE:
+    w->moveOriginValid = false;
     w->sizing = false;
     KillTimer(hwnd, 1);
     sendResize(w);
@@ -2262,6 +2277,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   case WM_DISPLAYCHANGE:
   case WM_SETTINGCHANGE:
+    if (w->state.fullscreen && !IsIconic(hwnd)) {
+      MONITORINFO monitor{};
+      monitor.cbSize = sizeof(monitor);
+      if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor))
+        SetWindowPos(hwnd, nullptr, monitor.rcMonitor.left, monitor.rcMonitor.top,
+                     monitor.rcMonitor.right - monitor.rcMonitor.left,
+                     monitor.rcMonitor.bottom - monitor.rcMonitor.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     sendResize(w);
     return 0;
   case WM_DPICHANGED: {
@@ -2281,8 +2304,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         r = &fullscreenRect;
       }
     }
+    bool applying = w->state.applying;
+    w->state.applying = true;
     SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                  SWP_NOZORDER | SWP_NOACTIVATE);
+    w->state.applying = applying;
     sendResize(w);
     return 0;
   }
@@ -2382,6 +2408,12 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     uint32_t button = (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)   ? 0x110
                       : (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) ? 0x111
                                                                                : 0x112;
+    if (message == WM_LBUTTONDOWN) {
+      w->movePress = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      ClientToScreen(hwnd, &w->movePress);
+      w->moveOriginValid = !IsZoomed(hwnd) && !w->state.fullscreen && GetWindowRect(hwnd, &w->movePlacement);
+    } else if (message == WM_LBUTTONUP)
+      w->moveOriginValid = false;
     if (down) {
       if (w->ime.composing) {
         sendIme(w, {}, std::wstring());
@@ -2804,8 +2836,11 @@ void dispatchNetwork() {
           (action == "maximize" || action == "restore"))
         setFullscreen(native, false);
       if (action == "move") {
+        native->movePending = true;
         ReleaseCapture();
-        PostMessageW(hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
+        POINT cursor{};
+        if (GetCursorPos(&cursor))
+          PostMessageW(hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, MAKELPARAM(cursor.x, cursor.y));
       } else if (action == "resize") {
         UINT edge = 0;
         switch (m.value("edge", 0u)) {
@@ -2836,13 +2871,15 @@ void dispatchNetwork() {
         }
         if (edge) {
           ReleaseCapture();
-          PostMessageW(hwnd, WM_SYSCOMMAND, SC_SIZE | edge, 0);
+          POINT cursor{};
+          if (GetCursorPos(&cursor))
+            PostMessageW(hwnd, WM_SYSCOMMAND, SC_SIZE | edge, MAKELPARAM(cursor.x, cursor.y));
         }
       } else if (action == "minimize")
         ShowWindow(hwnd, SW_MINIMIZE);
       else if (action == "maximize")
         ShowWindow(hwnd, SW_MAXIMIZE);
-      else if (action == "restore")
+      else if (action == "restore" || action == "unminimize")
         ShowWindow(hwnd, SW_RESTORE);
     } else if (type == "window_closed") {
       uint32_t id = m.at("id").get<uint32_t>();
@@ -2875,6 +2912,8 @@ void dispatchNetwork() {
       continue;
     w->width = frame->logicalWidth;
     w->height = frame->logicalHeight;
+    w->pixelWidth = frame->width;
+    w->pixelHeight = frame->height;
     w->originX = frame->originX;
     w->originY = frame->originY;
     clientStats.record("ui_queue", millis(Clock::now() - frame->decoded));

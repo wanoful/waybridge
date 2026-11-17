@@ -2124,7 +2124,12 @@ impl CompositorHandler for App {
             if mapped != remote.mapped {
                 remote.state.mapping_epoch += 1;
                 if !mapped {
-                    remote.state.fullscreen(false);
+                    // X11 clients can detach their buffer when iconified or
+                    // unfocused; _NET_WM_STATE_FULLSCREEN survives that hide.
+                    // Only xdg-shell unmapping resets the toplevel role state.
+                    if !remote.window.is_x11() {
+                        remote.state.fullscreen(false);
+                    }
                     // CUDA registration must end before the GL attachment is destroyed.
                     // Retain both resources if the context cannot be made current.
                     if remote.gpu_source.is_none()

@@ -123,7 +123,23 @@ struct NativeWindowState {
     info->ptMinTrackSize.y = std::min(info->ptMinTrackSize.y, info->ptMaxTrackSize.y);
   }
   void clamp(HWND hwnd, UINT dpi, bool clientDecorated, WINDOWPOS *position) const {
-    if (fullscreen || applying || !metadataReady || (position->flags & SWP_NOSIZE))
+    if (applying || !metadataReady)
+      return;
+    if (fullscreen) {
+      // Keep fullscreen on its current monitor, including SetWindowPos calls
+      // from external window managers. Iconic windows use OS-owned placement.
+      MONITORINFO monitor{};
+      monitor.cbSize = sizeof(monitor);
+      if (!IsIconic(hwnd) &&
+          GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        position->x = monitor.rcMonitor.left;
+        position->y = monitor.rcMonitor.top;
+        position->cx = monitor.rcMonitor.right - monitor.rcMonitor.left;
+        position->cy = monitor.rcMonitor.bottom - monitor.rcMonitor.top;
+      }
+      return;
+    }
+    if (position->flags & SWP_NOSIZE)
       return;
     auto min = outer(hwnd, dpi, clientDecorated, minWidth, minHeight),
          max = outer(hwnd, dpi, clientDecorated, maxWidth, maxHeight);

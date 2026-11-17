@@ -7,6 +7,7 @@ from smoke import ROOT,Viewer
 class LockedViewer(Viewer):
     def __init__(self,*args,**kwargs):
         self.lock_active=False
+        self.actions=[]
         port,token=args
         self.sock=socket.create_connection(('127.0.0.1',port),timeout=10)
         self.geometry={}
@@ -15,6 +16,7 @@ class LockedViewer(Viewer):
     def receive(self):
         packet=super().receive()
         kind,value=packet
+        if kind=='control' and value.get('type')=='window_action':self.actions.append(value)
         if kind=='control' and value.get('type')=='pointer_lock':
             self.lock_active=value['active']
             if value['active']:
@@ -31,11 +33,11 @@ def wait(check,seconds=12):
 
 def main():
     bounded = '--bounded-screen' in sys.argv
-    flags=subprocess.check_output(['pkg-config','--cflags','--libs','glfw3','gl'],text=True).split()
+    flags=subprocess.check_output(['pkg-config','--cflags','--libs','glfw3','gl','x11'],text=True).split()
     subprocess.run(['cc','tests/x11_pointer_app.c','-o','build/tests/x11-pointer-app',*flags],cwd=ROOT,check=True)
     subprocess.run(['bash','tests/build-fixture.sh'],cwd=ROOT,check=True)
     with tempfile.TemporaryDirectory(prefix='waybridge-x11-pointer-') as directory,open(ROOT/'build/tests/x11-pointer-host.log','w') as log,open(ROOT/'build/tests/x11-pointer-app.log','w') as app_log:
-        env={**os.environ,'XDG_RUNTIME_DIR':directory}
+        env={**os.environ,'XDG_RUNTIME_DIR':directory,'WAYBRIDGE_TEST_CSD':'1'}
         token='pointer-'+40*'a';path=Path(directory)/'token';path.write_text(token);path.chmod(0o600)
         with socket.socket() as free:free.bind(('127.0.0.1',0));port=free.getsockname()[1]
         host=subprocess.Popen([str(ROOT/'target/debug/waybridge'),'--socket','pointer-0','--listen',f'127.0.0.1:{port}','--token-file',str(path),'--codec','png','--no-audio'],env=env,stdout=log,stderr=log)
@@ -68,8 +70,21 @@ def main():
                 assert abs(cx-expected[0])<2 and abs(cy-expected[1])<2,(match,expected,viewer.geometry[id])
             initial=frame(launcher)
             click(launcher,initial,40,50,'Waybridge GLFW launcher')
+            # JavaFX and Wine CSDs can use XMoveWindow rather than EWMH move.
+            # A held same-window gesture hands off to native movement once.
+            before_press=Path(app_log.name).read_text().count('CLICK ')
+            viewer.send(type='pointer',id=launcher,x=250,y=20)
+            viewer.send(type='button',id=launcher,button=272,down=True,x=250,y=20)
+            wait(lambda:Path(app_log.name).read_text().count('CLICK ')>before_press)
+            viewer.send(type='pointer',id=launcher,x=258,y=24)
+            move=viewer.until(lambda k,v:k=='control' and v.get('type')=='window_action' and v.get('action')=='move')
+            assert move['id']==launcher,move
+            viewer.send(type='button',id=launcher,button=272,down=False,x=258,y=24)
             if bounded:
+                before=len(viewer.actions)
                 app.stdin.write(b'o');app.stdin.flush();wait(lambda:'OFFSCREEN_REQUEST' in Path(app_log.name).read_text());time.sleep(.15)
+                viewer.send(type='ping',nonce='no-gesture');viewer.until(lambda k,v:k=='control' and v.get('type')=='pong')
+                assert len(viewer.actions)==before,'application placement without a held gesture must not move the native window'
                 for x,y in [(20,20),(300,200),(480,370)]:click(launcher,initial,x,y,'Waybridge GLFW launcher')
             app.stdin.write(b'g');app.stdin.flush();game=window('Waybridge GLFW game');current=frame(game)
             assert topology()==original
@@ -101,6 +116,7 @@ def main():
             for x,y in [(20,30),(180,140),(300,200)]:click(launcher,initial,x,y,'Waybridge GLFW launcher')
             assert topology()==original
             print('PASS: actual GLFW X11 cursor/button pixels across resize and 175%/125% DPI, launcher clicks restored after disabled-cursor game closes')
+            print('PASS: X11 ConfigureRequest CSD gesture hands off native movement without leaking independent root placement')
             if bounded:
                 print('PASS: negative X11 placement, finite 1920x1200 monitor vs 1920x1080 work area, maximized/fullscreen edge coordinates and stable RandR topology')
         finally:

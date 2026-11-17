@@ -292,6 +292,7 @@ impl App {
     }
 
     fn x11_fullscreen(&mut self, window: &X11Surface, value: bool) {
+        tracing::debug!(xid = window.window_id(), value, "X11 fullscreen request");
         let _ = window.set_fullscreen(value);
         if let Some(remote) = self
             .windows
@@ -530,7 +531,47 @@ impl XwmHandler for App {
         h: Option<u32>,
         _: Option<Reorder>,
     ) {
+        tracing::debug!(
+            xid = window.window_id(),
+            ?x,
+            ?y,
+            ?w,
+            ?h,
+            "X11 configure request"
+        );
         let mut r = window.geometry();
+        if self.semantics_enabled()
+            && !window.is_override_redirect()
+            && !window.is_fullscreen()
+            && !self.pointer_locked()
+            && !self.external_drag_input()
+            && self.data_drop.native.is_none()
+            && self.pressed_buttons.contains(&0x110)
+        {
+            if let Some(id) = self
+                .windows
+                .iter()
+                .find(|remote| {
+                    remote.window.x11_surface() == Some(&window)
+                        && self.pointer_window == Some(remote.id)
+                        && self
+                            .last_interaction
+                            .is_some_and(|(_, id, _)| id == remote.id)
+                })
+                .map(|remote| remote.id)
+            {
+                // X11 CSDs may move themselves with ConfigureRequest instead
+                // of _NET_WM_MOVERESIZE. Root coordinates remain private to
+                // Xwayland. Hand the gesture to the native move loop so it
+                // cannot oscillate at the finite hidden root's edges.
+                let dx = x.map_or(0, |x| x - r.loc.x);
+                let dy = y.map_or(0, |y| y - r.loc.y);
+                if dx != 0 || dy != 0 {
+                    self.release_input();
+                    self.control(json!({"type":"window_action","id":id,"action":"move"}));
+                }
+            }
+        }
         if let Some(x) = x {
             r.loc.x = x;
         }
@@ -592,7 +633,7 @@ impl XwmHandler for App {
     fn unminimize_request(&mut self, _: XwmId, window: X11Surface) {
         self.activation_x11(window.clone());
         let _ = window.set_suspended(false);
-        self.x11_action(&window, "restore", None);
+        self.x11_action(&window, "unminimize", None);
     }
     fn fullscreen_request(&mut self, _: XwmId, window: X11Surface) {
         self.x11_fullscreen(&window, true);
@@ -614,6 +655,7 @@ impl XwmHandler for App {
         self.x11_action(&window, "resize", Some(edge));
     }
     fn move_request(&mut self, _: XwmId, window: X11Surface, _: u32) {
+        tracing::debug!(xid = window.window_id(), "X11 interactive move request");
         self.x11_action(&window, "move", None);
     }
     fn allow_selection_access(&mut self, _: XwmId, selection: SelectionTarget) -> bool {

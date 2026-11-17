@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include "window_semantics.h"
+#include "image_geometry.h"
 #include <iostream>
 #include <stdexcept>
 using Json = nlohmann::json;
@@ -54,6 +55,17 @@ int main(int argc, char **argv) {
       return 1;
     std::string mode = argv[1];
     if (mode == "self") {
+      RECT viewport{0,0,2560,1600};
+      for (auto size : {SIZE{2559,1600}, SIZE{2559,1599}, SIZE{2561,1601}}) {
+        auto fitted=fitImageRect(viewport,size.cx,size.cy,true,144);
+        require(EqualRect(&fitted,&viewport), "fractional-DPI fullscreen must fill every pixel");
+      }
+      auto letterbox=fitImageRect(viewport,1920,1080,true,144);
+      require(letterbox.top==80 && letterbox.bottom==1520 && letterbox.right==2560,
+              "different fullscreen aspect ratio must retain letterboxing");
+      auto odd=fitImageRect({0,0,1001,701},700,450,false,120);
+      require(odd.right-odd.left==1001 && odd.bottom-odd.top==644,
+              "aspect fit uses rounded extents without losing a centered pixel");
       NativeWindowState s;
       s.metadataReady = true;
       s.constraints({{"min_size", {320, 200}}, {"max_size", {640, 480}}});
@@ -135,6 +147,10 @@ int main(int argc, char **argv) {
     require(hwnd && IsWindow(hwnd), "missing live window");
     if (mode == "state") {
       std::cout << state(hwnd).dump() << '\n';
+      return 0;
+    }
+    if (mode == "sysrestore") {
+      SendMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
       return 0;
     }
     if (mode == "key") {
