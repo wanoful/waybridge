@@ -1,5 +1,58 @@
 # Validation
 
+## X11 CSD movement and native fullscreen — 2026-11-17
+
+X11 CSD ConfigureRequest movement now hands the gesture to the independent
+Windows HWND's native move loop. The viewer retains the original mouse-down
+anchor, so request latency does not lose the first part of a drag. Releasing the
+Linux grab prevents oscillation at the finite hidden X11 root's boundary.
+This covers JavaFX/Wine-style client-driven
+movement without application-name rules. Standard EWMH move/resize requests
+also carry the actual cursor position into the native operation. Fullscreen
+survives X11 buffer hides, native minimize/taskbar restore and external
+SetWindowPos attempts. Physical frame aspect fitting and a bounded fullscreen
+DPI-rounding correction remove fractional-scale edge gaps.
+
+`x11_pointer_smoke.py` verifies real GLFW CSD movement, rejects placement without
+a held gesture, and retains the pointer/DPI/RandR and pointer-lock regressions.
+`windows_semantics_smoke.py` verifies external move/resize and system restore in
+fullscreen, plus exact restoration of the previous normal/maximized placement.
+Its geometry probes cover 2559/2561-pixel sources on a 2560x1600 viewport and
+retained 16:9 letterboxing on a 16:10 display.
+
+The opt-in `windows_game_laptop.py --host laptop` test drives the production x64
+viewer with real Windows mouse input. Both ConfigureRequest and `--ewmh` move a
+fixture HWND by exactly the requested 120x80 pixels. `--hmcl` also passes with the
+installed HMCL 3.16.4 and a disposable HOME after its initial scene has loaded.
+`--hmcl --drag-dx 600 --drag-dy 0` moves both the fixture and actual HMCL by the
+full 600 pixels, crossing the hidden X11 root's placement limit.
+The installed REDlauncher also moves by the full 120x80 pixels through a real
+streamed title-bar gesture; its game launch is separate from this acceptance.
+Fullscreen bounds remain 1920x1080 at the laptop's current 125% DPI after an
+external move/resize and minimize/system restore. The rightmost and center
+pixels both read RGB(25,76,127), rejecting a black/blank capture. `--dpi 134`
+repeats the checks with nonintegral presentation density in the disposable
+worker, without changing Windows display settings. The GLFW regression also
+covers real deactivation to an owned native window and foreground restoration
+with fullscreen bounds and caption state retained. A new physical Minecraft/AltSnap play session
+and physical ARM64 acceptance remain separate checks.
+
+Cyberpunk's reported failure was independently reproduced as Wine
+`EXCEPTION_WINE_STUB` (0x80000100): builtin `icuuc.dll` lacks
+`u_setMemoryFunctions_65`, before the game window is mapped. A temporary
+native-ICU launch created the game window and confirmed that diagnosis. Per
+project scope, no game DLL override or persistent Proton configuration is
+installed by Waybridge. This does not certify the complete Cyberpunk workflow.
+
+Manifold Garden also stalls during shader compilation in a separate Weston
+15.0.1 headless GL compositor with a virtual seat,
+on the same NVIDIA 620.70.06/GE-Proton11-3 stack. Direct Weston framebuffer
+captures at 100 and 145 seconds still show `Compiling shaders... (60%)`; this
+control does not involve Waybridge's compositor, encoder or Windows viewer.
+This establishes that the observed stall can occur without Waybridge. Wine
+versus DXVK versus driver responsibility has not been narrowed further. No compatibility-layer
+workaround is installed, and neither game's complete workflow is certified.
+
 ## Native X11/Wayland DND interoperability — 2026-11-17
 
 The production compositor now routes both native backends through the selectively

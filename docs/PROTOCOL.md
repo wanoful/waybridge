@@ -115,6 +115,19 @@ Server `popup`: `id`, `root` toplevel ID, `parent` surface ID (possibly another 
 
 Server `window_action`: `id`, `action` (`move`, `resize`, `minimize`, `maximize`, `restore`), optional `edge` using xdg_toplevel resize-edge values. These requests originate in the application's client-side title bar. Move/resize requests require a valid same-client pointer grab. The viewer runs the native Windows action. Its resulting geometry/state is sent back through `resize`.
 
+With `window_semantics_v1`, a changed X11 CSD ConfigureRequest position during
+the application's own held left-button gesture can also emit `move`.
+Private X11 root coordinates never become Windows desktop coordinates;
+initial placement and requests without that gesture stay local to Xwayland.
+The compositor releases the application's input grab and the viewer continues
+in the native move loop, preventing feedback at the hidden X11 root's edges.
+The viewer retains the original native mouse-down anchor and accounts for
+motion that arrived while the request was in transit before entering that loop.
+Fullscreen, pointer-lock and active data-drag windows do not use this path.
+`unminimize` restores an X11 window while retaining fullscreen, separately from
+`restore` for an unmaximize request. EWMH `move`/`resize` start the Windows modal
+operation at the current screen cursor position.
+
 Client messages:
 
 | type | fields |
@@ -157,6 +170,15 @@ Negotiated `window` metadata additionally contains `min_size:[w,h]`, `max_size:[
 `window_action` adds `fullscreen` and `unfullscreen` actions and includes `fullscreen_epoch`. The viewer saves the prior native placement, uses the monitor rectangle and borderless fullscreen style (distinct from maximized work-area bounds), and restores the prior normal/maximized placement. Negotiated `resize` also sends `fullscreen` and `fullscreen_epoch`; only the current epoch can change the fullscreen configure state. Older-epoch geometry may still be used as an intermediate resize, but cannot overwrite newer fullscreen intent. Application min/max constraints apply to normal/maximized client dimensions, including DPI conversion and native tracking/programmatic resizing; fullscreen dimensions bypass those constraints. Restoring from fullscreen preserves hidden/minimized state.
 
 Server `window_visibility`: `id`, `mapped`, `mapping_epoch`, `fullscreen`, `fullscreen_epoch`, on buffer map/unmap. Native windows are hidden on unmap and reused on remap. Wayland unmap clears the role's parent/modal/title/app_id, min/max/geometry, focus/grabs and requested fullscreen, as required for a new mapping. A remapping application must send its metadata again. Client `window_state`: `id`, `visible`, `minimized`, `mapping_epoch` reports native visibility after the window has first been shown; stale epochs are ignored. Hidden/minimized windows receive xdg `suspended` and low-rate callbacks, skip capture, and release input; restore marks the retained surface dirty for a fresh frame. Already queued media is decoded/retained in order and acknowledged after retention while hidden, so frame credits and H.264 references cannot deadlock restoration. It does not report occlusion by other desktop windows.
+
+An X11 buffer detach preserves `_NET_WM_STATE_FULLSCREEN`; it is not an
+xdg-shell role reset. Native fullscreen survives minimize/taskbar restore and
+rejects system move/size commands and external position/size changes. Display
+and DPI changes refit the monitor rectangle. Image layout uses physical frame
+dimensions with rounded extents. A fullscreen frame within one logical pixel
+of the monitor in each axis fills the native client rectangle to absorb X11
+fractional-DPI quantization; other aspect ratios retain letterboxing. Input and
+IME mapping use that same image rectangle.
 
 `input_region` is independent of visual alpha. It is null for conservative default hit testing, or `{origin_x,origin_y,width,height,layers:[{x,y,width,height,rects}]}` in root surface logical coordinates. Each layer is a mapped root/subsurface; `rects:null` accepts its full bounds, `[]` accepts none, otherwise ordered `[add,x,y,width,height]` operations add/subtract within its bounds. Union the layers. Limits are 64 layers and 256 operations total; excessive/invalid regions and regions whose geometry does not match the displayed frame fall back to accepting input. The Windows viewer preserves non-client/CSD resize hit tests and returns `HTTRANSPARENT` for excluded client pixels. Win32 only forwards that result to underlying windows in the same UI thread: this supports overlapping Waybridge windows, **not general click-through to other processes or the desktop**. No visual cropping, alpha-derived input shape, or cross-process pass-through is claimed.
 
