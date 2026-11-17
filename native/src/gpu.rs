@@ -4,7 +4,26 @@ use std::{
     ffi::{c_char, c_int, c_void, CStr},
     ptr::NonNull,
     rc::Rc,
+    sync::Arc,
 };
+
+#[repr(C)]
+struct PoolOwner {
+    opaque: *const c_void,
+    retain: unsafe extern "C" fn(*const c_void),
+    release: unsafe extern "C" fn(*const c_void),
+}
+// The outer Arc supplies a thin FFI pointer while the caller may supply any
+// thread-safe guard, including a dynamically sized trait object.
+struct OwnerGuard {
+    _owner: Arc<dyn Send + Sync>,
+}
+unsafe extern "C" fn retain_owner(opaque: *const c_void) {
+    unsafe { Arc::increment_strong_count(opaque.cast::<OwnerGuard>()) };
+}
+unsafe extern "C" fn release_owner(opaque: *const c_void) {
+    unsafe { Arc::decrement_strong_count(opaque.cast::<OwnerGuard>()) };
+}
 unsafe extern "C" {
     fn wb_gpu_device_new(error: *mut c_char, size: usize) -> *mut c_void;
     fn wb_gpu_device_free(device: *mut c_void);
@@ -14,6 +33,16 @@ unsafe extern "C" {
         width: c_int,
         height: c_int,
         hdr: c_int,
+        error: *mut c_char,
+        size: usize,
+    ) -> *mut c_void;
+    fn wb_gpu_source_new_mode_owned(
+        device: *mut c_void,
+        renderbuffer: u32,
+        width: c_int,
+        height: c_int,
+        hdr: c_int,
+        owner: *const PoolOwner,
         error: *mut c_char,
         size: usize,
     ) -> *mut c_void;
@@ -83,17 +112,59 @@ impl GpuSource {
         height: u32,
         hdr: bool,
     ) -> Result<Self, String> {
+        Self::new_mode_inner(device, renderbuffer, width, height, hdr, None)
+    }
+    /// Keep a thread-safe guard alive until both native frame pools are freed,
+    /// including buffers retained by surviving frames or cached NVENC sessions.
+    /// The guard is also retained throughout construction and all failure paths.
+    pub fn new_mode_with_owner(
+        device: Rc<GpuDevice>,
+        renderbuffer: u32,
+        width: u32,
+        height: u32,
+        hdr: bool,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<Self, String> {
+        Self::new_mode_inner(device, renderbuffer, width, height, hdr, Some(owner))
+    }
+    fn new_mode_inner(
+        device: Rc<GpuDevice>,
+        renderbuffer: u32,
+        width: u32,
+        height: u32,
+        hdr: bool,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Self, String> {
+        let owner = owner.map(|owner| Arc::new(OwnerGuard { _owner: owner }));
+        let bridge = owner.as_ref().map(|owner| PoolOwner {
+            opaque: Arc::as_ptr(owner).cast(),
+            retain: retain_owner,
+            release: release_owner,
+        });
         let mut error = [0 as c_char; 512];
         let handle = unsafe {
-            wb_gpu_source_new_mode(
-                device.handle.as_ptr(),
-                renderbuffer,
-                width as c_int,
-                height as c_int,
-                i32::from(hdr),
-                error.as_mut_ptr(),
-                error.len(),
-            )
+            if let Some(bridge) = &bridge {
+                wb_gpu_source_new_mode_owned(
+                    device.handle.as_ptr(),
+                    renderbuffer,
+                    width as c_int,
+                    height as c_int,
+                    i32::from(hdr),
+                    bridge,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            } else {
+                wb_gpu_source_new_mode(
+                    device.handle.as_ptr(),
+                    renderbuffer,
+                    width as c_int,
+                    height as c_int,
+                    i32::from(hdr),
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            }
         };
         NonNull::new(handle)
             .map(|handle| Self {
@@ -187,5 +258,40 @@ impl Drop for GpuFrame {
         unsafe {
             wb_gpu_frame_free(self.handle.as_ptr());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn opaque_pool_guards_keep_trait_owner_until_last_threaded_release() {
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(OwnerGuard {
+            _owner: Arc::new(Tracked(dropped.clone())),
+        });
+        let opaque = Arc::as_ptr(&owner).cast::<c_void>();
+        // Primary and HDR fallback contexts each retain through the C ABI.
+        unsafe {
+            retain_owner(opaque);
+            retain_owner(opaque);
+        }
+        drop(owner);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        let opaque = opaque as usize;
+        std::thread::spawn(move || unsafe { release_owner(opaque as *const c_void) })
+            .join()
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        unsafe { release_owner(opaque as *const c_void) };
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 }

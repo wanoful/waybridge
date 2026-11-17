@@ -1,5 +1,63 @@
 # Validation
 
+## Parallel resource, input and network delivery — 2026-11-17
+
+Three workstreams now share the `main` development baseline. This is a first
+Linux resource-admission slice, experimental native multitouch and authenticated
+UDP feedback pacing; it does not complete M2/M3 or physical-device acceptance.
+
+- Linux CPU workspaces, GL attachments, CUDA pools and active/idle codec sessions
+  now hold atomic reservation/split lifetime tickets, with session/window limits
+  from `[media_budget]`. Exact scope/defaults/estimates are in
+  [MEDIA_BUDGET.md](MEDIA_BUDGET.md). Queue dequeue cannot release a running
+  frame's ticket. Native AVHWFramesContext finalizers retain pool owners after
+  source destruction and after frames/encoder caches move between threads.
+- Real low-budget PNG cases verify protected-target contention and recovery of
+  final static pixels without a new application commit, impossible requests
+  without unrelated target/codec churn, reconnect and complete lease return.
+  The real CUDA/H.264 one-slot case provides usable temporary PNG, retains the
+  focused video, then restores an independent IDR/P chain after release without
+  application repaint; stale pressure cannot churn the recovered encoder.
+- Native Windows multitouch is opt-in with `WAYBRIDGE_TOUCH=1`. Real Wayland
+  `wl_touch` tests cover ten contacts, 175% coordinates, atomic malformed batches,
+  stale generations, read-only, focus, unmap, disconnect and source destruction.
+  The PE/Wine adapter verifies first-tap buffering, exact marked handoff, no
+  buffered-tap replay after policy revocation/regrant, wrong-target leases and
+  touch-only promoted mouse filtering. Both x64 and ARM64 workers compile;
+  physical WM_POINTER acquisition, pads/rumble/pen and X11 native touch remain
+  separate work. A generic Smithay fix ensures contacts already framed still
+  receive cancel. See [INPUT_DEVICES.md](INPUT_DEVICES.md).
+- UDP feedback uses existing authenticated ACK/repair messages and keeps reliable
+  references/order. Seven UDP/controller tests cover pacing, delay/repair backoff,
+  bounded recovery, early/duplicate feedback and final-DATA ACK before trailing
+  parity. Production PE/CNG through a private relay delivers 180 exact ordered
+  frames after 16 dropped shards and ten ACKs delayed 200 ms; the 80 Mbit/s ceiling
+  test records about 8.0 Mbit/s backoff and 24.7 Mbit/s recovery. These are fixture
+  control trajectories, not general throughput/physical latency claims. Existing
+  twenty-window, disconnect, corruption/replay and H.264 TCP-repair paths pass.
+  See [NETWORK.md](NETWORK.md).
+
+Final strict formatting/Clippy and 43 workspace tests pass (one real-FUSE test
+is skipped by the default runner and passes when explicitly executed). The full
+Linux suite passes serially; Windows/Wine native/GUI/IPC/TLS/OLE regressions,
+Core management tests and configuration CLI checks pass. Focused native touch
+probes and x64/ARM64 rebuilds include the final handoff fix. Real H.264/HEVC/AV1,
+FP16/Main10 HDR fallback and native CUDA lifetime/fault regressions pass.
+
+Evidence: `build/diagnostics/media-budget-{png,oversized,cuda}.*`,
+`build/parallel-media-regression.log`, `build/input-touch-{protocol,native,x64,arm64}.log`,
+`build/tests/udp-adaptive-report.json`, and `build/parallel-{linux,windows}-suite.log`.
+The deterministic GPU probe also verifies source/frame destruction before the
+encoder, cross-thread final release, failed registration cleanup and independent
+HDR primary/fallback pools. GPU/codec admission is an estimate; Windows decoded
+textures and encoded transport packet lifetimes are not included yet.
+
+The scheduler visits the focused window first. Two existing DND fixtures were
+updated to collect initial metadata/pixels without assuming window-ID frame
+order; drag content/action checks remain unchanged. Full suites use the same
+`build/tests` generated protocol sources and should run serially against a shared
+checkout, because concurrent fixture regeneration can expose incomplete headers.
+
 ## Capture admission and scheduling diagnostics — 2026-11-17
 
 Existing application/device acceptance is the development baseline; remaining

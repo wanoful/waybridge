@@ -620,12 +620,13 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
     }
 
     fn cancel(&mut self, data: &mut D, seat: &Seat<D>, seq: Serial) {
-        for state in self.focus.values_mut() {
-            if state.current.map(|c| c >= state.pending).unwrap_or(false) {
-                continue;
-            }
-            state.current = Some(seq);
-            if let Some((focus, _)) = state.focus.take() {
+        // Cancellation ends the active gesture, including contacts whose last
+        // frame has already been delivered. The pending-frame test used by
+        // frame() must not suppress cancel after an otherwise idle frame.
+        for (_, state) in self.focus.drain() {
+            if let Some((focus, _)) = state.focus {
+                focus.cancel(seat, data, seq);
+            } else if let Some(focus) = state.frame_pending {
                 focus.cancel(seat, data, seq);
             }
         }

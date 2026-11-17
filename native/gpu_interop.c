@@ -136,10 +136,29 @@ void wb_gpu_source_free(struct wb_gpu_source *source) {
     av_buffer_unref(&source->fallback_frames);
     free(source);
 }
-struct wb_gpu_source *wb_gpu_source_new_mode(struct wb_gpu_device *device,unsigned int renderbuffer,
-    int width,int height,int hdr,char *error,size_t size) {
+static void frame_pool_owner_free(AVHWFramesContext *frames) {
+    struct wb_gpu_owner *owner=frames->user_opaque;
+    /* libavutil destroys the AVBufferPool before invoking this callback. */
+    owner->release(owner->opaque);
+    free(owner);
+}
+static int frame_pool_owner(AVHWFramesContext *frames,const struct wb_gpu_owner *owner) {
+    if (!owner) return 0;
+    struct wb_gpu_owner *reference=malloc(sizeof(*reference));
+    if (!reference) return AVERROR(ENOMEM);
+    *reference=*owner;
+    reference->retain(reference->opaque);
+    frames->free=frame_pool_owner_free;
+    frames->user_opaque=reference;
+    return 0;
+}
+struct wb_gpu_source *wb_gpu_source_new_mode_owned(struct wb_gpu_device *device,unsigned int renderbuffer,
+    int width,int height,int hdr,const struct wb_gpu_owner *owner,char *error,size_t size) {
     if (!device || !renderbuffer || width<48 || width>4096 || height<48 || height>2304) {
         snprintf(error,size,"invalid GPU source or dimensions"); return NULL;
+    }
+    if (owner && (!owner->opaque || !owner->retain || !owner->release)) {
+        snprintf(error,size,"invalid GPU pool owner callbacks"); return NULL;
     }
     struct wb_gpu_source *source = calloc(1,sizeof(*source));
     if (!source) return NULL;
@@ -149,7 +168,8 @@ struct wb_gpu_source *wb_gpu_source_new_mode(struct wb_gpu_device *device,unsign
     AVHWFramesContext *frames=(AVHWFramesContext *)source->frames->data;
     frames->format=AV_PIX_FMT_CUDA; frames->sw_format=hdr?AV_PIX_FMT_P010LE:AV_PIX_FMT_RGBA;
     frames->width=(width+1)&~1; frames->height=(height+1)&~1;
-    int status=av_hwframe_ctx_init(source->frames);
+    int status=frame_pool_owner(frames,owner);
+    if(status>=0)status=av_hwframe_ctx_init(source->frames);
     if (status<0) { av_strerror(status,error,size); goto failed; }
     if (hdr) {
         source->fallback_frames=av_hwframe_ctx_alloc(device->device);
@@ -157,7 +177,8 @@ struct wb_gpu_source *wb_gpu_source_new_mode(struct wb_gpu_device *device,unsign
         AVHWFramesContext *fallback=(AVHWFramesContext *)source->fallback_frames->data;
         fallback->format=AV_PIX_FMT_CUDA;fallback->sw_format=AV_PIX_FMT_RGBA;
         fallback->width=frames->width;fallback->height=frames->height;
-        status=av_hwframe_ctx_init(source->fallback_frames);
+        status=frame_pool_owner(fallback,owner);
+        if(status>=0)status=av_hwframe_ctx_init(source->fallback_frames);
         if(status<0){av_strerror(status,error,size);goto failed;}
     }
     if (!push(device)) { snprintf(error,size,"cannot push CUDA source context"); goto failed; }
@@ -169,6 +190,10 @@ struct wb_gpu_source *wb_gpu_source_new_mode(struct wb_gpu_device *device,unsign
     return source;
 failed:
     wb_gpu_source_free(source); return NULL;
+}
+struct wb_gpu_source *wb_gpu_source_new_mode(struct wb_gpu_device *device,unsigned int renderbuffer,
+    int width,int height,int hdr,char *error,size_t size) {
+    return wb_gpu_source_new_mode_owned(device,renderbuffer,width,height,hdr,NULL,error,size);
 }
 struct wb_gpu_source *wb_gpu_source_new(struct wb_gpu_device *device,unsigned int renderbuffer,
     int width,int height,char *error,size_t size) {
@@ -273,6 +298,7 @@ int wb_gpu_frame_download(const struct wb_gpu_frame *frame,uint8_t *rgba,size_t 
 struct wb_gpu_device *wb_gpu_device_new(char *error,size_t size) { snprintf(error,size,"built without CUDA interop headers"); return NULL; }
 void wb_gpu_device_free(struct wb_gpu_device *device) { (void)device; }
 struct wb_gpu_source *wb_gpu_source_new_mode(struct wb_gpu_device *d,unsigned int r,int w,int h,int hdr,char *e,size_t s) { (void)hdr;return wb_gpu_source_new(d,r,w,h,e,s); }
+struct wb_gpu_source *wb_gpu_source_new_mode_owned(struct wb_gpu_device *d,unsigned int r,int w,int h,int hdr,const struct wb_gpu_owner *owner,char *e,size_t s) { (void)owner;return wb_gpu_source_new_mode(d,r,w,h,hdr,e,s); }
 struct wb_gpu_source *wb_gpu_source_new(struct wb_gpu_device *d,unsigned int r,int w,int h,char *e,size_t s) { (void)d;(void)r;(void)w;(void)h;snprintf(e,s,"CUDA interop is unavailable");return NULL; }
 void wb_gpu_source_free(struct wb_gpu_source *source) { (void)source; }
 struct wb_gpu_frame *wb_gpu_capture(struct wb_gpu_source *source,int flip,char *error,size_t size) { (void)source;(void)flip;snprintf(error,size,"CUDA interop is unavailable");return NULL; }

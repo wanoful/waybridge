@@ -1,5 +1,10 @@
 //! Bounded raw-frame queue. Dependent H.264 packets are never discarded after encoding.
-use crate::{metrics, network::Peer, protocol};
+use crate::{
+    media_budget::{self, Budget, Lease},
+    metrics,
+    network::Peer,
+    protocol,
+};
 use image::{
     codecs::png::{CompressionType, FilterType, PngEncoder},
     ImageEncoder,
@@ -23,8 +28,10 @@ pub struct Frame {
     pub straight: bool,
     pub peer: Arc<Peer>,
     pub video_eligible: bool,
+    pub budget_video: bool,
     pub enqueued: Instant,
     pub captured: Instant,
+    pub _lease: Lease,
 }
 impl Frame {
     fn memory_bytes(&self) -> usize {
@@ -54,10 +61,13 @@ struct Queue {
     reset: bool,
     closed: bool,
     config: Option<(Option<nvenc::Codec>, u32, u32)>,
+    reclaim: Option<(u32, bool, bool)>,
+    last_reclaim: Option<Instant>,
 }
 pub struct Encoder {
     queue: Arc<(Mutex<Queue>, Condvar)>,
     worker: Option<thread::JoinHandle<()>>,
+    budget: Budget,
 }
 struct Session {
     width: u32,
@@ -66,6 +76,8 @@ struct Session {
     input_key: usize,
     owner: Weak<Peer>,
     encoder: Option<nvenc::Encoder>,
+    lease: Option<Lease>,
+    touched: Instant,
     failed: bool,
     epoch: u32,
     force_idr: bool,
@@ -100,22 +112,24 @@ fn trim_idle(idle: &mut VecDeque<(u32, Session)>) {
 }
 
 impl Encoder {
-    pub fn new(codec: Option<nvenc::Codec>, fps: u32, bitrate: u32) -> Self {
+    pub fn new(codec: Option<nvenc::Codec>, fps: u32, bitrate: u32, budget: Budget) -> Self {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let worker = queue.clone();
+        let worker_budget = budget.clone();
         let worker = thread::spawn(move || {
             let (mut codec, mut fps, mut bitrate) = (codec, fps, bitrate);
             let mut sessions: BTreeMap<u32, Session> = BTreeMap::new();
             let mut idle = VecDeque::<(u32, Session)>::new();
             let mut epoch = 0u32;
             loop {
-                let (frame, reset, forget, config) = {
+                let (frame, reset, forget, config, reclaim) = {
                     let (lock, wake) = &*worker;
                     let mut q = lock.lock().unwrap();
                     while q.frames.is_empty()
                         && !q.reset
                         && q.forget.is_empty()
                         && q.config.is_none()
+                        && q.reclaim.is_none()
                         && !q.closed
                     {
                         q = wake.wait(q).unwrap();
@@ -142,7 +156,8 @@ impl Encoder {
                         frame
                     });
                     let config = q.config.take();
-                    (frame, reset, forget, config)
+                    let reclaim = q.reclaim.take();
+                    (frame, reset, forget, config, reclaim)
                 };
                 if let Some(config) = config {
                     (codec, fps, bitrate) = config;
@@ -156,6 +171,24 @@ impl Encoder {
                 for id in forget {
                     sessions.remove(&id);
                     idle.retain(|(cached_id, _)| *cached_id != id);
+                }
+                if let Some((requested, obsolete, global)) = reclaim {
+                    idle.clear();
+                    // Also release this window's old pool/codec after a resize.
+                    if obsolete {
+                        sessions.remove(&requested);
+                    }
+                    let victim = sessions
+                        .iter()
+                        .filter(|(id, _)| {
+                            global && **id != requested && Some(**id) != worker_budget.focused()
+                        })
+                        .min_by_key(|(_, s)| s.touched)
+                        .map(|(id, _)| *id);
+                    if let Some(victim) = victim {
+                        sessions.remove(&victim);
+                    }
+                    metrics::increment("media_encoder_reclaim");
                 }
                 let Some(mut frame) = frame else { continue };
                 if frame.peer.is_closed() || frame.peer.window_closed(frame.id) {
@@ -244,6 +277,8 @@ impl Encoder {
                             input_key: frame.input_key(),
                             owner: Arc::downgrade(&frame.peer),
                             encoder: None,
+                            lease: None,
+                            touched: Instant::now(),
                             failed: false,
                             epoch,
                             force_idr: true,
@@ -253,52 +288,66 @@ impl Encoder {
                         sessions.insert(frame.id, next);
                     }
                     let session = sessions.get_mut(&frame.id).unwrap();
+                    session.touched = Instant::now();
                     if !session.failed && session.encoder.is_none() {
-                        let started = Instant::now();
-                        let create = || {
-                            if let Some(gpu) = &frame.gpu {
-                                nvenc::Encoder::with_gpu(
-                                    selected_codec,
-                                    frame.width,
-                                    frame.height,
-                                    fps,
-                                    bitrate,
-                                    gpu,
-                                )
-                            } else {
-                                nvenc::Encoder::with_codec(
-                                    selected_codec,
-                                    frame.width,
-                                    frame.height,
-                                    fps,
-                                    bitrate,
-                                )
-                            }
-                        };
-                        let mut result = create();
-                        if result.is_err() && !idle.is_empty() {
+                        let cost = media_budget::encoder(
+                            frame.width,
+                            frame.height,
+                            selected_codec.hdr(),
+                            frame.gpu.is_some(),
+                        );
+                        let lease = worker_budget.acquire(frame.id, cost).or_else(|| {
                             idle.clear();
-                            result = create();
-                        }
-                        metrics::record("encoder_init", started.elapsed());
-                        match result {
-                            Ok(encoder) => {
-                                session.encoder = Some(encoder);
-                                tracing::info!(
-                                    id = frame.id,
-                                    width = frame.width,
-                                    height = frame.height,
-                                    codec = selected_codec.name(),
-                                    input = if frame.gpu.is_some() { "cuda" } else { "cpu" },
-                                    "NVENC ultra-low-latency encoder active"
-                                );
-                            }
-                            Err(error) => {
-                                session.failed = true;
-                                if frame.gpu.is_some() {
-                                    frame.peer.disable_gpu(frame.id);
+                            worker_budget.acquire(frame.id, cost)
+                        });
+                        if let Some(lease) = lease {
+                            let started = Instant::now();
+                            let create = || {
+                                if let Some(gpu) = &frame.gpu {
+                                    nvenc::Encoder::with_gpu(
+                                        selected_codec,
+                                        frame.width,
+                                        frame.height,
+                                        fps,
+                                        bitrate,
+                                        gpu,
+                                    )
+                                } else {
+                                    nvenc::Encoder::with_codec(
+                                        selected_codec,
+                                        frame.width,
+                                        frame.height,
+                                        fps,
+                                        bitrate,
+                                    )
                                 }
-                                tracing::warn!(id=frame.id,%error,"NVENC unavailable; using lossless PNG");
+                            };
+                            let mut result = create();
+                            if result.is_err() && !idle.is_empty() {
+                                idle.clear();
+                                result = create();
+                            }
+                            metrics::record("encoder_init", started.elapsed());
+                            match result {
+                                Ok(encoder) => {
+                                    session.encoder = Some(encoder);
+                                    session.lease = Some(lease);
+                                    tracing::info!(
+                                        id = frame.id,
+                                        width = frame.width,
+                                        height = frame.height,
+                                        codec = selected_codec.name(),
+                                        input = if frame.gpu.is_some() { "cuda" } else { "cpu" },
+                                        "NVENC ultra-low-latency encoder active"
+                                    );
+                                }
+                                Err(error) => {
+                                    session.failed = true;
+                                    if frame.gpu.is_some() {
+                                        frame.peer.disable_gpu(frame.id);
+                                    }
+                                    tracing::warn!(id=frame.id,%error,"NVENC unavailable; using lossless PNG");
+                                }
                             }
                         }
                     }
@@ -414,6 +463,7 @@ impl Encoder {
                             Err(error) => {
                                 tracing::warn!(id=frame.id,%error,"NVENC failed; falling back to PNG");
                                 session.encoder = None;
+                                session.lease = None;
                                 session.failed = true;
                                 if frame.gpu.is_some() {
                                     frame.peer.disable_gpu(frame.id);
@@ -462,6 +512,21 @@ impl Encoder {
         Self {
             queue,
             worker: Some(worker),
+            budget,
+        }
+    }
+    pub fn budget(&self) -> &Budget {
+        &self.budget
+    }
+    pub fn reclaim(&self, window: u32, obsolete: bool, global: bool) {
+        let (lock, wake) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        if q.last_reclaim
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
+        {
+            q.reclaim = Some((window, obsolete, global));
+            q.last_reclaim = Some(Instant::now());
+            wake.notify_one();
         }
     }
     pub fn reconfigure(&self, codec: Option<nvenc::Codec>, fps: u32, bitrate: u32) {

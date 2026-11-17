@@ -368,6 +368,7 @@ impl App {
             announced: false,
             last_info: Value::Null,
             frame_sequence: 0,
+            capture_after: Instant::now(),
             gpu_source: None,
             target: None,
             target_size: (0, 0),

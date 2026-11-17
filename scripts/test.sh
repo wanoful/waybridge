@@ -16,6 +16,8 @@ python3 tests/session_service_status_smoke.py
 python tests/output_bind_race_smoke.py
 python tests/smoke.py
 python3 tests/media_backpressure_smoke.py
+python3 tests/media_budget_smoke.py --png-only
+python3 tests/touch_smoke.py
 python tests/cursor_smoke.py
 if command -v rsvg-convert >/dev/null; then
   python tests/app_icon_smoke.py

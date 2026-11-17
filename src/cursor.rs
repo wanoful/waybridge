@@ -14,7 +14,7 @@ pub(crate) struct Cursor {
     generation: u64,
     last_root: u32,
     last_tick: Instant,
-    target: Option<GlesRenderbuffer>,
+    target: Option<capture::Target>,
     target_size: (i32, i32),
 }
 impl Default for Cursor {
@@ -177,8 +177,10 @@ impl App {
                                         &mut None,
                                         self.color_programs.as_ref(),
                                         None,
+                                        self.encoder.budget(),
+                                        None,
                                     ) {
-                                        Ok(mut frame) => {
+                                        Ok(Some(mut frame)) => {
                                             if frame.straight {
                                                 for pixel in frame.rgba.chunks_exact_mut(4) {
                                                     let alpha = u16::from(pixel[3]);
@@ -198,6 +200,9 @@ impl App {
                                                 "hotspot_x":hotspot.x.clamp(0, frame.width as i32 - 1),
                                                 "hotspot_y":hotspot.y.clamp(0, frame.height as i32 - 1),
                                                 "pixels":B64.encode(&frame.rgba)});
+                                        }
+                                        Ok(None) => {
+                                            self.cursor.dirty = true;
                                         }
                                         Err(error) => {
                                             tracing::warn!(%error, "cursor capture failed; using default")

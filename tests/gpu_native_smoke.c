@@ -7,11 +7,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../native/gpu_interop.h"
+#include <stdatomic.h>
+#include <pthread.h>
+#include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
 struct wb_encoder;
 struct wb_encoder *wb_encoder_new_gpu_codec(int,int,int,int,int,const void *,char *,size_t);
 int wb_encoder_encode_gpu(struct wb_encoder *,void *,int64_t,int,const uint8_t **,int64_t *,int *);
 void wb_encoder_free(struct wb_encoder *);
 static void check(int okay,const char *what) { if (!okay) { fprintf(stderr,"FAIL %s EGL=%x GL=%x\n",what,eglGetError(),glGetError()); exit(1); } }
+struct lifetime { atomic_int refs, retained, released; };
+static void retain_owner(void *opaque) {
+    struct lifetime *owner=opaque;
+    atomic_fetch_add(&owner->refs,1); atomic_fetch_add(&owner->retained,1);
+}
+static void release_owner(void *opaque) {
+    struct lifetime *owner=opaque;
+    atomic_fetch_sub(&owner->refs,1); atomic_fetch_add(&owner->released,1);
+}
+static void *release_encoder(void *opaque) { wb_encoder_free(opaque); return NULL; }
 int main(void) {
     PFNEGLQUERYDEVICESEXTPROC devices_fn=(PFNEGLQUERYDEVICESEXTPROC)eglGetProcAddress("eglQueryDevicesEXT");
     PFNEGLGETPLATFORMDISPLAYEXTPROC platform_fn=(PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
@@ -47,7 +61,10 @@ int main(void) {
     char error[512]={0};
     struct wb_gpu_device *device=wb_gpu_device_new(error,sizeof(error));
     if (!device) { fprintf(stderr,"%s\n",error); return 1; }
-    struct wb_gpu_source *source=wb_gpu_source_new(device,renderbuffer,width,height,error,sizeof(error));
+    struct lifetime owner={0};
+    struct wb_gpu_owner guard={&owner,retain_owner,release_owner};
+    struct wb_gpu_source *source=wb_gpu_source_new_mode_owned(device,renderbuffer,width,height,0,&guard,error,sizeof(error));
+    check(atomic_load(&owner.refs)==1,"SDR primary pool retains one owner");
     if (!source) { fprintf(stderr,"%s\n",error); return 1; }
     size_t length=(size_t)width*height*4;
     uint8_t *input=malloc(length),*output=malloc(length);
@@ -94,7 +111,46 @@ int main(void) {
         }
         wb_gpu_frame_free(frame);
     }
-    wb_gpu_source_free(source); wb_gpu_device_free(device);
+    /* Both the raw frame and the encoder independently keep the original pool alive. */
+    struct wb_gpu_frame *held=wb_gpu_capture(source,0,error,sizeof(error));
+    check(held!=NULL,"capture held owner frame");
+    struct wb_encoder *held_encoder=wb_encoder_new_gpu_codec(2,width,height,60,30000,wb_gpu_frame_avframe(held),error,sizeof(error));
+    check(held_encoder!=NULL,"create held owner encoder");
+    wb_gpu_source_free(source);
+    check(atomic_load(&owner.refs)==1,"source destruction does not release retained native pool owner");
+    wb_gpu_frame_free(held);
+    check(atomic_load(&owner.refs)==1,"encoder keeps native owner after final raw frame destruction");
+    pthread_t worker; check(pthread_create(&worker,NULL,release_encoder,held_encoder)==0,"start encoder teardown thread");
+    check(pthread_join(worker,NULL)==0,"join encoder teardown thread");
+    check(atomic_load(&owner.refs)==0 && atomic_load(&owner.retained)==1 && atomic_load(&owner.released)==1,"encoder-thread final release occurs once");
+
+    /* Failure after context setup must release all owner references. */
+    source=wb_gpu_source_new_mode_owned(device,0x7ffffffeU,width,height,0,&guard,error,sizeof(error));
+    check(source==NULL && atomic_load(&owner.refs)==0,"failed GL registration releases primary owner");
+    source=wb_gpu_source_new_mode_owned(device,0x7ffffffeU,width,height,1,&guard,error,sizeof(error));
+    check(source==NULL && atomic_load(&owner.refs)==0,"failed HDR registration releases both owners");
+
+    /* HDR fallback may die before the primary pool retained by an encoder. */
+    glBindRenderbuffer(GL_RENDERBUFFER,renderbuffer);
+    glRenderbufferStorage(GL_RENDERBUFFER,GL_RGBA16F,width,height);
+    glBindFramebuffer(GL_FRAMEBUFFER,fbo); glClearColor(.5f,.5f,.5f,.5f); glClear(GL_COLOR_BUFFER_BIT); glFinish();
+    source=wb_gpu_source_new_mode_owned(device,renderbuffer,width,height,1,&guard,error,sizeof(error));
+    if (!source) fprintf(stderr,"HDR source: %s\n",error);
+    check(source!=NULL && atomic_load(&owner.refs)==2,"HDR source owns both pool guards");
+    held=wb_gpu_capture(source,0,error,sizeof(error));
+    if (!held) fprintf(stderr,"HDR frame: %s\n",error);
+    check(held!=NULL,"HDR owner capture");
+    AVFrame *avframe=wb_gpu_frame_avframe(held);
+    AVBufferRef *retained=av_buffer_ref(avframe->hw_frames_ctx);
+    check(retained!=NULL,"hold primary context independently of fallback");
+    wb_gpu_source_free(source);
+    check(atomic_load(&owner.refs)==2,"HDR frame keeps both owners after source release");
+    wb_gpu_frame_free(held);
+    check(atomic_load(&owner.refs)==1,"HDR fallback owner releases independently");
+    av_buffer_unref(&retained);
+    check(atomic_load(&owner.refs)==0 && atomic_load(&owner.retained)==atomic_load(&owner.released),"all HDR pool owners release exactly once");
+    wb_gpu_device_free(device);
+    puts("PASS: native owner survives source/frame destruction, releases on encoder thread, failed registration rolls back, HDR main/fallback pools release independently");
     glDeleteFramebuffers(1,&fbo); glDeleteFramebuffers(1,&upload); glDeleteRenderbuffers(1,&renderbuffer); glDeleteTextures(1,&texture);
     eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT); eglDestroyContext(display,context); eglTerminate(display);
     free(input); free(output);

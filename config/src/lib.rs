@@ -16,6 +16,7 @@ pub struct Config {
     pub service: Service,
     pub session: Session,
     pub limits: Limits,
+    pub media_budget: MediaBudget,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -84,6 +85,28 @@ impl Default for Limits {
     }
 }
 
+/// Per-session resource admission; GPU values are allocation estimates, not driver VRAM readings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaBudget {
+    pub cpu_mib: u32,
+    pub gpu_mib: u32,
+    pub window_cpu_mib: u32,
+    pub window_gpu_mib: u32,
+    pub encoders: u32,
+}
+impl Default for MediaBudget {
+    fn default() -> Self {
+        Self {
+            cpu_mib: 512,
+            gpu_mib: 1024,
+            window_cpu_mib: 384,
+            window_gpu_mib: 512,
+            encoders: 8,
+        }
+    }
+}
+
 /// Map both startup and wire codec names to the same family before checking policy.
 pub fn codec_family(codec: &str, hdr: bool) -> Result<&'static str> {
     Ok(match codec {
@@ -117,6 +140,23 @@ impl Limits {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        let media = &self.media_budget;
+        for (name, value) in [
+            ("cpu_mib", media.cpu_mib),
+            ("gpu_mib", media.gpu_mib),
+            ("window_cpu_mib", media.window_cpu_mib),
+            ("window_gpu_mib", media.window_gpu_mib),
+        ] {
+            if !(4..=32768).contains(&value) {
+                bail!("media_budget.{name} must be between 4 and 32768 MiB");
+            }
+        }
+        if media.window_cpu_mib > media.cpu_mib || media.window_gpu_mib > media.gpu_mib {
+            bail!("media_budget window limits cannot exceed session limits");
+        }
+        if !(1..=64).contains(&media.encoders) {
+            bail!("media_budget.encoders must be between 1 and 64");
+        }
         for (name, value) in [
             ("service.listen", &self.service.listen),
             ("session.listen", &self.session.listen),
@@ -482,5 +522,27 @@ mod tests {
             config.session.socket = "/tmp/waybridge-test/socket".into();
             config.validate().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod media_budget_tests {
+    use super::*;
+    #[test]
+    fn media_limits_are_validated_and_part_of_effective_configuration() {
+        let mut config = Config::default();
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["media_budget"]["encoders"],
+            8
+        );
+        config.media_budget.encoders = 0;
+        assert!(config.validate().is_err());
+        config.media_budget.encoders = 8;
+        config.media_budget.window_cpu_mib = config.media_budget.cpu_mib + 1;
+        assert!(config.validate().is_err());
+        config.media_budget.window_cpu_mib = 4;
+        config.media_budget.gpu_mib = 3;
+        assert!(config.validate().is_err());
     }
 }

@@ -125,3 +125,7 @@ extra_argv = ["--example-option"]
 本地可将请求写给 `python3 scripts/session-control.py`；TLS 请求另加已配对的身份字段，见 [服务接口](SERVICE.md)。GIO 的 action 契约不接受文件/URI，因此不能在同一请求中同时指定 `action` 和非空 `uris`。
 
 启动方案显示来源、目录、动作和激活方式；环境定制仅显示 `env_keys`、`unset_env`，不导出环境值或会话令牌。桌面启动返回的 `dispatched` 或 `activation-requested` 只表示已提交请求，直接命令的 `spawned` 表示已创建进程，均不能证明应用已创建窗口。
+
+## 媒体资源预算
+
+可用 `[media_budget]` 为每个 Linux 会话及窗口设置 CPU 工作区、GPU 估算和编解码器数量上限。默认值、计账范围、压力回收与诊断见 [媒体预算](MEDIA_BUDGET.md)。它随新会话生效，包含在 `--check-config` 和 `--print-config` 中。

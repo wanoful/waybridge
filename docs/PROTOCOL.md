@@ -807,3 +807,36 @@ cannot clear that newer gesture. Selection pipe writers have bounded concurrency
 and write deadlines. These internal identities are not filenames or application
 compatibility rules. See [DESKTOP_INTERACTIONS.md](DESKTOP_INTERACTIONS.md) for the
 precise direction, MIME, action and hover coverage.
+
+## Native touch (`touch_v1`)
+
+Client hello explicitly requests `touch_v1:true`; server hello echoes negotiated
+availability. Without it, the viewer receives no active touch lease. Native
+Wayland window metadata includes `touch_input:true`; X11 reports false and keeps
+pointer compatibility. The initial Windows implementation is experimental and
+requires `WAYBRIDGE_TOUCH=1` in the native worker environment.
+
+Server `touch_state {id,generation,enabled,max_contacts:10}` binds input to the
+current mapped/visible/input-allowed native Wayland root and mapping epoch.
+Client `touch {id,generation,origin_x,origin_y,points:[...]}` contains up to ten
+unique slots 0–9 with `phase:"down"|"motion"|"up"`; down/motion carry finite
+logical x/y. Coordinates use the ordinary image/crop-origin transform. A batch
+is validated in full before dispatch and ends in one `wl_touch.frame`. Motion
+and up retain each contact's initial surface. `touch {id,generation,action:"cancel"}`
+cancels the entire gesture and invalidates its lease. Policy changes, input
+ownership, unmap/death, focus changes and disconnect release contacts; old
+leases cannot affect a newer mapping/focus.
+
+An initial Windows down may precede the server focus lease. The native adapter
+buffers at most 64 events for 500 ms. An otherwise-disabled state may include
+`pending_target:<id>` only for a single explicit focus handoff; this permits an
+unsent first gesture for exactly that current HWND to await the matching grant.
+Unmarked disable, another-target grant, wrong-target handoff or local focus loss
+purges pending input. Read-only, explicit cancel and disconnect are unmarked;
+regranting the same HWND cannot replay its revoked old tap. See
+[INPUT_DEVICES.md](INPUT_DEVICES.md) for device/application limits and tests.
+
+UDP framing and authenticated ACK/repair messages are unchanged. Adaptive pacing
+uses those existing feedback messages, with local send-data boundaries and
+separate bounded transport diagnostics; see [NETWORK.md](NETWORK.md). Media
+resource budgets are local policy and introduce no wire fields.

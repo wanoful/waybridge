@@ -1,7 +1,10 @@
 //! Optional authenticated, paced UDP media with 8+1 XOR shards and TCP repair.
-use crate::protocol;
+use crate::{metrics, protocol};
+#[path = "udp_pacing.rs"]
+mod pacing;
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use pacing::{Change, Pacing};
 use ring::{
     aead,
     rand::{SecureRandom, SystemRandom},
@@ -51,12 +54,18 @@ struct Cached {
     body: Vec<u8>,
     retry: Instant,
 }
+struct Pending {
+    bytes: usize,
+    data_boundary: Option<Instant>,
+    udp: bool,
+    repaired: bool,
+}
 #[derive(Default)]
 struct Cache {
     next: u64,
     bytes: usize,
     frames: BTreeMap<u64, Cached>,
-    pending: BTreeMap<u64, usize>,
+    pending: BTreeMap<u64, Pending>,
     pending_bytes: usize,
 }
 impl Cache {
@@ -74,7 +83,7 @@ pub struct Transport {
     endpoint: Mutex<Option<(SocketAddr, Instant, u64)>>,
     counter: Mutex<u64>,
     cache: Mutex<Cache>,
-    pace: Duration,
+    pacing: Mutex<Pacing>,
     cancelled: AtomicBool,
 }
 pub struct Hub {
@@ -120,7 +129,7 @@ impl Hub {
             counter: Mutex::new(0),
             cache: Mutex::new(Cache::default()),
             cancelled: AtomicBool::new(false),
-            pace: Duration::from_secs_f64(1100.0 * 8.0 / (f64::from(self.mbps) * 1_000_000.0)),
+            pacing: Mutex::new(Pacing::new(self.mbps, Instant::now())),
         });
         let mut current = self.current.lock().unwrap();
         if let Some(old) = current.upgrade() {
@@ -182,35 +191,89 @@ impl Transport {
     pub fn ready(&self) -> bool {
         self.endpoint.lock().unwrap().is_some()
     }
+    fn observe_pacing(&self, change: Option<Change>) {
+        metrics::gauge(
+            "udp_pacing_kbps",
+            self.pacing.lock().unwrap().kbps() as usize,
+        );
+        if let Some(reason) = change {
+            metrics::increment(match reason {
+                Change::Repair => "udp_pacing_backoff_repair",
+                Change::Delay => "udp_pacing_backoff_delay",
+                Change::Recovery => "udp_pacing_recovery",
+            });
+        }
+    }
+    fn delivery_boundary(&self, message: u64, udp: bool) {
+        if let Some(pending) = self.cache.lock().unwrap().pending.get_mut(&message) {
+            pending.data_boundary = Some(Instant::now());
+            pending.udp = udp;
+        }
+        self.observe_pacing(None);
+    }
     pub fn ack(&self, message: u64) {
-        let mut c = self.cache.lock().unwrap();
-        if !c.pending.contains_key(&message) {
-            return;
-        }
-        let pending: Vec<_> = c.pending.range(..=message).map(|(n, _)| *n).collect();
-        for n in pending {
-            if let Some(size) = c.pending.remove(&n) {
-                c.pending_bytes -= size;
+        let now = Instant::now();
+        let sample = {
+            let mut c = self.cache.lock().unwrap();
+            let Some(acked) = c.pending.get(&message) else {
+                return;
+            };
+            // Train only from UDP delivery with no requested repair. TCP repair,
+            // replayed/unknown ACKs and early ACKs cannot manufacture healthy feedback.
+            let sample = acked
+                .data_boundary
+                .filter(|sent| acked.udp && !acked.repaired && *sent <= now)
+                .map(|sent| now.duration_since(sent));
+            let pending: Vec<_> = c.pending.range(..=message).map(|(n, _)| *n).collect();
+            for n in pending {
+                if let Some(pending) = c.pending.remove(&n) {
+                    c.pending_bytes -= pending.bytes;
+                }
             }
-        }
-        let done: Vec<_> = c.frames.range(..=message).map(|(n, _)| *n).collect();
-        for n in done {
-            if let Some(v) = c.frames.remove(&n) {
-                c.bytes -= v.body.len();
+            let done: Vec<_> = c.frames.range(..=message).map(|(n, _)| *n).collect();
+            for n in done {
+                if let Some(v) = c.frames.remove(&n) {
+                    c.bytes -= v.body.len();
+                }
             }
+            metrics::gauge("udp_pending_messages", c.pending.len());
+            metrics::gauge("udp_pending_bytes", c.pending_bytes);
+            sample
+        };
+        if let Some(delivery) = sample {
+            metrics::record("udp_delivery_ack", delivery);
+            let change = self.pacing.lock().unwrap().acknowledge(now, delivery);
+            self.observe_pacing(change);
         }
     }
     pub fn retry(&self, message: u64) -> Option<Vec<u8>> {
         if self.cancelled.load(Ordering::Relaxed) {
             return None;
         }
-        let mut c = self.cache.lock().unwrap();
-        let v = c.frames.get_mut(&message)?;
-        if v.retry.elapsed() < Duration::from_millis(50) {
-            return None;
+        let now = Instant::now();
+        let (repair, penalize) = {
+            let mut c = self.cache.lock().unwrap();
+            let v = c.frames.get_mut(&message)?;
+            if v.retry.elapsed() < Duration::from_millis(50) {
+                return None;
+            }
+            v.retry = now;
+            let repair = repair(message, v.kind, &v.body);
+            let pending = c.pending.get_mut(&message)?;
+            // The receiver can request the next message before its paced send
+            // finishes. Still repair it, but do not call that packet loss.
+            let penalize = pending.data_boundary.is_some_and(|sent| sent <= now)
+                && pending.udp
+                && !pending.repaired;
+            pending.repaired = true;
+            (repair, penalize)
+        };
+        metrics::increment("udp_tcp_repair_requests");
+        if penalize {
+            let change = self.pacing.lock().unwrap().repair(now);
+            self.observe_pacing(change);
         }
-        v.retry = Instant::now();
-        Some(repair(message, v.kind, &v.body))
+        Some(repair)
     }
     pub fn send(&self, kind: u8, body: &[u8], tcp: &mut TcpStream) -> io::Result<()> {
         self.check_cancelled()?;
@@ -233,13 +296,23 @@ impl Transport {
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("UDP message sequence exhausted"))?;
             let message = c.next;
-            c.pending.insert(message, body.len());
-            c.pending_bytes += body.len();
             let use_udp = alive
                 && !body.is_empty()
                 && body.len() <= MAX_FRAME
                 && c.frames.len() < 16
                 && c.bytes + body.len() <= MAX_CACHE;
+            c.pending.insert(
+                message,
+                Pending {
+                    bytes: body.len(),
+                    data_boundary: None,
+                    udp: use_udp,
+                    repaired: false,
+                },
+            );
+            c.pending_bytes += body.len();
+            metrics::gauge("udp_pending_messages", c.pending.len());
+            metrics::gauge("udp_pending_bytes", c.pending_bytes);
             if use_udp {
                 c.bytes += body.len();
                 c.frames.insert(
@@ -255,11 +328,12 @@ impl Transport {
         };
         if !use_udp {
             self.check_cancelled()?;
-            return protocol::write_packet(tcp, REPAIR, &repair(message, kind, body));
+            protocol::write_packet(tcp, REPAIR, &repair(message, kind, body))?;
+            self.delivery_boundary(message, false);
+            return Ok(());
         }
         let count = body.len().div_ceil(CHUNK);
-        let mut next = Instant::now();
-        let mut send = |typ: u8, index: usize, payload: &[u8]| -> io::Result<()> {
+        let send = |typ: u8, index: usize, payload: &[u8]| -> io::Result<()> {
             self.check_cancelled()?;
             let mut plain = Vec::with_capacity(20 + payload.len());
             plain.extend([typ, kind]);
@@ -281,12 +355,25 @@ impl Transport {
                 .seal_in_place_append_tag(nonce(counter), aead::Aad::from(&wire), &mut plain)
                 .map_err(|_| io::Error::other("UDP encrypt"))?;
             wire.extend(plain);
-            if let Some(delay) = next.checked_duration_since(Instant::now()) {
+            // Include UDP and the base IP header; link/VPN encapsulation is
+            // outside this socket's accounting.
+            let wire_bytes = wire.len() + if address.is_ipv4() { 28 } else { 48 };
+            let slot = self
+                .pacing
+                .lock()
+                .unwrap()
+                .reserve(Instant::now(), wire_bytes);
+            if let Some(delay) = slot.checked_duration_since(Instant::now()) {
                 thread::sleep(delay);
             }
             self.check_cancelled()?;
+            if typ == 1 && index + 1 == count {
+                // A healthy low-RTT receiver can ACK the final DATA before
+                // trailing parity is sent. Publish the sample boundary before
+                // exposing that DATA, or every such ACK can miss training.
+                self.delivery_boundary(message, true);
+            }
             self.socket.send_to(&wire, address)?;
-            next += self.pace;
             Ok(())
         };
         for first in (0..count).step_by(GROUP) {
@@ -298,12 +385,20 @@ impl Transport {
                 }
                 if send(1, index, block).is_err() {
                     self.check_cancelled()?;
-                    return protocol::write_packet(tcp, REPAIR, &repair(message, kind, body));
+                    // Disable UDP training before TCP can expose this repair.
+                    self.delivery_boundary(message, false);
+                    protocol::write_packet(tcp, REPAIR, &repair(message, kind, body))?;
+                    metrics::increment("udp_tcp_send_fallback");
+                    return Ok(());
                 }
             }
             if send(2, first, &parity).is_err() {
                 self.check_cancelled()?;
-                return protocol::write_packet(tcp, REPAIR, &repair(message, kind, body));
+                // Disable UDP training before TCP can expose this repair.
+                self.delivery_boundary(message, false);
+                protocol::write_packet(tcp, REPAIR, &repair(message, kind, body))?;
+                metrics::increment("udp_tcp_send_fallback");
+                return Ok(());
             }
         }
         Ok(())
@@ -313,9 +408,8 @@ impl Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn authenticate_endpoint_and_reject_replay_or_rebinding() {
-        let t = Transport {
+    fn transport() -> Transport {
+        Transport {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
             session: 17,
             tx: key(&[1; 32]),
@@ -325,8 +419,12 @@ mod tests {
             counter: Mutex::new(0),
             cache: Mutex::new(Cache::default()),
             cancelled: AtomicBool::new(false),
-            pace: Duration::ZERO,
-        };
+            pacing: Mutex::new(Pacing::new(200, Instant::now())),
+        }
+    }
+    #[test]
+    fn authenticate_endpoint_and_reject_replay_or_rebinding() {
+        let t = transport();
         let make = |number, secret: &[u8]| {
             let mut h = header(17, number);
             let mut p = vec![0];
@@ -356,6 +454,142 @@ mod tests {
         assert_eq!(t.endpoint.lock().unwrap().unwrap(), old);
         t.bind(&second, address);
         assert_eq!(t.endpoint.lock().unwrap().unwrap().2, 2);
+    }
+    #[test]
+    fn only_live_unrepaired_udp_feedback_trains_pacing() {
+        let t = transport();
+        t.pacing
+            .lock()
+            .unwrap()
+            .repair(Instant::now() - Duration::from_secs(2));
+        assert_eq!(t.pacing.lock().unwrap().kbps(), 150_000);
+        for message in 1..=4 {
+            assert!(t.retry(message).is_none());
+            t.ack(message);
+        }
+        assert_eq!(t.pacing.lock().unwrap().kbps(), 150_000);
+        for message in 1..=4 {
+            let mut cache = t.cache.lock().unwrap();
+            cache.pending.insert(
+                message,
+                Pending {
+                    bytes: 4,
+                    data_boundary: Some(Instant::now() - Duration::from_millis(20)),
+                    udp: true,
+                    repaired: false,
+                },
+            );
+            cache.pending_bytes += 4;
+            drop(cache);
+            t.ack(message);
+        }
+        assert_eq!(t.pacing.lock().unwrap().kbps(), 157_500);
+        t.ack(4);
+        assert_eq!(t.pacing.lock().unwrap().kbps(), 157_500);
+        let mut cache = t.cache.lock().unwrap();
+        cache.pending.insert(
+            5,
+            Pending {
+                bytes: 4,
+                data_boundary: None,
+                udp: true,
+                repaired: false,
+            },
+        );
+        cache.pending_bytes += 4;
+        cache.frames.insert(
+            5,
+            Cached {
+                kind: 2,
+                body: vec![1, 2, 3, 4],
+                retry: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        cache.bytes += 4;
+        drop(cache);
+        assert_eq!(t.retry(5).unwrap(), repair(5, 2, &[1, 2, 3, 4]));
+        assert_eq!(t.pacing.lock().unwrap().kbps(), 157_500);
+        assert!(t.retry(5).is_none());
+        t.delivery_boundary(5, true);
+        t.ack(5);
+        assert_eq!(t.pacing.lock().unwrap().kbps(), 157_500);
+        assert_eq!(t.cache.lock().unwrap().pending_bytes, 0);
+        assert_eq!(t.cache.lock().unwrap().bytes, 0);
+        // An ACK may enter before send completion but acquire the cache lock
+        // afterwards. A completion timestamp newer than ACK entry is still early.
+        let early = transport();
+        early
+            .pacing
+            .lock()
+            .unwrap()
+            .repair(Instant::now() - Duration::from_secs(2));
+        for message in 1..=4 {
+            let mut cache = early.cache.lock().unwrap();
+            cache.pending.insert(
+                message,
+                Pending {
+                    bytes: 4,
+                    data_boundary: Some(if message == 4 {
+                        Instant::now() + Duration::from_secs(1)
+                    } else {
+                        Instant::now() - Duration::from_millis(20)
+                    }),
+                    udp: true,
+                    repaired: false,
+                },
+            );
+            cache.pending_bytes += 4;
+            drop(cache);
+            early.ack(message);
+        }
+        assert_eq!(early.pacing.lock().unwrap().kbps(), 150_000);
+    }
+    #[test]
+    fn final_data_ack_trains_before_trailing_parity() {
+        use std::net::TcpListener;
+        let mut t = transport();
+        // A sub-Mbit fixture gives the receiver a deterministic 500ms DATA to
+        // parity gap without requiring CPU scheduler timing in microseconds.
+        t.pacing = Mutex::new(Pacing::with_ceiling(16_000, Instant::now()));
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        t.endpoint = Mutex::new(Some((receiver.local_addr().unwrap(), Instant::now(), 1)));
+        let t = Arc::new(t);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_reader, _) = listener.accept().unwrap();
+        let sender = t.clone();
+        let worker = thread::spawn(move || sender.send(2, &[7; CHUNK], &mut tcp));
+        let mut packet = [0; 1201];
+        let (size, _) = receiver.recv_from(&mut packet).unwrap();
+        let count = u64::from_be_bytes(packet[12..20].try_into().unwrap());
+        let mut plain = packet[20..size].to_vec();
+        let data = key(&[1; 32])
+            .open_in_place(nonce(count), aead::Aad::from(&packet[..20]), &mut plain)
+            .unwrap();
+        assert_eq!(data[0], 1);
+        assert_eq!(&data[20..], &[7; CHUNK]);
+        let acked = Instant::now();
+        assert!(t.cache.lock().unwrap().pending[&1]
+            .data_boundary
+            .is_some_and(|sent| sent <= acked));
+        assert!(
+            !worker.is_finished(),
+            "parity should still be paced behind DATA"
+        );
+        t.ack(1);
+        assert!(t.cache.lock().unwrap().pending.is_empty());
+        assert_eq!(t.cache.lock().unwrap().pending_bytes, 0);
+        worker.join().unwrap().unwrap();
+        let (size, _) = receiver.recv_from(&mut packet).unwrap();
+        let count = u64::from_be_bytes(packet[12..20].try_into().unwrap());
+        let mut plain = packet[20..size].to_vec();
+        let parity = key(&[1; 32])
+            .open_in_place(nonce(count), aead::Aad::from(&packet[..20]), &mut plain)
+            .unwrap();
+        assert_eq!(parity[0], 2);
     }
     #[test]
     fn keys_and_sessions_are_fresh() {

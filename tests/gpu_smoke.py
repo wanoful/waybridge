@@ -20,7 +20,7 @@ from codecs_smoke import check_alpha, wait_socket
 def native():
     cuda = Path(os.environ.get('WAYBRIDGE_CUDA_ROOT', '/opt/cuda'))
     flags = subprocess.check_output(['pkg-config','--cflags','--libs','egl','glesv2','libavutil','libavcodec'],text=True).split()
-    subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-DWB_CUDA_INTEROP=1',f'-I{cuda}/include','tests/gpu_native_smoke.c','native/gpu_interop.c','native/nvenc.c','-o','build/tests/gpu-native-smoke',*flags,'-ldl'],cwd=ROOT,check=True)
+    subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-DWB_CUDA_INTEROP=1',f'-I{cuda}/include','tests/gpu_native_smoke.c','native/gpu_interop.c','native/nvenc.c','-pthread','-o','build/tests/gpu-native-smoke',*flags,'-ldl'],cwd=ROOT,check=True)
     subprocess.run([str(ROOT/'build/tests/gpu-native-smoke')],cwd=ROOT,check=True)
     for kind,extension in ((2,'h264'),(4,'hevc'),(5,'obu')):
         output=subprocess.check_output(['ffmpeg','-hide_banner','-loglevel','error','-f',extension,'-i',str(ROOT/f'build/tests/native-gpu.{extension}'),'-f','rawvideo','-pix_fmt','rgba','pipe:1'])

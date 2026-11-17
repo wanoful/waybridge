@@ -71,3 +71,13 @@ The X11/Qt and native Windows regressions in the parent project exercise the X11
     this patch. Real Qt Wayland/XCB, delayed-offer,
     native Windows/Wine and physical Windows regressions validate these paths;
     detailed current limits are in the parent `docs/XDND.md`.
+
+14. Touch cancellation clears all active slot focus even after the latest
+    `wl_touch.frame`. The previous pending-frame guard incorrectly skipped every
+    contact when cancellation followed a delivered frame, leaving clients with
+    held touches after compositor focus/policy/disconnect changes. Pending up
+    focus is canceled as well and stale slots are removed. The existing
+    per-resource sequence filter deduplicates cancellation across contacts on
+    the same client. The parent project's real `tests/touch_smoke.py` verifies
+    two/ten contacts and cancellation on focus, read-only, unmap, disconnect and
+    surface destruction; fresh contacts remain usable afterwards.

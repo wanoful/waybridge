@@ -1,5 +1,11 @@
 //! Window composition and CPU/CUDA capture; GL resources stay on the compositor thread.
-use crate::{color, metrics, network::Peer, video};
+use crate::{
+    color,
+    media_budget::{self, Budget, Cost, Lease},
+    metrics,
+    network::Peer,
+    video,
+};
 use anyhow::{bail, Result};
 use smithay::{
     backend::{
@@ -18,6 +24,13 @@ use smithay::{
     utils::{Logical, Point, Rectangle, Transform},
 };
 use std::{rc::Rc, sync::Arc, time::Instant};
+
+pub struct Target {
+    pub buffer: GlesRenderbuffer,
+    // Buffer must be destroyed before its ticket is returned.
+    _lease: Lease,
+    pub touched: Instant,
+}
 
 /// Inspect downstream capacity without touching any GL resource. False leaves
 /// the caller dirty; frame callbacks and control messages must still run.
@@ -48,14 +61,16 @@ pub fn surface(
     sequence: u64,
     bbox: Rectangle<i32, Logical>,
     scale: f64,
-    target: &mut Option<GlesRenderbuffer>,
+    target: &mut Option<Target>,
     target_size: &mut (i32, i32),
     peer: Arc<Peer>,
     gpu_device: Option<&Rc<waybridge_codec::GpuDevice>>,
     gpu_source: &mut Option<waybridge_codec::GpuSource>,
     color_programs: Option<&color::Programs>,
     hdr_codec: Option<waybridge_codec::Codec>,
-) -> Result<video::Frame> {
+    budget: &Budget,
+    video_codec: Option<waybridge_codec::Codec>,
+) -> Result<Option<video::Frame>> {
     let captured = Instant::now();
     let color_ids = color_programs
         .map(|_| color::scrgb_ids(surface))
@@ -85,12 +100,105 @@ pub fn surface(
         renderer.with_context(|_| drop(gpu_source.take()))?;
     }
     if *target_size != (pixels.w, pixels.h)
-        || target.as_ref().and_then(|target| target.format()) != Some(capture_format)
+        || target.as_ref().and_then(|target| target.buffer.format()) != Some(capture_format)
     {
-        renderer.with_context(|_| drop(gpu_source.take()))?;
-        *target = Some(renderer.create_buffer(capture_format, (pixels.w, pixels.h).into())?);
+        // Release the old registration and attachment before reserving the new
+        // size; old frame/codec pool references keep their own native tickets.
+        renderer.with_context(|_| {
+            drop(gpu_source.take());
+            drop(target.take());
+        })?;
+        *target_size = (0, 0);
+    }
+    let count = pixels.w as usize * pixels.h as usize;
+    let gpu_device = gpu_device.filter(|_| {
+        pixels.w >= 48
+            && pixels.h >= 48
+            && pixels.w <= 4096
+            && pixels.h <= 2304
+            && peer.gpu_allowed(id)
+    });
+    let mut gpu_device = gpu_device;
+    let selected_codec = if linear_scene {
+        hdr_codec.or(video_codec)
+    } else {
+        video_codec
+    };
+    let mut budget_video = selected_codec.is_some_and(|codec| peer.supports(codec, id))
+        && pixels.w >= 48
+        && pixels.h >= 48
+        && pixels.w <= 4096
+        && pixels.h <= 2304;
+    let minimum = Cost {
+        cpu: count * (if linear_scene { 24 } else { 16 }) + 65536,
+        gpu: count * (if linear_scene { 8 } else { 4 }),
+        encoders: 0,
+    };
+    if budget_video {
+        let pool = if gpu_device.is_some() {
+            media_budget::cuda_pool(pixels.w as u32, pixels.h as u32, linear_scene)
+        } else {
+            Cost::default()
+        };
+        let codec = selected_codec.unwrap();
+        let working_set = minimum
+            .add(pool)
+            .and_then(|c| {
+                c.add(media_budget::encoder(
+                    pixels.w as u32,
+                    pixels.h as u32,
+                    codec.hdr(),
+                    gpu_device.is_some(),
+                ))
+            })
+            .unwrap();
+        if !budget.fits_limits(working_set) {
+            // A stream's minimum working set cannot fit even on an empty budget.
+            // Use temporary CPU/PNG for this capture, without poisoning capability.
+            budget_video = false;
+            gpu_device = None;
+            renderer.with_context(|_| drop(gpu_source.take()))?;
+            metrics::increment("media_video_workset_exceeds_limit");
+        }
+    }
+    let frame_cost = Cost::cpu(count * 16 + 65536);
+    let scratch_cost = Cost::cpu(if linear_scene { count * 8 } else { 0 });
+    let target_cost = Cost::gpu(if target.is_none() {
+        count * if linear_scene { 8 } else { 4 }
+    } else {
+        0
+    });
+    let pool_cost = if gpu_device.is_some() && gpu_source.is_none() {
+        media_budget::cuda_pool(pixels.w as u32, pixels.h as u32, linear_scene)
+    } else {
+        Cost::default()
+    };
+    // Reserve the whole capture atomically. Failed partial admission must not
+    // leave misleading pressure after rolling back its temporary reservations.
+    let total = frame_cost
+        .add(scratch_cost)
+        .and_then(|c| c.add(target_cost))
+        .and_then(|c| c.add(pool_cost))
+        .unwrap();
+    let Some(mut frame_lease) = budget.acquire(id, total) else {
+        return Ok(None);
+    };
+    let _scratch = frame_lease.split(scratch_cost);
+    let pool_owner = if pool_cost != Cost::default() {
+        Some(Arc::new(frame_lease.split(pool_cost)))
+    } else {
+        None
+    };
+    if target.is_none() {
+        let lease = frame_lease.split(target_cost);
+        *target = Some(Target {
+            buffer: renderer.create_buffer(capture_format, (pixels.w, pixels.h).into())?,
+            _lease: lease,
+            touched: Instant::now(),
+        });
         *target_size = (pixels.w, pixels.h);
     }
+    target.as_mut().unwrap().touched = Instant::now();
     let started = Instant::now();
     let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
         render_elements_from_surface_tree(
@@ -101,14 +209,10 @@ pub fn surface(
             1.0,
             Kind::Unspecified,
         );
-    let mut bound = renderer.bind(target.as_mut().unwrap())?;
+    let mut bound = renderer.bind(&mut target.as_mut().unwrap().buffer)?;
     let damage = Rectangle::from_size(pixels);
     let mut source_object = (0i32, 0i32);
-    let mut fp16 = if linear_scene {
-        vec![0u8; pixels.w as usize * pixels.h as usize * 8]
-    } else {
-        vec![]
-    };
+    let mut fp16 = vec![];
     {
         let mut frame = renderer.render(&mut bound, pixels, Transform::Flipped180)?;
         frame.clear(Color32F::new(0., 0., 0., 0.), &[damage])?;
@@ -116,6 +220,7 @@ pub fn surface(
             let colored = color::color_elements(elements, &color_ids, color_programs.unwrap());
             draw_render_elements(&mut frame, scale, &colored, &[damage])?;
             if gpu_device.is_none() {
+                fp16.resize(count * 8, 0);
                 frame.with_context(|gl| unsafe {
                     use smithay::backend::renderer::gles::ffi;
                     let mut pack = 0;
@@ -171,12 +276,15 @@ pub fn surface(
                 return Err("expected a public GL renderbuffer framebuffer attachment".into());
             }
             if gpu_source.is_none() {
-                *gpu_source = Some(waybridge_codec::GpuSource::new_mode(
+                *gpu_source = Some(waybridge_codec::GpuSource::new_mode_with_owner(
                     device.clone(),
                     source_object.1 as u32,
                     pixels.w as u32,
                     pixels.h as u32,
                     linear_scene,
+                    pool_owner
+                        .clone()
+                        .expect("new source reserved before rendering"),
                 )?);
                 tracing::info!(
                     id,
@@ -191,7 +299,7 @@ pub fn surface(
             Ok(gpu) => {
                 metrics::record("gpu_capture", started.elapsed());
                 metrics::record("capture", captured.elapsed());
-                return Ok(video::Frame {
+                return Ok(Some(video::Frame {
                     id,
                     width: pixels.w as u32,
                     height: pixels.h as u32,
@@ -202,9 +310,11 @@ pub fn surface(
                     straight: true,
                     peer,
                     video_eligible: false,
+                    budget_video,
                     enqueued: Instant::now(),
                     captured,
-                });
+                    _lease: frame_lease,
+                }));
             }
             Err(error) => {
                 peer.disable_gpu(id);
@@ -215,6 +325,7 @@ pub fn surface(
     }
     if linear_scene {
         if gpu_device.is_some() {
+            fp16.resize(count * 8, 0);
             let mut frame = renderer.render(&mut bound, pixels, Transform::Flipped180)?;
             frame.with_context(|gl| unsafe {
                 use smithay::backend::renderer::gles::ffi;
@@ -238,7 +349,7 @@ pub fn surface(
         let rgba = color::tonemap_fp16(&fp16, pixels.w as usize, pixels.h as usize, true);
         metrics::record("hdr_tonemap_cpu", started.elapsed());
         metrics::record("capture", captured.elapsed());
-        return Ok(video::Frame {
+        return Ok(Some(video::Frame {
             id,
             width: pixels.w as u32,
             height: pixels.h as u32,
@@ -249,9 +360,11 @@ pub fn surface(
             straight: true,
             peer,
             video_eligible: false,
+            budget_video,
             enqueued: Instant::now(),
             captured,
-        });
+            _lease: frame_lease,
+        }));
     }
     let started = Instant::now();
     let mapping = renderer.copy_framebuffer(
@@ -274,7 +387,7 @@ pub fn surface(
     }
     metrics::record("readback", started.elapsed());
     metrics::record("capture", captured.elapsed());
-    Ok(video::Frame {
+    Ok(Some(video::Frame {
         id,
         width: pixels.w as u32,
         height: pixels.h as u32,
@@ -285,7 +398,9 @@ pub fn surface(
         straight: false,
         peer,
         video_eligible: false,
+        budget_video,
         enqueued: Instant::now(),
         captured,
-    })
+        _lease: frame_lease,
+    }))
 }

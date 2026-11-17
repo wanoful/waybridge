@@ -22,7 +22,7 @@ pub(crate) struct DragVisual {
     dirty: bool,
     offset: Point<i32, Logical>,
     last_tick: Instant,
-    target: Option<GlesRenderbuffer>,
+    target: Option<capture::Target>,
     target_size: (i32, i32),
 }
 impl Default for DragVisual {
@@ -221,8 +221,10 @@ impl App {
                         &mut None,
                         self.color_programs.as_ref(),
                         None,
+                        self.encoder.budget(),
+                        None,
                     ) {
-                        Ok(mut frame) => {
+                        Ok(Some(mut frame)) => {
                             if frame.straight {
                                 for pixel in frame.rgba.chunks_exact_mut(4) {
                                     let alpha = u16::from(pixel[3]);
@@ -250,6 +252,9 @@ impl App {
                                 "revision":self.drag_visual.revision,"active":true,"visible":true,
                                 "format":"rgba8-premultiplied","width":frame.width,"height":frame.height,
                                 "scale":scale,"offset_x":x,"offset_y":y,"pixels":B64.encode(&frame.rgba)});
+                        }
+                        Ok(None) => {
+                            self.drag_visual.dirty = true;
                         }
                         Err(error) => tracing::debug!(%error,"DND icon capture unavailable"),
                     }

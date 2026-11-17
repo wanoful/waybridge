@@ -37,13 +37,16 @@ def main():
                 viewer = Viewer(port, token.read_text(), data_drag_v1=True)
                 app = subprocess.Popen([str(ROOT / 'target/debug/waybridge'), '--socket', 'xdnd-0', '--launch', '--',
                     str(executable), str(root / 'files')], env=env, stdout=app_log, stderr=app_log)
-                ids = {}
-                while len(ids) < 2:
-                    window = viewer.until(lambda k, m: k == 'control' and m['type'] == 'window' and m['title'] not in ids)
-                    ids[window['title']] = window['id']
+                ids, initial_frames = {}, set()
+                # Focused-window scheduling need not emit window IDs in order;
+                # collect metadata and pixels together so neither is discarded.
+                while len(ids) < 2 or not set(ids.values()).issubset(initial_frames):
+                    kind, message = viewer.receive()
+                    if kind == 'control' and message['type'] == 'window':
+                        ids[message['title']] = message['id']
+                    elif kind == 'frame':
+                        initial_frames.add(message[0])
                 first, second = ids['Waybridge drag source'], ids['Waybridge drag target']
-                for ident in (first, second):
-                    viewer.until(lambda k, m: k == 'frame' and m[0] == ident)
                 # Unicode, then INCR-sized text through the same generic MIME bridge.
                 for drag, text in enumerate(('Windows 你好 λ', 'x' * 180000), 1):
                     before = (root / 'app.log').read_text().count('OTHER ')

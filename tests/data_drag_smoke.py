@@ -41,13 +41,16 @@ def main():
                 viewer = Viewer(port, token.read_text(), file_drop_out=False, data_drag_v1=True)
                 viewer.send(type='hello', file_drop_out=False, toplevel_drag_v1=True)
                 app = subprocess.Popen([str(executable), str(root / 'files')], env=env, stdout=log, stderr=log)
-                ids = {}
-                for _ in range(2):
-                    window = viewer.until(lambda k, m: k == 'control' and m['type'] == 'window' and m['title'] not in ids)
-                    ids[window['title']] = window['id']
+                ids, initial_frames = {}, set()
+                # Focused-window scheduling need not emit window IDs in order;
+                # collect metadata and pixels together so neither is discarded.
+                while len(ids) < 2 or not set(ids.values()).issubset(initial_frames):
+                    kind, message = viewer.receive()
+                    if kind == 'control' and message['type'] == 'window':
+                        ids[message['title']] = message['id']
+                    elif kind == 'frame':
+                        initial_frames.add(message[0])
                 first, second = ids['Waybridge drag source'], ids['Waybridge drag target']
-                for ident in (first, second):
-                    viewer.until(lambda k, m: k == 'frame' and m[0] == ident)
 
                 def motion(ident, x, y):
                     viewer.send(type='pointer', id=ident, x=x, y=y)

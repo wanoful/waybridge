@@ -29,6 +29,7 @@
 #include "drag_visual.h"
 #include "relative_input.h"
 #include "ime.h"
+#include "native_touch.h"
 #include "third_party/json.hpp"
 #include "native_transport.h"
 #include "host_control.h"
@@ -64,6 +65,7 @@ void sendStreamConfiguration();
 void sendJson(const Json &value);
 RemoteNotifications remoteNotifications([](Json message) { hostControl.emit(std::move(message)); },
                                       [](Json message) { sendJson(message); });
+NativeTouch nativeTouch([](const Json &message) { sendJson(message); });
 constexpr size_t MaxPacket = 72 * 1024 * 1024;
 constexpr UINT NetworkReady = WM_APP + 1;
 SOCKET connection = INVALID_SOCKET;
@@ -175,6 +177,7 @@ struct RemoteWindow {
   std::unique_ptr<Presentation> presentation;
   UINT dpi = 96;
   int originX = 0, originY = 0;
+  bool touchInput = false;
   bool shown = false;
   bool popup = false;
   uint32_t root = 0, parent = 0;
@@ -1956,6 +1959,7 @@ void suspendImeForOle() {
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   if (hostedReadOnly && (message == WM_INPUT || (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) ||
       (message >= WM_KEYFIRST && message <= WM_KEYLAST) ||
+      (message >= WM_POINTERUPDATE && message <= WM_POINTERLEAVE) ||
       message == WM_IME_STARTCOMPOSITION || message == WM_IME_COMPOSITION ||
       message == WM_IME_ENDCOMPOSITION)) return 0;
   auto w = reinterpret_cast<RemoteWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1966,6 +1970,16 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   }
   if (!w)
     return DefWindowProcW(hwnd, message, wp, lp);
+  if ((message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) &&
+      nativeTouch.promotedMouse(hwnd, ULONG_PTR(GetMessageExtraInfo()))) return 0;
+  if (message == WM_POINTERDOWN || message == WM_POINTERUPDATE || message == WM_POINTERUP ||
+      message == WM_POINTERCAPTURECHANGED) {
+    NativeTouch::Target target{hwnd,w->id,w->width,w->height,w->originX,w->originY,imageRect(w),
+                              w->touchInput && !w->popup && !hostedReadOnly && !w->sizing &&
+                              !relativeInput.active() && !grabbedRoot && !windowDrag.active && !FileDrag::ownsInput()};
+    if (target.enabled && message == WM_POINTERDOWN) SetFocus(hwnd);
+    if (nativeTouch.handle(target,message,wp)) return 0;
+  }
   if (GetEnvironmentVariableW(L"WAYBRIDGE_IME_TRACE", nullptr, 0) &&
       (message == WM_KEYDOWN || message == WM_KEYUP || message == WM_CHAR ||
        message == WM_IME_STARTCOMPOSITION || message == WM_IME_ENDCOMPOSITION ||
@@ -1999,6 +2013,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       releasePointer();
     break;
   case WM_CANCELMODE:
+    nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
       releasePointer();
     break;
@@ -2017,6 +2032,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       w->state.clamp(hwnd, w->dpi, w->clientDecorated, reinterpret_cast<WINDOWPOS *>(lp));
     break;
   case WM_SHOWWINDOW:
+    if (!wp) nativeTouch.cancel(hwnd);
     sendWindowState(w);
     break;
   case WM_SYSCOMMAND:
@@ -2106,6 +2122,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     return semanticsNegotiated && !acceptsInput(w, lp) ? HTTRANSPARENT : HTCLIENT;
   case WM_ENTERSIZEMOVE:
+    nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
       releasePointer();
     w->sizing = true;
@@ -2118,6 +2135,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_DESTROY:
+    nativeTouch.cancel(hwnd);
     ApplicationIdentity::clear(hwnd);
     w->dropLifetime.reset();
     if (relativeInput.active(hwnd))
@@ -2166,6 +2184,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     updateIme();
     return 0;
   case WM_KILLFOCUS:
+    nativeTouch.cancel();
     if (relativeInput.active(hwnd))
       releasePointer();
     if (w->popup)
@@ -2288,6 +2307,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_DPICHANGED: {
+    nativeTouch.cancel(hwnd);
     if (w->popup) {
       positionPopup(w);
       return 0;
@@ -2313,6 +2333,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   }
   case WM_SIZE:
+    nativeTouch.cancel(hwnd);
     sendWindowState(w);
     if (relativeInput.active(hwnd))
       releasePointer();
@@ -2547,6 +2568,7 @@ void dispatchNetwork() {
       if (remoteTray.receive(m,*iconDecoder)) continue;
     }
     if (type == "hello") {
+      nativeTouch.hello(m.value("touch_v1",false));
       dragVisual.configure(m.value("data_drag_v1", false));
       nativeActivation.hello(m.value("activation_v1", false));
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
@@ -2643,6 +2665,8 @@ void dispatchNetwork() {
         ShowWindow(w->hwnd, SW_SHOWNOACTIVATE);
       reconcileWindows();
       sendWindowState(w);
+    } else if (type == "touch_state") {
+      nativeTouch.state(m);
     } else if (type == "ime_state") {
       imeStatus = m;
     } else if (type == "pong") {
@@ -2729,6 +2753,7 @@ void dispatchNetwork() {
       }
       iconWindow->icon.apply(iconWindow->hwnd, iconWindow->dpi);
       auto *updated = windows.at(id).get();
+      updated->touchInput = m.value("touch_input",false);
       auto parent = m.find("parent");
       updated->parent =
           parent != m.end() && parent->is_number_unsigned() ? parent->get<uint32_t>() : 0;
@@ -3007,6 +3032,7 @@ void applyHostedSettings(const Json &settings, bool live) {
         break;
       }
     TextDrag::reset();
+    nativeTouch.cancel();
     releasePointer(); cancelWindowDrag(); suspendImeForOle();
     for (auto &[id,window] : windows) sendJson({{"type","cancel_input"},{"id",id}});
   }
@@ -3401,6 +3427,7 @@ int wmain(int argc, wchar_t **argv) {
             {"data_drag_v1", true},
             {"notifications_v1", hostControl.active()},
             {"notifications_enabled", false},
+            {"touch_v1", GetEnvironmentVariableW(L"WAYBRIDGE_TOUCH", nullptr, 0) != 0},
             {"pointer_lock", true},
             {"toplevel_drag_v1", true},
             {"data_drag_v1", true},
@@ -3425,6 +3452,7 @@ int wmain(int argc, wchar_t **argv) {
   windowDrag.cancelled = true;
   endWindowDrag();
   releasePointer(false);
+  nativeTouch.cancel(nullptr,false);
   running = false;
   hostControl.stop();
   FileTree::cancelUploads();

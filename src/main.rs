@@ -17,6 +17,7 @@ mod file_tree;
 mod ime;
 mod input_focus;
 mod launch;
+mod media_budget;
 mod metrics;
 mod network;
 mod protocol;
@@ -27,6 +28,7 @@ mod session_services;
 mod shutdown;
 mod stream_config;
 mod toplevel_drag;
+mod touch;
 mod transfer;
 mod transfer_worker;
 mod udp;
@@ -156,7 +158,7 @@ struct Args {
     /// Optional encrypted UDP media endpoint; SSH forwards only TCP.
     #[arg(long)]
     udp_listen: Option<String>,
-    /// UDP pacing ceiling, including parity shards (not adaptive congestion control).
+    /// UDP pacing ceiling, including parity shards; delivery feedback may lower the rate.
     #[arg(long, default_value_t=200, value_parser=clap::value_parser!(u32).range(1..=1000))]
     udp_mbps: u32,
     /// Require Xwayland (otherwise enabled automatically when installed).
@@ -267,8 +269,9 @@ struct RemoteWindow {
     announced: bool,
     last_info: Value,
     frame_sequence: u64,
+    capture_after: Instant,
     gpu_source: Option<waybridge_codec::GpuSource>,
-    target: Option<GlesRenderbuffer>,
+    target: Option<capture::Target>,
     target_size: (i32, i32),
     output: Output,
     output_global: Option<GlobalId>,
@@ -286,7 +289,7 @@ struct RemotePopup {
     last_info: Value,
     sequence: u64,
     gpu_source: Option<waybridge_codec::GpuSource>,
-    target: Option<GlesRenderbuffer>,
+    target: Option<capture::Target>,
     target_size: (i32, i32),
 }
 
@@ -325,6 +328,7 @@ struct App {
     _toplevel_icons: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
     tray: Option<desktop_tray::Tray>,
     relative: relative_input::RelativeInput,
+    touch: touch::Touch,
     _relative_manager: RelativePointerManagerState,
     _constraints: PointerConstraintsState,
     ime: ime::Ime,
@@ -394,9 +398,19 @@ impl Drop for App {
 impl App {
     fn release_gpu_sources(&mut self) {
         let windows = &mut self.windows;
+        let popups = &mut self.remote_popups;
         let _ = self.renderer.with_context(|_| {
             for window in windows {
-                window.gpu_source.take();
+                drop(window.gpu_source.take());
+                drop(window.target.take());
+                window.target_size = (0, 0);
+                window.dirty = true;
+            }
+            for popup in popups {
+                drop(popup.gpu_source.take());
+                drop(popup.target.take());
+                popup.target_size = (0, 0);
+                popup.dirty = true;
             }
         });
     }
@@ -462,6 +476,7 @@ impl App {
             if let Some(root) = self.x11.grab.filter(|root| Some(*root) != id) {
                 self.x11_cancel_popup(root);
             }
+            self.touch_handoff(id);
             self.release_input();
             if let Some(root) = self
                 .focused_window
@@ -932,6 +947,7 @@ impl App {
         }
     }
     fn release_input(&mut self) {
+        self.cancel_touch();
         self.release_keys();
         let pointer = self.seat.get_pointer().unwrap();
         for button in std::mem::take(&mut self.pressed_buttons) {
@@ -1044,6 +1060,7 @@ impl App {
             }
             "window_state" => self.native_window_state(id, &value),
             "ime" => self.ime_message(&value),
+            "touch" => self.touch_message(&value),
             "text_drag_enter" | "text_drag_motion" | "text_drag_drop" | "text_drag_cancel"
             | "text_drag_retarget" => self.text_drag_message(&value),
             "drag_claim" | "drag_return" | "drag_drop" | "drag_result" | "drag_read" => {
@@ -1064,6 +1081,7 @@ impl App {
                     }
                     self.drag_visual.enabled = enabled;
                 }
+                self.touch_available(value["touch_v1"] == true);
                 self.activation.negotiated = value["activation_v1"] == true;
                 self.window_drag.available = value["toplevel_drag_v1"].as_bool().unwrap_or(false);
                 self.relative_available(value["pointer_lock"].as_bool().unwrap_or(false));
@@ -1424,6 +1442,48 @@ impl App {
     }
 
     fn render(&mut self) -> Result<()> {
+        self.encoder.budget().focus(self.focused_window);
+        if let Some(pressure) = self.encoder.budget().take_pressure() {
+            let requested = pressure.window;
+            if let Some(window) = self.windows.iter_mut().find(|w| w.id == requested) {
+                window.dirty = true;
+            }
+            let obsolete = self
+                .windows
+                .iter()
+                .find(|w| w.id == requested)
+                .is_some_and(|w| w.target.is_none());
+            if pressure.reclaim {
+                self.encoder.reclaim(requested, obsolete, pressure.global);
+            }
+            // GL attachments/registrations are released only on the compositor
+            // thread. Last presented client pixels remain until a fresh capture.
+            let victim = self
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| {
+                    pressure.reclaim
+                        && pressure.global
+                        && pressure.gpu
+                        && w.id != requested
+                        && Some(w.id) != self.focused_window
+                        && w.target.is_some()
+                })
+                .min_by_key(|(_, w)| (w.state.visible, w.target.as_ref().unwrap().touched))
+                .map(|(i, _)| i);
+            if let Some(victim) = victim {
+                let w = &mut self.windows[victim];
+                self.renderer.with_context(|_| {
+                    drop(w.gpu_source.take());
+                    drop(w.target.take());
+                })?;
+                w.target_size = (0, 0);
+                w.capture_after = Instant::now() + Duration::from_millis(500);
+                w.dirty = true;
+                metrics::increment("media_target_reclaim");
+            }
+        }
         self.popups.cleanup();
         if self
             .popup_grab
@@ -1500,7 +1560,10 @@ impl App {
             .filter_map(|w| w.window.x11_surface().map(|x| (x.clone(), w.id)))
             .collect();
         let focused = self.focused_window;
-        for (index, remote) in self.windows.iter_mut().enumerate() {
+        let mut render_order: Vec<_> = (0..self.windows.len()).collect();
+        render_order.sort_by_key(|i| Some(self.windows[*i].id) != focused);
+        for index in render_order {
+            let remote = &mut self.windows[index];
             let Some(surface) = remote.window.wl_surface().map(|s| s.into_owned()) else {
                 continue;
             };
@@ -1599,6 +1662,7 @@ impl App {
                 .icon
                 .observe(info["app_id"].as_str().unwrap_or_default());
             info["icon_revision"] = json!(remote.icon.revision);
+            info["touch_input"] = json!(!remote.window.is_x11());
             let mut deferred = false;
             if let Some(peer) = &self.peer {
                 if !remote.announced || remote.last_info != info {
@@ -1649,11 +1713,13 @@ impl App {
                 }
                 remote.dirty |= peer.take_capture_refresh(remote.id);
                 if remote.dirty && (!semantics || remote.state.visible) {
-                    if !capture::ready(&self.encoder, peer, remote.id, bbox, remote.scale) {
+                    if (Some(remote.id) != focused && Instant::now() < remote.capture_after)
+                        || !capture::ready(&self.encoder, peer, remote.id, bbox, remote.scale)
+                    {
                         deferred = true;
                     } else {
                         remote.frame_sequence += 1;
-                        let mut frame = capture::surface(
+                        let frame = capture::surface(
                             &mut self.renderer,
                             &surface,
                             remote.id,
@@ -1678,9 +1744,16 @@ impl App {
                             self.video_codec
                                 .filter(|_| self.hdr_requested)
                                 .and_then(|c| c.hdr_variant()),
+                            self.encoder.budget(),
+                            self.video_codec,
                         )?;
-                        frame.video_eligible = remote.last_info["type"] == "window";
-                        deferred = !self.encoder.submit(frame);
+                        deferred = if let Some(mut frame) = frame {
+                            frame.video_eligible =
+                                remote.last_info["type"] == "window" && frame.budget_video;
+                            !self.encoder.submit(frame)
+                        } else {
+                            true
+                        };
                     }
                 }
             }
@@ -1746,8 +1819,10 @@ impl App {
                             &mut popup.gpu_source,
                             self.color_programs.as_ref(),
                             None,
+                            self.encoder.budget(),
+                            None,
                         )?;
-                        deferred = !self.encoder.submit(frame);
+                        deferred = frame.is_none_or(|frame| !self.encoder.submit(frame));
                     }
                 }
             }
@@ -2022,6 +2097,7 @@ impl XdgShellHandler for App {
             announced: false,
             last_info: Value::Null,
             frame_sequence: 0,
+            capture_after: Instant::now(),
             gpu_source: None,
             target: None,
             target_size: (0, 0),
@@ -2537,6 +2613,7 @@ fn main() -> Result<()> {
         30,
     )?;
     seat.add_pointer();
+    seat.add_touch();
     let mut dmabuf = DmabufState::new();
     if let Some(node) = render_node {
         let feedback =
@@ -2599,6 +2676,7 @@ fn main() -> Result<()> {
         tray: None,
         _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<App>(&dh),
         relative: relative_input::RelativeInput::default(),
+        touch: touch::Touch::default(),
         _relative_manager: RelativePointerManagerState::new::<App>(&dh),
         _constraints: PointerConstraintsState::new::<App>(&dh),
         ime: ime::Ime::new(&dh),
@@ -2645,7 +2723,12 @@ fn main() -> Result<()> {
         default_scale: 1.0,
         focused_window: None,
         last_interaction: None,
-        encoder: video::Encoder::new(video_codec, args.fps, args.bitrate),
+        encoder: video::Encoder::new(
+            video_codec,
+            args.fps,
+            args.bitrate,
+            media_budget::Budget::new(&configuration.config.media_budget),
+        ),
     };
     toplevel_drag::State::register(&app.dh);
     let (sink_server, sink_client) = UnixStream::pair()?;
@@ -2729,6 +2812,7 @@ fn main() -> Result<()> {
             display.dispatch_clients(&mut app)?;
             app.poll_window_drag();
             app.sync_pointer_lock();
+            app.sync_touch();
             app.pump_outbound()?;
             app.finish_file_drop();
             app.read_pending_clipboard();
@@ -2911,6 +2995,7 @@ fn main() -> Result<()> {
                             app.x11_cancel_popup(root);
                             app.x11.grab = None;
                         }
+                        app.touch_available(false);
                         app.relative_available(false);
                         app.end_outbound(false);
                         app.drag_enabled = false;
