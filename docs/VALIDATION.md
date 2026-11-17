@@ -9,6 +9,21 @@ negotiated server capability. Disable cancels contacts; enabling obtains a fresh
 lease. The worker no longer reads the former touch environment variable. The
 raw viewer uses an explicit `--touch` argument.
 
+Code commit `7b56055` is installed on both ends. The Linux Release compositor
+and service binaries match their build outputs; the restarted user service's
+running executable inode and pinned TLS hello were verified. Listener, unit,
+configuration and trust identity remain unchanged, and no compositor was active
+at replacement. The x64 Windows installation matches all 541 files in the new
+package inventory. Its limited interactive GUI restarted at 00:37 UTC+8 and the
+startup log confirms MainWindow activation. The existing single profile's
+previously enabled choice was migrated to `settings.touch=true`; semantic checks
+preserved all other profile fields. The former user environment variable was
+removed and is absent from the restarted GUI's launch environment. x64 and
+ARM64 portable packages both pass architecture/runtime/inventory validation.
+Deployment evidence: `build/deploy-touch-settings.json`,
+`build/deploy-touch-settings-{linux,windows}.log` and
+`build/touch-settings-{release,packages}.log`.
+
 Focused real-Wayland tests pass for initial OFF, live ON/OFF, contact cancel,
 fresh generations, immutable negotiation and legacy clients. Native PE/Wine
 adapter tests pass for preference changes without stale contact/tap replay.
@@ -20,7 +35,10 @@ input policies and separate-process startup/live settings serialization.
 
 A private actual-WinUI probe on the x64 `laptop` renders the production toggle,
 uses its Toggle/Invoke automation providers to save both values and reload them,
-and preserves IME/read-only/file/clipboard choices. It does not connect a server
+and preserves IME/read-only/file/clipboard choices. Persistent touch status also
+survives generic success/save notices and distinguishes saved preferences from
+the current connection, older-server reconnect requirements and read-only pause.
+It does not connect a server
 or inject physical touch. The existing hosted-worker regression also passes actual file upload, live
 read-only/DPI/stream settings and graceful disconnect with retained applications.
 Strict workspace formatting/Clippy and workspace Rust tests pass. Evidence: `build/touch-settings-{protocol,native,hosted,clippy,rust}.log`
