@@ -1,5 +1,32 @@
 # Validation
 
+## Installed update and native-touch opt-in — 2026-11-18
+
+The Release workspace at code commit `42704d9` is now installed as
+`~/.local/bin/waybridge` and `waybridge-service`. The user service restarted at
+00:04 UTC+8; its running executable inode matches the rebuilt service hash.
+Both installed binaries match Release outputs, configuration checks pass and a
+real TLS hello succeeds with the unchanged certificate pin and 49092 listener.
+Persisted identity/trust, Linux configuration and user unit contents are unchanged.
+No compositor was active during replacement; existing application sessions were
+not ended.
+
+The matching x64 control-center/worker/runtime bundle replaced the existing
+`%LOCALAPPDATA%\Waybridge-Test\m0-m1-20261114\app\Waybridge` installation on
+`laptop`; all 541 inventory hashes were verified. Windows profiles and connection
+settings are unchanged. The GUI was restarted in the logged-in user's limited
+interactive session and its startup log confirms MainWindow activation.
+`WAYBRIDGE_TOUCH=1` is persisted for that Windows user and was explicitly inherited
+by the restarted GUI, whose native workers inherit the same environment. The
+standard environment-change notification was broadcast for subsequent launches.
+Native multitouch is therefore opted in for subsequent connections; this update
+does not claim a new physical-touchscreen acceptance run.
+
+Both x64 and ARM64 portable packages were rebuilt and validated; the actual
+installed Windows device in this update is x64. Evidence:
+`build/deploy-current.json`, `build/deploy-current-windows.log`,
+`build/deploy-current-release.log` and `build/deploy-current-packages.log`.
+
 ## Parallel resource, input and network delivery — 2026-11-17
 
 Three workstreams now share the `main` development baseline. This is a first
