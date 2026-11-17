@@ -101,6 +101,98 @@ second-finger isolation and stale requests. Existing contact-delivery tests do
 not cover these window-management requests. Gamepads/rumble remain a separate
 unimplemented professional-input workstream.
 
+## Proposed touch interaction integration — 2026-11-18
+
+This is an implementation plan, not delivered behavior. Reuse the existing MIME,
+text snapshot, virtual-file/read-only delivery, target-revision and completion
+machinery; extend input ownership instead of treating a touch as a permanently
+pressed mouse button.
+
+### Gesture ownership
+
+Introduce one input-gesture identity, scoped to connection and mapping/input
+generation, with device kind, owning contact/slot, last physical screen position
+and phase. Track application touch, window manipulation, native DND, external OLE
+and popup interaction as explicit owners. A valid application move/resize or DND
+request authorizes a controlled handoff; client acknowledgement must reject a
+request whose contact has already ended. Only the owning contact may move or
+finish a single-contact operation. A second contact cannot release it. Contact
+cancel, source destruction, disconnect or read-only cancels it once.
+
+Route captured owner updates before normal per-window touch eligibility checks.
+Do not revoke a valid DND touch grab merely because `window_drag.active()` becomes
+true, or discard the physical owner when an application touch lease ends. Use
+protocol-specific touch/grab transition rules; application cancellation must not
+also cancel the newly installed operation grab.
+
+### Text and file drag
+
+1. **Between streamed windows in one Linux session:** retain the original native
+   source, MIME and negotiated COPY/MOVE. Record `GrabType` and touch start data
+   in the native drag state. Drive the existing Smithay touch DND grab with the
+   initiating contact's motion/up/cancel, with hit testing and coordinates from
+   the actual Windows target under that contact, independent of keyboard focus.
+   Preserve operation ownership while crossing HWNDs. Native X11 targets require
+   an explicit touch-to-pointer/XDND compatibility adapter; current native
+   `wl_touch` routing does not cover them.
+2. **Linux to Windows:** `prepare_native_export`, `drag_claim`, drop and return
+   must validate the actual input owner rather than `pressed_buttons`. Reuse the
+   existing text provider and delayed file streams. OLE needs a system-supported
+   mouse-input handoff; changing `QueryContinueDrag` alone is insufficient.
+3. **Windows to Linux:** retain the OS-owned OLE drag and existing target adapter.
+   Verify touch/pen-origin OLE entry, retarget, immediate release and completion.
+   Keep snapshot reuse tied to a trustworthy gesture lifetime; when no such
+   identity is available, preserve the existing no-cross-target-cache fallback.
+4. **Leave and return:** retain the original source and operation identity through
+   OLE attempts. Returning to a streamed target must restore the correct native
+   grab type, without re-uploading the source or replaying an old touch-down.
+   A physical release initiates drop; only target completion reports success.
+
+Microsoft's [DoDragDrop contract](https://learn.microsoft.com/en-us/windows/win32/api/ole2/nf-ole2-dodragdrop)
+requires the synthesized mouse-message path for touch/pen. The documented
+[ConvertPrimaryPointerToMouseDrag](https://learn.microsoft.com/en-us/windows/win32/winmsg/winuser/nf-winuser-convertprimarypointertomousedrag)
+can bridge a primary contact but is marked prerelease and requires exactly one
+primary contact. It needs a focused availability/behavior experiment before
+being selected for shipping. A mouse-compatibility mode selected before the
+gesture provides the fallback on unsupported systems. Native-touch to arbitrary
+local Windows OLE targets remains an explicit integration milestone until that
+handoff is validated. Cross-platform file delivery remains COPY; same-session
+native source/target action negotiation stays intact.
+
+### Menus, long press and text selection
+
+- **Menus:** map each popup HWND to its root, popup surface and generation; add
+  touch-aware popup grab/routing, nested-menu hit testing and outside-dismiss.
+  Do not disable all touch when a popup appears. Preserve the remote application's
+  menu and selection behavior, and prevent the same contact from also producing
+  a duplicate compatibility click. Popups destroyed during a gesture revoke
+  their route, not an unrelated newer menu.
+- **Long press:** native mode leaves recognition to the application. Mouse
+  compatibility uses the system's press-and-hold mouse/right-button path. Do not
+  add a universal timer which sends a right-click after an application has
+  already received native touch: there is no general per-widget handled/selection
+  signal here, and long press may be selecting text or holding a drawing stroke.
+  Any later explicit right-click recognizer must own the gesture from its start,
+  cancel its candidate on movement/multitouch, and emit one right-button pair.
+- **Selection:** the remote application owns text ranges and any selection
+  handles. Native touch must reach those handles and popup surfaces with stable
+  capture. Compatibility mode supports mouse-style drag selection and the
+  application's normal double-click selection. Selected-text dragging then
+  enters the same DND path above. This does not guarantee mobile-style handles
+  in applications which do not provide them.
+- **Settings:** expose per-application native-touch/mouse-compatibility choice in
+  the existing input settings, inheriting the connection default. Resolve and
+  freeze the choice at gesture start. Changing a setting cancels current input;
+  it must not reinterpret half of an existing stroke or selection.
+
+Deliver first the shared ownership plus native window move/resize, then popup
+routing and same-session text/file DND, followed by the Windows OLE handoff.
+Use Chrome text/selection/menu cases and a native Wayland file model; add mixed
+Xwayland coverage through its adapter. Verify cross-HWND motion, immediate up,
+second-finger isolation, lost capture, source/target destruction, stale generation,
+read-only and delayed acceptance/finish. Keep the already working touch drawing
+as a regression, including a long held stroke that must not open a context menu.
+
 ## Protocol extension
 
 The v3 hello negotiates immutable `touch_v1` capability independently of the

@@ -43,6 +43,10 @@ flowchart LR
 
 新服务端广播 `data_drag_result_v1`；新客户端只在该能力存在时发送 retarget、匹配 revision 并等待完成。旧服务端保留原兼容行为，因此完整修复需更新两端。具体消息见 [协议](PROTOCOL.md#generic-mime-drag-negotiation-data_drag_v1)。
 
+## 原生触控接入方案（待实现）
+
+现有跨端拖放的启动、导出、OLE claim/drop/return 及源手势缓存仍有鼠标按键依赖。触控接入需保存发起触点和 grab 类型，按原触点的移动、抬起和取消驱动会话；不能只去掉左键检查。先贯通同一 Linux 会话的原生触控 DND，再验证 Windows OLE 所需的系统鼠标兼容交接；跨回串流窗口时保留原 source，恢复相应 grab。数据表示、只读文件交付、目标 revision 和完成回执继续复用。详细设计及菜单、长按和文字选择的行为边界见 [触控交互接入方案](INPUT_DEVICES.md#proposed-touch-interaction-integration--2026-11-18)。
+
 ## 设置、诊断和验证
 
 控制中心「输入与共享 → 文字拖放」单独控制跨端双向文字，默认开启，独立于剪贴板方向和文件共享。只读模式仍优先禁止输入。旧配置缺少该字段时保留开启；原生会话内应用之间的拖放不会因为跨端分享开关而被禁用。
