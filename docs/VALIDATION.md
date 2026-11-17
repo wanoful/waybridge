@@ -1,5 +1,72 @@
 # Validation
 
+## Capture admission and scheduling diagnostics — 2026-11-17
+
+Existing application/device acceptance is the development baseline; remaining
+compatibility cases continue alongside implementation. Development now proceeds
+on `main`, fast-forwarded from `codex/m0-m1` without rewriting its 78 commits.
+
+Window composition and CPU/CUDA capture now live in `src/capture.rs`. Before GL
+allocation/composition/readback, media capture checks presentation credits, the
+window's pending raw slot and the raw-queue byte estimate. A deferred or rejected
+submission retains dirty; callbacks, metadata, input and other windows continue.
+The raw queue checks actual CPU/CUDA bytes on submit and requeue and no longer
+evicts another window's final unencoded update to make room. A failed worker
+requeue asks for a fresh capture. Cursor and DND visuals use the same capture
+implementation independently of media credit, preserving their feedback paths.
+
+`--stats` keeps average/max fields and adds fixed-memory histogram P50/P95/P99
+(bucket upper bounds, at most 6.25% rounding, capped at the actual maximum),
+capture-to-encode and capture-to-network-queue durations, media-send queue time,
+raw-queue entry/byte gauges and distinct wait/retry counters. Wait counters count
+render polls, not dropped frames. The 128 MiB budget covers queued raw images;
+it does not yet cover the active encoder frame, GL targets, driver sessions or
+Windows decode textures. These same-clock stages do not measure physical
+input-to-display latency.
+
+`tests/media_backpressure_smoke.py` runs real Wayland fixture windows with a real
+split-media viewer. It fills both windows' two presentation credits, repeatedly
+requests refresh and resize without ACKs, and requires no further composition.
+It separately verifies callbacks and ping while blocked, a second window's
+independent recovery, then exact final 700×450 pixels after ACK without a fresh
+commit/refresh. PNG and real NVENC H.264 runs pass, including queue/percentile
+logging. The PNG test is included in `scripts/test.sh`.
+
+The unchanged previous Release binary (SHA-256
+`8bde0df87c18af31eff7158e875a8f881deb59c596e0cf7e666cc68329b57a8c`)
+fails the same test because composition continues while credits are exhausted:
+32 composites were recorded in the blocked interval. The updated PNG and H.264
+runs record zero composites in that interval. This establishes avoided capture
+work in this scenario, not a general latency/FPS improvement.
+
+Commands and evidence (repository root):
+
+```sh
+cargo test --workspace --locked
+python3 tests/session_fixture.py python3 tests/media_backpressure_smoke.py
+python3 tests/session_fixture.py python3 tests/media_backpressure_smoke.py --codec h264
+./scripts/test.sh
+python3 tests/session_fixture.py python3 tests/hardware_smoke.py
+python3 tests/session_fixture.py python3 tests/codecs_smoke.py
+python3 tests/session_fixture.py python3 tests/hdr_video_smoke.py
+python3 tests/session_fixture.py python3 tests/gpu_window_lifecycle_smoke.py
+```
+
+Strict workspace Clippy, formatting, workspace unit tests (34 passed, one
+explicit-FUSE test skipped by default), the separately executed real FUSE test
+and the complete `scripts/test.sh` Linux suite pass. Real NVENC H.264/HEVC/AV1
+reference continuity, exact alpha, two-credit resume, codec fallback, cached resize
+and reconnect checks pass. FP16/CUDA Main10 HEVC/AV1 tests retain 277 distinct
+luma levels at 960×640 and pass HDR/SDR policy/fault recovery; same-size CUDA
+window detach/remap also passes. Logs: `build/media-scheduling-linux.log` and
+`build/media-scheduling-hardware.log`. No Windows client/protocol change is
+required; these runs are Linux/GPU evidence rather than new physical-Windows
+acceptance.
+
+Reports are `build/diagnostics/media-backpressure-{png,h264}.json`; their `.log`
+and `-app.log` companions contain diagnostics and callback evidence. The
+before-change capture trace is `build/diagnostics/media-backpressure-baseline.log`.
+
 ## X11 CSD movement and native fullscreen — 2026-11-17
 
 X11 CSD ConfigureRequest movement now hands the gesture to the independent

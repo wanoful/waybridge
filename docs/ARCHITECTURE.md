@@ -191,9 +191,9 @@ C# 控制中心通过当前用户专用 named pipe 管理原生内核，通过 T
 
 TCP 控制、媒体和音频连接分别认证，窗口控制与文件数据目前共用控制连接。可选 UDP 使用认证加密、XOR FEC 和 TCP 补帧，并按全局消息顺序交付媒体。TLS 网关与现有 SSH 隧道均可承载这些 TCP 连接。
 
-当前交付重点仍是 M0/M1 基础能力。上文的逐窗口清晰/交互/游戏策略、捕获前背压、覆盖完整媒体资源的全局预算、文件独立通道和网络自适应尚未完成；手柄、触控、笔、麦克风、摄像头、富文本和打印尚未交付。已有编码器、UDP 或文件工作队列不代表这些目标已经达成，状态以 [Roadmap](ROADMAP.md#当前进展) 为准。
+现有 M0/M1 验收作为继续开发的基线，当前推进媒体调度与 M2 日常体验。捕获前背压和队列诊断已接入；上文的逐窗口清晰/交互/游戏策略、覆盖完整媒体资源的全局预算、文件独立通道和网络自适应尚未完成；手柄、触控、笔、麦克风、摄像头、富文本和打印尚未交付。已有编码器、UDP 或文件工作队列不代表这些目标已经达成，状态以 [Roadmap](ROADMAP.md#当前进展) 为准。
 
-实现入口：[TLS 用户入口](../service/src/main.rs)、[合成器](../src/main.rs)、[共享配置](../config/src/lib.rs)、[应用启动助手](../scripts/session-control.py)、[会话环境](../src/launch.rs)、[桌面服务](../src/session_services.rs)、[文件工作队列](../src/transfer_worker.rs)、[网络](../src/network.rs)、[编码调度](../src/video.rs)、[Windows 内核](../client/main.cpp)、[Windows 呈现](../client/presentation.h)、[GUI 会话控制](../gui/Waybridge.Control.Core/SessionController.cs)。当前线协议见 [PROTOCOL.md](PROTOCOL.md)，设备验证范围见 [VALIDATION.md](VALIDATION.md)。
+实现入口：[TLS 用户入口](../service/src/main.rs)、[合成器](../src/main.rs)、[共享配置](../config/src/lib.rs)、[应用启动助手](../scripts/session-control.py)、[会话环境](../src/launch.rs)、[桌面服务](../src/session_services.rs)、[文件工作队列](../src/transfer_worker.rs)、[网络](../src/network.rs)、[捕获](../src/capture.rs)、[编码调度](../src/video.rs)、[Windows 内核](../client/main.cpp)、[Windows 呈现](../client/presentation.h)、[GUI 会话控制](../gui/Waybridge.Control.Core/SessionController.cs)。当前线协议见 [PROTOCOL.md](PROTOCOL.md)，设备验证范围见 [VALIDATION.md](VALIDATION.md)。
 
 ## 画面路径的研究方向
 
@@ -275,7 +275,7 @@ Linux 适配层维护标准接口对象、应用来源和状态，Windows 原生
 
 当前已有每窗口两帧呈现 credit、128 MiB 原始帧队列、空闲编码器缓存及 UDP 传输预算。下一步可将活动编码器、合成目标、解码纹理、带宽与排队时间纳入全局预算，并同时保留每窗口上限。
 
-背压应影响捕获决策。当前合成器在窗口 dirty 时捕获，编码线程之后才检查呈现 credit；下游忙时，可能持续生成随后被替换的画面。可在捕获前检查容量，保留 dirty 状态，并在额度恢复后捕获最新内容，同时继续处理 Wayland 协议和 frame callback。
+背压应影响捕获决策。当前 `src/capture.rs` 在合成和回读前检查呈现 credit、每窗口待编码槽和原始队列容量；下游忙时保留 dirty，额度恢复后捕获当前内容，同时继续处理 Wayland 协议、窗口元数据和 frame callback。原始队列维持 128 MiB 上限；提交时按实际 CPU/CUDA 字节复核，拒绝后保留 dirty，不驱逐其他窗口的最终更新。编码线程重排队时同样检查上限，无法保留的未编码更新请求重新捕获。该预算只覆盖排队的原始画面；正在捕获/编码的画面、GL 目标、活动编码器及解码纹理仍需后续统一预算。
 
 前台游戏、正在交互的办公窗口和后台窗口可使用不同调度权重。排队预算需要同时考虑字节数、资源数和帧龄，防止平均吞吐正常但交互延迟持续增长。
 
@@ -306,7 +306,7 @@ M0 已将 Linux 和 Windows 文件接收移至有界顺序工作队列，完成�
 
 ### 质量指标与验收
 
-现有指标主要统计同一时钟下的阶段平均值和最大值。建议增加分位数、每窗口队列深度、帧龄、丢弃原因、回退次数和资源占用，以解释高延迟及资源增长。
+`--stats` 每两秒报告同一时钟下的阶段平均值、最大值和 P50/P95/P99；分位数使用固定大小的微秒直方图，报告桶上界并以实际最大值封顶，舍入误差最多 6.25%。已记录捕获、原始编码队列、捕获至编码/网络队列、媒体发送队列，以及原始队列条目/字节数的最近值和区间峰值。等待计数分别标记呈现额度、编码槽和队列预算不足；它们统计轮询次数，不是丢帧数。完整每窗口资源、回退次数和物理性能基线继续扩展。
 
 呈现提交时长、控制 RTT 和各端阶段时间不能直接相加作为物理输入到显示延迟。物理延迟需要单独的端到端实验。
 

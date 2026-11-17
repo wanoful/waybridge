@@ -207,7 +207,7 @@ impl App {
                 let bbox = bbox_from_surface_tree(&surface, (0, 0));
                 if bounded(&surface, bbox) {
                     let scale = capture_scale(bbox.size, scale);
-                    match capture_surface(
+                    match capture::surface(
                         &mut self.renderer,
                         &surface,
                         0,

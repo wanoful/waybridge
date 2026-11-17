@@ -1,6 +1,9 @@
 //! Precision preflight. Hardware capabilities are distinct from implemented HDR.
 use super::*;
-use smithay::backend::renderer::{ImportMem, Texture, TextureFilter};
+use smithay::backend::renderer::{
+    element::{surface::WaylandSurfaceRenderElement, Kind},
+    Bind, Color32F, ExportMem, Frame, ImportMem, Offscreen, Renderer, Texture, TextureFilter,
+};
 use std::collections::HashSet;
 
 pub const HIGH_PRECISION_TEXTURE: &str = r#"#version 100

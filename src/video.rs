@@ -24,6 +24,7 @@ pub struct Frame {
     pub peer: Arc<Peer>,
     pub video_eligible: bool,
     pub enqueued: Instant,
+    pub captured: Instant,
 }
 impl Frame {
     fn memory_bytes(&self) -> usize {
@@ -74,6 +75,17 @@ struct Session {
 // The pixel budget bounds cached resolutions; driver allocations also include codec surfaces.
 const MAX_IDLE_ENCODERS: usize = 2;
 const MAX_IDLE_PIXELS: u64 = 4 * 1024 * 1024;
+const MAX_RAW_BYTES: usize = 128 * 1024 * 1024;
+
+impl Queue {
+    fn fits(&self, bytes: usize) -> bool {
+        bytes <= MAX_RAW_BYTES.saturating_sub(self.bytes)
+    }
+    fn observe(&self) {
+        metrics::gauge("raw_queue_frames", self.frames.len());
+        metrics::gauge("raw_queue_bytes", self.bytes);
+    }
+}
 
 fn trim_idle(idle: &mut VecDeque<(u32, Session)>) {
     while idle.len() > MAX_IDLE_ENCODERS
@@ -126,6 +138,7 @@ impl Encoder {
                         q.last_id = id;
                         let frame = q.frames.remove(&id).unwrap();
                         q.bytes -= frame.memory_bytes();
+                        q.observe();
                         frame
                     });
                     let config = q.config.take();
@@ -171,9 +184,15 @@ impl Encoder {
                     if q.closed {
                         return;
                     }
-                    if !q.frames.contains_key(&frame.id) {
+                    if !q.frames.contains_key(&frame.id) && q.fits(frame.memory_bytes()) {
                         q.bytes += frame.memory_bytes();
                         q.frames.insert(frame.id, frame);
+                        q.observe();
+                    } else if !q.frames.contains_key(&frame.id) {
+                        // A concurrent capture may have used this slot. Keep the
+                        // queue bounded and ask the compositor for current content.
+                        frame.peer.request_capture(frame.id);
+                        metrics::increment("raw_retry_budget");
                     }
                     let _ = wake.wait_timeout(q, Duration::from_millis(2)).unwrap();
                     continue;
@@ -299,11 +318,13 @@ impl Encoder {
                         }
                         let latest = q.frames.remove(&frame.id).unwrap();
                         q.bytes -= latest.memory_bytes();
+                        q.observe();
                         frame = latest;
                         queue_wait = frame.enqueued.elapsed();
                     }
                 }
                 metrics::record("encode_queue", queue_wait);
+                metrics::record("capture_to_encode", frame.captured.elapsed());
                 let conversion = Instant::now();
                 let transparent = frame.gpu.as_ref().map_or_else(
                     || frame.rgba.chunks_exact(4).any(|p| p[3] != 255),
@@ -383,6 +404,10 @@ impl Encoder {
                                 }
                                 body.extend(color);
                                 body.extend(mask);
+                                metrics::record(
+                                    "capture_to_network_queue",
+                                    frame.captured.elapsed(),
+                                );
                                 frame.peer.video_frame(frame.id, selected_codec, body);
                                 continue;
                             }
@@ -428,6 +453,7 @@ impl Encoder {
                                 trim_idle(&mut idle);
                             }
                         }
+                        metrics::record("capture_to_network_queue", frame.captured.elapsed());
                         frame.peer.frame(frame.id, bytes);
                     }
                 }
@@ -443,6 +469,7 @@ impl Encoder {
         let mut queue = lock.lock().unwrap();
         queue.frames.clear();
         queue.bytes = 0;
+        queue.observe();
         queue.config = Some((codec, fps, bitrate));
         wake.notify_one();
     }
@@ -456,6 +483,7 @@ impl Encoder {
             q.closed = true;
             q.frames.clear();
             q.bytes = 0;
+            q.observe();
             wake.notify_one();
         }
         // Release active and cached NVENC/CUDA sessions before EGL/driver teardown.
@@ -464,24 +492,41 @@ impl Encoder {
             tracing::warn!("video worker panicked during shutdown");
         }
     }
-    pub fn submit(&self, frame: Frame) {
+    /// The compositor is the sole producer. A pending raw update already owns
+    /// this window's slot; newer commits stay dirty until that slot is consumed.
+    pub fn capture_ready(&self, id: u32, estimated_bytes: usize) -> bool {
+        let q = self.queue.0.lock().unwrap();
+        if q.closed {
+            return false;
+        }
+        if q.frames.contains_key(&id) {
+            metrics::increment("capture_wait_encoder");
+            return false;
+        }
+        if !q.fits(estimated_bytes) {
+            metrics::increment("capture_wait_budget");
+            return false;
+        }
+        true
+    }
+    pub fn submit(&self, frame: Frame) -> bool {
         let (lock, wake) = &*self.queue;
         let mut q = lock.lock().unwrap();
         if q.closed {
-            return;
+            return false;
         }
-        if let Some(old) = q.frames.remove(&frame.id) {
-            q.bytes -= old.memory_bytes();
+        // CUDA pitch/alpha may exceed the RGBA admission estimate. Refuse this
+        // capture and retain caller dirty; never evict another window's final frame.
+        let replaced = q.frames.get(&frame.id).map_or(0, Frame::memory_bytes);
+        if frame.memory_bytes() > MAX_RAW_BYTES - q.bytes + replaced {
+            metrics::increment("raw_capture_retry_budget");
+            return false;
         }
-        while q.bytes + frame.memory_bytes() > 128 * 1024 * 1024 {
-            let Some((_, old)) = q.frames.pop_first() else {
-                return;
-            };
-            q.bytes -= old.memory_bytes();
-        }
-        q.bytes += frame.memory_bytes();
+        q.bytes = q.bytes - replaced + frame.memory_bytes();
         q.frames.insert(frame.id, frame);
+        q.observe();
         wake.notify_one();
+        true
     }
     pub fn forget(&self, id: u32) {
         let (lock, wake) = &*self.queue;
@@ -489,6 +534,7 @@ impl Encoder {
         if let Some(frame) = q.frames.remove(&id) {
             q.bytes -= frame.memory_bytes();
         }
+        q.observe();
         q.forget.push(id);
         wake.notify_one();
     }
@@ -497,6 +543,7 @@ impl Encoder {
         let mut q = lock.lock().unwrap();
         q.frames.clear();
         q.bytes = 0;
+        q.observe();
         q.reset = true;
         wake.notify_one();
     }

@@ -42,7 +42,12 @@ pub enum Event {
     },
 }
 
-type QueuedFrame = (u8, Vec<u8>, Option<Instant>);
+struct QueuedFrame {
+    kind: u8,
+    bytes: Vec<u8>,
+    resize: Option<Instant>,
+    queued: Instant,
+}
 
 #[derive(Default)]
 struct Queue {
@@ -58,7 +63,7 @@ struct Queue {
     png_only: BTreeSet<u32>,
     active_codec: BTreeMap<u32, waybridge_codec::Codec>,
     gpu_disabled: BTreeSet<u32>,
-    gpu_refresh: BTreeSet<u32>,
+    capture_refresh: BTreeSet<u32>,
     hdr_windows: BTreeSet<u32>,
     in_flight: BTreeMap<u32, BTreeMap<u64, std::time::Instant>>,
     closed_windows: BTreeSet<u32>,
@@ -84,7 +89,7 @@ impl Queue {
             ))
             .next()
             .or_else(|| self.frames.first_key_value())
-            .and_then(|(id, frames)| frames.front().map(|(_, bytes, _)| (*id, bytes.len())))
+            .and_then(|(id, frames)| frames.front().map(|frame| (*id, frame.bytes.len())))
     }
     fn resize_marker(&mut self, id: u32, bytes: &[u8]) -> Option<Instant> {
         let resize = self.resizes.get_mut(&id)?;
@@ -298,7 +303,7 @@ impl Peer {
                 if let Some(previous) = q.frames.get(&id) {
                     let sequences: Vec<_> = previous
                         .iter()
-                        .map(|(_, bytes, _)| u64::from_be_bytes(bytes[12..20].try_into().unwrap()))
+                        .map(|frame| u64::from_be_bytes(frame.bytes[12..20].try_into().unwrap()))
                         .collect();
                     for sequence in sequences {
                         q.in_flight.entry(id).or_default().remove(&sequence);
@@ -310,8 +315,15 @@ impl Peer {
                 );
             }
             let resize = q.resize_marker(id, &bytes);
-            q.frames
-                .insert(id, VecDeque::from([(protocol::FRAME, bytes, resize)]));
+            q.frames.insert(
+                id,
+                VecDeque::from([QueuedFrame {
+                    kind: protocol::FRAME,
+                    bytes,
+                    resize,
+                    queued: Instant::now(),
+                }]),
+            );
         }
         self.wake.notify_all();
     }
@@ -338,11 +350,17 @@ impl Peer {
             return;
         }
         if q.gpu_disabled.insert(id) {
-            q.gpu_refresh.insert(id);
+            q.capture_refresh.insert(id);
         }
     }
-    pub fn take_gpu_refresh(&self, id: u32) -> bool {
-        self.queue.lock().unwrap().gpu_refresh.remove(&id)
+    pub fn request_capture(&self, id: u32) {
+        let mut q = self.queue.lock().unwrap();
+        if !q.closed && !q.closed_windows.contains(&id) {
+            q.capture_refresh.insert(id);
+        }
+    }
+    pub fn take_capture_refresh(&self, id: u32) -> bool {
+        self.queue.lock().unwrap().capture_refresh.remove(&id)
     }
     pub fn video_ready(&self, id: u32) -> bool {
         let q = self.queue.lock().unwrap();
@@ -382,8 +400,8 @@ impl Peer {
             }
             q.active_codec.insert(id, codec);
             let resize = q.resize_marker(id, &bytes);
-            q.frames.entry(id).or_default().push_back((
-                match codec {
+            q.frames.entry(id).or_default().push_back(QueuedFrame {
+                kind: match codec {
                     waybridge_codec::Codec::H264 => protocol::VIDEO,
                     waybridge_codec::Codec::Hevc => protocol::HEVC_VIDEO,
                     waybridge_codec::Codec::Av1 => protocol::AV1_VIDEO,
@@ -392,7 +410,8 @@ impl Peer {
                 },
                 bytes,
                 resize,
-            ));
+                queued: Instant::now(),
+            });
         }
         self.wake.notify_all();
     }
@@ -413,7 +432,7 @@ impl Peer {
         q.closed_windows.insert(id);
         q.active_codec.remove(&id);
         q.gpu_disabled.remove(&id);
-        q.gpu_refresh.remove(&id);
+        q.capture_refresh.remove(&id);
         q.hdr_windows.remove(&id);
         q.in_flight.remove(&id);
         q.resizes.remove(&id);
@@ -488,7 +507,8 @@ impl Peer {
                     if q.frames[&id].is_empty() {
                         q.frames.remove(&id);
                     }
-                    frame
+                    crate::metrics::record("media_send_queue", frame.queued.elapsed());
+                    (frame.kind, frame.bytes, frame.resize)
                 } else {
                     (protocol::JSON, q.bulk.pop_front().unwrap(), None)
                 }

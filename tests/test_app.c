@@ -202,6 +202,12 @@ static void released(void *data, struct wl_buffer *buffer) {
 static const struct wl_buffer_listener buffer_listener = {.release = released};
 #include "cursor_fixture.h"
 #include "drag_visual_fixture.h"
+static void capture_callback(void *data, struct wl_callback *callback, uint32_t time) {
+  struct window *w = data;
+  wl_callback_destroy(callback);
+  printf("FRAME_DONE %d %u\n", w->id, time); fflush(stdout);
+}
+static const struct wl_callback_listener capture_listener = {.done = capture_callback};
 static void draw(struct window *w) {
   int shadow = client_decorated ? 12 : 0;
   int width = w->width + shadow * 2, height = w->height + shadow * 2;
@@ -234,6 +240,8 @@ static void draw(struct window *w) {
   wl_surface_attach(w->surface, p->buffer, 0, 0);
   xdg_surface_set_window_geometry(w->xdg, shadow, shadow, w->width, w->height);
   wl_surface_damage_buffer(w->surface, 0, 0, width, height);
+  if (getenv("WAYBRIDGE_TEST_FRAME_CALLBACKS"))
+    wl_callback_add_listener(wl_surface_frame(w->surface), &capture_listener, w);
   wl_surface_commit(w->surface);
   printf("CONFIGURE %d %d %d\n", w->id, w->width, w->height);
   fflush(stdout);

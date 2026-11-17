@@ -163,7 +163,7 @@ impl App {
                                     .then(|| bounds(bbox, hotspot, scale))
                                     .flatten()
                                 {
-                                    match capture_surface(
+                                    match capture::surface(
                                         &mut self.renderer,
                                         surface,
                                         id,
