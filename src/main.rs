@@ -435,6 +435,9 @@ impl App {
     }
 
     fn focus(&mut self, id: Option<u32>) {
+        if self.defer_touch_focus(id) {
+            return;
+        }
         if self.window_drag.defer_focus(id) {
             return;
         }
@@ -718,7 +721,11 @@ impl App {
         };
         drag.cancelled.store(true, Ordering::Relaxed);
         let success = success && drag.external && drag.dropped;
-        if drag.external && !drag.dropped {
+        let touch_source = self.touch_source_active(drag.source.id);
+        if drag.external && !drag.dropped && touch_source {
+            self.finish_touch_interaction(true);
+        }
+        if drag.external && !drag.dropped && !touch_source {
             let pointer = self.seat.get_pointer().unwrap();
             pointer.motion(
                 self,
@@ -759,6 +766,27 @@ impl App {
         let Some(id) = message["drag"].as_u64() else {
             return;
         };
+        if self
+            .data_drop
+            .outbound
+            .as_ref()
+            .filter(|d| d.id == id)
+            .is_some_and(|drag| !self.touch_drag_matches(drag.source.id, message))
+        {
+            return;
+        }
+        let touch_source = self
+            .data_drop
+            .outbound
+            .as_ref()
+            .filter(|d| d.id == id)
+            .is_some_and(|d| self.touch_source_active(d.source.id));
+        let touch_held = self
+            .data_drop
+            .outbound
+            .as_ref()
+            .filter(|d| d.id == id)
+            .is_some_and(|d| self.touch_source_held(d.source.id));
         let Some(drag) = self.data_drop.outbound.as_mut().filter(|d| d.id == id) else {
             return;
         };
@@ -767,13 +795,13 @@ impl App {
             "drag_claim"
                 if !drag.external
                     && drag.files.is_some()
-                    && self.pressed_buttons.contains(&0x110) =>
+                    && (touch_held || (!touch_source && self.pressed_buttons.contains(&0x110))) =>
             {
                 let Some(surface) = self.drag_surface.clone() else {
                     self.end_outbound(false);
                     return;
                 };
-                if self.pressed_buttons.len() != 1 {
+                if !touch_source && self.pressed_buttons.len() != 1 {
                     self.end_outbound(false);
                     return;
                 }
@@ -786,7 +814,15 @@ impl App {
                 self.release_keys();
                 let serial = SERIAL_COUNTER.next_serial();
                 if let Some(sink) = &mut self.drag_sink {
-                    sink.arm_mime(serial.into(), &mime);
+                    if touch_source {
+                        sink.arm_touch_mime(serial.into(), &mime);
+                    } else {
+                        sink.arm_mime(serial.into(), &mime);
+                    }
+                }
+                if touch_source {
+                    self.touch_claim_sink(surface);
+                    return;
                 }
                 let pointer = self.seat.get_pointer().unwrap();
                 let location = pointer.current_location();
@@ -816,16 +852,30 @@ impl App {
                 drag.external = false;
                 drag.returned = true;
                 drag.ready = false;
+                let source = drag.source.id;
                 if let Some(sink) = &mut self.drag_sink {
                     sink.finish(false);
                 }
-                self.pointer_message(target, message);
+                if touch_source {
+                    self.touch_begin_return(source);
+                    let (x, y) = self.message_position(target, message);
+                    if !self.touch_drag_motion(target, x, y) {
+                        self.finish_touch_interaction(true);
+                        self.end_outbound(false);
+                    }
+                } else {
+                    self.pointer_message(target, message);
+                }
             }
             "drag_drop" if drag.external && drag.ready && !drag.dropped => {
                 drag.dropped = true;
                 let deferred_focus = drag.deferred_focus.take();
                 self.release_keys();
-                if self.pressed_buttons.remove(&0x110) {
+                if touch_source {
+                    self.touch_drag_up();
+                    self.finish_touch_interaction(false);
+                }
+                if !touch_source && self.pressed_buttons.remove(&0x110) {
                     let pointer = self.seat.get_pointer().unwrap();
                     pointer.button(
                         self,
@@ -1061,6 +1111,8 @@ impl App {
             "window_state" => self.native_window_state(id, &value),
             "ime" => self.ime_message(&value),
             "touch" => self.touch_message(&value),
+            "touch_interaction_ack" => self.touch_interaction_ack(&value),
+            "touch_interaction_input" => self.touch_interaction_input(&value),
             "touch_enabled" => {
                 if let Some(enabled) = value["enabled"].as_bool() {
                     self.touch_enabled(enabled);
@@ -1095,6 +1147,7 @@ impl App {
                     } else {
                         value["touch_enabled"].as_bool().unwrap_or(false)
                     },
+                    value["touch_interaction_v1"] == true,
                 );
                 self.activation.negotiated = value["activation_v1"] == true;
                 self.window_drag.available = value["toplevel_drag_v1"].as_bool().unwrap_or(false);
@@ -1676,7 +1729,16 @@ impl App {
                 .icon
                 .observe(info["app_id"].as_str().unwrap_or_default());
             info["icon_revision"] = json!(remote.icon.revision);
-            info["touch_input"] = json!(!remote.window.is_x11());
+            info["touch_input"] = json!(
+                !remote.window.is_x11()
+                    && self.seat.get_touch().is_some_and(|touch| {
+                        remote
+                            .window
+                            .wl_surface()
+                            .and_then(|surface| surface.client())
+                            .is_some_and(|client| touch.client_touches(&client).next().is_some())
+                    })
+            );
             let mut deferred = false;
             if let Some(peer) = &self.peer {
                 if !remote.announced || remote.last_info != info {
@@ -2214,6 +2276,8 @@ impl XdgShellHandler for App {
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
         if self.has_pointer_grab(&surface, &seat, serial) {
             self.window_action(&surface, "move", None);
+        } else {
+            self.touch_window_action(&surface, &seat, serial, "move", None);
         }
     }
     fn resize_request(
@@ -2225,6 +2289,8 @@ impl XdgShellHandler for App {
     ) {
         if self.has_pointer_grab(&surface, &seat, serial) {
             self.window_action(&surface, "resize", Some(edge as u32));
+        } else if matches!(edge as u32, 1 | 2 | 4 | 5 | 6 | 8 | 9 | 10) {
+            self.touch_window_action(&surface, &seat, serial, "resize", Some(edge as u32));
         }
     }
     fn fullscreen_request(
@@ -2272,7 +2338,8 @@ impl XdgShellHandler for App {
                     .as_ref()
                     == Some(&root)
         });
-        if !recent && !pointer.has_grab(serial) && !keyboard.has_grab(serial) {
+        let touch_grab = self.touch_popup_serial(&root, serial);
+        if !recent && !pointer.has_grab(serial) && !keyboard.has_grab(serial) && !touch_grab {
             return;
         }
         let seat = self.seat.clone();
@@ -2981,7 +3048,10 @@ fn main() -> Result<()> {
                                     let text = files.text.as_ref().map(|b| B64.encode(b));
                                     let mime = files.mime.clone();
                                     drag.files = Some(files);
-                                    app.control(json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"tree":tree,"text":text,"mime":mime,"action":"copy"}));
+                                    let source = drag.source.id;
+                                    let mut offer = json!({"type":"drag_offer","drag":id,"id":window,"files":manifest,"tree":tree,"text":text,"mime":mime,"action":"copy"});
+                                    app.touch_drag_tag(&mut offer, Some(source));
+                                    app.control(offer);
                                 }
                                 Err(error) => {
                                     tracing::debug!(%error, "outbound drag not supported");

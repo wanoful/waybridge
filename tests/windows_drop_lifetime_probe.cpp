@@ -207,6 +207,51 @@ int wmain() {
     auto fileState=std::make_shared<FileDrag::Transfer>();fileState->files.push_back({L"blocked.txt",0,false});auto fileData=new FileDrag::DataObject(fileState);
     effect=DROPEFFECT_COPY;adapter->DragEnter(fileData,0,point,&effect);require(effect==DROPEFFECT_NONE,"file disabled policy was bypassed");adapter->DragLeave();fileData->Release();adapter->Release();destroyRemote(Id);hostedFiles=true;
     require(operationsEnded == 2, "async operation was not ended after target closure");
+    // Exercise the actual viewer callback and windowProc, not just geometry.
+    createTarget();
+    auto *touchTarget=windows.at(Id).get(); touchTarget->width=400; touchTarget->height=300;
+    touchTarget->clientDecorated=true; touchTarget->touchInput=true; touchTarget->appId="fixture.touch";
+    ShowWindow(touchTarget->hwnd,SW_SHOW); SetFocus(touchTarget->hwnd);
+    std::vector<Json> touchWire;
+    nativeTouch=NativeTouch([&](const Json &message){touchWire.push_back(message);});
+    nativeTouch.onInteraction(touchInteractionSample); nativeTouch.hello(true); nativeTouch.enabled(true);
+    nativeTouch.state({{"generation",11},{"id",Id},{"enabled",true}});
+    RECT image=imageRect(touchTarget); POINT first{image.left+60,image.top+60};
+    ClientToScreen(touchTarget->hwnd,&first);
+    NativeTouch::Target input{touchTarget->hwnd,Id,400,300,0,0,image,true,Id,touchTarget->hwnd};
+    nativeTouch.sample(input,WM_POINTERDOWN,501,first);
+    auto gesture=touchWire.back().at("gesture").get<uint64_t>();
+    RECT before{}; GetWindowRect(touchTarget->hwnd,&before);
+    require(nativeTouch.beginInteraction({{"operation",31},{"kind","resize"},{"edge",10},
+      {"id",Id},{"generation",11},{"gesture",gesture},{"slot",0}},touchTarget->hwnd),"production touch resize rejected");
+    POINT after{first.x+70,first.y+40}; input.enabled=false;
+    nativeTouch.sample(input,WM_POINTERUPDATE,501,after);
+    RECT resized{}; GetWindowRect(touchTarget->hwnd,&resized);
+    require(nativeTouch.ownsInteraction(touchTarget->hwnd) && touchTarget->sizing &&
+      resized.right-resized.left == before.right-before.left+70 &&
+      resized.bottom-resized.top == before.bottom-before.top+40,
+      "production WM_SIZE revoked its owning touch resize");
+    nativeTouch.sample(input,WM_POINTERUP,501,after);
+    require(!nativeTouch.ownsInteraction() && !touchTarget->sizing,"production resize did not release ownership");
+    nativeTouch.state({{"generation",12},{"id",Id},{"enabled",true}}); input.enabled=true;
+    SetFocus(touchTarget->hwnd); nativeTouch.sample(input,WM_POINTERDOWN,502,first);
+    gesture=touchWire.back().at("gesture").get<uint64_t>();
+    require(nativeTouch.beginInteraction({{"operation",32},{"kind","dnd"},{"id",Id},
+      {"generation",12},{"gesture",gesture},{"slot",0}},touchTarget->hwnd),"production touch DND rejected");
+    require(nativeTouch.externalInteraction(32,true),"external owner not retained");
+    auto returned=std::make_shared<FileDrag::Transfer>(); returned->id=51; returned->touchOperation=32;
+    { std::lock_guard<std::mutex> lock(FileDrag::activeMutex); FileDrag::active=returned; }
+    touchOlePromotedOperation=32; touchOleMouseReady=true;
+    SetCursorPos(first.x,first.y);
+    auto started=GetTickCount64();
+    require(!touchOleMouse(touchTarget->hwnd,WM_MOUSEMOVE,MK_LBUTTON,0xff515780) &&
+      GetTickCount64()-started < 500 && nativeTouch.ownsInteraction(),
+      "returned remote motion was consumed by an unclaimed OLE wait");
+    nativeTouch.endInteraction(32);
+    { std::lock_guard<std::mutex> lock(FileDrag::activeMutex); FileDrag::active.reset(); }
+    nativeTouch=NativeTouch{}; resetTouchOle(); destroyRemote(Id);
+    std::cout << "PASS: production touch resize survives WM_SIZE and releases sizing; returned touch motion bypasses unclaimed OLE readiness wait\n";
+
     std::cout << "PASS: OLE target closure/replacement during query, data read, medium release, async setup; cancelled without scheduling uploads\n";
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';

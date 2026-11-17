@@ -89,8 +89,113 @@ int main(){
   require(touch.promotedMouse(window,0xff515780),"promoted touch mouse not suppressed");
   require(!touch.promotedMouse(window,0xff515700)&&!touch.promotedMouse(window,0),"pen/mouse suppressed");
   touch.hello(false);require(!touch.promotedMouse(window,0xff515780),"legacy mouse suppression");
+  // Server takeover is bound to a physical gesture and owning slot, rather
+  // than a focus HWND or a slot number that can already have been reused.
+  SetFocus(window);
+  std::vector<NativeTouch::Json> wire;
+  std::vector<NativeTouch::InteractionSample> events;
+  NativeTouch takeover([&](const auto &p){wire.push_back(p);});
+  bool ackBeforeBegin=false;
+  takeover.onInteraction([&](const auto &s){
+    if(s.phase=="begin")ackBeforeBegin=!wire.empty()&&wire.back().value("type",std::string())=="touch_interaction_ack"&&wire.back().value("accepted",false);
+    events.push_back(s);
+  });
+  takeover.hello(true);takeover.state({{"generation",10},{"id",7},{"enabled",true}});
+  takeover.sample(target,WM_POINTERDOWN,101,first);
+  uint64_t firstGesture=wire.back()["gesture"];
+  require(firstGesture!=0,"missing physical gesture identity");
+  takeover.sample(target,WM_POINTERDOWN,102,first);
+  takeover.sample(target,WM_POINTERUPDATE,101,moved);
+  RECT originalWindow{};GetWindowRect(window,&originalWindow);
+  auto start=[&](uint64_t operation,uint64_t physical,uint32_t slot=0,const char *kind="move"){
+    return NativeTouch::Json{{"operation",operation},{"kind",kind},{"id",7},{"generation",10},{"gesture",physical},{"slot",slot},{"edge",8}};
+  };
+  require(takeover.beginInteraction(start(1,firstGesture),window),"valid operation rejected");
+  require(ackBeforeBegin&&events.size()==1&&events.back().pointerId==101,"ack/owner ordering");
+  require(events.back().initialScreen.x==first.x&&events.back().screen.x==moved.x&&
+          events.back().initialWindow.left==originalWindow.left&&events.back().initialWindow.right==originalWindow.right,
+          "takeover lost physical press geometry");
+  require(takeover.ownsInteraction(window)&&takeover.ownsPointer(101),"operation ownership unavailable");
+  require(takeover.beginInteraction(start(1,firstGesture),window)&&events.size()==1,"duplicate begin replayed callback");
+  require(!takeover.beginInteraction(start(1,firstGesture+1),window)&&takeover.ownsInteraction(),"duplicate operation accepted wrong gesture");
+  require(!takeover.beginInteraction(start(1,firstGesture,1),window)&&takeover.ownsInteraction(),"duplicate operation accepted another slot");
+  HWND elsewhere=CreateWindowExW(0,L"STATIC",L"Other focus",WS_OVERLAPPEDWINDOW,850,10,200,100,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+  require(elsewhere!=nullptr,"other focus window");ShowWindow(elsewhere,SW_SHOW);SetFocus(elsewhere);
+  NativeTouch::Target ineligible{};
+  size_t wireCount=wire.size();
+  require(takeover.sample(ineligible,WM_POINTERUPDATE,101,first),"captured owner rejected after eligibility change");
+  require(events.back().phase=="motion"&&events.back().pointerId==101&&wire.size()==wireCount,"operation emitted ordinary touch");
+  size_t eventCount=events.size();
+  takeover.sample(ineligible,WM_POINTERUP,102,first);
+  takeover.sample(ineligible,WM_POINTERCAPTURECHANGED,102,first);
+  takeover.sample(ineligible,WM_POINTERDOWN,103,first);
+  require(events.size()==eventCount&&takeover.ownsInteraction()&&!takeover.ownsPointer(103),"second finger altered operation");
+  require(!takeover.endInteraction(99)&&takeover.ownsInteraction(),"stale end killed operation");
+  require(takeover.promotedMouse(elsewhere,0xff515780)&&!takeover.promotedMouse(window,0xff515700),"takeover touch-only suppression");
+  takeover.sample(ineligible,WM_POINTERUP,101,first);
+  require(events.size()==eventCount+1&&events.back().phase=="up"&&!takeover.ownsInteraction()&&!takeover.ownsPointer(101),"owner release did not end operation");
+  require(!takeover.beginInteraction(start(2,firstGesture),window)&&!wire.back()["accepted"].get<bool>(),"ended contact acknowledged");
+  SetFocus(window);
+  takeover.sample(target,WM_POINTERDOWN,104,first);
+  uint64_t secondGesture=wire.back()["gesture"];
+  require(secondGesture!=firstGesture,"new gesture reused old identity");
+  require(!takeover.beginInteraction(start(2,firstGesture),window),"old gesture took over reused slot");
+  require(takeover.beginInteraction(start(2,secondGesture),window),"fresh gesture rejected after stale start");
+  require(!takeover.beginInteraction(start(1,firstGesture),window)&&takeover.activeInteraction()->operation==2,"stale operation replaced active operation");
+  // External native-to-OLE handoff tolerates OS capture changes and keeps the
+  // operation token after UP, without pretending a released pointer is held.
+  require(!takeover.externalInteraction(1,true)&&takeover.externalInteraction(2,true),"external handoff token validation");
+  require(!takeover.promotedMouse(window,0xff515780),"external handoff suppressed compatibility mouse");
+  eventCount=events.size();
+  takeover.sample(ineligible,WM_POINTERCAPTURECHANGED,104,first);
+  require(takeover.ownsInteraction()&&events.size()==eventCount,"external OS capture transfer canceled operation");
+  takeover.sample(ineligible,WM_POINTERUPDATE,104,moved);
+  require(events.back().external&&events.back().phase=="motion","external motion lost identity");
+  require(takeover.externalInteraction(2,false)&&takeover.promotedMouse(window,0xff515780),"failed external promotion could not restore native mode");
+  require(takeover.externalInteraction(2,true),"second external handoff failed");
+  takeover.sample(ineligible,WM_POINTERUP,104,moved);
+  require(events.back().external&&events.back().phase=="up"&&takeover.ownsInteraction()&&!takeover.ownsPointer(104),"external UP lifetime");
+  require(!takeover.externalInteraction(2,false),"released pointer restored native mode");
+  require(!takeover.endInteraction(1)&&takeover.endInteraction(2)&&events.back().phase=="end"&&!takeover.ownsInteraction(),"external completion token");
+  // Ordinary DOWN/UP before the control request must never be resurrected.
+  takeover.sample(target,WM_POINTERDOWN,105,first);uint64_t releasedGesture=wire.back()["gesture"];
+  takeover.sample(target,WM_POINTERUP,105,first);
+  require(!takeover.beginInteraction(start(3,releasedGesture),window),"down/up before ACK resurrected contact");
+  takeover.sample(target,WM_POINTERDOWN,106,first);uint64_t cancelGesture=wire.back()["gesture"];
+  require(takeover.beginInteraction(start(3,cancelGesture,0,"resize"),window),"resize start");
+  wireCount=wire.size();eventCount=events.size();takeover.enabled(false);
+  require(events.size()==eventCount+1&&events.back().phase=="cancel"&&wire.size()==wireCount&&!takeover.ownsInteraction(),"policy cancel duplicated or lost operation cancel");
+  takeover.cancel();require(events.size()==eventCount+1,"operation cancel replayed");
+  takeover.enabled(true);takeover.state({{"generation",11},{"id",7},{"enabled",true}});
+  takeover.sample(target,WM_POINTERDOWN,107,first);uint64_t revokedGesture=wire.back()["gesture"];
+  auto revokedStart=start(4,revokedGesture);revokedStart["generation"]=11;
+  require(takeover.beginInteraction(revokedStart,window),"post-disable recovery");
+  eventCount=events.size();wireCount=wire.size();
+  takeover.state({{"generation",12},{"id",0},{"enabled",false}});
+  require(events.size()==eventCount+1&&events.back().phase=="end"&&wire.size()==wireCount&&!takeover.ownsInteraction(),"server revoke echoed operation cancel");
+  takeover.state({{"generation",13},{"id",7},{"enabled",true}});
+  takeover.sample(target,WM_POINTERDOWN,108,first);auto capturedStart=start(5,wire.back()["gesture"],0,"dnd");capturedStart["generation"]=13;
+  require(takeover.beginInteraction(capturedStart,window),"captured DND start");
+  eventCount=events.size();wireCount=wire.size();takeover.sample(ineligible,WM_POINTERCAPTURECHANGED,108,first);
+  require(events.size()==eventCount+1&&events.back().phase=="cancel"&&wire.size()==wireCount&&!takeover.ownsInteraction(),"owning native capture loss failed to cancel exactly once");
+  // Concrete popup coordinates use the root lease, including a first queued
+  // tap when the keyboard focus remains on the root window.
+  HWND popup=CreateWindowExW(0,L"STATIC",L"Touch popup",WS_POPUP,200,200,220,180,window,nullptr,GetModuleHandleW(nullptr),nullptr);
+  require(popup!=nullptr,"popup window");ShowWindow(popup,SW_SHOWNOACTIVATE);SetFocus(window);
+  NativeTouch::Target popupTarget{popup,7,200,160,4,6,{0,0,200,160},true,9,window};
+  POINT popupPoint{50,60};ClientToScreen(popup,&popupPoint);
+  std::vector<NativeTouch::Json> popupWire;
+  NativeTouch popupTouch([&](const auto &p){popupWire.push_back(p);});popupTouch.hello(true);
+  popupTouch.sample(popupTarget,WM_POINTERDOWN,201,popupPoint);popupTouch.sample(popupTarget,WM_POINTERUP,201,popupPoint);
+  popupTouch.sample(popupTarget,WM_POINTERDOWN,202,popupPoint);popupTouch.sample(popupTarget,WM_POINTERUP,202,popupPoint);
+  popupTouch.state({{"generation",1},{"id",0},{"enabled",false},{"pending_target",7}});
+  popupTouch.state({{"generation",2},{"id",7},{"enabled",true}});
+  require(popupWire.size()==4&&popupWire[0]["id"]==7&&popupWire[0]["target"]==9&&popupWire[0]["generation"]==2&&
+          popupWire[0]["origin_x"]==4&&popupWire[0]["points"][0]["x"]==50.,"popup root lease/transform");
+  require(popupWire[0]["gesture"]==popupWire[1]["gesture"]&&popupWire[0]["gesture"]!=popupWire[2]["gesture"],"queued taps reused gesture identity");
+  DestroyWindow(popup);DestroyWindow(elsewhere);
   DestroyWindow(window);
-  std::cout<<"PASS: native touch first-tap and marked handoff buffering, revocation/retarget no-replay, startup/live preference cancel and recovery, fractional image geometry, ten slots, motion/up/cancel, stale leases, capture loss and touch-only mouse suppression\n";
+  std::cout<<"PASS: native touch lease/popup geometry, distinct queued gestures, takeover ACK ordering, exact owning contact, second-finger isolation, focus-independent motion/up, stale operations, down/up-before-ACK, external capture/UP/completion, policy/server cancel and touch-only mouse suppression\n";
   return 0;
  }catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}
 }

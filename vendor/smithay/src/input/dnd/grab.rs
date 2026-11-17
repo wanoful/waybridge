@@ -495,6 +495,7 @@ where
             return;
         }
 
+        self.should_drop = true;
         handle.unset_grab(self, data);
     }
 

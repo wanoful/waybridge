@@ -18,6 +18,7 @@ public sealed record ClientSettings
     public bool ReadOnly { get; set; }
     public bool Ime { get; set; } = true;
     public bool Touch { get; set; }
+    public Dictionary<string, string> TouchModes { get; set; } = new(StringComparer.Ordinal);
     public string Clipboard { get; set; } = "both";
     public bool ClipboardImages { get; set; } = true;
     public bool Files { get; set; } = true;
@@ -29,6 +30,9 @@ public sealed record ClientSettings
     public string GpuInput { get; set; } = "cpu";
     public void Validate()
     {
+        if (TouchModes is null || TouchModes.Count > 100 || TouchModes.Any(p =>
+            string.IsNullOrWhiteSpace(p.Key) || p.Key.Length > 256 || p.Key.Any(char.IsControl) || p.Value is not ("native" or "mouse")))
+            throw new ArgumentException("应用触控模式无效，最多配置 100 个应用");
         if (BadgePng is null || BadgePng.Length > 32768) throw new ArgumentException("自定义角标过大");
         if (BadgePng.Length > 0)
         {

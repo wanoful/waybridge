@@ -30,6 +30,8 @@
 #include "relative_input.h"
 #include "ime.h"
 #include "native_touch.h"
+#include "touch_window.h"
+#include "touch_ole.h"
 #include "third_party/json.hpp"
 #include "native_transport.h"
 #include "host_control.h"
@@ -58,7 +60,13 @@ Json hostedSettings = Json::object();
 bool hostedReadOnly = false, hostedIme = true, hostedFiles = true, hostedImages = true, hostedDragText = true;
 std::string hostedClipboard = "both";
 bool streamConfigNegotiated = false;
-bool hostedTouch = false, touchNegotiated = false, touchSettingsNegotiated = false;
+bool hostedTouch = false, touchNegotiated = false, touchSettingsNegotiated = false, touchInteractionNegotiated = false;
+std::map<std::string, bool> touchApplicationModes;
+TouchWindowManipulation touchWindow;
+TouchOle::Bridge touchOle;
+uint64_t touchOlePromotedOperation = 0, touchOleWarning = 0;
+bool touchOleMouseReady = false, touchOlePumping = false;
+ULONGLONG touchOleDeadline = 0;
 std::atomic<uint64_t> networkBytes{0}, presentedFrames{0};
 uint64_t streamRequest = 0;
 void applyHostedSettings(const Json &settings, bool live);
@@ -209,11 +217,25 @@ bool semanticsNegotiated = false;
 void reconcileWindows();
 RelativeInput relativeInput;
 struct WindowDrag {
-  bool active = false, released = false, cancelled = false;
+  bool active = false, released = false, cancelled = false, touch = false;
   uint32_t source = 0, attached = 0, target = 0;
   int offsetX = 0, offsetY = 0;
 } windowDrag;
-constexpr UINT_PTR WindowDragTimer = 5;
+constexpr UINT_PTR WindowDragTimer = 5, TouchOleTimer = 6;
+Json touchInteractionInput(const NativeTouch::InteractionSample &sample);
+
+bool nativeTouchFor(const RemoteWindow *window) {
+  if (!hostedTouch || !window) return false;
+  const RemoteWindow *root = window;
+  if (window->popup) {
+    auto found = windows.find(window->root);
+    if (found == windows.end()) return false;
+    root = found->second.get();
+  }
+  if (!root->touchInput) return false;
+  auto mode = touchApplicationModes.find(root->appId);
+  return mode == touchApplicationModes.end() || mode->second;
+}
 
 DWORD windowStyle(bool clientDecorated) {
   // Client-decorated applications already supply their own title bar and controls.
@@ -1579,6 +1601,17 @@ void moveDraggedWindow() {
 }
 void sendWindowDragMotion(bool release = false) {
   if (!windowDrag.active || windowDrag.released) return;
+  if (windowDrag.touch) {
+    auto owner = nativeTouch.activeInteraction();
+    if (!owner || owner->kind != "dnd" || !owner->external) return;
+    FileDrag::maybeClaim();
+    if (FileDrag::ownsInput()) return;
+    moveDraggedWindow();
+    auto input = *owner; input.phase = release ? "up" : "motion";
+    if (GetCursorPos(&input.screen)) sendJson(touchInteractionInput(input));
+    if (release) windowDrag.released = true;
+    return;
+  }
   if (dataDragNegotiated) {
     FileDrag::maybeClaim();
     if (FileDrag::ownsInput()) return;
@@ -1957,6 +1990,152 @@ void suspendImeForOle() {
   imeOleSuspending = false;
 }
 
+Json touchInteractionInput(const NativeTouch::InteractionSample &sample) {
+  Json input = {{"type","touch_interaction_input"},{"operation",sample.operation},
+                {"gesture",sample.gesture},{"generation",sample.generation},{"slot",sample.slot},
+                {"phase",sample.phase},{"id",0},{"x",0.0},{"y",0.0}};
+  if (sample.kind != "dnd") return input;
+  if (auto *target = windowDragTarget(sample.screen)) {
+    POINT point = sample.screen; ScreenToClient(target->hwnd, &point);
+    RECT image = imageRect(target);
+    if (image.right > image.left && image.bottom > image.top) {
+      input["id"] = target->id;
+      input["x"] = double(point.x-image.left)*target->width/(image.right-image.left);
+      input["y"] = double(point.y-image.top)*target->height/(image.bottom-image.top);
+      input["origin_x"] = target->originX; input["origin_y"] = target->originY;
+    }
+  }
+  return input;
+}
+void resetTouchOle(uint64_t expected = 0) {
+  if (expected && touchOlePromotedOperation != expected) return;
+  touchOle.reset(); touchOlePromotedOperation=0; touchOleMouseReady=false; touchOleDeadline=0;
+  if (controller) KillTimer(controller,TouchOleTimer);
+}
+bool tryTouchOle(const NativeTouch::InteractionSample &sample) {
+  if (sample.kind != "dnd" || sample.phase != "motion" || sample.external || windowDragTarget(sample.screen)) return false;
+  auto transfer = FileDrag::current();
+  if (!transfer || transfer->touchOperation != sample.operation) return false;
+  // The OS call must run while this real contact's pointer message is current.
+  if (!nativeTouch.externalInteraction(sample.operation,true)) return false;
+  touchOlePromotedOperation=sample.operation; touchOleMouseReady=false;
+  touchOleDeadline=GetTickCount64()+1000;
+  sendJson(touchInteractionInput(sample));
+  auto result=touchOle.promote(sample.hwnd,sample.pointerId);
+  if (result.promoted()) {
+    auto owner=nativeTouch.activeInteraction();
+    // Promotion can synchronously dispatch the entire mouse/OLE attempt.
+    // Do not rearm an expired operation or overwrite a newer target position.
+    if (owner && owner->operation == sample.operation && owner->external &&
+        touchOlePromotedOperation == sample.operation && !touchOleMouseReady &&
+        nativeTouch.ownsPointer(owner->pointerId)) SetTimer(controller,TouchOleTimer,50,nullptr);
+    return true;
+  }
+  nativeTouch.externalInteraction(sample.operation,false); resetTouchOle(sample.operation);
+  if (touchOleWarning != sample.operation) {
+    touchOleWarning=sample.operation;
+    hostControl.emit({{"type","settings_warning"},
+      {"message","当前系统未能接管原生触控跨端拖放；可在输入设置中为此应用选择鼠标兼容后重试"},
+      {"reason",TouchOle::name(result.code)}});
+  }
+  return false;
+}
+bool touchOleMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
+  if (touchOlePumping || (message != WM_MOUSEMOVE && message != WM_LBUTTONDOWN)) return false;
+  auto owner=nativeTouch.activeInteraction();
+  if (!owner || !owner->external || owner->operation != touchOlePromotedOperation ||
+      !(keys & MK_LBUTTON) || (extra & 0xffffff00) != 0xff515700 || !(extra & 0x80)) return false;
+  if (!touchOleMouseReady) {
+    if (!touchOle.takeMouseReady(hwnd,message,keys,extra)) return false;
+    touchOleMouseReady=true; touchOleDeadline=0; KillTimer(controller,TouchOleTimer);
+  }
+  auto transfer=FileDrag::current();
+  if (!transfer || transfer->touchOperation != owner->operation) return true;
+  touchOlePumping=true;
+  struct Reset { ~Reset() { touchOlePumping=false; } } reset;
+  FileDrag::maybeClaim();
+  {
+    std::lock_guard<std::mutex> lock(transfer->mutex);
+    // Returning inside a remote HWND restores the typed native drag loop.
+    // Only an actual externally claimed attempt may wait for OLE readiness.
+    if (!transfer->claimed) return false;
+  }
+  auto current=[&] {
+    auto active=nativeTouch.activeInteraction();
+    if (!active || active->operation != owner->operation || !nativeTouch.ownsPointer(active->pointerId) ||
+        hostedReadOnly || FileDrag::current() != transfer) return false;
+    std::lock_guard<std::mutex> lock(transfer->mutex);
+    return !transfer->cancelled && !transfer->done;
+  };
+  auto ready=[&] {
+    std::lock_guard<std::mutex> lock(transfer->mutex);
+    return transfer->ready && transfer->claimed && !transfer->inOle && !transfer->oleDone;
+  };
+  auto pump=[] {
+    MSG pending{};
+    while (PeekMessageW(&pending,nullptr,0,0,PM_REMOVE)) {
+      if (pending.message == WM_QUIT) { running=false; PostQuitMessage(int(pending.wParam)); break; }
+      TranslateMessage(&pending); DispatchMessageW(&pending);
+    }
+  };
+  // Keep the accepted synthesized mouse-handler stack while server claim/ready
+  // completes. The existing identities survive nested STA message dispatch.
+  if (DragSession::wait(ready,current,pump,750) && current()) {
+    FileDrag::start(controller);
+    touchOle.reset(); // The converted contact remains a mouse until physical UP.
+  } else if (current()) {
+    // A stationary contact cannot provide a later mouse-handler entry. End the
+    // timed-out attempt rather than leaving an externally owned gesture idle.
+    nativeTouch.cancel(); transfer->finish(false); resetTouchOle();
+    hostControl.emit({{"type","settings_warning"},
+      {"message","触控拖放协商超时，本次拖动已取消，请重试"},{"reason","touch_drag_ready_timeout"}});
+  }
+  return true;
+}
+void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
+  auto found = windows.find(sample.id);
+  RemoteWindow *source = found == windows.end() ? nullptr : found->second.get();
+  bool manipulating = sample.kind == "move" || sample.kind == "resize";
+  if (sample.phase == "begin") {
+    if (manipulating) {
+      if (!source || source->state.fullscreen) {
+        auto cancel = sample; cancel.phase = "cancel"; sendJson(touchInteractionInput(cancel));
+        nativeTouch.endInteraction(sample.operation); return;
+      }
+      source->sizing = true;
+      if (!touchWindow.begin(source->hwnd,sample.kind,sample.edge,sample.initialWindow,
+                             sample.initialScreen,sample.screen)) {
+        auto cancel = sample; cancel.phase = "cancel"; sendJson(touchInteractionInput(cancel));
+        nativeTouch.endInteraction(sample.operation);
+      }
+    }
+    return;
+  }
+  if (sample.kind == "dnd" && !sample.external && sample.phase == "motion") {
+    if (tryTouchOle(sample)) return;
+    auto attached = windows.find(windowDrag.attached);
+    if (windowDrag.touch && attached != windows.end()) {
+      auto *window = attached->second.get(); POINT client{}; RECT outer{};
+      ClientToScreen(window->hwnd,&client); GetWindowRect(window->hwnd,&outer);
+      SetWindowPos(window->hwnd,nullptr,
+        sample.screen.x-MulDiv(windowDrag.offsetX,window->dpi,96)-(client.x-outer.left),
+        sample.screen.y-MulDiv(windowDrag.offsetY,window->dpi,96)-(client.y-outer.top),
+        0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+    }
+  }
+  if (manipulating && (sample.phase == "motion" || sample.phase == "up"))
+    touchWindow.update(sample.screen);
+  if (sample.phase != "end" && (!sample.external || sample.phase == "cancel" || sample.phase == "up"))
+    sendJson(touchInteractionInput(sample));
+  if (sample.phase == "up" || sample.phase == "cancel" || sample.phase == "end") {
+    if (sample.phase != "up" || !sample.external) resetTouchOle(sample.operation);
+    if (manipulating) {
+      touchWindow.end();
+      if (source) { source->sizing=false; KillTimer(source->hwnd,1); sendResize(source); }
+    }
+  }
+}
+
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   if (hostedReadOnly && (message == WM_INPUT || (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) ||
       (message >= WM_KEYFIRST && message <= WM_KEYLAST) ||
@@ -1971,14 +2150,20 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   }
   if (!w)
     return DefWindowProcW(hwnd, message, wp, lp);
+  if (touchOleMouse(hwnd,message,wp,ULONG_PTR(GetMessageExtraInfo()))) return 0;
   if ((message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) &&
-      nativeTouch.promotedMouse(hwnd, ULONG_PTR(GetMessageExtraInfo()))) return 0;
+      nativeTouchFor(w) && nativeTouch.promotedMouse(hwnd, ULONG_PTR(GetMessageExtraInfo()))) return 0;
   if (message == WM_POINTERDOWN || message == WM_POINTERUPDATE || message == WM_POINTERUP ||
       message == WM_POINTERCAPTURECHANGED) {
-    NativeTouch::Target target{hwnd,w->id,w->width,w->height,w->originX,w->originY,imageRect(w),
-                              w->touchInput && hostedTouch && !w->popup && !hostedReadOnly && !w->sizing &&
-                              !relativeInput.active() && !grabbedRoot && !windowDrag.active && !FileDrag::ownsInput()};
-    if (target.enabled && message == WM_POINTERDOWN) SetFocus(hwnd);
+    auto root = w->popup ? windows.find(w->root) : windows.find(w->id);
+    RemoteWindow *rootWindow = root == windows.end() ? nullptr : root->second.get();
+    uint32_t rootId = rootWindow ? rootWindow->id : w->id;
+    NativeTouch::Target target{hwnd,rootId,w->width,w->height,w->originX,w->originY,imageRect(w),
+                              nativeTouchFor(w) && (!w->popup || touchInteractionNegotiated) && !hostedReadOnly &&
+                              !w->sizing && !relativeInput.active() && !FileDrag::ownsInput() &&
+                              (!grabbedRoot || touchInteractionNegotiated),
+                              w->id,rootWindow ? rootWindow->hwnd : hwnd};
+    if (target.enabled && message == WM_POINTERDOWN && rootWindow) SetFocus(rootWindow->hwnd);
     if (nativeTouch.handle(target,message,wp)) return 0;
   }
   if (GetEnvironmentVariableW(L"WAYBRIDGE_IME_TRACE", nullptr, 0) &&
@@ -2185,7 +2370,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     updateIme();
     return 0;
   case WM_KILLFOCUS:
-    nativeTouch.cancel();
+    if (auto owner = nativeTouch.activeInteraction(); !owner || owner->kind != "dnd") nativeTouch.cancel();
     if (relativeInput.active(hwnd))
       releasePointer();
     if (w->popup)
@@ -2334,7 +2519,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   }
   case WM_SIZE:
-    nativeTouch.cancel(hwnd);
+    if (!nativeTouch.ownsInteraction(hwnd)) nativeTouch.cancel(hwnd);
     sendWindowState(w);
     if (relativeInput.active(hwnd))
       releasePointer();
@@ -2571,6 +2756,7 @@ void dispatchNetwork() {
     if (type == "hello") {
       touchNegotiated = m.value("touch_v1",false);
       touchSettingsNegotiated = touchNegotiated && m.value("touch_settings_v1",false);
+      touchInteractionNegotiated = touchNegotiated && m.value("touch_interaction_v1",false);
       nativeTouch.hello(touchNegotiated);
       nativeTouch.enabled(hostedTouch);
       if (hostedTouch && !touchNegotiated)
@@ -2619,6 +2805,12 @@ void dispatchNetwork() {
       hostControl.emit(m);
     } else if (type == "toplevel_drag") {
       if (!m.value("active", false)) { endWindowDrag(); continue; }
+      if (m.value("input","") == "touch") {
+        windowDrag.active = true; windowDrag.touch = true;
+        windowDrag.source = m.value("source",0u); windowDrag.attached = m.value("id",0u);
+        windowDrag.offsetX = m.value("offset_x",0); windowDrag.offsetY = m.value("offset_y",0);
+        continue;
+      }
       if (!windowDrag.active) {
         releasePointer();
         windowDrag = {};
@@ -2671,6 +2863,16 @@ void dispatchNetwork() {
         ShowWindow(w->hwnd, SW_SHOWNOACTIVATE);
       reconcileWindows();
       sendWindowState(w);
+    } else if (type == "touch_interaction") {
+      auto operation = m.value("operation",uint64_t(0));
+      if (m.value("kind","") == "end") nativeTouch.endInteraction(operation);
+      else {
+        auto source = windows.find(m.value("id",uint32_t(0)));
+        if (!touchInteractionNegotiated || source == windows.end() || hostedReadOnly ||
+            (source->second->state.fullscreen && m.value("kind","") != "dnd")) {
+          sendJson({{"type","touch_interaction_ack"},{"operation",operation},{"accepted",false}});
+        } else nativeTouch.beginInteraction(m,source->second->hwnd);
+      }
     } else if (type == "touch_state") {
       nativeTouch.state(m);
       hostControl.emit(m);
@@ -3019,6 +3221,17 @@ void applyHostedSettings(const Json &settings, bool live) {
   if (settings.contains("touch") && !settings["touch"].is_boolean())
     throw std::runtime_error("Touch setting must be boolean");
   bool requestedTouch = settings.value("touch",false);
+  auto applicationModes = settings.value("touch_modes", Json::object());
+  if (!applicationModes.is_object() || applicationModes.size() > 100)
+    throw std::runtime_error("Invalid application touch modes");
+  std::map<std::string, bool> nextTouchModes;
+  for (auto entry = applicationModes.begin(); entry != applicationModes.end(); ++entry) {
+    const auto &id = entry.key();
+    if (id.empty() || id.size() > 1024 || std::any_of(id.begin(), id.end(), [](unsigned char c) { return c < 32; }) ||
+        !entry.value().is_string() || (entry.value() != "native" && entry.value() != "mouse"))
+      throw std::runtime_error("Invalid application touch mode");
+    nextTouchModes.emplace(id, entry.value() == "native");
+  }
   int fps=settings.value("fps",60), bitrate=settings.value("bitrate",30000), dpi=settings.value("dpi",0);
   int volume=settings.value("volume",100);
   std::string codec=settings.value("codec","auto"), clipboard=settings.value("clipboard","both");
@@ -3053,6 +3266,7 @@ void applyHostedSettings(const Json &settings, bool live) {
       ? "触控设置已保存；当前服务端不支持实时切换，请重新连接（更新 Linux 服务端后可实时应用）"
       : "触控设置已保存；Linux 服务端不支持原生触控，请更新服务端并重新连接"}});
   nativeTouch.enabled(hostedTouch);
+  touchApplicationModes = std::move(nextTouchModes);
   hostedSettings=settings;
   remoteNotifications.settings(settings.value("notifications",true));
   remoteTray.configure(trayNegotiated,settings.value("tray",true),settings.value("read_only",false));
@@ -3093,7 +3307,7 @@ void publishHostedStatus() {
   Json list=Json::array();
   for (auto &[id,w] : windows) if (!w->popup) {
     wchar_t title[256]{}; GetWindowTextW(w->hwnd,title,256);
-    list.push_back({{"id",id},{"title",utf8(title)},{"width",w->width},{"height",w->height},
+    list.push_back({{"id",id},{"title",utf8(title)},{"app_id",w->appId},{"width",w->width},{"height",w->height},
       {"codec",w->frame?(VideoDecoder::videoKind(w->frame->codec)?VideoDecoder::name(w->frame->codec):"PNG"):"等待画面"},
       {"hardware_decode",bool(w->frame&&w->frame->video.texture)},{"presentation",w->presentation?"D3D11 / DirectComposition":"GDI"}});
   }
@@ -3106,6 +3320,15 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
     if(message==WM_TIMER && wp==TextDrag::Timer){TextDrag::tick();return 0;}
     if (message == WM_TIMER && wp == DragVisual::Timer) { dragVisual.tick(); return 0; }
+    if (message == WM_TIMER && wp == TouchOleTimer) {
+      if (touchOleDeadline && GetTickCount64() >= touchOleDeadline) {
+        auto owner=nativeTouch.activeInteraction();
+        if (owner && owner->operation == touchOlePromotedOperation) nativeTouch.cancel();
+        resetTouchOle();
+      }
+      return 0;
+    }
+    if (touchOleMouse(hwnd,message,wp,ULONG_PTR(GetMessageExtraInfo()))) return 0;
     if (remoteTray.message(message,wp,lp)) return 0;
     if (message == HostControl::Message) {
       for (const auto &request : hostControl.take()) {
@@ -3172,6 +3395,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == FileDrag::StartMessage) {
+      if (auto transfer=FileDrag::current(); transfer && transfer->touchOperation) return 0;
       if (FileDrag::ownsInput()) {
         releasePointer();
         suspendImeForOle();
@@ -3298,6 +3522,7 @@ int wmain(int argc, wchar_t **argv) {
     return 1;
   }
   nativeTouch.enabled(hostedTouch);
+  nativeTouch.onInteraction(touchInteractionSample);
   if (remoteApplicationSource.empty()) remoteApplicationSource = utf8(argv[1]) + ":" + utf8(argv[2]);
   if (!SetProcessDpiAwarenessContext(reinterpret_cast<DPI_AWARENESS_CONTEXT>(-4)))
     SetProcessDPIAware();
@@ -3456,6 +3681,7 @@ int wmain(int argc, wchar_t **argv) {
             {"notifications_enabled", false},
             {"touch_v1", true},
             {"touch_enabled", hostedTouch},
+            {"touch_interaction_v1", true},
             {"pointer_lock", true},
             {"toplevel_drag_v1", true},
             {"data_drag_v1", true},

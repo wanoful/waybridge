@@ -208,8 +208,9 @@ impl App {
                     .find(|w| w.window.wl_surface().as_deref() == Some(&a.surface))
             })
             .map_or(0, |w| w.id);
-        let message = json!({"type":"toplevel_drag","active":true,"source":active.origin,
+        let mut message = json!({"type":"toplevel_drag","active":true,"source":active.origin,
             "id":id,"offset_x":attached.map_or(0,|a|a.x),"offset_y":attached.map_or(0,|a|a.y)});
+        self.touch_drag_tag(&mut message, None);
         if message != self.window_drag.last {
             self.control(message.clone());
             self.window_drag.last = message;

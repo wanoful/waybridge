@@ -42,6 +42,13 @@ internal sealed class MainWindow : Window
     private Guid? touchStatusProfile;
     private bool? touchActive, touchSupported, touchLiveSupported;
     private bool touchReadOnly;
+    private sealed record TouchApplication(string Id, string Name);
+    private readonly ComboBox touchApplication = new() { DisplayMemberPath = "Name", MinWidth = 220, PlaceholderText = "连接后选择应用" };
+    private readonly ComboBox touchAppMode = Combo(["自动选择", "优先原生触控", "鼠标兼容（长按右键、拖选）"]);
+    private Dictionary<string, string> touchModes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> touchApplicationNames = new(StringComparer.Ordinal);
+    private bool loadingTouchApplication;
+    private string? editingTouchApplication;
     private readonly ComboBox codec = Combo(["自动", "H.264", "HEVC", "AV1", "PNG 无损"]);
     private readonly ComboBox scale = Combo(["跟随 Windows", "100%", "125%", "150%", "175%", "200%", "250%", "300%", "400%"]);
     private readonly ComboBox clipboard = Combo(["双向同步", "仅 Windows → Linux", "仅 Linux → Windows", "关闭"]);
@@ -326,6 +333,9 @@ internal sealed class MainWindow : Window
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(touch, "原生多点触控");
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(touchStatus, "NativeTouchStatus");
         touch.Toggled += (_, _) => { if (!loading) UpdateTouchStatus(); };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(touchApplication, "TouchApplication");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(touchAppMode, "TouchApplicationMode");
+        touchApplication.SelectionChanged += (_, _) => LoadTouchApplicationMode();
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(saveSettings, "InputSettingsSave");
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(apply, "InputSettingsApply");
         return Column(BadgeEditor(), Row("剪贴板方向", "可分别限制 Windows 与 Linux 间的数据同步", clipboard),
@@ -338,6 +348,8 @@ internal sealed class MainWindow : Window
             Row("Windows 本地 IME", "使用本地候选窗口与远端预编辑", ime),
             Row("原生多点触控（实验）", "向支持触控的 Linux 应用发送最多十点触摸；关闭时使用鼠标兼容模式。按连接保存，可立即应用。", touch),
             touchStatus,
+            Row("应用触控模式", "默认自动选择：应用接入触控时使用原生输入，否则使用鼠标兼容。可为有兼容问题的应用单独覆盖，随连接保存。", touchApplication),
+            Row("所选应用的输入方式", "通常保留自动选择。原生触控的长按与选字由应用处理，鼠标兼容支持系统长按右键和拖选。", touchAppMode),
             Row("紧急释放鼠标", "游戏捕获鼠标时可随时释放", Text("Ctrl + Alt + Shift + F12")), Actions(saveSettings, apply));
     }
     private UIElement ApplicationsPage()
@@ -432,7 +444,7 @@ internal sealed class MainWindow : Window
     }
     private void Load(ConnectionProfile profile)
     {
-        if (selected.Id != profile.Id) ResetTouchStatus();
+        if (selected.Id != profile.Id) { ResetTouchStatus(); touchApplicationNames.Clear(); }
         loading = true; selected = profile;
         name.Text = profile.Name; host.Text = profile.Host; user.Text = profile.User; identity.Text = profile.IdentityFile;
         binary.Text = profile.ServerBinary; session.Text = profile.Session; sshPort.Value = profile.SshPort; remotePort.Value = profile.Port;
@@ -442,6 +454,8 @@ internal sealed class MainWindow : Window
         reconnect.IsOn = profile.AutoReconnect;
         token.Password = secrets.Read(profile.Id) ?? ""; remember.IsChecked = token.Password.Length > 0;
         var settings = profile.Settings;
+        touchModes = new(settings.TouchModes, StringComparer.Ordinal);
+        RefreshTouchApplications();
         badgePng = settings.BadgePng;
         _ = GuardAsync(UpdateBadgePreviewAsync);
         codec.SelectedIndex = Array.IndexOf(new[] { "auto", "h264", "hevc", "av1", "png" }, settings.Codec);
@@ -461,6 +475,7 @@ internal sealed class MainWindow : Window
     }
     private ConnectionProfile ReadEditor()
     {
+        CommitTouchApplicationMode();
         var settings = new ClientSettings
         {
             Codec = new[] { "auto", "h264", "hevc", "av1", "png" }[Math.Max(0, codec.SelectedIndex)],
@@ -470,7 +485,7 @@ internal sealed class MainWindow : Window
             Hdr = hdr.IsOn, Udp = udp.IsOn, UdpHost = udpHost.Text.Trim(), GpuInput = gpu.SelectedIndex == 1 ? "cuda" : "cpu",
             Clipboard = new[] { "both", "send", "receive", "off" }[Math.Max(0, clipboard.SelectedIndex)],
             BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, DragText = dragText.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn, Touch = touch.IsOn,
-            Notifications = notifications.IsOn, Tray = remoteTray.IsOn
+            Notifications = notifications.IsOn, Tray = remoteTray.IsOn, TouchModes = new(touchModes, StringComparer.Ordinal)
         };
         var result = selected with
         {
@@ -488,7 +503,8 @@ internal sealed class MainWindow : Window
         var profile = ReadEditor();
         if (profile.Mode is "tunnel" or "direct" && remember.IsChecked == true && token.Password.Length > 0) secrets.Write(profile.Id, token.Password);
         else secrets.Delete(profile.Id);
-        int index = profiles.IndexOf(selected);
+        int index = profiles.ToList().FindIndex(saved => saved.Id == profile.Id);
+        if (index < 0) throw new InvalidOperationException("当前连接配置已不存在，请重新选择连接");
         loading = true; profiles[index] = profile; profilePicker.SelectedIndex = index; loading = false;
         selected = profile; await store.SaveAsync(profiles); Inform("连接设置已保存。"); UpdateTouchStatus();
     }
@@ -549,6 +565,40 @@ internal sealed class MainWindow : Window
             menu.Click += async (_, _) => await GuardAsync(() => controller.SendEngineAsync(new { type = "tray_action", id, epoch, generation, action = "menu" }));
             backgroundList.Items.Add(Row(title, state == "NeedsAttention" ? "应用需要注意" : "通过应用菜单正常退出", Actions(restore, menu)));
         }
+    }
+    private void RefreshTouchApplications()
+    {
+        string? previous = (touchApplication.SelectedItem as TouchApplication)?.Id;
+        var entries = touchApplicationNames.Keys.Concat(touchModes.Keys).Distinct(StringComparer.Ordinal)
+            .OrderBy(id => touchApplicationNames.GetValueOrDefault(id, id), StringComparer.CurrentCulture)
+            .Select(id => new TouchApplication(id, touchApplicationNames.GetValueOrDefault(id, id))).ToList();
+        if (touchApplication.ItemsSource is List<TouchApplication> current && current.SequenceEqual(entries))
+        {
+            if (loading) LoadTouchApplicationMode();
+            return;
+        }
+        loadingTouchApplication = true;
+        touchApplication.ItemsSource = entries;
+        touchApplication.SelectedItem = entries.FirstOrDefault(e => e.Id == previous) ?? entries.FirstOrDefault();
+        loadingTouchApplication = false;
+        LoadTouchApplicationMode();
+    }
+    private void CommitTouchApplicationMode()
+    {
+        if (loading || loadingTouchApplication || editingTouchApplication is not { } id) return;
+        if (touchAppMode.SelectedIndex <= 0) touchModes.Remove(id);
+        else touchModes[id] = touchAppMode.SelectedIndex == 1 ? "native" : "mouse";
+    }
+    private void LoadTouchApplicationMode()
+    {
+        if (loadingTouchApplication) return;
+        CommitTouchApplicationMode();
+        loadingTouchApplication = true;
+        editingTouchApplication = (touchApplication.SelectedItem as TouchApplication)?.Id;
+        touchAppMode.IsEnabled = touchApplication.SelectedItem is TouchApplication;
+        touchAppMode.SelectedIndex = touchApplication.SelectedItem is TouchApplication app
+            ? touchModes.GetValueOrDefault(app.Id) switch { "native" => 1, "mouse" => 2, _ => 0 } : 0;
+        loadingTouchApplication = false;
     }
     private static bool? TouchFlag(JsonElement message, string name) =>
         message.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False
@@ -651,11 +701,16 @@ internal sealed class MainWindow : Window
             }
             lastTick = tick; lastBytes = bytes; lastUpdates = updates;
             if (message.TryGetProperty("background", out var background)) UpdateBackground(background);
+            if (controller.ActiveProfileId == selected.Id) touchApplicationNames.Clear();
             windowList.Items.Clear();
             var descriptions = new List<string>();
             foreach (var window in message.GetProperty("windows").EnumerateArray())
             {
                 uint id = window.GetProperty("id").GetUInt32();
+                if (controller.ActiveProfileId == selected.Id && window.TryGetProperty("app_id", out var inputApp) &&
+                    inputApp.GetString() is { Length: > 0 } applicationId)
+                    touchApplicationNames[applicationId] = window.TryGetProperty("title", out var appTitle)
+                        ? $"{appTitle.GetString()} · {applicationId}" : applicationId;
                 string title = window.TryGetProperty("title", out var titleValue) ? titleValue.GetString() ?? $"窗口 {id}" : $"窗口 {id}";
                 string description = $"{title} · {window.GetProperty("codec")} · {(window.GetProperty("hardware_decode").GetBoolean() ? "GPU 解码" : "PNG/非视频")} · {window.GetProperty("presentation")}";
                 descriptions.Add(description);
@@ -663,6 +718,7 @@ internal sealed class MainWindow : Window
                 focus.Click += async (_, _) => await GuardAsync(() => controller.ActivateWindowAsync(id));
                 windowList.Items.Add(Row(description, $"{window.GetProperty("width")} × {window.GetProperty("height")} 逻辑像素", focus));
             }
+            if (controller.ActiveProfileId == selected.Id) RefreshTouchApplications();
             actual.Text = descriptions.Count > 0 ? string.Join('\n', descriptions) : "已连接，等待远端应用窗口";
         }
         else if (type == "transfer")

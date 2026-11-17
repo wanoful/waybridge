@@ -1,5 +1,55 @@
 # Validation
 
+## Touch window, popup and DND integration — 2026-11-18
+
+Default input selection now checks live `wl_touch` resources: subscribed native
+Wayland clients receive touch, unsubscribed/X11 windows retain mouse compatibility.
+Application overrides are optional. Releasing a subscription revokes active
+input and updates metadata. Native move/resize, popup routing and same-session
+Wayland URI/text DND now keep the original physical gesture and owning slot.
+
+The real Wayland interaction fixture passes live binding/release, touch xdg
+move/resize and invalid serial/owner/ACK rejection, popup coordinates/outside
+dismissal, cross-client text and file bytes/source finish, private-sink
+claim/return and deferred external drop. It checks all three return/UP/target
+settlement orders, rejects stale metadata/invalid release targets, and reads
+file ranges after prompt interaction retirement. Legacy native touch, real Qt
+pointer DND and lazy file export pass. A generic Smithay touch-grab bug was fixed:
+owning UP now requests drop instead of unconditionally canceling.
+
+Production PE adapter and real HWND controlled probes pass gesture/slot reuse,
+second-finger isolation, popup/root routing, focus/capture changes, external
+handoff and completion, size constraints and maximized restore. The actual
+viewer `windowProc`/callback regression additionally verifies WM_SIZE cannot
+cancel its own touch resize, and returned touch motion bypasses an unclaimed
+OLE wait. Existing target-lifetime/COM reentry, hosted IPC/live settings/Unicode
+upload/detach and missing-field/default/older-server tests pass. Strict workspace
+formatting/Clippy and 43 Rust tests pass (one real-FUSE test remains ignored by
+the default runner). x64 and ARM64 workers build.
+
+The actual-source WinUI settings probe passes on `laptop`, including selecting
+an application, saving/reloading mouse compatibility and restoring automatic
+selection, alongside independent input/sharing policies and persistent status.
+It uses private state and automation providers, not physical touch injection.
+Profile replacement now follows its stable ID rather than collection/reference
+equality after settings with dictionaries are reloaded.
+
+The Windows system handoff helper resolves the API by name, validates one active
+primary contact, and enters OLE from real synthesized mouse input with a bounded
+STA wait. Its x64/ARM64 independent probes compile strictly. The API's named
+export is present on Windows build26200, but **positive OS touch-to-OLE and full
+production-client touch injection remain unverified**: `LockScreenBackstopFrame`
+covered both private fixtures. Ownership guards stopped before any injected
+contact, and the user deferred unlocking. No unlock or lock-screen input was
+attempted. Repeat the opt-in laptop probes when unlocked; API presence and Wine
+controller tests do not replace those runs.
+
+Evidence: `build/tests/touch-interaction-{host,source-*,receiver-*}.log`,
+`build/touch-interactions-{clippy,rust,release,client,arm64,core,ui-live,drop-lifetime,gui-native,hosted-settings}.log`,
+`build/tests/touch-settings-laptop.log`, `build/tests/touch-client-laptop/` and
+`build/tests/windows-touch-ole-laptop.json`. Exact scope and runnable commands:
+[INPUT_DEVICES.md](INPUT_DEVICES.md#window-popup-and-drag-integration--2026-11-18).
+
 ## User-reported physical touch and Chrome window gap — 2026-11-18
 
 The user confirms finger drawing works in their current streamed setup and

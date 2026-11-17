@@ -43,9 +43,11 @@ flowchart LR
 
 新服务端广播 `data_drag_result_v1`；新客户端只在该能力存在时发送 retarget、匹配 revision 并等待完成。旧服务端保留原兼容行为，因此完整修复需更新两端。具体消息见 [协议](PROTOCOL.md#generic-mime-drag-negotiation-data_drag_v1)。
 
-## 原生触控接入方案（待实现）
+## 原生触控接入
 
-现有跨端拖放的启动、导出、OLE claim/drop/return 及源手势缓存仍有鼠标按键依赖。触控接入需保存发起触点和 grab 类型，按原触点的移动、抬起和取消驱动会话；不能只去掉左键检查。先贯通同一 Linux 会话的原生触控 DND，再验证 Windows OLE 所需的系统鼠标兼容交接；跨回串流窗口时保留原 source，恢复相应 grab。数据表示、只读文件交付、目标 revision 和完成回执继续复用。详细设计及菜单、长按和文字选择的行为边界见 [触控交互接入方案](INPUT_DEVICES.md#proposed-touch-interaction-integration--2026-11-18)。
+拖放现在保留发起触点、手势及操作编号，原生 Wayland 串流窗口之间的文字和文件拖放由原触点的移动、抬起和取消驱动。应用原数据源、MIME、COPY/MOVE、跨端只读文件交付及完成回执继续复用。导出、claim/drop/return 不再只认可鼠标左键；离开后返回保留同一来源，异步文件读取与物理触点的生命期分开。
+
+Windows 端新增按名称查询的系统触控转鼠标交接，并在真实合成鼠标处理栈内有界等待协商后进入 OLE。当前 laptop 锁屏，实机探针在触控注入前停止，因此完整 Windows 触控→OLE 正向路径仍待解锁验证；不能把系统接口存在当成拖放成功。当前默认自动检测应用的原生触控订阅，鼠标兼容可作为应用级覆盖。详细协议、设置和验证边界见 [触控交互](INPUT_DEVICES.md#window-popup-and-drag-integration--2026-11-18)。
 
 ## 设置、诊断和验证
 

@@ -229,25 +229,30 @@ try
 
     var legacySettings = JsonSerializer.Deserialize<ClientSettings>("{\"files\":false}", ProfileStore.Json)!;
     Check(!legacySettings.Files && legacySettings.DragText, "legacy file sharing must not disable text drags");
-    Check(!legacySettings.Touch, "profiles without a touch field must retain mouse-compatible defaults");
+    Check(!legacySettings.Touch && legacySettings.TouchModes.Count == 0, "profiles without touch fields must retain mouse-compatible defaults");
     var textDisabled = JsonSerializer.Deserialize<ClientSettings>(JsonSerializer.Serialize(new ClientSettings { DragText = false }, ProfileStore.Json), ProfileStore.Json)!;
     Check(!textDisabled.DragText && textDisabled.Files, "independent text drag policy failed to persist");
     var store = new ProfileStore(directory);
     await store.SaveAsync([profile]);
     var loaded = await store.LoadAsync();
-    Check(loaded.Single() == profile, "profile round trip");
+    Check(JsonSerializer.Serialize(loaded.Single(), ProfileStore.Json) ==
+        JsonSerializer.Serialize(profile, ProfileStore.Json), "profile round trip");
     Check(!File.ReadAllText(Path.Combine(directory, "profiles.json")).Contains("token", StringComparison.OrdinalIgnoreCase), "credential field in profile");
     await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => store.SaveAsync([profile])));
     Check((await store.LoadAsync()).Count == 1, "atomic concurrent save");
     Console.WriteLine("PASS: atomic profile persistence without credential fields");
 
     var touchProfile = profile with { Settings = new ClientSettings {
-        Touch = true, Ime = false, ReadOnly = true, Files = false, DragText = false, Clipboard = "off" } };
+        Touch = true, Ime = false, ReadOnly = true, Files = false, DragText = false, Clipboard = "off",
+        TouchModes = new() { ["org.example.Drawing"] = "native", ["org.example.Editor"] = "mouse" } } };
     await store.SaveAsync([touchProfile]);
     var touchLoaded = (await new ProfileStore(directory).LoadAsync()).Single();
     Check(touchLoaded.Settings.Touch && !touchLoaded.Settings.Ime && touchLoaded.Settings.ReadOnly &&
         !touchLoaded.Settings.Files && !touchLoaded.Settings.DragText && touchLoaded.Settings.Clipboard == "off",
         "native touch preference did not persist independently of IME/read-only/file policy");
+    Check(touchLoaded.Settings.TouchModes["org.example.Editor"] == "mouse" &&
+        touchLoaded.Settings.TouchModes["org.example.Drawing"] == "native", "per-application touch modes did not persist");
+    await Reject<ArgumentException>(() => Task.Run(() => (new ClientSettings { TouchModes = new() { ["app"] = "guess" } }).Validate()));
     await store.SaveAsync([touchLoaded with { Settings = touchLoaded.Settings with { Touch = false } }]);
     var touchDisabled = (await new ProfileStore(directory).LoadAsync()).Single();
     Check(!touchDisabled.Settings.Touch && !touchDisabled.Settings.Ime && touchDisabled.Settings.ReadOnly &&

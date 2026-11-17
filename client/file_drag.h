@@ -23,6 +23,16 @@ struct Response {
 };
 struct Transfer {
   uint64_t id = 0, nextRequest = 0;
+  uint64_t touchOperation = 0, touchGesture = 0, touchGeneration = 0;
+  uint32_t touchSlot = 0;
+  Json ownerMessage(Json message) const {
+    if (touchOperation) {
+      message["touch_operation"]=touchOperation; message["touch_gesture"]=touchGesture;
+      message["touch_generation"]=touchGeneration;
+      message["touch_slot"]=touchSlot;
+    }
+    return message;
+  }
   HWND source = nullptr;
   std::vector<File> files;
   std::optional<std::wstring> text;
@@ -46,10 +56,10 @@ struct Transfer {
       cancelled = !success;
     }
     wake.notify_all();
-    sendJson({{"type", "drag_result"},
+    sendJson(ownerMessage({{"type", "drag_result"},
               {"drag", id},
               {"success", success},
-              {"effect", success ? "copy" : "none"}});
+              {"effect", success ? "copy" : "none"}}));
   }
   void cancel() {
     {
@@ -125,7 +135,7 @@ inline bool returnToRemote(IDataObject *object, const Json &position) {
     if(transfer->returnRemote)return true;
     transfer->returnRemote=true;transfer->returnAccepted=false;++transfer->returnToken;
   }
-  Json message=position;message["type"]="drag_return";message["drag"]=transfer->id;message["return_token"]=transfer->returnToken;sendJson(message);return true;
+  Json message=position;message["type"]="drag_return";message["drag"]=transfer->id;message["return_token"]=transfer->returnToken;sendJson(transfer->ownerMessage(message));return true;
 }
 inline bool waitForReturn() {
   auto transfer=current();if(!transfer)return false;
@@ -546,7 +556,7 @@ public:
       }
     }
     if (drop)
-      sendJson({{"type", "drag_drop"}, {"drag", transfer->id}});
+      sendJson(transfer->ownerMessage({{"type", "drag_drop"}, {"drag", transfer->id}}));
     return keys & MK_LBUTTON ? S_OK : DRAGDROP_S_DROP;
   }
   HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override { return DRAGDROP_S_USEDEFAULTCURSORS; }
@@ -580,7 +590,7 @@ inline void maybeClaim() {
     transfer->claimed = true;
   }
   trace("claim");
-  sendJson({{"type", "drag_claim"}, {"drag", transfer->id}});
+  sendJson(transfer->ownerMessage({{"type", "drag_claim"}, {"drag", transfer->id}}));
 }
 inline void releasedBeforeStart() {
   auto transfer = current();
@@ -657,6 +667,12 @@ inline bool control(const Json &message, HWND controllerWindow, HWND sourceWindo
     auto state = std::make_shared<Transfer>();
     state->id = message.at("drag");
     state->source = sourceWindow;
+    if (message.value("input", "") == "touch") {
+      state->touchOperation=message.value("touch_operation",uint64_t(0));
+      state->touchGesture=message.value("touch_gesture",uint64_t(0));
+      state->touchGeneration=message.value("touch_generation",uint64_t(0));
+      state->touchSlot=message.value("touch_slot",uint32_t(0));
+    }
     if (auto old = current()) {
       std::lock_guard<std::mutex> lock(old->mutex);
       if (!old->done && !old->cancelled) {

@@ -325,6 +325,7 @@ struct SinkState {
     device: Option<wl_data_device::WlDataDevice>,
     offer: Option<wl_data_offer::WlDataOffer>,
     expected_serial: Option<u32>,
+    serial_after: bool,
     mime: String,
     accepted: bool,
     dropped: bool,
@@ -343,7 +344,16 @@ impl Sink {
     }
     pub fn arm_mime(&mut self, serial: u32, mime: &str) {
         self.state.expected_serial = Some(serial);
+        self.state.serial_after = false;
+        self.state.accepted = false;
         self.state.mime = mime.into();
+    }
+    /// Touch DND allocates its enter serial inside the grab. A freshly reserved
+    /// compositor serial fences all already queued enters; accept only the first
+    /// later enter into this private, unaddressable sink surface.
+    pub fn arm_touch_mime(&mut self, serial: u32, mime: &str) {
+        self.arm_mime(serial, mime);
+        self.state.serial_after = true;
     }
     pub fn accepted(&self) -> bool {
         self.state.accepted
@@ -449,10 +459,19 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for SinkState {
             } => {
                 // Cancellation can race the queued enter. Never negotiate an
                 // old offer after its source has already been cancelled.
-                if state.expected_serial != Some(serial) {
+                let expected = state.expected_serial.is_some_and(|expected| {
+                    if state.serial_after {
+                        let distance = serial.wrapping_sub(expected);
+                        distance != 0 && distance < (1 << 31)
+                    } else {
+                        expected == serial
+                    }
+                });
+                if !expected {
                     offer.destroy();
                     return;
                 }
+                state.expected_serial = None;
                 if let Some(old) = state.offer.take() {
                     old.destroy();
                 }

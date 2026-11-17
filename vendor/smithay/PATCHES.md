@@ -81,3 +81,16 @@ The X11/Qt and native Windows regressions in the parent project exercise the X11
     the same client. The parent project's real `tests/touch_smoke.py` verifies
     two/ten contacts and cancellation on focus, read-only, unmap, disconnect and
     surface destruction; fresh contacts remain usable afterwards.
+
+15. Native touch DND sets `should_drop` only when the original grabbing slot is
+    released. The generic touch grab previously always ran its cancellation
+    path, even for an accepted target; secondary contacts still cannot finish
+    the drag. Touch cancellation remains a cancellation, without a synthetic up.
+    The parent project's real Wayland touch interaction regression exercises a
+    data-device drag, target negotiation, payload receive and source completion.
+
+16. `TouchHandle::client_touches` publicly exposes live `wl_touch` resources for
+    one client. Waybridge uses this protocol subscription to select native touch
+    automatically and updates metadata when the client binds/releases touch.
+    This query does not claim a per-widget event-handled acknowledgement, which
+    the Wayland touch protocol does not provide.

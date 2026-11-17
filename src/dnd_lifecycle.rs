@@ -167,6 +167,7 @@ pub(crate) struct NativeDrag {
     pub exported: bool,
     pub metadata_ready: bool,
     pub toplevel: bool,
+    pub touch: bool,
 }
 struct MimeSource {
     payload: std::sync::Weak<BTreeMap<String, Vec<u8>>>,
@@ -232,18 +233,29 @@ impl App {
         let attached = resource
             .as_ref()
             .is_some_and(|s| self.window_drag.is_toplevel_source(s));
+        let touch_drag = matches!(kind, GrabType::Touch);
+        let id = self.next_source();
+        if touch_drag && !self.start_touch_interaction(serial, "dnd", None, Some(id)) {
+            source.cancel();
+            return;
+        }
         self.start_drag_visual(resource.as_ref(), icon);
         self.start_window_drag(resource);
-        let id = self.next_source();
         let source = TrackedSource::new(id, source, self.data_drop.feedback.clone(), attached);
         self.data_drop.native = Some(NativeDrag {
             source: source.clone(),
             toplevel: attached,
-            window: self.pointer_window.or(self.focused_window).unwrap_or(0),
+            window: if touch_drag {
+                self.focused_window
+            } else {
+                self.pointer_window.or(self.focused_window)
+            }
+            .unwrap_or(0),
             metadata_ready: source
                 .metadata()
                 .is_some_and(|m| !m.mime_types.is_empty() && !m.dnd_actions.is_empty()),
             exported: false,
+            touch: touch_drag,
         });
         let dh = self.dh.clone();
         match kind {
@@ -261,6 +273,7 @@ impl App {
             GrabType::Touch => {
                 let p = seat.get_touch().unwrap();
                 if let Some(start) = p.grab_start_data() {
+                    p.cancel(self);
                     p.set_grab(
                         self,
                         DnDGrab::new_touch(&dh, start, SharedSource(source), seat),
@@ -297,7 +310,11 @@ impl App {
         }) {
             self.data_drop.native.as_mut().unwrap().metadata_ready = true;
             if let Some((id, x, y)) = self.data_drop.point {
-                self.pointer_motion(id, x, y);
+                if self.data_drop.native.as_ref().is_some_and(|n| n.touch) {
+                    self.touch_drag_motion(id, x, y);
+                } else {
+                    self.pointer_motion(id, x, y);
+                }
             }
         }
         let feedback = std::mem::take(&mut *self.data_drop.feedback.lock().unwrap());
@@ -322,7 +339,16 @@ impl App {
                 .filter(|d| d.source.id == id && d.returned && !d.external)
                 .map(|d| (d.id, d.return_token));
             if let Some((drag, token)) = returned {
-                self.control(json!({"type":"drag_return_ready","drag":drag,"return_token":token,"accepted":f.accepted&&f.action!=Action::None}));
+                let touch = self.touch_source_active(id);
+                if !touch || f.settled {
+                    self.control(json!({"type":"drag_return_ready","drag":drag,"return_token":token,"accepted":f.accepted&&f.action!=Action::None}));
+                }
+                if f.finished.is_none() {
+                    self.touch_return_feedback(id, f.settled);
+                }
+            }
+            if let Some(success) = f.finished {
+                self.touch_source_finished(id, success);
             }
             if f.finished.is_some() {
                 if self
@@ -354,8 +380,9 @@ impl App {
             return;
         };
         if self.data_drop.outbound.is_some()
-            || !self.pressed_buttons.contains(&0x110)
-            || self.pressed_buttons.len() != 1
+            || (native.touch && !self.touch_source_held(native.source.id))
+            || (!native.touch
+                && (!self.pressed_buttons.contains(&0x110) || self.pressed_buttons.len() != 1))
         {
             return;
         }
@@ -446,6 +473,9 @@ impl DndGrabHandler for App {
     ) {
         self.stop_drag_visual();
         self.window_drag.ended();
+        if let Some(native) = &self.data_drop.native {
+            self.touch_source_finished(native.source.id, validated);
+        }
         self.data_drop.native = None;
         if self
             .data_drop

@@ -167,6 +167,33 @@ internal static class GuiFocusProbe
         Receive(window, new { type = "local_settings_applied", settings = new { touch = true, read_only = false },
             touch_enabled = true, touch_live_supported = true });
         Check(!effective.Text.Contains("只读模式已暂停", StringComparison.Ordinal), "readonly touch pause survived a live readonly-off acknowledgement");
+        var settingsController = Get<SessionController>(window, "controller");
+        var activeField = typeof(SessionController).GetField("active", Private)!;
+        var savedActive = activeField.GetValue(settingsController);
+        try
+        {
+            activeField.SetValue(settingsController, ReadSavedProfile());
+            Receive(window, new { type = "status", uptime_ms = 2UL, tcp_bytes = 0UL, presented_updates = 0UL,
+                windows = new[] { new { id = 17u, app_id = "org.waybridge.PrivateEditor", title = "Private editor",
+                    width = 400, height = 300, codec = "PNG", hardware_decode = false, presentation = "GDI" } } });
+            var application = Get<ComboBox>(window, "touchApplication");
+            var applicationMode = Get<ComboBox>(window, "touchAppMode");
+            Check(application.Items.Count == 1 && applicationMode.IsEnabled,
+                "active application status did not populate the touch mode selector");
+            applicationMode.SelectedIndex = 2;
+            savePeer.Invoke();
+            await Wait(() => ReadSavedProfile().Settings.TouchModes.GetValueOrDefault("org.waybridge.PrivateEditor") == "mouse",
+                "application mouse compatibility mode was not saved");
+            var appProfile = ReadSavedProfile(); CheckIndependentPolicies(appProfile);
+            typeof(MainWindow).GetMethod("Load", Private)!.Invoke(window, [appProfile]);
+            Check(applicationMode.SelectedIndex == 2, "application mouse compatibility mode did not reload");
+            applicationMode.SelectedIndex = 0;
+            savePeer.Invoke();
+            await Wait(() => !ReadSavedProfile().Settings.TouchModes.ContainsKey("org.waybridge.PrivateEditor"),
+                "following connection did not remove the application override");
+        }
+        finally { activeField.SetValue(settingsController, savedActive); }
+        Log("PASS actual WinUI application selector, saved mouse compatibility override, reload and restore connection default preserve independent policies");
         // Reload through the production method used when a connection is selected.
         togglePeer.Toggle();
         Check(!touch.IsOn, "unsaved native touch edit failed");

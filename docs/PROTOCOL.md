@@ -850,6 +850,20 @@ purges pending input. Read-only, explicit cancel and disconnect are unmarked;
 regranting the same HWND cannot replay its revoked old tap. See
 [INPUT_DEVICES.md](INPUT_DEVICES.md) for device/application limits and tests.
 
+Touch interaction support is separately negotiated with `touch_interaction_v1`.
+Normal touch packets carry `gesture` and concrete `target` (root/popup); `id` and
+`generation` remain the root lease. Server `touch_interaction` starts a move,
+resize or DND with `operation`, `kind`, root `id`, original `generation`,
+`gesture`, owning `slot` and optional `edge`. `touch_interaction_ack` accepts only
+the still-held owner. Client `touch_interaction_input` carries that operation,
+gesture, slot, `phase:"motion"|"up"|"cancel"` and DND target coordinates; only
+matching ownership can change the operation. Server `kind:"end"` retires it.
+Native DND and popup routing preserve ownership through focus changes; policy
+revocation and invalid release targets cancel. DND export/toplevel metadata tags
+`input:"touch"` and `touch_operation`, `touch_generation`, `touch_gesture`,
+`touch_slot`, echoed on external claim/return/drop/result when available. See
+[INPUT_DEVICES.md](INPUT_DEVICES.md) for routing and physical verification limits.
+
 UDP framing and authenticated ACK/repair messages are unchanged. Adaptive pacing
 uses those existing feedback messages, with local send-data boundaries and
 separate bounded transport diagnostics; see [NETWORK.md](NETWORK.md). Media

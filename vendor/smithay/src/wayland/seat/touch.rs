@@ -4,7 +4,7 @@ use atomic_float::AtomicF64;
 use wayland_server::{
     backend::ClientId,
     protocol::wl_touch::{self, WlTouch},
-    Dispatch, DisplayHandle, Resource,
+    Client, Dispatch, DisplayHandle, Resource,
 };
 
 use super::{SeatHandler, SeatState};
@@ -24,6 +24,20 @@ impl<D: SeatHandler> TouchHandle<D> {
 }
 
 impl<D: SeatHandler + 'static> TouchHandle<D> {
+    /// Return live touch resources owned by a client. This reports protocol
+    /// subscription, not whether an application widget handled an event.
+    pub fn client_touches(&self, client: &Client) -> impl Iterator<Item = WlTouch> {
+        let client_id = client.id();
+        self.known_instances
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(touch, _)| touch.upgrade().ok())
+            .filter(|touch| touch.client().is_some_and(|client| client.id() == client_id))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
     /// Attempt to retrieve a [`TouchHandle`] from an existing resource
     ///
     /// May return `None` for a valid `WlTouch` that was created without
