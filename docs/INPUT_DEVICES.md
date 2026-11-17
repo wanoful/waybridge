@@ -128,8 +128,9 @@ The implemented default is automatic protocol detection; optional application
 settings address exceptional compatibility, not normal setup. Native mode leaves
 long press/selection to the app, compatibility mode keeps system right-click and
 mouse-style selection. Applications without selection handles are not promised
-mobile-style controls. General gesture mapping, native pen/tablet input,
-X11 native touch, richer contact samples and gamepads/rumble remain follow-up.
+mobile-style controls. General gesture mapping, X11 native touch and richer
+contact samples remain follow-up. Native pen and gamepads/rumble now have separate
+experimental implementations described in [PEN.md](PEN.md) and [GAMEPADS.md](GAMEPADS.md).
 Mixed-monitor DPI and lock/sleep/device recovery still require physical checks.
 
 ### Interaction protocol

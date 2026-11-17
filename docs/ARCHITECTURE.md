@@ -193,7 +193,7 @@ C# 控制中心通过当前用户专用 named pipe 管理原生内核，通过 T
 
 TCP 控制、媒体和音频连接分别认证，窗口控制与文件数据目前共用控制连接。可选 UDP 使用认证加密、XOR FEC 和 TCP 补帧，并按全局消息顺序交付媒体。TLS 网关与现有 SSH 隧道均可承载这些 TCP 连接。
 
-现有 M0/M1 验收作为继续开发的基线，当前推进媒体调度与 M2 日常体验。捕获前背压和队列诊断已接入；上文的逐窗口清晰/交互/游戏策略、覆盖完整媒体资源的全局预算、文件独立通道和网络/编码负载的完整自适应联动尚未完成；原生触控已有显式启用的实验子集，手柄、笔、麦克风、摄像头、富文本和打印尚未交付。已有编码器、UDP 或文件工作队列不代表这些目标已经达成，状态以 [Roadmap](ROADMAP.md#当前进展) 为准。
+现有 M0/M1 验收作为继续开发的基线，当前推进媒体调度与 M2 日常体验。捕获前背压和队列诊断已接入；上文的逐窗口清晰/交互/游戏策略、覆盖完整媒体资源的全局预算、文件独立通道和网络/编码负载的完整自适应联动尚未完成；原生触控、笔和手柄/震动已有显式启用的实验子集，实体设备和应用覆盖仍待扩展；麦克风、摄像头、富文本和打印尚未交付。已有编码器、UDP 或文件工作队列不代表这些目标已经达成，状态以 [Roadmap](ROADMAP.md#当前进展) 为准。
 
 实现入口：[TLS 用户入口](../service/src/main.rs)、[合成器](../src/main.rs)、[共享配置](../config/src/lib.rs)、[应用启动助手](../scripts/session-control.py)、[会话环境](../src/launch.rs)、[桌面服务](../src/session_services.rs)、[文件工作队列](../src/transfer_worker.rs)、[网络](../src/network.rs)、[捕获](../src/capture.rs)、[编码调度](../src/video.rs)、[Windows 内核](../client/main.cpp)、[Windows 呈现](../client/presentation.h)、[GUI 会话控制](../gui/Waybridge.Control.Core/SessionController.cs)。当前线协议见 [PROTOCOL.md](PROTOCOL.md)，设备验证范围见 [VALIDATION.md](VALIDATION.md)。
 

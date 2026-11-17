@@ -2,6 +2,16 @@
 
 ## Pen and gamepad integration — 2026-11-18
 
+Implementation `4cd03a1` is installed on both ends. Linux user-service PID102010
+runs the verified service inode and launches the new Release compositor; pinned
+TLS hello, listener, certificate and persisted state/configuration are unchanged.
+No installed compositor was active during replacement. Windows x64 GUI PID21400
+runs in interactive session1 with a fresh MainWindow activation; all 543 package
+files match their inventory. Existing profiles/trust remain byte-for-byte intact:
+touch stays enabled, while the new pen/gamepad preferences default to off. Enable
+them under **输入与共享**, then apply to the connection. Deployment evidence:
+`build/deploy-pen-gamepad.json` and `build/deploy-pen-gamepad-{linux,windows}.log`.
+
 Both opt-in features now share `main`, the hosted native worker and the control
 center's saved/live input settings. New profiles default to off. Pen calibration
 and gamepad deadzone/rumble remain independent of touch, IME, files and read-only.
