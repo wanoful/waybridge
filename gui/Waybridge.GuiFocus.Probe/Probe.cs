@@ -4,6 +4,9 @@ using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Automation;
+using Microsoft.UI.Xaml.Automation.Peers;
+using Microsoft.UI.Xaml.Automation.Provider;
 using Microsoft.Windows.AppNotifications;
 using System.Diagnostics;
 using System.Reflection;
@@ -97,6 +100,98 @@ internal static class GuiFocusProbe
         var name = new System.Text.StringBuilder(128); GetClassName(hwnd, name, name.Capacity);
         return pid == worker && name.ToString() == "WaybridgeRemote" && Title(hwnd).StartsWith(prefix, StringComparison.Ordinal);
     }
+    private static ConnectionProfile ReadSavedProfile()
+    {
+        using var stream = new FileStream(Path.Combine(root, "state", "profiles.json"),
+            FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return JsonSerializer.Deserialize<List<ConnectionProfile>>(stream, ProfileStore.Json)!.Single();
+    }
+    private static void CheckIndependentPolicies(ConnectionProfile profile)
+    {
+        Check(!profile.Settings.Ime && profile.Settings.ReadOnly && !profile.Settings.Files &&
+            !profile.Settings.DragText && profile.Settings.Clipboard == "off",
+            "native touch setting changed an independent input/sharing preference");
+    }
+    private static void Receive(MainWindow window, object message) =>
+        typeof(MainWindow).GetMethod("Receive", Private)!.Invoke(window, [JsonSerializer.SerializeToElement(message)]);
+    private static object TouchStatus(bool enabled, bool supported, bool live) => new {
+        type = "status", uptime_ms = 1UL, tcp_bytes = 0UL, presented_updates = 0UL,
+        windows = Array.Empty<object>(), touch_enabled = enabled,
+        touch_supported = supported, touch_live_supported = live };
+    private static async Task RunSettingsAsync(MainWindow window)
+    {
+        var navigation = Get<NavigationView>(window, "navigation");
+        navigation.SelectedItem = navigation.MenuItems.Cast<NavigationViewItem>().Single(x => x.Tag as string == "input");
+        var touch = Get<ToggleSwitch>(window, "touch");
+        await Wait(() => touch.IsLoaded && touch.IsEnabled && touch.ActualWidth > 0, "native touch toggle not rendered");
+        touch.StartBringIntoView(new BringIntoViewOptions { AnimationDesired = false });
+        await Task.Delay(250);
+        Check(AutomationProperties.GetAutomationId(touch) == "NativeTouchToggle" &&
+            AutomationProperties.GetName(touch).Contains("多点触控", StringComparison.Ordinal),
+            "native touch setting lacks its accessible identity");
+        Check(!touch.IsOn && !ReadSavedProfile().Settings.Touch, "legacy/default profile unexpectedly enabled native touch");
+        CheckIndependentPolicies(ReadSavedProfile());
+        Check(!Get<SessionController>(window, "controller").IsRunning, "offline settings probe must not connect");
+        var save = Descendants((DependencyObject)window.Content).OfType<Button>().Single(x =>
+            AutomationProperties.GetAutomationId(x) == "InputSettingsSave");
+        var togglePeer = (IToggleProvider)new ToggleSwitchAutomationPeer(touch).GetPattern(PatternInterface.Toggle)!;
+        var savePeer = (IInvokeProvider)new ButtonAutomationPeer(save).GetPattern(PatternInterface.Invoke)!;
+        togglePeer.Toggle();
+        Check(touch.IsOn, "actual WinUI toggle action did not enable native touch");
+        savePeer.Invoke();
+        await Wait(() => ReadSavedProfile().Settings.Touch, "enabled touch was not saved by the GUI");
+        var enabled = ReadSavedProfile();
+        CheckIndependentPolicies(enabled);
+        var effective = Get<TextBlock>(window, "touchStatus");
+        Check(AutomationProperties.GetAutomationId(effective) == "NativeTouchStatus", "missing persistent touch status identity");
+        Receive(window, new { type = "local_settings_applied", settings = new { touch = true, read_only = true },
+            touch_enabled = false, touch_live_supported = false });
+        Check(touch.IsOn && effective.Text.Contains("当前连接原生触控已关闭", StringComparison.Ordinal) &&
+            effective.Text.Contains("重连后生效", StringComparison.Ordinal), "saved touch-on masked old connection's effective off state");
+        Receive(window, new { type = "settings_warning", message = "触控设置已保存；当前连接需要重连后生效" });
+        Receive(window, new { type = "stream_config", ok = true, fps = 30, bitrate = 12000,
+            codec = "png", read_only = true });
+        Check(effective.Text.Contains("重连后生效", StringComparison.Ordinal), "generic stream success erased the touch warning");
+        savePeer.Invoke();
+        await Wait(() => Get<InfoBar>(window, "notice").Message == "连接设置已保存。", "GUI save did not complete");
+        Check(effective.Text.Contains("重连后生效", StringComparison.Ordinal), "saved notice erased the touch warning");
+        effective.StartBringIntoView(new BringIntoViewOptions { AnimationDesired = false });
+        await Wait(() => effective.IsLoaded && effective.ActualWidth > 0, "persistent touch status not rendered");
+        Receive(window, TouchStatus(false, false, false));
+        Check(effective.Text.Contains("Linux 端", StringComparison.Ordinal) && effective.Text.Contains("重连", StringComparison.Ordinal),
+            "unsupported server status did not explain inactive native touch");
+        Receive(window, TouchStatus(true, true, true));
+        Check(effective.Text.Contains("当前连接原生触控已开启", StringComparison.Ordinal) &&
+            effective.Text.Contains("只读模式已暂停", StringComparison.Ordinal) && !effective.Text.Contains("重连", StringComparison.Ordinal),
+            "negotiated touch preference was confused with readonly input suspension");
+        Receive(window, new { type = "local_settings_applied", settings = new { touch = true, read_only = false },
+            touch_enabled = true, touch_live_supported = true });
+        Check(!effective.Text.Contains("只读模式已暂停", StringComparison.Ordinal), "readonly touch pause survived a live readonly-off acknowledgement");
+        // Reload through the production method used when a connection is selected.
+        togglePeer.Toggle();
+        Check(!touch.IsOn, "unsaved native touch edit failed");
+        typeof(MainWindow).GetMethod("Load", Private)!.Invoke(window, [enabled]);
+        Check(touch.IsOn, "saved enabled touch did not reload into the actual control");
+        togglePeer.Toggle();
+        savePeer.Invoke();
+        await Wait(() => !ReadSavedProfile().Settings.Touch, "disabled touch was not saved by the GUI");
+        var disabled = ReadSavedProfile();
+        CheckIndependentPolicies(disabled);
+        typeof(MainWindow).GetMethod("Load", Private)!.Invoke(window, [disabled]);
+        Check(!touch.IsOn, "saved disabled touch did not reload into the actual control");
+        Receive(window, TouchStatus(false, true, true));
+        Check(effective.Text.Contains("当前连接原生触控已关闭", StringComparison.Ordinal) &&
+            !effective.Text.Contains("重连", StringComparison.Ordinal), "negotiated disabled preference still showed a reconnect warning");
+        typeof(MainWindow).GetMethod("TouchConnectionChanged", Private)!.Invoke(window, [false]);
+        Check(effective.Text.Contains("当前未连接", StringComparison.Ordinal), "disconnect kept a stale touch state");
+        Receive(window, TouchStatus(true, true, true));
+        typeof(MainWindow).GetMethod("Load", Private)!.Invoke(window, [disabled with { Id = Guid.NewGuid() }]);
+        Check(effective.Text.Contains("当前未连接", StringComparison.Ordinal), "profile switch kept another connection's touch state");
+        typeof(MainWindow).GetMethod("Load", Private)!.Invoke(window, [disabled]);
+        Check(!Get<SessionController>(window, "controller").IsRunning, "settings persistence unexpectedly connected a session");
+        Log("PASS actual WinUI native-touch setting is rendered, accessible, toggles on/off, saves and reloads independently from IME/read-only/files without connecting");
+        Log("PASS persistent touch status survives generic success/saved notices, distinguishes saved/effective and readonly states, and resets on disconnect/profile switch");
+    }
     private static async Task RunAsync(ControlApplication app)
     {
         MainWindow? window = null; SessionController? controller = null;
@@ -109,6 +204,12 @@ internal static class GuiFocusProbe
             var picker = Get<ComboBox>(window, "profilePicker");
             await Wait(() => picker.SelectedIndex == 0 && Get<ComboBox>(window, "output").Items.Count > 0, "profile initialize");
             Check(Get<ConnectionProfile>(window, "selected").Id.ToString() == File.ReadAllText(Path.Combine(root, "profile-id.txt")).Trim(), "fixture profile mismatch");
+            if (File.Exists(Path.Combine(root, "settings-only")))
+            {
+                await RunSettingsAsync(window);
+                Environment.ExitCode = 0;
+                return;
+            }
             await Click(window, Get<Button>(window, "connect"));
             await Wait(() => controller.Connected || Get<InfoBar>(window, "notice") is { IsOpen: true, Severity: InfoBarSeverity.Error }, "GUI connection failed", 60000);
             Check(controller.Connected, "GUI connection error: " + Get<InfoBar>(window, "notice").Message);

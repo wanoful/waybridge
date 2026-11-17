@@ -811,12 +811,26 @@ precise direction, MIME, action and hover coverage.
 ## Native touch (`touch_v1`)
 
 Client hello explicitly requests `touch_v1:true`; server hello echoes negotiated
-availability. Without it, the viewer receives no active touch lease. Native
+availability. Capability is immutable for the connection; the separate boolean
+`touch_enabled` in the initial client hello selects the saved preference. Missing
+preference defaults to enabled for legacy clients that explicitly negotiate
+`touch_v1`; a missing capability never enables touch. The hosted Windows worker
+always sends its saved `settings.touch` preference (default false). Native
 Wayland window metadata includes `touch_input:true`; X11 reports false and keeps
-pointer compatibility. The initial Windows implementation is experimental and
-requires `WAYBRIDGE_TOUCH=1` in the native worker environment.
+pointer compatibility. The experimental Windows implementation is configured
+per connection in the control center; the raw viewer also accepts `--touch`.
 
-Server `touch_state {id,generation,enabled,max_contacts:10}` binds input to the
+The server echoes `touch_settings_v1:true` when touch is negotiated. A negotiated
+client can then send `touch_enabled {enabled:bool}` to change its preference
+without reconnecting. Disable cancels contacts and invalidates the lease; enable
+issues a fresh generation under the usual focus/visibility/read-only rules. The
+capability cannot be acquired by a later hello or preference message. Against
+older servers the worker preserves its current live preference and emits a
+`settings_warning` requiring reconnect for the newly saved choice.
+
+Server `touch_state {id,generation,enabled,requested,max_contacts:10}` reports the
+connection preference as `requested`; `enabled` additionally requires an eligible
+focused target. It binds input to the
 current mapped/visible/input-allowed native Wayland root and mapping epoch.
 Client `touch {id,generation,origin_x,origin_y,points:[...]}` contains up to ten
 unique slots 0–9 with `phase:"down"|"motion"|"up"`; down/motion carry finite

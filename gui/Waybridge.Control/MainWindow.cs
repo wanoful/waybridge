@@ -37,6 +37,11 @@ internal sealed class MainWindow : Window
     private readonly NumberBox sshPort = Number(22, 1, 65535), remotePort = Number(49090, 0, 65535);
     private readonly ToggleSwitch reconnect = Toggle(true), audio = Toggle(true), files = Toggle(true), dragText = Toggle(true), images = Toggle(true), readOnly = Toggle(false), ime = Toggle(true), udp = Toggle(false), hdr = Toggle(false);
     private readonly ToggleSwitch notifications = Toggle(true);
+    private readonly ToggleSwitch touch = Toggle(false);
+    private readonly TextBlock touchStatus = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12 };
+    private Guid? touchStatusProfile;
+    private bool? touchActive, touchSupported, touchLiveSupported;
+    private bool touchReadOnly;
     private readonly ComboBox codec = Combo(["自动", "H.264", "HEVC", "AV1", "PNG 无损"]);
     private readonly ComboBox scale = Combo(["跟随 Windows", "100%", "125%", "150%", "175%", "200%", "250%", "300%", "400%"]);
     private readonly ComboBox clipboard = Combo(["双向同步", "仅 Windows → Linux", "仅 Linux → Windows", "关闭"]);
@@ -86,6 +91,7 @@ internal sealed class MainWindow : Window
         controller.ConnectionChanged += connected => UI(() =>
         {
             desktopNotifications.ConnectionChanged(connected);
+            TouchConnectionChanged(connected);
             if (!connected) { backgroundList.Items.Clear(); trayStatus.Text = "托盘：未连接"; }
             connect.Content = connected ? "断开连接" : (busy || controller.IsRunning) ? "取消连接" : "连接";
             end.IsEnabled = connected && selected.Mode is "ssh" or "direct";
@@ -314,16 +320,25 @@ internal sealed class MainWindow : Window
     }
     private UIElement InputPage()
     {
+        var saveSettings = Button("保存设置"); saveSettings.Click += async (_, _) => await GuardAsync(SaveAsync);
         var apply = Button("应用到当前连接", true); apply.Click += async (_, _) => await GuardAsync(ApplyAsync);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(touch, "NativeTouchToggle");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(touch, "原生多点触控");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(touchStatus, "NativeTouchStatus");
+        touch.Toggled += (_, _) => { if (!loading) UpdateTouchStatus(); };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(saveSettings, "InputSettingsSave");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(apply, "InputSettingsApply");
         return Column(BadgeEditor(), Row("剪贴板方向", "可分别限制 Windows 与 Linux 间的数据同步", clipboard),
             Row("剪贴板图片", "文本同步保持独立", images),
             Row("文字拖放", "双向文字拖放，独立于剪贴板与文件共享", dragText),
             Row("文件与目录共享", "控制文件与目录的剪贴板、拖入与拖出", files),
             Row("桌面通知", "Linux 应用通知与动作，遵循 Windows 通知设置及免打扰", notifications),
             Row("远端应用托盘", "在 Windows 通知区域显示应用托盘，关闭主窗口后仍可从后台列表恢复", remoteTray),
-            Row("只读模式", "暂停键盘和鼠标输入，服务端同时释放按键与指针锁定", readOnly),
+            Row("只读模式", "暂停键盘、鼠标和触控，释放按键与鼠标锁定", readOnly),
             Row("Windows 本地 IME", "使用本地候选窗口与远端预编辑", ime),
-            Row("紧急释放鼠标", "游戏捕获鼠标时可随时释放", Text("Ctrl + Alt + Shift + F12")), apply);
+            Row("原生多点触控（实验）", "向支持触控的 Linux 应用发送最多十点触摸；关闭时使用鼠标兼容模式。按连接保存，可立即应用。", touch),
+            touchStatus,
+            Row("紧急释放鼠标", "游戏捕获鼠标时可随时释放", Text("Ctrl + Alt + Shift + F12")), Actions(saveSettings, apply));
     }
     private UIElement ApplicationsPage()
     {
@@ -417,6 +432,7 @@ internal sealed class MainWindow : Window
     }
     private void Load(ConnectionProfile profile)
     {
+        if (selected.Id != profile.Id) ResetTouchStatus();
         loading = true; selected = profile;
         name.Text = profile.Name; host.Text = profile.Host; user.Text = profile.User; identity.Text = profile.IdentityFile;
         binary.Text = profile.ServerBinary; session.Text = profile.Session; sshPort.Value = profile.SshPort; remotePort.Value = profile.Port;
@@ -438,10 +454,10 @@ internal sealed class MainWindow : Window
         gpu.SelectedIndex = settings.GpuInput == "cuda" ? 1 : 0;
         clipboard.SelectedIndex = Array.IndexOf(new[] { "both", "send", "receive", "off" }, settings.Clipboard);
         remoteTray.IsOn = settings.Tray;
-        images.IsOn = settings.ClipboardImages; files.IsOn = settings.Files; dragText.IsOn = settings.DragText; readOnly.IsOn = settings.ReadOnly; ime.IsOn = settings.Ime;
+        images.IsOn = settings.ClipboardImages; files.IsOn = settings.Files; dragText.IsOn = settings.DragText; readOnly.IsOn = settings.ReadOnly; ime.IsOn = settings.Ime; touch.IsOn = settings.Touch;
         notifications.IsOn = settings.Notifications;
         desktopNotifications.SharingChanged(settings.Notifications);
-        loading = false; UpdateMode();
+        loading = false; UpdateMode(); UpdateTouchStatus();
     }
     private ConnectionProfile ReadEditor()
     {
@@ -453,7 +469,7 @@ internal sealed class MainWindow : Window
             Audio = audio.IsOn, Volume = (int)volume.Value, AudioDevice = audioDevices[Math.Clamp(output.SelectedIndex, 0, audioDevices.Count - 1)].Id,
             Hdr = hdr.IsOn, Udp = udp.IsOn, UdpHost = udpHost.Text.Trim(), GpuInput = gpu.SelectedIndex == 1 ? "cuda" : "cpu",
             Clipboard = new[] { "both", "send", "receive", "off" }[Math.Max(0, clipboard.SelectedIndex)],
-            BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, DragText = dragText.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn,
+            BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, DragText = dragText.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn, Touch = touch.IsOn,
             Notifications = notifications.IsOn, Tray = remoteTray.IsOn
         };
         var result = selected with
@@ -474,7 +490,7 @@ internal sealed class MainWindow : Window
         else secrets.Delete(profile.Id);
         int index = profiles.IndexOf(selected);
         loading = true; profiles[index] = profile; profilePicker.SelectedIndex = index; loading = false;
-        selected = profile; await store.SaveAsync(profiles); Inform("连接设置已保存。");
+        selected = profile; await store.SaveAsync(profiles); Inform("连接设置已保存。"); UpdateTouchStatus();
     }
     private async Task ConnectOrDisconnectAsync()
     {
@@ -534,10 +550,60 @@ internal sealed class MainWindow : Window
             backgroundList.Items.Add(Row(title, state == "NeedsAttention" ? "应用需要注意" : "通过应用菜单正常退出", Actions(restore, menu)));
         }
     }
+    private static bool? TouchFlag(JsonElement message, string name) =>
+        message.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? value.GetBoolean() : null;
+    private void ResetTouchStatus()
+    {
+        touchStatusProfile = null; touchActive = touchSupported = touchLiveSupported = null; touchReadOnly = false;
+    }
+    private void TouchConnectionChanged(bool connected)
+    {
+        if (!connected) ResetTouchStatus();
+        else
+        {
+            var profile = controller.ActiveProfileId ?? selected.Id;
+            if (touchStatusProfile != profile)
+            {
+                ResetTouchStatus(); touchStatusProfile = profile; touchReadOnly = readOnly.IsOn;
+            }
+        }
+        UpdateTouchStatus();
+    }
+    private void ReceiveTouchStatus(JsonElement message)
+    {
+        if (TouchFlag(message, "touch_enabled") is not { } enabled) return;
+        var profile = controller.ActiveProfileId ?? selected.Id;
+        if (touchStatusProfile != profile) ResetTouchStatus();
+        touchStatusProfile = profile; touchActive = enabled;
+        touchSupported = TouchFlag(message, "touch_supported") ?? touchSupported;
+        touchLiveSupported = TouchFlag(message, "touch_live_supported") ?? touchLiveSupported;
+        if (message.TryGetProperty("settings", out var settings) && settings.ValueKind == JsonValueKind.Object)
+            touchReadOnly = TouchFlag(settings, "read_only") ?? touchReadOnly;
+        UpdateTouchStatus();
+    }
+    private void UpdateTouchStatus()
+    {
+        bool saved = selected.Settings.Touch;
+        string text = $"设置：{(saved ? "开启" : "关闭")}。";
+        if (touchStatusProfile != selected.Id) text += "当前未连接，连接后使用此设置。";
+        else if (touchActive is not { } active) text += "正在确认当前连接的触控状态。";
+        else
+        {
+            text += $"当前连接原生触控已{(active ? "开启" : "关闭")}。";
+            if (saved && touchSupported == false) text += "Linux 端暂不支持原生触控，请更新后重连。";
+            else if (saved != active) text += touchLiveSupported == false
+                ? "已保存，重连后生效。" : "已保存，应用到当前连接后生效。";
+            if (touchReadOnly) text += "只读模式已暂停远端输入。";
+        }
+        if (touch.IsOn != saved) text += "当前触控编辑尚未保存。";
+        touchStatus.Text = text;
+    }
     private void Receive(JsonElement message)
     {
         if (desktopNotifications.Receive(message)) return;
         string? type = message.GetProperty("type").GetString();
+        if (type is "status" or "local_settings_applied") ReceiveTouchStatus(message);
         if (type == "notification_status") { Inform(message.GetProperty("message").GetString() ?? "通知服务状态已更新"); return; }
         if (type == "connected" && message.TryGetProperty("hardware_codecs", out var supported))
         {
@@ -557,6 +623,8 @@ internal sealed class MainWindow : Window
         {
             if (message.GetProperty("ok").GetBoolean())
             {
+                touchReadOnly = TouchFlag(message, "read_only") ?? touchReadOnly;
+                UpdateTouchStatus();
                 string reason = message.TryGetProperty("fallback_reason", out var fallback) && fallback.GetString() == "session_video_disabled"
                     ? " 当前会话启动时限定 PNG；请新建使用视频编码的会话。" : "";
                 Inform($"服务端已应用：{message.GetProperty("fps")} FPS，{message.GetProperty("bitrate").GetInt32()/1000.0:g} Mbps/窗口，{message.GetProperty("codec")}。实际画面路径见诊断。" + reason);

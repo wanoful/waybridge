@@ -10,6 +10,7 @@ cmake -S client -B build/windows -G Ninja -DCMAKE_TOOLCHAIN_FILE=mingw.cmake -DC
 cmake --build build/windows --target waybridge-client
 python3 tests/windows_app_icon_smoke.py
 python3 tests/windows_touch_smoke.py
+python3 tests/touch_settings_smoke.py
 python3 tests/windows_tray_smoke.py
 python3 tests/tray_actions_e2e.py
 python3 tests/native_notifications_smoke.py

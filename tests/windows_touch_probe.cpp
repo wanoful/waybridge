@@ -50,6 +50,24 @@ int main(){
   wrongHandoff.state({{"generation",1},{"id",0},{"enabled",false},{"pending_target",8}});
   wrongHandoff.state({{"generation",2},{"id",7},{"enabled",true}});
   require(queued.empty(),"wrong-target handoff retained queued tap");
+  queued.clear();
+  NativeTouch settings([&](const auto &p){queued.push_back(p);});
+  settings.enabled(false); settings.hello(true);
+  settings.state({{"generation",1},{"id",7},{"enabled",true}});
+  require(!settings.sample(target,WM_POINTERDOWN,1,first)&&queued.empty(),"startup preference off consumed touch");
+  settings.enabled(true);settings.state({{"generation",2},{"id",7},{"enabled",true}});
+  settings.sample(target,WM_POINTERDOWN,1,first);
+  require(queued.size()==1&&queued.back()["generation"]==2,"live touch enable");
+  settings.enabled(false);
+  require(queued.size()==2&&queued.back()["action"]=="cancel","live disable did not cancel contact");
+  require(!settings.promotedMouse(window,0xff515780),"disabled preference suppressed compatibility mouse");
+  settings.enabled(true);settings.state({{"generation",2},{"id",7},{"enabled",true}});
+  size_t disabledSize=queued.size();settings.sample(target,WM_POINTERUPDATE,1,first);
+  require(queued.size()==disabledSize,"reenable resumed stale held contact");
+  settings.sample(target,WM_POINTERDOWN,2,first);settings.sample(target,WM_POINTERUP,2,first);
+  settings.enabled(false);settings.enabled(true);
+  settings.state({{"generation",3},{"id",7},{"enabled",true}});
+  require(queued.size()==disabledSize,"preference toggle replayed unsent queued tap");
   sent.clear();
   for(UINT i=1;i<=11;++i)touch.sample(target,WM_POINTERDOWN,i,first);
   require(sent.size()==10,"ten contact bound");
@@ -72,7 +90,7 @@ int main(){
   require(!touch.promotedMouse(window,0xff515700)&&!touch.promotedMouse(window,0),"pen/mouse suppressed");
   touch.hello(false);require(!touch.promotedMouse(window,0xff515780),"legacy mouse suppression");
   DestroyWindow(window);
-  std::cout<<"PASS: native touch first-tap and marked handoff buffering, revocation/retarget no-replay, fractional image geometry, ten slots, motion/up/cancel, stale leases, capture loss and touch-only mouse suppression\n";
+  std::cout<<"PASS: native touch first-tap and marked handoff buffering, revocation/retarget no-replay, startup/live preference cancel and recovery, fractional image geometry, ten slots, motion/up/cancel, stale leases, capture loss and touch-only mouse suppression\n";
   return 0;
  }catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}
 }

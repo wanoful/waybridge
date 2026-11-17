@@ -5,25 +5,31 @@ applications which consume `wl_touch`. Gamepads/rumble, pen/tablet input,
 application-specific gesture mapping and X11 native touch remain follow-up work.
 This does not mark M3 complete.
 
-## Opt in
+## Control-center setting
 
-Set `WAYBRIDGE_TOUCH=1` in the **Windows native worker's environment**, then
-connect with an updated client and server. Without this opt-in the worker does
-not negotiate native touch and existing pointer/mouse compatibility remains.
-There is not yet a per-application compatibility or touch settings UI.
+In the control center's input/sharing settings, enable **原生多点触控（实验）**.
+The choice is saved per connection as the boolean `touch`, defaulting to false
+for a new profile. **保存设置** persists it for subsequent connections;
+**应用到当前连接** also changes the active native worker and Linux session.
+Touch remains subject to the existing read-only input setting.
 
-For a directly launched native viewer in PowerShell:
+Turning it off immediately cancels local pending/held contacts, stops native
+WM_POINTER collection and touch-mouse suppression, and asks the server to cancel
+its contacts. Turning it on obtains a fresh server lease; earlier contacts and
+queued taps cannot resume. A per-application mouse/gesture compatibility UI is
+still follow-up work.
+
+For a directly launched native viewer, add the explicit final option:
 
 ```powershell
-$env:WAYBRIDGE_TOUCH = '1'
-.\waybridge-client.exe <host> <port> <token>
-# Remove the opt-in for subsequent launches:
-Remove-Item Env:WAYBRIDGE_TOUCH
+.\waybridge-client.exe <host> <port> <token> --touch
 ```
 
-The normal authenticated TLS/SSH transport requirements still apply. When using
-the control center, set the environment before starting it so its worker inherits
-it. Touch remains subject to the existing read-only input setting.
+Omitting `--touch` leaves native touch disabled. The normal authenticated TLS/SSH
+transport requirements still apply. With an older server which has native-touch
+capability but lacks live-preference support, a changed live setting is saved
+and produces a reconnect/upgrade warning; the active setting stays unchanged.
+A server without native-touch capability requires an upgrade before use.
 
 ## Current behavior
 
@@ -65,14 +71,22 @@ hardware history/coalescing are not included in this slice.
 
 ## Protocol extension
 
-The v3 hello negotiates `touch_v1` explicitly. Legacy viewers do not receive
-active touch leases. Native Wayland window metadata includes `touch_input:true`;
+The v3 hello negotiates immutable `touch_v1` capability independently of the
+initial boolean `touch_enabled` preference. New native workers always advertise
+the capability and send their saved preference explicitly. For compatibility,
+a legacy viewer which requested `touch_v1` but omitted `touch_enabled` retains
+its previously enabled behavior; viewers without capability cannot enable touch
+through a later hello or live toggle. The server advertises `touch_settings_v1`
+for live preference support. A negotiated viewer can send
+`{"type":"touch_enabled","enabled":true}` (or false) without reconnecting.
+Viewers without `touch_v1` do not receive active touch leases. Native Wayland
+window metadata includes `touch_input:true`;
 X11 metadata reports false.
 
 The server sends:
 
 ```json
-{"type":"touch_state","id":1,"generation":7,"enabled":true,"max_contacts":10}
+{"type":"touch_state","id":1,"generation":7,"enabled":true,"requested":true,"max_contacts":10}
 ```
 
 The client sends bounded, atomically validated contact batches:
@@ -99,9 +113,26 @@ with zero/another ID) is a policy revocation and clears pending input.
 cargo build --locked
 python3 tests/session_fixture.py python3 tests/touch_smoke.py
 python3 tests/windows_touch_smoke.py
+python3 tests/session_fixture.py python3 tests/touch_settings_smoke.py
 cmake --build build/windows --target waybridge-client
 scripts/build-windows-arm64.sh
+dotnet run --project gui/Waybridge.Control.Tests -c Release
+# Publish the production-source settings-only probe before running on a test PC:
+dotnet publish gui/Waybridge.GuiFocus.Probe/Waybridge.GuiFocus.Probe.csproj -c Release \
+  -r win-x64 --self-contained true -p:WindowsAppSDKSelfContained=true \
+  -p:MicrosoftWindowsAppSDKPackageDir= \
+  "-p:ManifestTool=$PWD/scripts/merge-windows-manifest.py" -o build/gui-settings-probe-x64
+python3 tests/windows_touch_settings_laptop.py --host laptop
 ```
+
+The live-preference tests exercise an initially disabled negotiated viewer,
+actual contact cancellation on disable, fresh generations on reenable, immutable
+capability gating and the legacy missing-preference default. The hosted-settings
+regression runs the production PE worker and private host-control pipe against
+real Linux sessions, checking startup OFF, live ON/OFF, server preference/status
+feedback and boolean validation. A local relay removes only the new server's
+live-setting capability to verify the old-server warning and absence of an
+unsupported toggle; it does not change system networking.
 
 The protocol fixture exposed and fixes a vendored Smithay cancellation bug:
 contacts whose last frame was already delivered were skipped by cancel. The

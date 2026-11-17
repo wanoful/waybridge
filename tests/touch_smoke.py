@@ -18,11 +18,13 @@ def wait(check, timeout=8):
 
 
 class TouchViewer(Viewer):
-    def __init__(self, port, token, enabled=True):
+    def __init__(self, port, token, enabled=True, preference=None):
         self.geometry = {}
         self.state = {}
         self.sock = socket.create_connection(('127.0.0.1', port), timeout=8)
-        self.send(type='hello', version=3, token=token, touch_v1=enabled, window_semantics_v1=True, dpi=168)
+        hello = dict(type='hello', version=3, token=token, touch_v1=enabled, window_semantics_v1=True, dpi=168)
+        if preference is not None: hello['touch_enabled'] = preference
+        self.send(**hello)
         hello = self.receive()[1]
         assert hello['type'] == 'hello' and hello.get('touch_v1', False) == enabled
     def receive(self):
@@ -81,11 +83,19 @@ def main():
                 if kind=='control' and value.get('type')=='window': ids[value['title']]=value['id']
             first,other=ids['Touch fixture first'],ids['Touch fixture other']
             viewer.send(type='focus',id=first,focused=True);viewer.barrier()
+            viewer.send(type='touch_enabled',enabled=True)
+            viewer.send(type='hello',touch_v1=True,touch_enabled=True)
             viewer.send(type='touch',id=first,generation=1,points=[point(0)])
             viewer.barrier();assert event_count()==0,log()
+            assert not viewer.state, 'legacy connection upgraded touch capability after hello'
             viewer.sock.close();time.sleep(.25)
-            viewer=TouchViewer(port,token)
+            viewer=TouchViewer(port,token,preference=False)
             viewer.until(lambda k,v:k=='control' and v.get('type')=='window' and v['id']==other)
+            viewer.send(type='focus',id=first,focused=True);viewer.barrier()
+            assert not viewer.state.get('enabled') and viewer.state.get('requested') is False, viewer.state
+            viewer.send(type='touch',id=first,generation=viewer.state['generation'],points=[point(0)])
+            viewer.barrier();assert event_count()==0,log()
+            viewer.send(type='touch_enabled',enabled=True)
             lease=viewer.lease(first)
             viewer.touch(lease,[point(0),point(1,x=200.5,y=160.25)])
             wait(lambda:'TOUCH_DOWN 0 1 100.250 80.750' in log() and 'TOUCH_DOWN 1 1 200.500 160.250' in log())
@@ -133,8 +143,26 @@ def main():
             before=log().count('TOUCH_CANCEL\n');command('destroy')
             wait(lambda:log().count('TOUCH_CANCEL\n')>before)
             viewer.barrier();assert not viewer.state.get('enabled'),viewer.state
+            lease=viewer.lease(other)
+            viewer.touch(lease,[point(0)])
+            wait(lambda:log().count('TOUCH_DOWN ')==17)
+            before=log().count('TOUCH_CANCEL\n')
+            viewer.send(type='touch_enabled',enabled=False)
+            viewer.barrier();wait(lambda:log().count('TOUCH_CANCEL\n')>before)
+            assert viewer.state.get('requested') is False and not viewer.state.get('enabled'),viewer.state
+            before=event_count();viewer.touch(lease,[point(0,'motion')]);viewer.barrier()
+            assert event_count()==before,log()
+            viewer.send(type='touch_enabled',enabled=True)
+            renewed=viewer.lease(other)
+            assert renewed['generation']>lease['generation']
+            before=event_count();viewer.touch(lease,[point(0,'motion')]);viewer.barrier()
+            assert event_count()==before,'preference reenable accepted stale contact'
+            viewer.touch(renewed,[point(0)]);wait(lambda:log().count('TOUCH_DOWN ')==18)
+            viewer.touch(renewed,[point(0,'up')]);viewer.barrier()
+            viewer.send(type='touch_enabled',enabled='false');viewer.barrier()
+            assert viewer.state.get('requested') is True,'malformed preference altered state'
             assert app.poll() is None and host.poll() is None
-            print('PASS: actual wl_touch 175% two/ten contacts and frames, atomic malformed-batch rejection, focus/stale generation, read-only, unmap/remap, disconnect/reconnect and surface-death cancellation; legacy opt-out')
+            print('PASS: initial touch preference off, live on/off/cancel/fresh lease, immutable capability and legacy preference compatibility; actual wl_touch 175% two/ten contacts and frames, atomic malformed-batch rejection, focus/stale generation, read-only, unmap/remap, disconnect/reconnect and surface-death cancellation; legacy opt-out')
         finally:
             if viewer: viewer.sock.close()
             if app and app.poll() is None:app.terminate();app.wait(timeout=5)

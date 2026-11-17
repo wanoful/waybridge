@@ -58,6 +58,7 @@ Json hostedSettings = Json::object();
 bool hostedReadOnly = false, hostedIme = true, hostedFiles = true, hostedImages = true, hostedDragText = true;
 std::string hostedClipboard = "both";
 bool streamConfigNegotiated = false;
+bool hostedTouch = false, touchNegotiated = false, touchSettingsNegotiated = false;
 std::atomic<uint64_t> networkBytes{0}, presentedFrames{0};
 uint64_t streamRequest = 0;
 void applyHostedSettings(const Json &settings, bool live);
@@ -1975,7 +1976,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   if (message == WM_POINTERDOWN || message == WM_POINTERUPDATE || message == WM_POINTERUP ||
       message == WM_POINTERCAPTURECHANGED) {
     NativeTouch::Target target{hwnd,w->id,w->width,w->height,w->originX,w->originY,imageRect(w),
-                              w->touchInput && !w->popup && !hostedReadOnly && !w->sizing &&
+                              w->touchInput && hostedTouch && !w->popup && !hostedReadOnly && !w->sizing &&
                               !relativeInput.active() && !grabbedRoot && !windowDrag.active && !FileDrag::ownsInput()};
     if (target.enabled && message == WM_POINTERDOWN) SetFocus(hwnd);
     if (nativeTouch.handle(target,message,wp)) return 0;
@@ -2568,7 +2569,12 @@ void dispatchNetwork() {
       if (remoteTray.receive(m,*iconDecoder)) continue;
     }
     if (type == "hello") {
-      nativeTouch.hello(m.value("touch_v1",false));
+      touchNegotiated = m.value("touch_v1",false);
+      touchSettingsNegotiated = touchNegotiated && m.value("touch_settings_v1",false);
+      nativeTouch.hello(touchNegotiated);
+      nativeTouch.enabled(hostedTouch);
+      if (hostedTouch && !touchNegotiated)
+        hostControl.emit({{"type","settings_warning"},{"message","Linux 服务端不支持原生触控，请更新服务端并重新连接"}});
       dragVisual.configure(m.value("data_drag_v1", false));
       nativeActivation.hello(m.value("activation_v1", false));
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
@@ -2667,6 +2673,7 @@ void dispatchNetwork() {
       sendWindowState(w);
     } else if (type == "touch_state") {
       nativeTouch.state(m);
+      hostControl.emit(m);
     } else if (type == "ime_state") {
       imeStatus = m;
     } else if (type == "pong") {
@@ -3009,6 +3016,9 @@ void sendStreamConfiguration() {
 }
 void applyHostedSettings(const Json &settings, bool live) {
   if (!settings.is_object()) throw std::runtime_error("Settings must be an object");
+  if (settings.contains("touch") && !settings["touch"].is_boolean())
+    throw std::runtime_error("Touch setting must be boolean");
+  bool requestedTouch = settings.value("touch",false);
   int fps=settings.value("fps",60), bitrate=settings.value("bitrate",30000), dpi=settings.value("dpi",0);
   int volume=settings.value("volume",100);
   std::string codec=settings.value("codec","auto"), clipboard=settings.value("clipboard","both");
@@ -3036,6 +3046,13 @@ void applyHostedSettings(const Json &settings, bool live) {
     releasePointer(); cancelWindowDrag(); suspendImeForOle();
     for (auto &[id,window] : windows) sendJson({{"type","cancel_input"},{"id",id}});
   }
+  if (!live || requestedTouch == hostedTouch || touchSettingsNegotiated)
+    hostedTouch = requestedTouch;
+  else
+    hostControl.emit({{"type","settings_warning"},{"message",touchNegotiated
+      ? "触控设置已保存；当前服务端不支持实时切换，请重新连接（更新 Linux 服务端后可实时应用）"
+      : "触控设置已保存；Linux 服务端不支持原生触控，请更新服务端并重新连接"}});
+  nativeTouch.enabled(hostedTouch);
   hostedSettings=settings;
   remoteNotifications.settings(settings.value("notifications",true));
   remoteTray.configure(trayNegotiated,settings.value("tray",true),settings.value("read_only",false));
@@ -3061,10 +3078,14 @@ void applyHostedSettings(const Json &settings, bool live) {
     if (hostedClipboard=="off" || hostedClipboard=="send") { FileTree::cancelIncoming(); VirtualFiles::cancel(); }
     sendJson({{"type","file_drop_out_enabled"},{"enabled",hostedFiles}});
     sendJson({{"type","text_drag_enabled"},{"enabled",hostedDragText}});
+    if (touchSettingsNegotiated)
+      sendJson({{"type","touch_enabled"},{"enabled",hostedTouch}});
     sendStreamConfiguration();
     for (auto &[id,window] : windows) if (!window->popup) { window->dpi=effectiveDpi(window->hwnd); sendResize(window.get()); }
     updateIme();
-    hostControl.emit({{"type","local_settings_applied"},{"settings",settings}});
+    hostControl.emit({{"type","local_settings_applied"},{"settings",settings},
+                      {"touch_enabled",hostedTouch && touchNegotiated},
+                      {"touch_live_supported",touchSettingsNegotiated}});
   }
 }
 void publishHostedStatus() {
@@ -3077,7 +3098,9 @@ void publishHostedStatus() {
       {"hardware_decode",bool(w->frame&&w->frame->video.texture)},{"presentation",w->presentation?"D3D11 / DirectComposition":"GDI"}});
   }
   hostControl.emit({{"type","status"},{"uptime_ms",GetTickCount64()},{"tcp_bytes",networkBytes.load()},
-                    {"presented_updates",presentedFrames.load()},{"windows",list},{"background",remoteTray.background()}});
+                    {"presented_updates",presentedFrames.load()},{"windows",list},{"background",remoteTray.background()},
+                    {"touch_supported",touchNegotiated},{"touch_live_supported",touchSettingsNegotiated},
+                    {"touch_enabled",hostedTouch && touchNegotiated}});
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
@@ -3266,11 +3289,15 @@ int wmain(int argc, wchar_t **argv) {
   }
   if (argc == 2 && std::wstring(argv[1]) == L"--check-shaders")
     return Presentation::validateShaders() ? 0 : 1;
+  if (argc == 5 && std::wstring(argv[4]) == L"--touch") {
+    hostedTouch = true; argc = 4;
+  }
   if (argc != 4) {
-    std::cerr << "Usage: waybridge-client.exe HOST PORT TOKEN\nUse an SSH "
+    std::cerr << "Usage: waybridge-client.exe HOST PORT TOKEN [--touch]\nUse an SSH "
                  "tunnel to the Linux loopback listener.\n";
     return 1;
   }
+  nativeTouch.enabled(hostedTouch);
   if (remoteApplicationSource.empty()) remoteApplicationSource = utf8(argv[1]) + ":" + utf8(argv[2]);
   if (!SetProcessDpiAwarenessContext(reinterpret_cast<DPI_AWARENESS_CONTEXT>(-4)))
     SetProcessDPIAware();
@@ -3427,7 +3454,8 @@ int wmain(int argc, wchar_t **argv) {
             {"data_drag_v1", true},
             {"notifications_v1", hostControl.active()},
             {"notifications_enabled", false},
-            {"touch_v1", GetEnvironmentVariableW(L"WAYBRIDGE_TOUCH", nullptr, 0) != 0},
+            {"touch_v1", true},
+            {"touch_enabled", hostedTouch},
             {"pointer_lock", true},
             {"toplevel_drag_v1", true},
             {"data_drag_v1", true},

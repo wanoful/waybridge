@@ -23,7 +23,7 @@ public:
 private:
   struct Contact { uint32_t slot; };
   std::function<void(const Json &)> emit;
-  bool negotiated = false;
+  bool negotiated = false, requested = true;
   uint32_t leaseId = 0;
   uint64_t generation = 0, lastGeneration = 0, pendingStarted = 0, suppressUntil = 0;
   Target owner;
@@ -57,9 +57,18 @@ public:
   void hello(bool enabled) {
     cancel(); negotiated = enabled; lastGeneration = generation = 0; leaseId = 0;
   }
+  void enabled(bool value) {
+    if (requested == value) return;
+    cancel(); requested = value;
+    if (!value) { suppressedWindow = nullptr; suppressUntil = 0; }
+  }
   void state(const Json &message) {
     uint64_t next = message.value("generation",uint64_t(0));
     if (!negotiated || !next || next <= lastGeneration) return;
+    if (!requested) {
+      cancel(nullptr,false); lastGeneration = next;
+      return;
+    }
     bool enabled = message.value("enabled",false);
     uint32_t id = enabled ? message.value("id",uint32_t(0)) : 0;
     bool acquiring = !enabled && owner.id && !pending.empty() &&
@@ -96,7 +105,7 @@ public:
   // Also used by the standalone probe: only the OS sample acquisition is outside
   // this method. Geometry, queueing, slots, cancellation and lease checks are production.
   bool sample(const Target &target, UINT message, UINT pointer, POINT screen, bool canceled = false) {
-    if (!negotiated || !target.enabled || !pointerMessage(message)) return false;
+    if (!negotiated || !requested || !target.enabled || !pointerMessage(message)) return false;
     if (message == WM_POINTERCAPTURECHANGED || canceled) { cancel(target.hwnd); return true; }
     if (message == WM_POINTERDOWN) {
       if (!IsWindow(target.hwnd) || GetFocus() != target.hwnd || target.width <= 0 || target.height <= 0 ||
@@ -130,7 +139,7 @@ public:
     return true;
   }
   bool handle(const Target &target, UINT message, WPARAM wp) {
-    if(!negotiated||!target.enabled||!pointerMessage(message))return false;
+    if(!negotiated||!requested||!target.enabled||!pointerMessage(message))return false;
     UINT pointer=GET_POINTERID_WPARAM(wp);
     if(message==WM_POINTERCAPTURECHANGED) {
       if(!contacts.count(pointer))return false;
@@ -144,7 +153,7 @@ public:
   }
   bool promotedMouse(HWND window, ULONG_PTR extra) const {
     // Documented Windows pen/touch signature; bit 7 distinguishes touch from pen.
-    return negotiated && suppressedWindow==window && GetTickCount64()<=suppressUntil &&
+    return negotiated && requested && suppressedWindow==window && GetTickCount64()<=suppressUntil &&
            (extra&0xffffff00)==0xff515700 && (extra&0x80);
   }
 };

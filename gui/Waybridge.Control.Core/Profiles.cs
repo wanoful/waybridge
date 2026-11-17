@@ -17,6 +17,7 @@ public sealed record ClientSettings
     public string UdpHost { get; set; } = "";
     public bool ReadOnly { get; set; }
     public bool Ime { get; set; } = true;
+    public bool Touch { get; set; }
     public string Clipboard { get; set; } = "both";
     public bool ClipboardImages { get; set; } = true;
     public bool Files { get; set; } = true;

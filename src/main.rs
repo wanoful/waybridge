@@ -1061,6 +1061,11 @@ impl App {
             "window_state" => self.native_window_state(id, &value),
             "ime" => self.ime_message(&value),
             "touch" => self.touch_message(&value),
+            "touch_enabled" => {
+                if let Some(enabled) = value["enabled"].as_bool() {
+                    self.touch_enabled(enabled);
+                }
+            }
             "text_drag_enter" | "text_drag_motion" | "text_drag_drop" | "text_drag_cancel"
             | "text_drag_retarget" => self.text_drag_message(&value),
             "drag_claim" | "drag_return" | "drag_drop" | "drag_result" | "drag_read" => {
@@ -1081,7 +1086,16 @@ impl App {
                     }
                     self.drag_visual.enabled = enabled;
                 }
-                self.touch_available(value["touch_v1"] == true);
+                // Older touch_v1 viewers had no separate preference; preserve
+                // their requested native-touch behavior only when capability exists.
+                self.touch_negotiate(
+                    value["touch_v1"] == true,
+                    if value.get("touch_enabled").is_none() {
+                        true
+                    } else {
+                        value["touch_enabled"].as_bool().unwrap_or(false)
+                    },
+                );
                 self.activation.negotiated = value["activation_v1"] == true;
                 self.window_drag.available = value["toplevel_drag_v1"].as_bool().unwrap_or(false);
                 self.relative_available(value["pointer_lock"].as_bool().unwrap_or(false));
@@ -2830,6 +2844,7 @@ fn main() -> Result<()> {
                             tray.set_peer(Some(peer.clone()));
                         }
                         app.read_only = false;
+                        app.touch_available(false);
                         if let Some(audio) = &app.audio {
                             audio.set_peer(Some(&peer));
                         }

@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Security.Authentication;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using Waybridge.Control.Core;
 
 static void Check(bool condition, string message) { if (!condition) throw new Exception(message); }
@@ -47,6 +48,9 @@ if (args is ["--control-pipe", var pipeName])
         Check(!string.IsNullOrWhiteSpace(transport.GetProperty("client_id").GetString()), "direct transport omitted client identity");
         await pipe.WriteAsync(Wire.Encode(new { type = "bootstrap_verified", transport_type = "tls", session = transport.GetProperty("session").GetString() }));
     }
+    // This process is the IPC boundary: report the actual serialized settings,
+    // without echoing credentials, before acknowledging startup.
+    await pipe.WriteAsync(Wire.Encode(new { type = "bootstrap_settings", settings = start.GetProperty("settings") }));
     await pipe.WriteAsync(Wire.Encode(new { type = "connected", version = 3 }));
     while (await input.ReadAsync(default) is { } request)
     {
@@ -225,6 +229,7 @@ try
 
     var legacySettings = JsonSerializer.Deserialize<ClientSettings>("{\"files\":false}", ProfileStore.Json)!;
     Check(!legacySettings.Files && legacySettings.DragText, "legacy file sharing must not disable text drags");
+    Check(!legacySettings.Touch, "profiles without a touch field must retain mouse-compatible defaults");
     var textDisabled = JsonSerializer.Deserialize<ClientSettings>(JsonSerializer.Serialize(new ClientSettings { DragText = false }, ProfileStore.Json), ProfileStore.Json)!;
     Check(!textDisabled.DragText && textDisabled.Files, "independent text drag policy failed to persist");
     var store = new ProfileStore(directory);
@@ -235,6 +240,33 @@ try
     await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => store.SaveAsync([profile])));
     Check((await store.LoadAsync()).Count == 1, "atomic concurrent save");
     Console.WriteLine("PASS: atomic profile persistence without credential fields");
+
+    var touchProfile = profile with { Settings = new ClientSettings {
+        Touch = true, Ime = false, ReadOnly = true, Files = false, DragText = false, Clipboard = "off" } };
+    await store.SaveAsync([touchProfile]);
+    var touchLoaded = (await new ProfileStore(directory).LoadAsync()).Single();
+    Check(touchLoaded.Settings.Touch && !touchLoaded.Settings.Ime && touchLoaded.Settings.ReadOnly &&
+        !touchLoaded.Settings.Files && !touchLoaded.Settings.DragText && touchLoaded.Settings.Clipboard == "off",
+        "native touch preference did not persist independently of IME/read-only/file policy");
+    await store.SaveAsync([touchLoaded with { Settings = touchLoaded.Settings with { Touch = false } }]);
+    var touchDisabled = (await new ProfileStore(directory).LoadAsync()).Single();
+    Check(!touchDisabled.Settings.Touch && !touchDisabled.Settings.Ime && touchDisabled.Settings.ReadOnly &&
+        !touchDisabled.Settings.Files && !touchDisabled.Settings.DragText,
+        "disabling saved native touch changed an unrelated input/sharing policy");
+    using (var saved = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(directory, "profiles.json"))))
+        Check(saved.RootElement[0].GetProperty("settings").GetProperty("touch").ValueKind == JsonValueKind.False,
+            "disabled touch was not persisted as an explicit false setting");
+    // Exercise a whole old profile through ProfileStore, rather than only a
+    // deserialized ClientSettings object, then upgrade it through a normal save.
+    await File.WriteAllTextAsync(Path.Combine(directory, "profiles.json"), JsonSerializer.Serialize(new[] { new {
+        id = profile.Id, name = profile.Name, host = profile.Host,
+        settings = new { ime = false, read_only = true, files = false } } }, ProfileStore.Json));
+    var oldProfile = (await new ProfileStore(directory).LoadAsync()).Single();
+    Check(!oldProfile.Settings.Touch && !oldProfile.Settings.Ime && oldProfile.Settings.ReadOnly && !oldProfile.Settings.Files,
+        "loading an old profile changed its saved policies or enabled native touch");
+    await store.SaveAsync([oldProfile with { Settings = oldProfile.Settings with { Touch = true } }]);
+    Check((await store.LoadAsync()).Single().Settings.Touch, "old profile could not save the native touch opt-in");
+    Console.WriteLine("PASS: native touch opt-in/off and legacy profiles persist independently from IME, read-only and file sharing");
 
     using var bytes = new MemoryStream(Encoding.UTF8.GetBytes("{\"value\":\"中文😀\"}\n{\"id\":2}\n"));
     var lines = new JsonLines(bytes, 1024);
@@ -274,6 +306,34 @@ try
         Check(reply.GetProperty("request").GetProperty("settings").GetProperty("clipboard").GetString() == "off", "IPC clipboard");
     }
     Console.WriteLine("PASS: separate-process named-pipe bootstrap, private credential transport, commands and graceful disconnect");
+
+    foreach (bool initialTouch in new[] { false, true })
+    {
+        var settings = new ClientSettings { Touch = initialTouch, Ime = false, ReadOnly = true, Files = false };
+        var channelEvents = Channel.CreateUnbounded<JsonElement>();
+        await using var touchEngine = await EngineChannel.StartAsync("dotnet", "127.0.0.1", 49090,
+            "test-touch-" + new string('d', 40), settings,
+            message => channelEvents.Writer.TryWrite(message), _ => { }, default,
+            [Assembly.GetExecutingAssembly().Location]);
+        var bootstrapSettings = await channelEvents.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Check(bootstrapSettings.GetProperty("type").GetString() == "bootstrap_settings", "missing native touch bootstrap observation");
+        var actual = bootstrapSettings.GetProperty("settings");
+        Check(actual.GetProperty("touch").GetBoolean() == initialTouch && !actual.GetProperty("ime").GetBoolean() &&
+            actual.GetProperty("read_only").GetBoolean() && !actual.GetProperty("files").GetBoolean(),
+            "EngineChannel start lost native touch or unrelated policy fields");
+        foreach (bool liveTouch in new[] { !initialTouch, initialTouch })
+        {
+            await touchEngine.SendAsync(new { type = "settings", settings = settings with { Touch = liveTouch } });
+            JsonElement response;
+            do { response = await channelEvents.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
+            while (response.GetProperty("type").GetString() != "observed");
+            var live = response.GetProperty("request").GetProperty("settings");
+            Check(live.GetProperty("touch").GetBoolean() == liveTouch && !live.GetProperty("ime").GetBoolean() &&
+                live.GetProperty("read_only").GetBoolean() && !live.GetProperty("files").GetBoolean(),
+                "EngineChannel live native touch toggle changed or lost independent policies");
+        }
+    }
+    Console.WriteLine("PASS: separate-process native touch startup and live on/off settings retain explicit booleans and independent policies");
 
     string silentMarker = Path.Combine(directory, "silent-worker.pid");
     using (var cancellation = new CancellationTokenSource())

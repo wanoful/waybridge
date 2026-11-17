@@ -1,8 +1,35 @@
 # Validation
 
-## Installed update and native-touch opt-in — 2026-11-18
+## Native touch saved settings — 2026-11-18
 
-The Release workspace at code commit `42704d9` is now installed as
+The control center exposes experimental native multitouch under **输入与共享**.
+The boolean `settings.touch` is saved per connection (missing fields default
+false), transmitted at worker startup, and applied live with a separately
+negotiated server capability. Disable cancels contacts; enabling obtains a fresh
+lease. The worker no longer reads the former touch environment variable. The
+raw viewer uses an explicit `--touch` argument.
+
+Focused real-Wayland tests pass for initial OFF, live ON/OFF, contact cancel,
+fresh generations, immutable negotiation and legacy clients. Native PE/Wine
+adapter tests pass for preference changes without stale contact/tap replay.
+The actual hosted worker and named pipe confirm default OFF, live server/client
+status, malformed boolean rejection, and a reconnect warning against an older
+server without sending unsupported messages. Core tests pass ten groups,
+including true/false profile round trips, missing-field defaults, independent
+input policies and separate-process startup/live settings serialization.
+
+A private actual-WinUI probe on the x64 `laptop` renders the production toggle,
+uses its Toggle/Invoke automation providers to save both values and reload them,
+and preserves IME/read-only/file/clipboard choices. It does not connect a server
+or inject physical touch. The existing hosted-worker regression also passes actual file upload, live
+read-only/DPI/stream settings and graceful disconnect with retained applications.
+Strict workspace formatting/Clippy and workspace Rust tests pass. Evidence: `build/touch-settings-{protocol,native,hosted,clippy,rust}.log`
+and `build/tests/touch-settings-laptop.log`. Repeatable commands are documented in
+[INPUT_DEVICES.md](INPUT_DEVICES.md).
+
+## Initial installed update (superseded by saved settings) — 2026-11-18
+
+The initial Release workspace at code commit `42704d9` was installed as
 `~/.local/bin/waybridge` and `waybridge-service`. The user service restarted at
 00:04 UTC+8; its running executable inode matches the rebuilt service hash.
 Both installed binaries match Release outputs, configuration checks pass and a
@@ -14,13 +41,14 @@ not ended.
 The matching x64 control-center/worker/runtime bundle replaced the existing
 `%LOCALAPPDATA%\Waybridge-Test\m0-m1-20261114\app\Waybridge` installation on
 `laptop`; all 541 inventory hashes were verified. Windows profiles and connection
-settings are unchanged. The GUI was restarted in the logged-in user's limited
+settings were unchanged. The GUI was restarted in the logged-in user's limited
 interactive session and its startup log confirms MainWindow activation.
-`WAYBRIDGE_TOUCH=1` is persisted for that Windows user and was explicitly inherited
+`WAYBRIDGE_TOUCH=1` was persisted for that Windows user and explicitly inherited
 by the restarted GUI, whose native workers inherit the same environment. The
 standard environment-change notification was broadcast for subsequent launches.
-Native multitouch is therefore opted in for subsequent connections; this update
-does not claim a new physical-touchscreen acceptance run.
+This initially opted in native multitouch for subsequent connections; the saved
+GUI setting above supersedes this environment-based setup. This initial update
+did not include a new physical-touchscreen acceptance run.
 
 Both x64 and ARM64 portable packages were rebuilt and validated; the actual
 installed Windows device in this update is x64. Evidence:
@@ -45,7 +73,7 @@ UDP feedback pacing; it does not complete M2/M3 or physical-device acceptance.
   The real CUDA/H.264 one-slot case provides usable temporary PNG, retains the
   focused video, then restores an independent IDR/P chain after release without
   application repaint; stale pressure cannot churn the recovered encoder.
-- Native Windows multitouch is opt-in with `WAYBRIDGE_TOUCH=1`. Real Wayland
+- Native Windows multitouch is opt-in (now a saved GUI setting). Real Wayland
   `wl_touch` tests cover ten contacts, 175% coordinates, atomic malformed batches,
   stale generations, read-only, focus, unmap, disconnect and source destruction.
   The PE/Wine adapter verifies first-tap buffering, exact marked handoff, no

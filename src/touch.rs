@@ -15,6 +15,8 @@ struct Contact {
 #[derive(Default)]
 pub struct Touch {
     available: bool,
+    initialized: bool,
+    enabled: bool,
     generation: u64,
     target: Option<(u32, u64)>,
     handoff: Option<u32>,
@@ -26,7 +28,7 @@ impl App {
         if self.touch.available {
             let mut message = json!({"type":"touch_state", "enabled":self.touch.target.is_some(),
                 "id":self.touch.target.map_or(0, |(id, _)| id),
-                "generation":self.touch.generation, "max_contacts":10});
+                "generation":self.touch.generation, "requested":self.touch.enabled, "max_contacts":10});
             if let Some(id) = pending_target {
                 message["pending_target"] = json!(id);
             }
@@ -36,10 +38,41 @@ impl App {
     pub fn touch_available(&mut self, available: bool) {
         self.cancel_touch();
         self.touch.available = available;
+        self.touch.initialized = available;
+        self.touch.enabled = available;
         self.touch.generation = self.touch.generation.wrapping_add(1).max(1);
         self.touch.target = None;
         self.publish_touch(None);
         self.sync_touch();
+    }
+    /// Bind capability/preference to the first hello of this connection. A
+    /// subsequent hello cannot upgrade a viewer which did not negotiate touch.
+    pub fn touch_negotiate(&mut self, available: bool, enabled: bool) {
+        if self.touch.initialized {
+            return;
+        }
+        self.touch.initialized = true;
+        self.touch.available = available;
+        self.touch.enabled = available && enabled;
+        self.touch.target = None;
+        self.touch.generation = self.touch.generation.wrapping_add(1).max(1);
+        self.publish_touch(None);
+        self.sync_touch();
+    }
+    pub fn touch_enabled(&mut self, enabled: bool) {
+        if !self.touch.initialized || !self.touch.available || self.touch.enabled == enabled {
+            return;
+        }
+        self.touch.enabled = enabled;
+        if !enabled {
+            self.cancel_touch();
+        } else {
+            let before = self.touch.generation;
+            self.sync_touch();
+            if self.touch.generation == before {
+                self.publish_touch(None);
+            }
+        }
     }
     pub fn cancel_touch(&mut self) {
         let pending_target = self.touch.handoff.take();
@@ -62,7 +95,8 @@ impl App {
         self.touch.handoff = id.and_then(|id| self.touch_candidate(id).map(|(id, _)| id));
     }
     fn touch_candidate(&self, id: u32) -> Option<(u32, u64)> {
-        if self.read_only
+        if !self.touch.enabled
+            || self.read_only
             || self.peer.as_ref().is_none_or(|p| !p.desktop_input())
             || self.external_drag_input()
             || self.window_drag.active()
