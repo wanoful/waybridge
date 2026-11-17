@@ -30,6 +30,8 @@
 #include "relative_input.h"
 #include "ime.h"
 #include "native_touch.h"
+#include "native_pen.h"
+#include "gamepad.h"
 #include "touch_window.h"
 #include "touch_ole.h"
 #include "third_party/json.hpp"
@@ -61,8 +63,13 @@ bool hostedReadOnly = false, hostedIme = true, hostedFiles = true, hostedImages 
 std::string hostedClipboard = "both";
 bool streamConfigNegotiated = false;
 bool hostedTouch = false, touchNegotiated = false, touchSettingsNegotiated = false, touchInteractionNegotiated = false;
+bool hostedPen = false, penNegotiated = false, penSettingsNegotiated = false;
+bool hostedGamepads = false, gamepadNegotiated = false, gamepadSettingsNegotiated = false;
+double hostedPenGamma = 1.0;
+bool hostedGamepadRumble = true;
+int hostedGamepadDeadzone = 15;
 std::map<std::string, bool> touchApplicationModes;
-TouchWindowManipulation touchWindow;
+TouchWindowManipulation touchWindow, penWindow;
 TouchOle::Bridge touchOle;
 uint64_t touchOlePromotedOperation = 0, touchOleWarning = 0;
 bool touchOleMouseReady = false, touchOlePumping = false;
@@ -75,6 +82,8 @@ void sendJson(const Json &value);
 RemoteNotifications remoteNotifications([](Json message) { hostControl.emit(std::move(message)); },
                                       [](Json message) { sendJson(message); });
 NativeTouch nativeTouch([](const Json &message) { sendJson(message); });
+NativePen nativePen([](const Json &message) { sendJson(message); });
+NativeGamepad nativeGamepads([](const Json &message) { sendJson(message); });
 constexpr size_t MaxPacket = 72 * 1024 * 1024;
 constexpr UINT NetworkReady = WM_APP + 1;
 SOCKET connection = INVALID_SOCKET;
@@ -186,7 +195,7 @@ struct RemoteWindow {
   std::unique_ptr<Presentation> presentation;
   UINT dpi = 96;
   int originX = 0, originY = 0;
-  bool touchInput = false;
+  bool touchInput = false, penInput = false;
   bool shown = false;
   bool popup = false;
   uint32_t root = 0, parent = 0;
@@ -221,7 +230,7 @@ struct WindowDrag {
   uint32_t source = 0, attached = 0, target = 0;
   int offsetX = 0, offsetY = 0;
 } windowDrag;
-constexpr UINT_PTR WindowDragTimer = 5, TouchOleTimer = 6;
+constexpr UINT_PTR WindowDragTimer = 5, TouchOleTimer = 6, GamepadTimer = 7;
 Json touchInteractionInput(const NativeTouch::InteractionSample &sample);
 
 bool nativeTouchFor(const RemoteWindow *window) {
@@ -235,6 +244,41 @@ bool nativeTouchFor(const RemoteWindow *window) {
   if (!root->touchInput) return false;
   auto mode = touchApplicationModes.find(root->appId);
   return mode == touchApplicationModes.end() || mode->second;
+}
+
+
+bool nativePenFor(const RemoteWindow *window) {
+  if (!hostedPen || !window) return false;
+  if (!window->popup) return window->penInput;
+  auto found = windows.find(window->root);
+  return found != windows.end() && found->second->penInput;
+}
+uint32_t gamepadForeground() {
+  if (hostedReadOnly) return 0;
+  HWND foreground=GetForegroundWindow();
+  for (auto &[id,window] : windows) {
+    if (window->hwnd != foreground || !IsWindowVisible(foreground) || IsIconic(foreground)) continue;
+    if (!window->popup) return id;
+    auto root=windows.find(window->root);
+    return root == windows.end() ? 0 : root->first;
+  }
+  return 0;
+}
+void pollGamepads() {
+  nativeGamepads.focus(gamepadForeground());
+  nativeGamepads.poll();
+}
+Json professionalInputStatus() {
+  Json result=nativeGamepads.status();
+  result["gamepad_live_supported"]=gamepadSettingsNegotiated;
+  result["pen_supported"]=penNegotiated;
+  result["pen_live_supported"]=penSettingsNegotiated;
+  result["pen_enabled"]=hostedPen && penNegotiated;
+  result["pen_native_active"]=nativePen.active();
+  result["pen_hardware_available"]=(GetSystemMetrics(SM_DIGITIZER) & (NID_INTEGRATED_PEN|NID_EXTERNAL_PEN)) != 0;
+  result["pen_error"]=hostedPen && !penNegotiated
+    ? "Linux 端不支持原生笔，请更新后重新连接" : "";
+  return result;
 }
 
 DWORD windowStyle(bool clientDecorated) {
@@ -1990,6 +2034,27 @@ void suspendImeForOle() {
   imeOleSuspending = false;
 }
 
+void penWindowInteractionSample(const NativePen::WindowInteractionSample &sample) {
+  auto found=windows.find(sample.id);
+  RemoteWindow *source=found == windows.end() ? nullptr : found->second.get();
+  if (sample.phase == "begin") {
+    nativeTouch.cancel();
+    if (!source || source->state.fullscreen) { nativePen.cancel(); return; }
+    source->sizing=true;
+    if (!penWindow.begin(source->hwnd,sample.kind,sample.edge,sample.initialWindow,
+                         sample.initialScreen,sample.screen)) nativePen.cancel();
+    return;
+  }
+  if (sample.phase == "motion" || sample.phase == "up") penWindow.update(sample.screen);
+  if (sample.phase == "up" || sample.phase == "cancel")
+    sendJson({{"type","pen_window_end"},{"operation",sample.operation},{"generation",sample.generation},
+      {"gesture",sample.gesture},{"tool",sample.tool},{"eraser",sample.eraser},{"cancelled",sample.phase == "cancel"}});
+  if (sample.phase == "up" || sample.phase == "cancel" || sample.phase == "end") {
+    penWindow.end();
+    if (source) { source->sizing=false; KillTimer(source->hwnd,1); sendResize(source); }
+  }
+}
+
 Json touchInteractionInput(const NativeTouch::InteractionSample &sample) {
   Json input = {{"type","touch_interaction_input"},{"operation",sample.operation},
                 {"gesture",sample.gesture},{"generation",sample.generation},{"slot",sample.slot},
@@ -2098,6 +2163,7 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
   bool manipulating = sample.kind == "move" || sample.kind == "resize";
   if (sample.phase == "begin") {
     if (manipulating) {
+      nativePen.cancel();
       if (!source || source->state.fullscreen) {
         auto cancel = sample; cancel.phase = "cancel"; sendJson(touchInteractionInput(cancel));
         nativeTouch.endInteraction(sample.operation); return;
@@ -2165,6 +2231,23 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, message, wp, lp);
   if (touchOleMouse(hwnd,message,wp,ULONG_PTR(GetMessageExtraInfo()))) return 0;
   if ((message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) &&
+      nativePenFor(w) && nativePen.promotedMouse(hwnd,ULONG_PTR(GetMessageExtraInfo()))) return 0;
+  if (message == WM_POINTERENTER || message == WM_POINTERLEAVE || message == WM_POINTERDOWN ||
+      message == WM_POINTERUPDATE || message == WM_POINTERUP || message == WM_POINTERCAPTURECHANGED) {
+    auto root=w->popup ? windows.find(w->root) : windows.find(w->id);
+    RemoteWindow *rootWindow=root == windows.end() ? nullptr : root->second.get();
+    NativePen::Target target{hwnd,rootWindow ? rootWindow->id : w->id,w->width,w->height,
+      w->originX,w->originY,imageRect(w),nativePenFor(w) && !hostedReadOnly && !w->sizing &&
+      !relativeInput.active() && !windowDrag.active && !FileDrag::ownsInput(),
+      w->id,rootWindow ? rootWindow->hwnd : hwnd};
+    if (target.enabled && message == WM_POINTERDOWN) {
+      POINTER_INPUT_TYPE kind{};
+      if (GetPointerType(GET_POINTERID_WPARAM(wp),&kind) && kind == PT_PEN && rootWindow)
+        SetFocus(rootWindow->hwnd);
+    }
+    if (nativePen.handle(target,message,wp)) return 0;
+  }
+  if ((message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) &&
       nativeTouchFor(w) && nativeTouch.promotedMouse(hwnd, ULONG_PTR(GetMessageExtraInfo()))) return 0;
   if (message == WM_POINTERDOWN || message == WM_POINTERUPDATE || message == WM_POINTERUP ||
       message == WM_POINTERCAPTURECHANGED) {
@@ -2212,6 +2295,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       releasePointer();
     break;
   case WM_CANCELMODE:
+    nativePen.cancel(hwnd);
     nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
       releasePointer();
@@ -2231,7 +2315,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       w->state.clamp(hwnd, w->dpi, w->clientDecorated, reinterpret_cast<WINDOWPOS *>(lp));
     break;
   case WM_SHOWWINDOW:
-    if (!wp) nativeTouch.cancel(hwnd);
+    if (!wp) { nativePen.cancel(hwnd); nativeTouch.cancel(hwnd); }
     sendWindowState(w);
     break;
   case WM_SYSCOMMAND:
@@ -2321,6 +2405,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     return semanticsNegotiated && !acceptsInput(w, lp) ? HTTRANSPARENT : HTCLIENT;
   case WM_ENTERSIZEMOVE:
+    nativePen.cancel(hwnd);
     nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
       releasePointer();
@@ -2334,6 +2419,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_DESTROY:
+    nativePen.cancel(hwnd);
     nativeTouch.cancel(hwnd);
     ApplicationIdentity::clear(hwnd);
     w->dropLifetime.reset();
@@ -2377,12 +2463,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_ERASEBKGND:
     return 1;
   case WM_SETFOCUS:
+    pollGamepads();
     if (w->popup)
       return 0;
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", true}});
     updateIme();
     return 0;
   case WM_KILLFOCUS:
+    nativePen.cancel(); nativeGamepads.focus(0);
     if (auto owner = nativeTouch.activeInteraction(); !owner || owner->kind != "dnd") nativeTouch.cancel();
     if (relativeInput.active(hwnd))
       releasePointer();
@@ -2506,6 +2594,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_DPICHANGED: {
+    nativePen.cancel(hwnd);
     nativeTouch.cancel(hwnd);
     if (w->popup) {
       positionPopup(w);
@@ -2532,6 +2621,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   }
   case WM_SIZE:
+    if (!nativePen.ownsWindowInteraction(hwnd)) nativePen.cancel(hwnd);
     if (!nativeTouch.ownsInteraction(hwnd)) nativeTouch.cancel(hwnd);
     sendWindowState(w);
     if (relativeInput.active(hwnd))
@@ -2767,6 +2857,13 @@ void dispatchNetwork() {
       if (remoteTray.receive(m,*iconDecoder)) continue;
     }
     if (type == "hello") {
+      penNegotiated=m.value("pen_v1",false);
+      penSettingsNegotiated=penNegotiated && m.value("pen_settings_v1",false);
+      gamepadNegotiated=m.value("gamepad_v1",false);
+      gamepadSettingsNegotiated=gamepadNegotiated && m.value("gamepad_settings_v1",false);
+      nativePen.hello(penNegotiated); nativePen.configure(hostedPen,hostedPenGamma);
+      nativeGamepads.configure(gamepadNegotiated,hostedGamepads,hostedGamepadRumble,hostedGamepadDeadzone);
+      pollGamepads();
       touchNegotiated = m.value("touch_v1",false);
       touchSettingsNegotiated = touchNegotiated && m.value("touch_settings_v1",false);
       touchInteractionNegotiated = touchNegotiated && m.value("touch_interaction_v1",false);
@@ -2886,6 +2983,13 @@ void dispatchNetwork() {
           sendJson({{"type","touch_interaction_ack"},{"operation",operation},{"accepted",false}});
         } else nativeTouch.beginInteraction(m,source->second->hwnd);
       }
+    } else if (type == "pen_state") {
+      nativePen.state(m); hostControl.emit(m);
+    } else if (type == "gamepad_state") {
+      nativeGamepads.state(m);
+      Json status=professionalInputStatus(); status["type"]="gamepad_state"; hostControl.emit(status);
+    } else if (type == "gamepad_rumble") {
+      nativeGamepads.feedback(m);
     } else if (type == "touch_state") {
       nativeTouch.state(m);
       hostControl.emit(m);
@@ -2976,6 +3080,7 @@ void dispatchNetwork() {
       iconWindow->icon.apply(iconWindow->hwnd, iconWindow->dpi);
       auto *updated = windows.at(id).get();
       updated->touchInput = m.value("touch_input",false);
+      updated->penInput = m.value("pen_input",false);
       auto parent = m.find("parent");
       updated->parent =
           parent != m.end() && parent->is_number_unsigned() ? parent->get<uint32_t>() : 0;
@@ -3075,6 +3180,16 @@ void dispatchNetwork() {
       if (semanticsNegotiated && m.contains("fullscreen_epoch"))
         native->state.fullscreenEpoch = m.at("fullscreen_epoch").get<uint64_t>();
       auto action = m.value("action", "");
+      if (m.value("input","") == "pen") {
+        if (!penNegotiated || hostedReadOnly || native->state.fullscreen ||
+            !nativePen.beginWindowInteraction(m,hwnd))
+          sendJson({{"type","pen_window_end"},{"operation",m.value("pen_operation",uint64_t(0))},
+            {"generation",m.value("pen_generation",uint64_t(0))},
+            {"gesture",m.value("pen_gesture",uint64_t(0))},
+            {"tool",m.value("pen_tool",uint64_t(0))},{"eraser",m.value("pen_eraser",false)},
+            {"cancelled",true}});
+        continue;
+      }
       if (semanticsNegotiated && (action == "fullscreen" || action == "unfullscreen")) {
         setFullscreen(native, action == "fullscreen");
         continue;
@@ -3234,6 +3349,30 @@ void applyHostedSettings(const Json &settings, bool live) {
   if (settings.contains("touch") && !settings["touch"].is_boolean())
     throw std::runtime_error("Touch setting must be boolean");
   bool requestedTouch = settings.value("touch",false);
+  for (const char *field : {"pen","gamepads","gamepad_rumble"})
+    if (settings.contains(field) && !settings[field].is_boolean()) throw std::runtime_error("Input settings must be boolean");
+  if (settings.contains("pen_pressure_gamma") && !settings["pen_pressure_gamma"].is_number())
+    throw std::runtime_error("Pen pressure curve must be numeric");
+  if (settings.contains("gamepad_deadzone") && !settings["gamepad_deadzone"].is_number_integer())
+    throw std::runtime_error("Gamepad deadzone must be an integer");
+  double penGamma=settings.value("pen_pressure_gamma",1.0);
+  int deadzone=15;
+  if (settings.contains("gamepad_deadzone")) {
+    const auto &value=settings["gamepad_deadzone"];
+    if (value.is_number_unsigned()) {
+      auto number=value.get<uint64_t>();
+      if (number > 50) throw std::runtime_error("Invalid gamepad deadzone range");
+      deadzone=int(number);
+    } else {
+      auto number=value.get<int64_t>();
+      if (number < 0 || number > 50) throw std::runtime_error("Invalid gamepad deadzone range");
+      deadzone=int(number);
+    }
+  }
+  if (!std::isfinite(penGamma) || penGamma < .25 || penGamma > 4. || deadzone < 0 || deadzone > 50)
+    throw std::runtime_error("Invalid pen/gamepad calibration range");
+  bool requestedPen=settings.value("pen",false), requestedGamepads=settings.value("gamepads",false);
+
   auto applicationModes = settings.value("touch_modes", Json::object());
   if (!applicationModes.is_object() || applicationModes.size() > 100)
     throw std::runtime_error("Invalid application touch modes");
@@ -3268,6 +3407,7 @@ void applyHostedSettings(const Json &settings, bool live) {
         break;
       }
     TextDrag::reset();
+    nativePen.cancel(); nativeGamepads.focus(0);
     nativeTouch.cancel();
     releasePointer(); cancelWindowDrag(); suspendImeForOle();
     for (auto &[id,window] : windows) sendJson({{"type","cancel_input"},{"id",id}});
@@ -3278,6 +3418,14 @@ void applyHostedSettings(const Json &settings, bool live) {
     hostControl.emit({{"type","settings_warning"},{"message",touchNegotiated
       ? "触控设置已保存；当前服务端不支持实时切换，请重新连接（更新 Linux 服务端后可实时应用）"
       : "触控设置已保存；Linux 服务端不支持原生触控，请更新服务端并重新连接"}});
+  if (!live || requestedPen == hostedPen || penSettingsNegotiated) hostedPen=requestedPen;
+  else hostControl.emit({{"type","settings_warning"},{"message","笔输入设置已保存；请更新 Linux 端并重新连接后生效"}});
+  if (!live || requestedGamepads == hostedGamepads || gamepadSettingsNegotiated) hostedGamepads=requestedGamepads;
+  else hostControl.emit({{"type","settings_warning"},{"message","手柄设置已保存；请更新 Linux 端并重新连接后生效"}});
+  hostedPenGamma=penGamma; hostedGamepadDeadzone=deadzone;
+  hostedGamepadRumble=settings.value("gamepad_rumble",true);
+  nativePen.configure(hostedPen,hostedPenGamma);
+  nativeGamepads.configure(gamepadNegotiated,hostedGamepads,hostedGamepadRumble,hostedGamepadDeadzone);
   nativeTouch.enabled(hostedTouch);
   touchApplicationModes = std::move(nextTouchModes);
   hostedSettings=settings;
@@ -3307,12 +3455,15 @@ void applyHostedSettings(const Json &settings, bool live) {
     sendJson({{"type","text_drag_enabled"},{"enabled",hostedDragText}});
     if (touchSettingsNegotiated)
       sendJson({{"type","touch_enabled"},{"enabled",hostedTouch}});
+    if (penSettingsNegotiated) sendJson({{"type","pen_enabled"},{"enabled",hostedPen}});
+    if (gamepadSettingsNegotiated) sendJson({{"type","gamepad_enabled"},{"enabled",hostedGamepads}});
+    pollGamepads();
     sendStreamConfiguration();
     for (auto &[id,window] : windows) if (!window->popup) { window->dpi=effectiveDpi(window->hwnd); sendResize(window.get()); }
     updateIme();
-    hostControl.emit({{"type","local_settings_applied"},{"settings",settings},
-                      {"touch_enabled",hostedTouch && touchNegotiated},
-                      {"touch_live_supported",touchSettingsNegotiated}});
+    Json applied=professionalInputStatus(); applied["type"]="local_settings_applied"; applied["settings"]=settings;
+    applied["touch_enabled"]=hostedTouch && touchNegotiated;
+    applied["touch_live_supported"]=touchSettingsNegotiated; hostControl.emit(applied);
   }
 }
 void publishHostedStatus() {
@@ -3324,13 +3475,15 @@ void publishHostedStatus() {
       {"codec",w->frame?(VideoDecoder::videoKind(w->frame->codec)?VideoDecoder::name(w->frame->codec):"PNG"):"等待画面"},
       {"hardware_decode",bool(w->frame&&w->frame->video.texture)},{"presentation",w->presentation?"D3D11 / DirectComposition":"GDI"}});
   }
-  hostControl.emit({{"type","status"},{"uptime_ms",GetTickCount64()},{"tcp_bytes",networkBytes.load()},
-                    {"presented_updates",presentedFrames.load()},{"windows",list},{"background",remoteTray.background()},
-                    {"touch_supported",touchNegotiated},{"touch_live_supported",touchSettingsNegotiated},
-                    {"touch_enabled",hostedTouch && touchNegotiated}});
+  Json status=professionalInputStatus();
+  status.update({{"type","status"},{"uptime_ms",GetTickCount64()},{"tcp_bytes",networkBytes.load()},
+    {"presented_updates",presentedFrames.load()},{"windows",list},{"background",remoteTray.background()},
+    {"touch_supported",touchNegotiated},{"touch_live_supported",touchSettingsNegotiated},
+    {"touch_enabled",hostedTouch && touchNegotiated}}); hostControl.emit(status);
 }
 LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   try {
+    if (message == WM_TIMER && wp == GamepadTimer) { pollGamepads(); return 0; }
     if(message==WM_TIMER && wp==TextDrag::Timer){TextDrag::tick();return 0;}
     if (message == WM_TIMER && wp == DragVisual::Timer) { dragVisual.tick(); return 0; }
     if (message == WM_TIMER && wp == TouchOleTimer) {
@@ -3442,6 +3595,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_CLOSE) {
+      nativePen.cancel(); nativeGamepads.disconnect();
       TextDrag::reset();
       dragVisual.reset();
       remoteTray.clear();
@@ -3526,14 +3680,21 @@ int wmain(int argc, wchar_t **argv) {
   }
   if (argc == 2 && std::wstring(argv[1]) == L"--check-shaders")
     return Presentation::validateShaders() ? 0 : 1;
-  if (argc == 5 && std::wstring(argv[4]) == L"--touch") {
-    hostedTouch = true; argc = 4;
+  bool validInputFlags=true;
+  for (int index=4; index<argc; ++index) {
+    std::wstring flag=argv[index];
+    if (flag==L"--touch") hostedTouch=true;
+    else if (flag==L"--pen") hostedPen=true;
+    else if (flag==L"--gamepads") hostedGamepads=true;
+    else validInputFlags=false;
   }
-  if (argc != 4) {
-    std::cerr << "Usage: waybridge-client.exe HOST PORT TOKEN [--touch]\nUse an SSH "
+  if (argc < 4 || !validInputFlags) {
+    std::cerr << "Usage: waybridge-client.exe HOST PORT TOKEN [--touch] [--pen] [--gamepads]\nUse an SSH "
                  "tunnel to the Linux loopback listener.\n";
     return 1;
   }
+  nativePen.configure(hostedPen,hostedPenGamma);
+  nativePen.onWindowInteraction(penWindowInteractionSample);
   nativeTouch.enabled(hostedTouch);
   nativeTouch.onInteraction(touchInteractionSample);
   if (remoteApplicationSource.empty()) remoteApplicationSource = utf8(argv[1]) + ":" + utf8(argv[2]);
@@ -3617,6 +3778,7 @@ int wmain(int argc, wchar_t **argv) {
   };
   AddClipboardFormatListener(controller);
   SetTimer(controller, 1, 2000, nullptr);
+  SetTimer(controller, GamepadTimer, 8, nullptr);
   SetConsoleCtrlHandler(consoleControl, TRUE);
   addrinfo hints{};
   hints.ai_socktype = SOCK_STREAM;
@@ -3692,6 +3854,8 @@ int wmain(int argc, wchar_t **argv) {
             {"data_drag_v1", true},
             {"notifications_v1", hostControl.active()},
             {"notifications_enabled", false},
+            {"pen_v1", true}, {"pen_enabled",hostedPen},
+            {"gamepad_v1", true}, {"gamepad_enabled",hostedGamepads},
             {"touch_v1", true},
             {"touch_enabled", hostedTouch},
             {"touch_interaction_v1", true},
@@ -3719,6 +3883,7 @@ int wmain(int argc, wchar_t **argv) {
   windowDrag.cancelled = true;
   endWindowDrag();
   releasePointer(false);
+  nativePen.cancel(nullptr,false); nativeGamepads.disconnect();
   nativeTouch.cancel(nullptr,false);
   running = false;
   hostControl.stop();

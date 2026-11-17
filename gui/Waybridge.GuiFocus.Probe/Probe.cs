@@ -218,6 +218,84 @@ internal static class GuiFocusProbe
         Check(!Get<SessionController>(window, "controller").IsRunning, "settings persistence unexpectedly connected a session");
         Log("PASS actual WinUI native-touch setting is rendered, accessible, toggles on/off, saves and reloads independently from IME/read-only/files without connecting");
         Log("PASS persistent touch status survives generic success/saved notices, distinguishes saved/effective and readonly states, and resets on disconnect/profile switch");
+        await RunProfessionalSettingsAsync(window);
+    }
+    private static async Task RunProfessionalSettingsAsync(MainWindow window)
+    {
+        var pen = Get<ToggleSwitch>(window, "pen"); var gamepads = Get<ToggleSwitch>(window, "gamepads");
+        var rumble = Get<ToggleSwitch>(window, "gamepadRumble");
+        var pressure = Get<NumberBox>(window, "penPressureGamma"); var deadzone = Get<NumberBox>(window, "gamepadDeadzone");
+        var penState = Get<TextBlock>(window, "penStatus"); var gamepadState = Get<TextBlock>(window, "gamepadStatus");
+        foreach (var (control, id) in new[] { (pen, "NativePenToggle"), (gamepads, "GamepadToggle"), (rumble, "GamepadRumbleToggle") })
+        {
+            control.StartBringIntoView(new BringIntoViewOptions { AnimationDesired = false });
+            await Wait(() => control.IsLoaded && control.IsEnabled && control.ActualWidth > 0, id + " not rendered");
+            Check(AutomationProperties.GetAutomationId(control) == id && !string.IsNullOrEmpty(AutomationProperties.GetName(control)), id + " inaccessible");
+        }
+        Check(!pen.IsOn && !gamepads.IsOn && rumble.IsOn && pressure.Value == 1 && deadzone.Value == 15,
+            "older GUI profile changed professional input defaults");
+        var penPeer = (IToggleProvider)new ToggleSwitchAutomationPeer(pen).GetPattern(PatternInterface.Toggle)!;
+        var gamepadPeer = (IToggleProvider)new ToggleSwitchAutomationPeer(gamepads).GetPattern(PatternInterface.Toggle)!;
+        var rumblePeer = (IToggleProvider)new ToggleSwitchAutomationPeer(rumble).GetPattern(PatternInterface.Toggle)!;
+        var save = Descendants((DependencyObject)window.Content).OfType<Button>().Single(x => AutomationProperties.GetAutomationId(x) == "InputSettingsSave");
+        var savePeer = (IInvokeProvider)new ButtonAutomationPeer(save).GetPattern(PatternInterface.Invoke)!;
+        penPeer.Toggle(); gamepadPeer.Toggle(); rumblePeer.Toggle(); pressure.Value = 1.75; deadzone.Value = 27;
+        savePeer.Invoke();
+        await Wait(() => ReadSavedProfile().Settings is { Pen: true, Gamepads: true, GamepadRumble: false, PenPressureGamma: 1.75, GamepadDeadzone: 27 },
+            "professional GUI settings did not save on the stable profile");
+        var enabled = ReadSavedProfile(); CheckIndependentPolicies(enabled);
+        Check(!enabled.Settings.Touch, "professional input settings enabled unrelated touch");
+        penPeer.Toggle(); gamepadPeer.Toggle(); pressure.Value = 1; deadzone.Value = 15;
+        typeof(MainWindow).GetMethod("Load", Private)!.Invoke(window, [enabled]);
+        Check(pen.IsOn && gamepads.IsOn && !rumble.IsOn && pressure.Value == 1.75 && deadzone.Value == 27,
+            "professional saved controls did not reload");
+        Receive(window, new { type = "local_settings_applied", settings = new { read_only = true },
+            pen_supported = false, pen_enabled = false, pen_live_supported = false,
+            gamepad_supported = false, gamepad_enabled = false, gamepad_live_supported = false, pen_error = "", gamepad_error = "" });
+        Check(penState.Text.Contains("当前连接手写笔已关闭", StringComparison.Ordinal) && penState.Text.Contains("暂不支持", StringComparison.Ordinal) &&
+            gamepadState.Text.Contains("当前连接手柄转发已关闭", StringComparison.Ordinal) && gamepadState.Text.Contains("暂不支持", StringComparison.Ordinal),
+            "professional unsupported state confused saved opt-in with active input");
+        Receive(window, new { type = "stream_config", ok = true, fps = 30, bitrate = 12000, codec = "png", read_only = true });
+        savePeer.Invoke(); await Wait(() => Get<InfoBar>(window, "notice").Message == "连接设置已保存。", "professional save notice");
+        Check(penState.Text.Contains("暂不支持", StringComparison.Ordinal) && gamepadState.Text.Contains("暂不支持", StringComparison.Ordinal),
+            "generic success/save erased professional input status");
+        Receive(window, new { type = "local_settings_applied", settings = new { read_only = true },
+            pen_supported = true, pen_enabled = true, pen_native_active = false, pen_hardware_available = false, pen_live_supported = true,
+            gamepad_supported = true, gamepad_enabled = true, gamepad_live_supported = true, gamepad_devices = Array.Empty<object>(),
+            rumble_supported = false, pen_error = "", gamepad_error = "" });
+        Check(penState.Text.Contains("未检测到可用的手写笔", StringComparison.Ordinal) &&
+            gamepadState.Text.Contains("未检测到已连接的手柄", StringComparison.Ordinal) &&
+            penState.Text.Contains("只读模式已暂停", StringComparison.Ordinal) && gamepadState.Text.Contains("只读模式已暂停", StringComparison.Ordinal),
+            "missing hardware/readonly professional state was hidden");
+        Receive(window, new { type = "local_settings_applied", settings = new { read_only = false },
+            pen_supported = true, pen_enabled = true, pen_native_active = true, pen_hardware_available = true,
+            gamepad_supported = true, gamepad_enabled = true,
+            gamepad_devices = new[] { new { userindex = 0, connected = true, name = "Private test controller" } },
+            rumble_supported = true, pen_error = "", gamepad_error = "" });
+        Check(penState.Text.Contains("当前应用已接入压感手写笔", StringComparison.Ordinal) &&
+            gamepadState.Text.Contains("Private test controller", StringComparison.Ordinal) && !penState.Text.Contains("只读模式已暂停", StringComparison.Ordinal),
+            "available professional device state failed to recover");
+        Receive(window, new { type = "local_settings_applied", gamepad_enabled = true, gamepad_active = false });
+        Check(gamepadState.Text.Contains("当前连接手柄转发已开启", StringComparison.Ordinal) &&
+            gamepadState.Text.Contains("请先聚焦远端窗口", StringComparison.Ordinal), "background focus lease was confused with the saved gamepad preference");
+        Receive(window, new { type = "local_settings_applied", pen_error = "测试笔设备不可用", gamepad_error = "测试手柄不可用" });
+        Check(penState.Text.Contains("测试笔设备不可用", StringComparison.Ordinal) && gamepadState.Text.Contains("测试手柄不可用", StringComparison.Ordinal),
+            "professional device errors were not retained inline");
+        penPeer.Toggle(); savePeer.Invoke(); await Wait(() => !ReadSavedProfile().Settings.Pen, "GUI pen-off save");
+        Check(ReadSavedProfile().Settings.Gamepads, "GUI pen-off disabled gamepad");
+        gamepadPeer.Toggle(); rumblePeer.Toggle(); savePeer.Invoke();
+        await Wait(() => !ReadSavedProfile().Settings.Gamepads && ReadSavedProfile().Settings.GamepadRumble, "GUI gamepad-off save");
+        var disabled = ReadSavedProfile(); CheckIndependentPolicies(disabled);
+        Check(disabled.Settings.PenPressureGamma == 1.75 && disabled.Settings.GamepadDeadzone == 27, "GUI opt-out discarded calibration");
+        typeof(MainWindow).GetMethod("TouchConnectionChanged", Private)!.Invoke(window, [false]);
+        Check(penState.Text.Contains("当前未连接", StringComparison.Ordinal) && gamepadState.Text.Contains("当前未连接", StringComparison.Ordinal) &&
+            !penState.Text.Contains("测试笔设备不可用", StringComparison.Ordinal), "disconnect retained another connection's device error");
+        Receive(window, new { type = "local_settings_applied", pen_enabled = true, gamepad_enabled = true });
+        typeof(MainWindow).GetMethod("Load", Private)!.Invoke(window, [disabled with { Id = Guid.NewGuid() }]);
+        Check(penState.Text.Contains("当前未连接", StringComparison.Ordinal) && gamepadState.Text.Contains("当前未连接", StringComparison.Ordinal), "profile switch leaked professional device state");
+        typeof(MainWindow).GetMethod("Load", Private)!.Invoke(window, [disabled]);
+        Check(!Get<SessionController>(window, "controller").IsRunning, "professional settings probe unexpectedly connected");
+        Log("PASS actual WinUI pen/gamepad controls save/reload independent opt-in, pressure/deadzone/rumble; persistent effective/unsupported/hardware/error/readonly states survive generic notices and reset across profiles");
     }
     private static async Task RunAsync(ControlApplication app)
     {
@@ -278,8 +356,11 @@ internal static class GuiFocusProbe
         {
             if (controller is not null) try { await controller.EndSessionAsync(); Log("CLEAN own remote session ended"); } catch (Exception e) { Log("CLEAN end-session: " + e.Message); }
             try { AppNotificationManager.Default.UnregisterAll(); } catch (Exception e) { Log("CLEAN notification registration: " + e.Message); }
-            SetCursorPos(originalCursor.x, originalCursor.y);
-            if (originalForeground != IntPtr.Zero && IsWindow(originalForeground)) SetForegroundWindow(originalForeground);
+            if (!File.Exists(Path.Combine(root, "settings-only")))
+            {
+                SetCursorPos(originalCursor.x, originalCursor.y);
+                if (originalForeground != IntPtr.Zero && IsWindow(originalForeground)) SetForegroundWindow(originalForeground);
+            }
             if (window is not null) typeof(MainWindow).GetMethod("TrayAction", Private)!.Invoke(window, ["quit"]);
             else app.Exit();
         }

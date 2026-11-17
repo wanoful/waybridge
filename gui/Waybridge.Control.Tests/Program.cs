@@ -230,6 +230,14 @@ try
     var legacySettings = JsonSerializer.Deserialize<ClientSettings>("{\"files\":false}", ProfileStore.Json)!;
     Check(!legacySettings.Files && legacySettings.DragText, "legacy file sharing must not disable text drags");
     Check(!legacySettings.Touch && legacySettings.TouchModes.Count == 0, "profiles without touch fields must retain mouse-compatible defaults");
+    Check(!legacySettings.Pen && legacySettings.PenPressureGamma == 1 && !legacySettings.Gamepads &&
+        legacySettings.GamepadRumble && legacySettings.GamepadDeadzone == 15, "legacy profiles enabled professional input or changed calibration defaults");
+    foreach (double invalid in new[] { .249, 4.001, double.NaN, double.PositiveInfinity, double.NegativeInfinity })
+        await Reject<ArgumentException>(() => { new ClientSettings { PenPressureGamma = invalid }.Validate(); return Task.CompletedTask; });
+    foreach (int invalid in new[] { -1, 51 })
+        await Reject<ArgumentException>(() => { new ClientSettings { GamepadDeadzone = invalid }.Validate(); return Task.CompletedTask; });
+    new ClientSettings { PenPressureGamma = .25, GamepadDeadzone = 0 }.Validate();
+    new ClientSettings { PenPressureGamma = 4, GamepadDeadzone = 50 }.Validate();
     var textDisabled = JsonSerializer.Deserialize<ClientSettings>(JsonSerializer.Serialize(new ClientSettings { DragText = false }, ProfileStore.Json), ProfileStore.Json)!;
     Check(!textDisabled.DragText && textDisabled.Files, "independent text drag policy failed to persist");
     var store = new ProfileStore(directory);
@@ -272,6 +280,28 @@ try
     await store.SaveAsync([oldProfile with { Settings = oldProfile.Settings with { Touch = true } }]);
     Check((await store.LoadAsync()).Single().Settings.Touch, "old profile could not save the native touch opt-in");
     Console.WriteLine("PASS: native touch opt-in/off and legacy profiles persist independently from IME, read-only and file sharing");
+    var professional = touchProfile with { Settings = touchProfile.Settings with {
+        Pen = true, PenPressureGamma = 1.75, Gamepads = true, GamepadRumble = false, GamepadDeadzone = 27 } };
+    await store.SaveAsync([professional]);
+    var professionalLoaded = (await new ProfileStore(directory).LoadAsync()).Single();
+    Check(professionalLoaded.Settings.Pen && professionalLoaded.Settings.PenPressureGamma == 1.75 &&
+        professionalLoaded.Settings.Gamepads && !professionalLoaded.Settings.GamepadRumble && professionalLoaded.Settings.GamepadDeadzone == 27,
+        "professional input settings did not persist through disk");
+    Check(professionalLoaded.Settings.Touch && !professionalLoaded.Settings.Ime && professionalLoaded.Settings.ReadOnly &&
+        !professionalLoaded.Settings.Files && professionalLoaded.Settings.TouchModes["org.example.Editor"] == "mouse",
+        "professional input settings changed existing independent policies");
+    await store.SaveAsync([professionalLoaded with { Settings = professionalLoaded.Settings with { Pen = false } }]);
+    var penDisabled = (await store.LoadAsync()).Single();
+    Check(!penDisabled.Settings.Pen && penDisabled.Settings.Gamepads && penDisabled.Settings.PenPressureGamma == 1.75,
+        "disabling pen changed gamepad or pressure calibration");
+    await store.SaveAsync([penDisabled with { Settings = penDisabled.Settings with { Gamepads = false, GamepadRumble = true } }]);
+    var professionalDisabled = (await store.LoadAsync()).Single();
+    Check(!professionalDisabled.Settings.Pen && !professionalDisabled.Settings.Gamepads && professionalDisabled.Settings.GamepadRumble &&
+        professionalDisabled.Settings.GamepadDeadzone == 27 && professionalDisabled.Settings.ReadOnly,
+        "disabling gamepad lost saved calibration or input policies");
+    Check(!oldProfile.Settings.Pen && !oldProfile.Settings.Gamepads && oldProfile.Settings.PenPressureGamma == 1 &&
+        oldProfile.Settings.GamepadDeadzone == 15 && oldProfile.Settings.GamepadRumble, "whole legacy profile changed professional input defaults");
+    Console.WriteLine("PASS: pen/gamepad disk persistence, legacy defaults, independent opt-in/calibration/rumble, and finite bounded calibration validation");
 
     using var bytes = new MemoryStream(Encoding.UTF8.GetBytes("{\"value\":\"中文😀\"}\n{\"id\":2}\n"));
     var lines = new JsonLines(bytes, 1024);
@@ -339,6 +369,40 @@ try
         }
     }
     Console.WriteLine("PASS: separate-process native touch startup and live on/off settings retain explicit booleans and independent policies");
+    foreach (bool initial in new[] { false, true })
+    {
+        var settings = new ClientSettings { Pen = initial, PenPressureGamma = .75, Gamepads = !initial,
+            GamepadRumble = false, GamepadDeadzone = 23, Touch = true, Ime = false, ReadOnly = true, Files = false };
+        var messages = Channel.CreateUnbounded<JsonElement>();
+        await using var engine = await EngineChannel.StartAsync("dotnet", "127.0.0.1", 49090,
+            "test-input-" + new string('e', 40), settings, value => messages.Writer.TryWrite(value), _ => { },
+            default, [Assembly.GetExecutingAssembly().Location]);
+        var startup = await messages.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Check(startup.GetProperty("type").GetString() == "bootstrap_settings", "missing professional input startup observation");
+        var serialized = startup.GetProperty("settings");
+        Check(serialized.GetProperty("pen").GetBoolean() == initial && serialized.GetProperty("pen_pressure_gamma").GetDouble() == .75 &&
+            serialized.GetProperty("gamepads").GetBoolean() == !initial && !serialized.GetProperty("gamepad_rumble").GetBoolean() &&
+            serialized.GetProperty("gamepad_deadzone").GetInt32() == 23, "professional startup settings did not cross process boundary");
+        foreach (var liveSettings in new[] { settings with { Pen = !initial, PenPressureGamma = 2 },
+                     settings with { Gamepads = initial, GamepadRumble = true, GamepadDeadzone = 0 } })
+        {
+            await engine.SendAsync(new { type = "settings", settings = liveSettings });
+            JsonElement response;
+            do { response = await messages.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
+            while (response.GetProperty("type").GetString() != "observed");
+            var actualSettings = response.GetProperty("request").GetProperty("settings");
+            Check(actualSettings.GetProperty("pen").GetBoolean() == liveSettings.Pen &&
+                actualSettings.GetProperty("pen_pressure_gamma").GetDouble() == liveSettings.PenPressureGamma &&
+                actualSettings.GetProperty("gamepads").GetBoolean() == liveSettings.Gamepads &&
+                actualSettings.GetProperty("gamepad_rumble").GetBoolean() == liveSettings.GamepadRumble &&
+                actualSettings.GetProperty("gamepad_deadzone").GetInt32() == liveSettings.GamepadDeadzone,
+                "professional live settings lost independent feature toggles or calibration");
+            Check(actualSettings.GetProperty("touch").GetBoolean() && !actualSettings.GetProperty("ime").GetBoolean() &&
+                actualSettings.GetProperty("read_only").GetBoolean() && !actualSettings.GetProperty("files").GetBoolean(),
+                "professional live settings altered unrelated input policies");
+        }
+    }
+    Console.WriteLine("PASS: separate-process pen/gamepad startup and independent live toggles carry pressure, deadzone and rumble without changing touch/read-only/IME/files");
 
     string silentMarker = Path.Combine(directory, "silent-worker.pid");
     using (var cancellation = new CancellationTokenSource())

@@ -258,6 +258,42 @@ int wmain() {
     nativeTouch=NativeTouch{}; resetTouchOle(); FileDrag::remoteHitTest={}; destroyRemote(Id);
     std::cout << "PASS: production touch resize survives WM_SIZE and releases sizing; returned motion bypasses unclaimed OLE wait and UP-before-ready cancels promptly\n";
 
+    // The production pen callback also receives synchronous WM_SIZE while it
+    // owns a native resize. That message must not cancel its own held tip.
+    createTarget();
+    auto *penTarget=windows.at(Id).get(); penTarget->width=400; penTarget->height=300;
+    penTarget->clientDecorated=true; penTarget->penInput=true;
+    ShowWindow(penTarget->hwnd,SW_SHOW); SetFocus(penTarget->hwnd);
+    std::vector<Json> penWire;
+    nativePen=NativePen([&](const Json &message){penWire.push_back(message);});
+    nativePen.onWindowInteraction(penWindowInteractionSample);
+    nativePen.hello(true); nativePen.configure(true);
+    nativePen.state({{"generation",21},{"id",Id},{"enabled",true}});
+    RECT penImage=imageRect(penTarget);
+    NativePen::Target penInput{penTarget->hwnd,Id,400,300,0,0,penImage,true,Id,penTarget->hwnd};
+    POINTER_PEN_INFO penInfo{}; penInfo.pointerInfo.pointerId=601;
+    penInfo.pointerInfo.pointerFlags=POINTER_FLAG_INRANGE|POINTER_FLAG_INCONTACT;
+    penInfo.pointerInfo.ptPixelLocation={penImage.left+60,penImage.top+60};
+    ClientToScreen(penTarget->hwnd,&penInfo.pointerInfo.ptPixelLocation);
+    require(nativePen.sample(penInput,WM_POINTERDOWN,penInfo),"production pen tip rejected");
+    const auto penDown=penWire.back(); RECT penBefore{};GetWindowRect(penTarget->hwnd,&penBefore);
+    require(nativePen.beginWindowInteraction({{"input","pen"},{"id",Id},{"action","resize"},{"edge",10},
+      {"pen_operation",41},{"pen_generation",21},{"pen_gesture",penDown.at("gesture")},
+      {"pen_tool",penDown.at("tool")},{"pen_eraser",false}},penTarget->hwnd),"production pen resize rejected");
+    penInput.enabled=false;
+    penInfo.pointerInfo.ptPixelLocation.x-=40;penInfo.pointerInfo.ptPixelLocation.y-=30;
+    nativePen.sample(penInput,WM_POINTERUPDATE,penInfo);
+    RECT penAfter{};GetWindowRect(penTarget->hwnd,&penAfter);
+    require(nativePen.ownsWindowInteraction(penTarget->hwnd)&&penTarget->sizing&&
+      penAfter.right-penAfter.left==penBefore.right-penBefore.left-40&&
+      penAfter.bottom-penAfter.top==penBefore.bottom-penBefore.top-30,
+      "production WM_SIZE revoked its owning pen resize");
+    penInfo.pointerInfo.pointerFlags=POINTER_FLAG_INRANGE;
+    nativePen.sample(penInput,WM_POINTERUP,penInfo);
+    require(!nativePen.ownsWindowInteraction()&&!penTarget->sizing,"production pen resize retained ownership");
+    nativePen=NativePen{}; destroyRemote(Id);
+    std::cout << "PASS: production pen resize survives WM_SIZE and releases sizing on tip up\n";
+
     std::cout << "PASS: OLE target closure/replacement during query, data read, medium release, async setup; cancelled without scheduling uploads\n";
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';

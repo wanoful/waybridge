@@ -868,3 +868,33 @@ UDP framing and authenticated ACK/repair messages are unchanged. Adaptive pacing
 uses those existing feedback messages, with local send-data boundaries and
 separate bounded transport diagnostics; see [NETWORK.md](NETWORK.md). Media
 resource budgets are local policy and introduce no wire fields.
+
+## Optional professional input v1
+
+Initial hello negotiates `pen_v1` / `pen_enabled` and `gamepad_v1` /
+`gamepad_enabled`. The server echoes supported capabilities and
+`pen_settings_v1` / `gamepad_settings_v1` for live boolean preference messages
+`pen_enabled` / `gamepad_enabled`. Missing capability or preference means off.
+Read-only and focus policy remain authoritative.
+
+`pen_state` grants a root-window generation; `window.pen_input` reports a live
+same-client tablet-seat subscription. `pen` packets carry root `id`, concrete
+`target`, `generation`, `gesture`, monotonically increasing `sequence`, logical
+`tool`, `eraser`, `phase` (`in`, `motion`, `out`, `cancel`), `tip`, `barrel`,
+logical `x/y`, crop `origin_x/y`, optional valid normalized `pressure`,
+`tilt_x/y` and `rotation`, plus observed `capabilities`. The server validates
+axes and exact owner before publishing tablet-v2 events. `window_action` with
+`input:"pen"` binds CSD move/resize to `pen_operation`, `pen_generation`,
+`pen_gesture`, `pen_tool` and `pen_eraser`; `pen_state.window_operation` marks
+authorized lease retirement. `pen_window_end` must match those identities.
+An unmarked policy revoke cancels manipulation. See [PEN.md](PEN.md).
+
+`gamepad_focus` supplies the actual local foreground root `id`; it must match
+server focus. `gamepad_state` grants `id` and `generation`, plus `supported`,
+`requested`, `enabled`, `devices`, `rumble_supported` and `error`. `gamepad`
+snapshots bind `id`, `generation`, `slot` (0–3), `device_generation`,
+`sequence`, `connected`, `buttons`, signed `lx/ly/rx/ry` and byte `lt/rt`.
+`gamepad_rumble` echoes generation, slot and device generation, with 16-bit
+`strong`/`weak` and a bounded `duration_ms` heartbeat. Revoke/disconnect
+neutralizes and destroys owned devices; stale feedback cannot vibrate a new
+incarnation. See [GAMEPADS.md](GAMEPADS.md).

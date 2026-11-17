@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in actual WinUI native-touch setting visibility and private save/reload.
+"""Opt-in actual WinUI touch/pen/gamepad settings and private save/reload.
 
 Uses the actual UI sources in GuiFocus.Probe's settings-only mode. Creates a
 unique limited interactive task and private state; never connects a server,
@@ -46,7 +46,7 @@ def main():
                    port=49090, auto_reconnect=False,
                    settings=dict(codec='png', fps=30, audio=False, notifications=False, tray=False,
                                  clipboard='off', files=False, drag_text=False, ime=False, read_only=True))
-    # Deliberately omit touch to verify a previous-version profile starts off.
+    # Omit touch/pen/gamepad fields to verify previous-version defaults.
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as bundle:
         for path in publish.rglob('*'):
             if path.is_file() and path.name != 'waybridge-client.exe':
@@ -91,7 +91,9 @@ Start-ScheduledTask -TaskName $name
               if lines and lines[0].strip() == '0' else result)
         assert result.splitlines()[0].strip() == '0', 'GUI touch settings test failed; inspect ' + str(logfile)
         assert 'PASS actual WinUI native-touch setting' in result
+        assert 'PASS actual WinUI pen/gamepad controls' in result
         print('PASS: actual WinUI native-touch control renders, saves on/off, reloads and preserves unrelated settings without a connection')
+        print('PASS: actual WinUI pen/gamepad controls persist calibration and independent policies; effective, missing-device, readonly and error states remain visible')
     finally:
         remote("$root='" + destination + "';Get-ScheduledTask -TaskName '" + key + "' -ErrorAction SilentlyContinue|Unregister-ScheduledTask -Confirm:$false;Get-CimInstance Win32_Process|Where-Object{$_.ExecutablePath -and $_.ExecutablePath.StartsWith($root+'\\',[StringComparison]::OrdinalIgnoreCase)}|ForEach-Object{Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue};Remove-Item -Recurse -Force -LiteralPath $root -ErrorAction SilentlyContinue;Remove-Item -Force -LiteralPath ($root+'.zip') -ErrorAction SilentlyContinue", check=False)
         archive.unlink(missing_ok=True)

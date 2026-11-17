@@ -42,6 +42,16 @@ internal sealed class MainWindow : Window
     private Guid? touchStatusProfile;
     private bool? touchActive, touchSupported, touchLiveSupported;
     private bool touchReadOnly;
+    private readonly ToggleSwitch pen = Toggle(false), gamepads = Toggle(false), gamepadRumble = Toggle(true);
+    private readonly NumberBox penPressureGamma = Number(1, .25, 4), gamepadDeadzone = Number(15, 0, 50);
+    private readonly TextBlock penStatus = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12 };
+    private readonly TextBlock gamepadStatus = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12 };
+    private Guid? inputDeviceStatusProfile;
+    private bool? penActive, penSupported, penNativeActive, penLiveSupported, penHardwareAvailable;
+    private bool? gamepadActive, gamepadActiveLease, gamepadSupported, gamepadLiveSupported, rumbleSupported;
+    private bool inputDeviceReadOnly;
+    private string penError = "", gamepadError = "";
+    private List<string>? connectedGamepads;
     private sealed record TouchApplication(string Id, string Name);
     private readonly ComboBox touchApplication = new() { DisplayMemberPath = "Name", MinWidth = 220, PlaceholderText = "连接后选择应用" };
     private readonly ComboBox touchAppMode = Combo(["自动选择", "优先原生触控", "鼠标兼容（长按右键、拖选）"]);
@@ -338,18 +348,41 @@ internal sealed class MainWindow : Window
         touchApplication.SelectionChanged += (_, _) => LoadTouchApplicationMode();
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(saveSettings, "InputSettingsSave");
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(apply, "InputSettingsApply");
+        foreach (var (control, id, label) in new[] { (pen, "NativePenToggle", "压感手写笔"),
+                     (gamepads, "GamepadToggle", "游戏手柄"), (gamepadRumble, "GamepadRumbleToggle", "手柄震动") })
+        {
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(control, id);
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(control, label);
+            control.Toggled += (_, _) => { if (!loading) UpdateInputDeviceStatus(); };
+        }
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(penPressureGamma, "PenPressureGamma");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(penPressureGamma, "笔压力度曲线");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(gamepadDeadzone, "GamepadDeadzone");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(gamepadDeadzone, "摇杆死区百分比");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(penStatus, "NativePenStatus");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(gamepadStatus, "GamepadStatus");
+        penPressureGamma.SmallChange = .25;
+        penPressureGamma.ValueChanged += (_, _) => { if (!loading) UpdateInputDeviceStatus(); };
+        gamepadDeadzone.ValueChanged += (_, _) => { if (!loading) UpdateInputDeviceStatus(); };
         return Column(BadgeEditor(), Row("剪贴板方向", "可分别限制 Windows 与 Linux 间的数据同步", clipboard),
             Row("剪贴板图片", "文本同步保持独立", images),
             Row("文字拖放", "双向文字拖放，独立于剪贴板与文件共享", dragText),
             Row("文件与目录共享", "控制文件与目录的剪贴板、拖入与拖出", files),
             Row("桌面通知", "Linux 应用通知与动作，遵循 Windows 通知设置及免打扰", notifications),
             Row("远端应用托盘", "在 Windows 通知区域显示应用托盘，关闭主窗口后仍可从后台列表恢复", remoteTray),
-            Row("只读模式", "暂停键盘、鼠标和触控，释放按键与鼠标锁定", readOnly),
+            Row("只读模式", "暂停远端输入，释放按键、鼠标锁定、手写笔和手柄", readOnly),
             Row("Windows 本地 IME", "使用本地候选窗口与远端预编辑", ime),
             Row("原生多点触控（实验）", "向支持触控的 Linux 应用发送最多十点触摸；关闭时使用鼠标兼容模式。按连接保存，可立即应用。", touch),
             touchStatus,
             Row("应用触控模式", "默认自动选择：应用接入触控时使用原生输入，否则使用鼠标兼容。可为有兼容问题的应用单独覆盖，随连接保存。", touchApplication),
             Row("所选应用的输入方式", "通常保留自动选择。原生触控的长按与选字由应用处理，鼠标兼容支持系统长按右键和拖选。", touchAppMode),
+            Row("压感手写笔（实验）", "向支持手写笔的绘图应用发送压力、倾斜和橡皮擦输入；按连接保存，可立即应用。", pen),
+            Row("笔压力度曲线", "1 为线性；小于 1 时轻压更明显，大于 1 时需要更用力。范围 0.25–4。", penPressureGamma),
+            penStatus,
+            Row("游戏手柄（实验）", "将 Windows 连接的手柄提供给当前 Linux 会话；只在开启此设置后转发。", gamepads),
+            Row("手柄震动", "允许游戏向当前连接的手柄发送震动反馈", gamepadRumble),
+            Row("摇杆死区（%）", "忽略摇杆中心附近的小幅偏移，减少漂移；范围 0%–50%。", gamepadDeadzone),
+            gamepadStatus,
             Row("紧急释放鼠标", "游戏捕获鼠标时可随时释放", Text("Ctrl + Alt + Shift + F12")), Actions(saveSettings, apply));
     }
     private UIElement ApplicationsPage()
@@ -444,7 +477,7 @@ internal sealed class MainWindow : Window
     }
     private void Load(ConnectionProfile profile)
     {
-        if (selected.Id != profile.Id) { ResetTouchStatus(); touchApplicationNames.Clear(); }
+        if (selected.Id != profile.Id) { ResetTouchStatus(); ResetInputDeviceStatus(); touchApplicationNames.Clear(); }
         loading = true; selected = profile;
         name.Text = profile.Name; host.Text = profile.Host; user.Text = profile.User; identity.Text = profile.IdentityFile;
         binary.Text = profile.ServerBinary; session.Text = profile.Session; sshPort.Value = profile.SshPort; remotePort.Value = profile.Port;
@@ -469,9 +502,11 @@ internal sealed class MainWindow : Window
         clipboard.SelectedIndex = Array.IndexOf(new[] { "both", "send", "receive", "off" }, settings.Clipboard);
         remoteTray.IsOn = settings.Tray;
         images.IsOn = settings.ClipboardImages; files.IsOn = settings.Files; dragText.IsOn = settings.DragText; readOnly.IsOn = settings.ReadOnly; ime.IsOn = settings.Ime; touch.IsOn = settings.Touch;
+        pen.IsOn = settings.Pen; penPressureGamma.Value = settings.PenPressureGamma;
+        gamepads.IsOn = settings.Gamepads; gamepadRumble.IsOn = settings.GamepadRumble; gamepadDeadzone.Value = settings.GamepadDeadzone;
         notifications.IsOn = settings.Notifications;
         desktopNotifications.SharingChanged(settings.Notifications);
-        loading = false; UpdateMode(); UpdateTouchStatus();
+        loading = false; UpdateMode(); UpdateTouchStatus(); UpdateInputDeviceStatus();
     }
     private ConnectionProfile ReadEditor()
     {
@@ -485,6 +520,8 @@ internal sealed class MainWindow : Window
             Hdr = hdr.IsOn, Udp = udp.IsOn, UdpHost = udpHost.Text.Trim(), GpuInput = gpu.SelectedIndex == 1 ? "cuda" : "cpu",
             Clipboard = new[] { "both", "send", "receive", "off" }[Math.Max(0, clipboard.SelectedIndex)],
             BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, DragText = dragText.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn, Touch = touch.IsOn,
+            Pen = pen.IsOn, PenPressureGamma = penPressureGamma.Value,
+            Gamepads = gamepads.IsOn, GamepadRumble = gamepadRumble.IsOn, GamepadDeadzone = checked((int)gamepadDeadzone.Value),
             Notifications = notifications.IsOn, Tray = remoteTray.IsOn, TouchModes = new(touchModes, StringComparer.Ordinal)
         };
         var result = selected with
@@ -506,7 +543,7 @@ internal sealed class MainWindow : Window
         int index = profiles.ToList().FindIndex(saved => saved.Id == profile.Id);
         if (index < 0) throw new InvalidOperationException("当前连接配置已不存在，请重新选择连接");
         loading = true; profiles[index] = profile; profilePicker.SelectedIndex = index; loading = false;
-        selected = profile; await store.SaveAsync(profiles); Inform("连接设置已保存。"); UpdateTouchStatus();
+        selected = profile; await store.SaveAsync(profiles); Inform("连接设置已保存。"); UpdateTouchStatus(); UpdateInputDeviceStatus();
     }
     private async Task ConnectOrDisconnectAsync()
     {
@@ -609,7 +646,7 @@ internal sealed class MainWindow : Window
     }
     private void TouchConnectionChanged(bool connected)
     {
-        if (!connected) ResetTouchStatus();
+        if (!connected) { ResetTouchStatus(); ResetInputDeviceStatus(); }
         else
         {
             var profile = controller.ActiveProfileId ?? selected.Id;
@@ -617,8 +654,12 @@ internal sealed class MainWindow : Window
             {
                 ResetTouchStatus(); touchStatusProfile = profile; touchReadOnly = readOnly.IsOn;
             }
+            if (inputDeviceStatusProfile != profile)
+            {
+                ResetInputDeviceStatus(); inputDeviceStatusProfile = profile; inputDeviceReadOnly = readOnly.IsOn;
+            }
         }
-        UpdateTouchStatus();
+        UpdateTouchStatus(); UpdateInputDeviceStatus();
     }
     private void ReceiveTouchStatus(JsonElement message)
     {
@@ -649,11 +690,102 @@ internal sealed class MainWindow : Window
         if (touch.IsOn != saved) text += "当前触控编辑尚未保存。";
         touchStatus.Text = text;
     }
+    private void ResetInputDeviceStatus()
+    {
+        inputDeviceStatusProfile = null;
+        penActive = penSupported = penNativeActive = penLiveSupported = penHardwareAvailable = null;
+        gamepadActive = gamepadActiveLease = gamepadSupported = gamepadLiveSupported = rumbleSupported = null;
+        inputDeviceReadOnly = false; penError = gamepadError = ""; connectedGamepads = null;
+    }
+    private void ReceiveInputDeviceStatus(JsonElement message)
+    {
+        if (!message.TryGetProperty("pen_enabled", out _) && !message.TryGetProperty("pen_supported", out _) &&
+            !message.TryGetProperty("gamepad_enabled", out _) && !message.TryGetProperty("gamepad_supported", out _) &&
+            !message.TryGetProperty("pen_error", out _) && !message.TryGetProperty("gamepad_error", out _)) return;
+        var profile = controller.ActiveProfileId ?? selected.Id;
+        if (inputDeviceStatusProfile != profile) ResetInputDeviceStatus();
+        inputDeviceStatusProfile = profile;
+        penActive = TouchFlag(message, "pen_enabled") ?? penActive;
+        penSupported = TouchFlag(message, "pen_supported") ?? penSupported;
+        penNativeActive = TouchFlag(message, "pen_native_active") ?? penNativeActive;
+        penLiveSupported = TouchFlag(message, "pen_live_supported") ?? penLiveSupported;
+        penHardwareAvailable = TouchFlag(message, "pen_hardware_available") ?? penHardwareAvailable;
+        gamepadActive = TouchFlag(message, "gamepad_enabled") ?? gamepadActive;
+        gamepadActiveLease = TouchFlag(message, "gamepad_active") ?? gamepadActiveLease;
+        gamepadSupported = TouchFlag(message, "gamepad_supported") ?? gamepadSupported;
+        gamepadLiveSupported = TouchFlag(message, "gamepad_live_supported") ?? gamepadLiveSupported;
+        rumbleSupported = TouchFlag(message, "rumble_supported") ?? rumbleSupported;
+        if (message.TryGetProperty("pen_error", out var penFailure) && penFailure.ValueKind == JsonValueKind.String)
+            penError = penFailure.GetString() ?? "";
+        if (message.TryGetProperty("gamepad_error", out var gamepadFailure) && gamepadFailure.ValueKind == JsonValueKind.String)
+            gamepadError = gamepadFailure.GetString() ?? "";
+        if (message.TryGetProperty("gamepad_devices", out var devices) && devices.ValueKind == JsonValueKind.Array)
+        {
+            connectedGamepads = [];
+            foreach (var device in devices.EnumerateArray())
+            {
+                if (device.ValueKind != JsonValueKind.Object || TouchFlag(device, "connected") == false) continue;
+                string label = device.TryGetProperty("name", out var deviceName) && deviceName.ValueKind == JsonValueKind.String
+                    ? deviceName.GetString() ?? "" : "";
+                if (string.IsNullOrWhiteSpace(label))
+                {
+                    int slot = device.TryGetProperty("slot", out var slotValue) && slotValue.TryGetInt32(out var parsedSlot)
+                        ? parsedSlot : device.TryGetProperty("userindex", out var userIndex) && userIndex.TryGetInt32(out var parsedIndex) ? parsedIndex : connectedGamepads.Count;
+                    label = $"手柄 {slot + 1}";
+                }
+                connectedGamepads.Add(label);
+            }
+        }
+        if (message.TryGetProperty("settings", out var settings) && settings.ValueKind == JsonValueKind.Object)
+            inputDeviceReadOnly = TouchFlag(settings, "read_only") ?? inputDeviceReadOnly;
+        inputDeviceReadOnly = TouchFlag(message, "read_only") ?? inputDeviceReadOnly;
+        UpdateInputDeviceStatus();
+    }
+    private static string InputDeviceState(bool saved, bool? active, bool? supported, bool? live, string name)
+    {
+        string text = $"设置：{(saved ? "开启" : "关闭")}。";
+        if (active is not { } enabled) return text + "正在确认当前连接的设备状态。";
+        text += $"当前连接{name}已{(enabled ? "开启" : "关闭")}。";
+        if (saved && supported == false) text += $"当前连接暂不支持{name}，请更新后重连。";
+        else if (saved != enabled) text += live == false ? "已保存，重连后生效。" : "已保存，应用到当前连接后生效。";
+        return text;
+    }
+    private void UpdateInputDeviceStatus()
+    {
+        bool current = inputDeviceStatusProfile == selected.Id;
+        string off = "当前未连接，连接后使用此设置。";
+        string penText = current ? InputDeviceState(selected.Settings.Pen, penActive, penSupported, penLiveSupported, "手写笔")
+            : $"设置：{(selected.Settings.Pen ? "开启" : "关闭")}。" + off;
+        string gamepadText = current ? InputDeviceState(selected.Settings.Gamepads, gamepadActive, gamepadSupported, gamepadLiveSupported, "手柄转发")
+            : $"设置：{(selected.Settings.Gamepads ? "开启" : "关闭")}。" + off;
+        if (current)
+        {
+            if (penActive == true && penSupported != false)
+            {
+                if (penHardwareAvailable == false) penText += "Windows 未检测到可用的手写笔设备。";
+                else if (penNativeActive == true) penText += "当前应用已接入压感手写笔。";
+                else if (penNativeActive == false) penText += "等待支持手写笔的应用接入。";
+            }
+            if (gamepadActive == true && gamepadSupported != false && connectedGamepads is not null)
+                gamepadText += connectedGamepads.Count == 0 ? "未检测到已连接的手柄。" : "已连接：" + string.Join("、", connectedGamepads) + "。";
+            if (gamepadActive == true && gamepadActiveLease == false && connectedGamepads?.Count > 0 && !inputDeviceReadOnly)
+                gamepadText += "当前未向远端应用发送手柄输入，请先聚焦远端窗口。";
+            if (gamepadActive == true && selected.Settings.GamepadRumble && rumbleSupported == false)
+                gamepadText += "当前连接不支持震动反馈。";
+            if (penError.Length > 0) penText += "手写笔暂不可用：" + penError;
+            if (gamepadError.Length > 0) gamepadText += "手柄暂不可用：" + gamepadError;
+            if (inputDeviceReadOnly) { penText += "只读模式已暂停远端输入。"; gamepadText += "只读模式已暂停远端输入。"; }
+        }
+        if (pen.IsOn != selected.Settings.Pen || penPressureGamma.Value != selected.Settings.PenPressureGamma) penText += "当前手写笔编辑尚未保存。";
+        if (gamepads.IsOn != selected.Settings.Gamepads || gamepadRumble.IsOn != selected.Settings.GamepadRumble ||
+            gamepadDeadzone.Value != selected.Settings.GamepadDeadzone) gamepadText += "当前手柄编辑尚未保存。";
+        penStatus.Text = penText; gamepadStatus.Text = gamepadText;
+    }
     private void Receive(JsonElement message)
     {
         if (desktopNotifications.Receive(message)) return;
         string? type = message.GetProperty("type").GetString();
-        if (type is "status" or "local_settings_applied") ReceiveTouchStatus(message);
+        if (type is "status" or "local_settings_applied") { ReceiveTouchStatus(message); ReceiveInputDeviceStatus(message); }
         if (type == "notification_status") { Inform(message.GetProperty("message").GetString() ?? "通知服务状态已更新"); return; }
         if (type == "connected" && message.TryGetProperty("hardware_codecs", out var supported))
         {
@@ -674,7 +806,8 @@ internal sealed class MainWindow : Window
             if (message.GetProperty("ok").GetBoolean())
             {
                 touchReadOnly = TouchFlag(message, "read_only") ?? touchReadOnly;
-                UpdateTouchStatus();
+                inputDeviceReadOnly = TouchFlag(message, "read_only") ?? inputDeviceReadOnly;
+                UpdateTouchStatus(); UpdateInputDeviceStatus();
                 string reason = message.TryGetProperty("fallback_reason", out var fallback) && fallback.GetString() == "session_video_disabled"
                     ? " 当前会话启动时限定 PNG；请新建使用视频编码的会话。" : "";
                 Inform($"服务端已应用：{message.GetProperty("fps")} FPS，{message.GetProperty("bitrate").GetInt32()/1000.0:g} Mbps/窗口，{message.GetProperty("codec")}。实际画面路径见诊断。" + reason);

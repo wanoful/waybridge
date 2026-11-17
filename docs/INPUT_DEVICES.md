@@ -1,9 +1,10 @@
 # Professional input and game devices
 
-The first implemented slice is experimental native multitouch for Wayland
-applications which consume `wl_touch`. Gamepads/rumble, pen/tablet input,
-application-specific gesture mapping and X11 native touch remain follow-up work.
-This does not mark M3 complete.
+Implemented experimental slices include native multitouch for `wl_touch`
+applications, [native pen/tablet-v2](PEN.md), and [XInput gamepads with rumble](GAMEPADS.md).
+Each is enabled and saved in the control center's input settings. Physical-device
+and application coverage, application-specific gesture mapping and X11 native
+touch remain follow-up work. This does not mark M3 complete.
 
 ## Control-center setting
 
@@ -70,12 +71,11 @@ A server without native-touch capability requires an upgrade before use.
   first tap.
 - Only mouse messages carrying Windows' documented *touch* promotion signature
   are suppressed after a consumed touch, avoiding duplicate primary clicks.
-  Physical mouse and pen messages retain their existing behavior. Pen pressure,
-  tilt and eraser fields are not converted into native touch.
+  Physical mouse messages retain their existing behavior. Pen pressure, tilt and
+  eraser fields use the separate optional tablet-v2 adapter, never native touch.
 
-An application which does not bind `wl_touch` is not automatically adapted to
-mouse input in native-touch mode. Use the default compatibility path for those
-applications until per-application mapping is implemented. Touchpad gestures are
+An application which does not bind `wl_touch` automatically retains Windows mouse
+compatibility. Optional per-application overrides can address exceptions. Touchpad gestures are
 not claimed as touchscreen contacts. Contact area/orientation, pressure and
 hardware history/coalescing are not included in this slice.
 

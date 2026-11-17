@@ -1,5 +1,54 @@
 # Validation
 
+## Pen and gamepad integration — 2026-11-18
+
+Both opt-in features now share `main`, the hosted native worker and the control
+center's saved/live input settings. New profiles default to off. Pen calibration
+and gamepad deadzone/rumble remain independent of touch, IME, files and read-only.
+Actual-source WinUI provider tests on Windows x64 pass private save/reload,
+calibration, independent policies and supported/missing/error/readonly states.
+They do not inject physical device input or require unlocking the laptop.
+
+- Real tablet-v2 protocol tests pass early tablet announcement, live client-seat
+  binding/release, pressure/tilt/rotation validity, pressure-less tip events,
+  pen/eraser/barrel, bounded identities, held-tip CSD move/resize and exact
+  serial/root/operation checks, malformed/stale rejection, focus/read-only/unmap/
+  capture/disconnect cancellation and reconnect. Strict x64/ARM64 NativePen probes
+  pass, with controlled samples and real HWND move/resize on private Wine.
+  The production viewer callback/windowProc test additionally proves its WM_SIZE
+  cannot revoke an owning pen resize and tip-up clears sizing.
+- Real disposable Linux uinput/evdev tests pass standard button/axis/HAT delivery,
+  actual FF_RUMBLE upload/play, finite effect expiry and zero feedback, lease
+  revocation and node deletion. Backend permission/type failures are isolated
+  from other input. Strict x64/ARM64 native gamepad probes with simulated XInput
+  pass four-slot hotplug, incarnation/focus isolation, deadzone, exact motor
+  routing, expiry and default-off behavior without touching unowned motors.
+  Authenticated compositor-to-evdev E2E also passes default-off, matching-focus
+  leases, real button/axis/HAT events, malformed/stale/replay rejection, held-input
+  revocation on focus/read-only/disconnect and fresh neutral recovery. Only its
+  uniquely owned PID/name/phys/sysname nodes are opened.
+- Actual hosted PE tests pass default-off, explicit-on and both older-server
+  capability modes, live toggles, requested-vs-active read-only status and atomic
+  rejection of twelve malformed settings including signed/unsigned integer
+  overflow. Four reconnects leave the application and compositor running.
+- Workspace formatting/Clippy, 47 default Rust tests and 12 .NET Core cases pass.
+  The real uinput test is also explicitly run and passes; the unrelated real-FUSE
+  case remains ignored. Legacy native touch/window/DND and production OLE
+  lifetime tests pass. Linux Release plus full x64/ARM64 worker/GUI packages build.
+
+Physical Windows pen/controller input and motors, representative drawing apps
+and SDL/Steam games remain **pending**. Native pen data-device DND/OLE is not yet
+connected. Non-XInput controllers are outside this slice. Focus changes currently
+recreate virtual gamepads and may change player indices; kernel nodes are
+system-visible, with session-owned lifetime rather than process isolation.
+These results do not complete M3 or the earlier positive OS touch/OLE tests.
+Details: [PEN.md](PEN.md), [GAMEPADS.md](GAMEPADS.md).
+
+Evidence: `build/pen-gamepad-{clippy,rust,uinput,release,client,packages,core,protocol,native-pen,native-gamepad,lifetime,touch,touch-interaction,gamepad-protocol,gui-native}.log`,
+`build/tests/professional-input-settings/`, and
+`build/tests/touch-settings-laptop.log`.
+
+
 ## Touch window, popup and DND integration — 2026-11-18
 
 The Linux compositor/server slice at `00345c3` and Windows final release at

@@ -1,4 +1,5 @@
-//! Headless compositor. It never connects to a host desktop or injects host input.
+//! Headless compositor. Desktop keyboard/pointer input stays inside the session;
+//! opt-in virtual gamepads are owned by its authenticated input lifetime.
 mod activation;
 mod app_icon;
 mod audio;
@@ -14,12 +15,14 @@ mod dnd_lifecycle;
 mod drag;
 mod drag_visual;
 mod file_tree;
+mod gamepad;
 mod ime;
 mod input_focus;
 mod launch;
 mod media_budget;
 mod metrics;
 mod network;
+mod pen;
 mod protocol;
 mod readonly_export;
 mod relative_input;
@@ -103,6 +106,7 @@ use smithay::{
             XdgToplevelSurfaceData,
         },
         shm::{ShmHandler, ShmState},
+        tablet_manager::TabletSeatTrait,
         viewporter::ViewporterState,
     },
 };
@@ -329,6 +333,9 @@ struct App {
     tray: Option<desktop_tray::Tray>,
     relative: relative_input::RelativeInput,
     touch: touch::Touch,
+    pen: pen::Pen,
+    gamepads: gamepad::Gamepads,
+    _tablet_manager: smithay::wayland::tablet_manager::TabletManagerState,
     _relative_manager: RelativePointerManagerState,
     _constraints: PointerConstraintsState,
     ime: ime::Ime,
@@ -381,6 +388,8 @@ struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.gamepads.disconnect();
+        self.cancel_pen();
         self.encoder.shutdown();
         // Unregister every GL resource while the renderer/context still exists.
         let windows = &mut self.windows;
@@ -480,6 +489,7 @@ impl App {
                 self.x11_cancel_popup(root);
             }
             self.touch_handoff(id);
+            self.pen_handoff(id);
             self.release_input();
             if let Some(root) = self
                 .focused_window
@@ -497,6 +507,8 @@ impl App {
             pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), self.time());
         }
         self.focused_window = id;
+        self.sync_pen();
+        self.sync_gamepads();
         if changed {
             if let Some(x) = id
                 .and_then(|id| self.window(id))
@@ -996,7 +1008,21 @@ impl App {
             );
         }
     }
+    fn sync_gamepads(&mut self) {
+        let focused = self.focused_window.filter(|id| self.input_allowed(*id));
+        let allowed =
+            !self.read_only && self.peer.as_ref().is_some_and(|peer| peer.desktop_input());
+        self.gamepads.policy(focused, allowed);
+        for message in self.gamepads.poll() {
+            self.control(message);
+        }
+    }
     fn release_input(&mut self) {
+        self.cancel_pen();
+        self.gamepads.policy(None, false);
+        for message in self.gamepads.poll() {
+            self.control(message);
+        }
         self.cancel_touch();
         self.release_keys();
         let pointer = self.seat.get_pointer().unwrap();
@@ -1110,6 +1136,26 @@ impl App {
             }
             "window_state" => self.native_window_state(id, &value),
             "ime" => self.ime_message(&value),
+            "pen" => self.pen_message(&value),
+            "pen_window_end" => self.pen_window_end(&value),
+            "pen_enabled" => {
+                if let Some(enabled) = value["enabled"].as_bool() {
+                    self.pen_enabled(enabled);
+                }
+            }
+            "gamepad" => {
+                self.sync_gamepads();
+                self.gamepads.input(&value);
+            }
+            "gamepad_enabled" => {
+                if let Some(enabled) = value["enabled"].as_bool() {
+                    self.gamepads.set_enabled(enabled);
+                }
+            }
+            "gamepad_focus" => {
+                self.gamepads.focus(id);
+                self.sync_gamepads();
+            }
             "touch" => self.touch_message(&value),
             "touch_interaction_ack" => self.touch_interaction_ack(&value),
             "touch_interaction_input" => self.touch_interaction_input(&value),
@@ -1149,6 +1195,12 @@ impl App {
                     },
                     value["touch_interaction_v1"] == true,
                 );
+                self.pen_negotiate(value["pen_v1"] == true, value["pen_enabled"] == true);
+                self.gamepads.negotiate(
+                    value["gamepad_v1"] == true,
+                    value["gamepad_enabled"] == true,
+                );
+                self.sync_gamepads();
                 self.activation.negotiated = value["activation_v1"] == true;
                 self.window_drag.available = value["toplevel_drag_v1"].as_bool().unwrap_or(false);
                 self.relative_available(value["pointer_lock"].as_bool().unwrap_or(false));
@@ -1739,6 +1791,19 @@ impl App {
                             .is_some_and(|client| touch.client_touches(&client).next().is_some())
                     })
             );
+            info["pen_input"] = json!(
+                !remote.window.is_x11()
+                    && remote
+                        .window
+                        .wl_surface()
+                        .and_then(|surface| surface.client())
+                        .is_some_and(|client| self
+                            .seat
+                            .tablet_seat()
+                            .client_tablet_seats(&client)
+                            .next()
+                            .is_some())
+            );
             let mut deferred = false;
             if let Some(peer) = &self.peer {
                 if !remote.announced || remote.last_info != info {
@@ -2276,7 +2341,7 @@ impl XdgShellHandler for App {
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
         if self.has_pointer_grab(&surface, &seat, serial) {
             self.window_action(&surface, "move", None);
-        } else {
+        } else if !self.pen_window_request(&surface, &seat, serial, "move", None) {
             self.touch_window_action(&surface, &seat, serial, "move", None);
         }
     }
@@ -2289,7 +2354,9 @@ impl XdgShellHandler for App {
     ) {
         if self.has_pointer_grab(&surface, &seat, serial) {
             self.window_action(&surface, "resize", Some(edge as u32));
-        } else if matches!(edge as u32, 1 | 2 | 4 | 5 | 6 | 8 | 9 | 10) {
+        } else if matches!(edge as u32, 1 | 2 | 4 | 5 | 6 | 8 | 9 | 10)
+            && !self.pen_window_request(&surface, &seat, serial, "resize", Some(edge as u32))
+        {
             self.touch_window_action(&surface, &seat, serial, "resize", Some(edge as u32));
         }
     }
@@ -2402,7 +2469,17 @@ impl SeatHandler for App {
         self.publish_ime();
     }
 }
-impl smithay::wayland::tablet_manager::TabletSeatHandler for App {}
+impl smithay::wayland::tablet_manager::TabletSeatHandler for App {
+    fn tablet_tool_image(
+        &mut self,
+        _: &smithay::backend::input::TabletToolDescriptor,
+        image: smithay::input::pointer::CursorImageStatus,
+    ) {
+        self.cursor.image = image;
+        self.cursor.dirty = true;
+    }
+}
+smithay::delegate_tablet_manager!(App);
 smithay::delegate_cursor_shape!(App);
 
 impl SelectionHandler for App {
@@ -2758,6 +2835,9 @@ fn main() -> Result<()> {
         _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<App>(&dh),
         relative: relative_input::RelativeInput::default(),
         touch: touch::Touch::default(),
+        pen: pen::Pen::default(),
+        gamepads: gamepad::Gamepads::default(),
+        _tablet_manager: smithay::wayland::tablet_manager::TabletManagerState::new::<App>(&dh),
         _relative_manager: RelativePointerManagerState::new::<App>(&dh),
         _constraints: PointerConstraintsState::new::<App>(&dh),
         ime: ime::Ime::new(&dh),
@@ -2811,6 +2891,7 @@ fn main() -> Result<()> {
             media_budget::Budget::new(&configuration.config.media_budget),
         ),
     };
+    app.init_pen();
     toplevel_drag::State::register(&app.dh);
     let (sink_server, sink_client) = UnixStream::pair()?;
     app.dh.insert_client(
@@ -2894,6 +2975,8 @@ fn main() -> Result<()> {
             app.poll_window_drag();
             app.sync_pointer_lock();
             app.sync_touch();
+            app.sync_pen();
+            app.sync_gamepads();
             app.pump_outbound()?;
             app.finish_file_drop();
             app.read_pending_clipboard();
@@ -2911,6 +2994,8 @@ fn main() -> Result<()> {
                             tray.set_peer(Some(peer.clone()));
                         }
                         app.read_only = false;
+                        app.pen_available(false);
+                        app.gamepads.disconnect();
                         app.touch_available(false);
                         if let Some(audio) = &app.audio {
                             audio.set_peer(Some(&peer));
@@ -3080,6 +3165,8 @@ fn main() -> Result<()> {
                             app.x11_cancel_popup(root);
                             app.x11.grab = None;
                         }
+                        app.pen_available(false);
+                        app.gamepads.disconnect();
                         app.touch_available(false);
                         app.relative_available(false);
                         app.end_outbound(false);
@@ -3130,6 +3217,8 @@ fn main() -> Result<()> {
                     Event::Clipboard { .. } => {}
                 }
             }
+            app.sync_pen();
+            app.sync_gamepads();
             if app.ime.focus(
                 app.seat
                     .get_keyboard()
@@ -3156,6 +3245,8 @@ fn main() -> Result<()> {
         }
         Ok(())
     })();
+    app.release_input();
+    app.gamepads.disconnect();
     let mut xloop_error_reported = false;
     let shutdown_result = application_session.stop_services(|| {
         // A failed Xwayland event source must not prevent native clients from

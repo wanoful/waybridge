@@ -58,6 +58,20 @@ pub struct TabletSeatHandle {
 }
 
 impl TabletSeatHandle {
+    /// Return live tablet-seat subscriptions owned by one client. Binding does
+    /// not imply that any particular application widget handles tablet events.
+    pub fn client_tablet_seats(&self, client: &Client) -> impl Iterator<Item = ZwpTabletSeatV2> {
+        let id = client.id();
+        self.inner
+            .lock()
+            .unwrap()
+            .instances
+            .iter()
+            .filter_map(|seat| seat.upgrade().ok())
+            .filter(|seat| seat.client().is_some_and(|client| client.id() == id))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
     pub(super) fn add_instance<D>(
         &self,
         state: &mut D,

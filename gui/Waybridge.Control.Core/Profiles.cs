@@ -18,6 +18,11 @@ public sealed record ClientSettings
     public bool ReadOnly { get; set; }
     public bool Ime { get; set; } = true;
     public bool Touch { get; set; }
+    public bool Pen { get; set; }
+    public double PenPressureGamma { get; set; } = 1;
+    public bool Gamepads { get; set; }
+    public bool GamepadRumble { get; set; } = true;
+    public int GamepadDeadzone { get; set; } = 15;
     public Dictionary<string, string> TouchModes { get; set; } = new(StringComparer.Ordinal);
     public string Clipboard { get; set; } = "both";
     public bool ClipboardImages { get; set; } = true;
@@ -30,6 +35,9 @@ public sealed record ClientSettings
     public string GpuInput { get; set; } = "cpu";
     public void Validate()
     {
+        if (!double.IsFinite(PenPressureGamma) || PenPressureGamma is < .25 or > 4)
+            throw new ArgumentException("笔压力度曲线范围为 0.25–4");
+        if (GamepadDeadzone is < 0 or > 50) throw new ArgumentException("手柄摇杆死区范围为 0%–50%");
         if (TouchModes is null || TouchModes.Count > 100 || TouchModes.Any(p =>
             string.IsNullOrWhiteSpace(p.Key) || p.Key.Length > 256 || p.Key.Any(char.IsControl) || p.Value is not ("native" or "mouse")))
             throw new ArgumentException("应用触控模式无效，最多配置 100 个应用");

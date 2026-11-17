@@ -94,3 +94,10 @@ The X11/Qt and native Windows regressions in the parent project exercise the X11
     automatically and updates metadata when the client binds/releases touch.
     This query does not claim a per-widget event-handled acknowledgement, which
     the Wayland touch protocol does not provide.
+
+17. `TabletSeatHandle::client_tablet_seats` exposes live tablet-v2 seat resources
+    for one client. Waybridge uses actual subscription to select native pen
+    delivery and updates leases/metadata after bind or release. This reports
+    protocol subscription rather than a per-widget event-handled result. The
+    parent project's real `tests/pen_smoke.py` covers early device announcement,
+    late bind/release and policy cancellation through actual tablet-v2 objects.
