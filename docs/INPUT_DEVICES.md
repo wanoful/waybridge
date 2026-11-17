@@ -69,6 +69,38 @@ applications until per-application mapping is implemented. Touchpad gestures are
 not claimed as touchscreen contacts. Contact area/orientation, pressure and
 hardware history/coalescing are not included in this slice.
 
+## Interaction integration gaps — 2026-11-18 audit
+
+The user reports being able to draw with a finger, but cannot drag the streamed
+Chrome title bar. This confirms a usable physical drawing interaction in that
+setup; the report does not establish all touch gestures, devices or backends.
+
+The current native-touch path delivers application contacts. Window management
+still has a separate mouse-only path: `App::move_request` and `resize_request`
+require `has_pointer_grab`, while the Windows `window_action` move handler
+checks `VK_LBUTTON` and uses cursor coordinates. A touch-origin move therefore
+needs both server-side touch-grab validation and client-side contact ownership,
+position, release and cancel handling. Chrome's client-drawn title bar is an
+immediate integration target. Native Windows frame behavior is a separate case.
+
+| Interaction | Current scope / remaining integration |
+|---|---|
+| Title-bar move and interactive resize | Native touch is not wired into the existing mouse-driven window-management path. |
+| Tab detach/merge and cross-window drags | The server has a native touch DND grab, but the Windows toplevel-drag loop uses cursor/mouse-button state and mouse release packets. Touch ownership must reach the complete gesture. |
+| Cross-platform text/file drag | Existing mouse/OLE paths remain; file export claim/start still require the mouse left button. A native touch handoff is not implemented end to end. |
+| Popup/menu interaction | Native collection excludes popup HWNDs, and popup grabs revoke the root touch lease. Mouse compatibility remains; touch-specific menu, long-press and selection behavior needs application testing and explicit routing where required. |
+| Pinch/rotate/pan and touchpad gestures | An application's own touchscreen recognizer may already work from contacts. Waybridge has no general gesture mapper, per-application input-mode UI or touchpad-gesture forwarding path. |
+| Pen/tablet input | No native pressure/hover/buttons/eraser/tilt/rotation forwarding; pen remains on its compatibility path. |
+| X11 and richer samples | X11 native touch, contact area/orientation and historical samples are not forwarded. |
+| Physical lifecycle coverage | Automated lease/cancel/scaling checks exist; mixed-monitor DPI, sleep/lock/device changes and the above desktop interactions still need physical acceptance. |
+
+Prioritize native-touch window move/resize, then tab and cross-platform drag
+handoffs; preserve direct application touch drawing throughout. Add focused
+regressions for the triggering touch serial, owning contact, release/cancel,
+second-finger isolation and stale requests. Existing contact-delivery tests do
+not cover these window-management requests. Gamepads/rumble remain a separate
+unimplemented professional-input workstream.
+
 ## Protocol extension
 
 The v3 hello negotiates immutable `touch_v1` capability independently of the

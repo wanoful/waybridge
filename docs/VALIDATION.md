@@ -1,5 +1,17 @@
 # Validation
 
+## User-reported physical touch and Chrome window gap — 2026-11-18
+
+The user confirms finger drawing works in their current streamed setup and
+reports that dragging the streamed Chrome title bar does not move the window.
+This is user-observed physical drawing coverage, without a recorded device,
+application version/backend or complete gesture matrix. Source audit identifies
+mouse-only checks in both native Wayland move/resize authorization and Windows
+window/toplevel-drag handling. Touch window management is not complete. Related
+integration gaps and the next focused checks are recorded in
+[INPUT_DEVICES.md](INPUT_DEVICES.md#interaction-integration-gaps--2026-11-18-audit).
+No code change, deployment or new device acceptance is claimed by this audit.
+
 ## Native touch saved settings — 2026-11-18
 
 The control center exposes experimental native multitouch under **输入与共享**.
