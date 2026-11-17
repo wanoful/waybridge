@@ -2,6 +2,17 @@
 
 ## Touch window, popup and DND integration — 2026-11-18
 
+The Linux compositor/server slice at `00345c3` and Windows final release at
+`c0c41b8` are installed. The user service's running inode, Release binary hashes,
+pinned TLS hello and unchanged listener/configuration/trust were verified. No
+installed compositor was active during replacement. The interactive x64 GUI
+restarted successfully with a fresh MainWindow activation log; all 541 package
+inventory hashes match, saved touch remains enabled, and all other profile fields
+are unchanged. x64 and ARM64 full portable packages pass runtime/architecture
+validation. Deployment evidence: `build/deploy-touch-interactions.json` and
+`build/deploy-touch-interactions-{linux,windows}.log`. The final Windows regression
+also confirms physical UP before OLE readiness cancels a claimed attempt promptly.
+
 Default input selection now checks live `wl_touch` resources: subscribed native
 Wayland clients receive touch, unsubscribed/X11 windows retain mouse compatibility.
 Application overrides are optional. Releasing a subscription revokes active
