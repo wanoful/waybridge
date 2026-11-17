@@ -242,15 +242,21 @@ int wmain() {
     auto returned=std::make_shared<FileDrag::Transfer>(); returned->id=51; returned->touchOperation=32;
     { std::lock_guard<std::mutex> lock(FileDrag::activeMutex); FileDrag::active=returned; }
     touchOlePromotedOperation=32; touchOleMouseReady=true;
+    FileDrag::remoteHitTest=[](POINT point){return windowDragTarget(point) != nullptr;};
     SetCursorPos(first.x,first.y);
     auto started=GetTickCount64();
     require(!touchOleMouse(touchTarget->hwnd,WM_MOUSEMOVE,MK_LBUTTON,0xff515780) &&
       GetTickCount64()-started < 500 && nativeTouch.ownsInteraction(),
       "returned remote motion was consumed by an unclaimed OLE wait");
-    nativeTouch.endInteraction(32);
+    require(!returned->done, "remote return was misclassified as a local OLE target");
+    returned->claimed=true; // Real claim is sent, but remote ready has not arrived.
+    nativeTouch.sample(input,WM_POINTERUP,502,first);
+    require(!nativeTouch.ownsInteraction(), "UP before ready retained native owner");
+    require(returned->done, "UP before ready did not cancel the pending transfer");
+    require(!touchOlePromotedOperation, "UP before ready retained promotion state");
     { std::lock_guard<std::mutex> lock(FileDrag::activeMutex); FileDrag::active.reset(); }
-    nativeTouch=NativeTouch{}; resetTouchOle(); destroyRemote(Id);
-    std::cout << "PASS: production touch resize survives WM_SIZE and releases sizing; returned touch motion bypasses unclaimed OLE readiness wait\n";
+    nativeTouch=NativeTouch{}; resetTouchOle(); FileDrag::remoteHitTest={}; destroyRemote(Id);
+    std::cout << "PASS: production touch resize survives WM_SIZE and releases sizing; returned motion bypasses unclaimed OLE wait and UP-before-ready cancels promptly\n";
 
     std::cout << "PASS: OLE target closure/replacement during query, data read, medium release, async setup; cancelled without scheduling uploads\n";
   } catch (const std::exception &error) {

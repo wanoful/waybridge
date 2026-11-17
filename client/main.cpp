@@ -2127,6 +2127,19 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
     touchWindow.update(sample.screen);
   if (sample.phase != "end" && (!sample.external || sample.phase == "cancel" || sample.phase == "up"))
     sendJson(touchInteractionInput(sample));
+  if (sample.phase == "up" && sample.external) {
+    auto transfer=FileDrag::current();
+    bool pending=false;
+    if (transfer && transfer->touchOperation == sample.operation) {
+      std::lock_guard<std::mutex> lock(transfer->mutex);
+      pending=transfer->claimed && !transfer->inOle && !transfer->oleDone && !transfer->done;
+    }
+    if (pending) {
+      // UP can win while claim/readiness is in flight. There is no remaining
+      // physical mouse-handler entry in which to start this OLE attempt.
+      nativeTouch.cancel(); transfer->finish(false); resetTouchOle(sample.operation);
+    }
+  }
   if (sample.phase == "up" || sample.phase == "cancel" || sample.phase == "end") {
     if (sample.phase != "up" || !sample.external) resetTouchOle(sample.operation);
     if (manipulating) {
