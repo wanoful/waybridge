@@ -1,6 +1,8 @@
 #pragma once
 #include "graphics.h"
 #include "hdr_capabilities.h"
+#include "image_geometry.h"
+#include "media_budget.h"
 #include <d3dcompiler.h>
 #include <cstdint>
 #include <vector>
@@ -29,8 +31,16 @@ float4 main(float4 pos:SV_Position,float2 uv:TEXCOORD0):SV_Target {
  float a=A.Sample(S,uv).r;return float4(rgb*a,a);
 })";
   std::shared_ptr<GraphicsDevice> gpu;
+  WindowMediaBudget *budget = nullptr;
+  uint32_t mediaWindow = 0;
+  WindowMediaBudget::Cost blocked;
+  std::shared_ptr<WindowMediaBudget::Lease> swapchainLease, displayedLease;
+  WindowMediaBudget::Lease videoTextureLease;
   ComPtr<IDCompositionTarget> target;
-  ComPtr<IDCompositionVisual> visual;
+  ComPtr<IDCompositionVisual> root, visual;
+  std::array<ComPtr<IDCompositionVisual>, 2> resizeFillVisuals;
+  ComPtr<IDCompositionSurface> resizeFillSurface;
+  bool previewLayout = false;
   ComPtr<IDXGISwapChain1> swapchain;
   ComPtr<ID3D11VertexShader> vertex;
   ComPtr<ID3D11PixelShader> pixel;
@@ -41,9 +51,21 @@ float4 main(float4 pos:SV_Position,float2 uv:TEXCOORD0):SV_Target {
   UINT width = 0, height = 0;
   bool hdrSurface = false;
   HWND window = nullptr;
+  bool reserveGpu(uint64_t bytes, WindowMediaBudget::Lease &lease) {
+    if (!budget) return true;
+    WindowMediaBudget::Cost cost{0, bytes, 0};
+    lease = budget->acquire(mediaWindow, cost);
+    if (lease) return true;
+    blocked = cost;
+    return false;
+  }
   bool surface(UINT w, UINT h, bool hdr = false) {
     if (swapchain && width == w && height == h && hdrSurface == hdr)
       return true;
+    WindowMediaBudget::Lease replacement;
+    // Two swap-chain buffers. Keep the displayed pair charged until the replacement is visible.
+    if (!reserveGpu(WindowMediaBudget::swapchainCost(uint64_t(w) * h, hdr).gpu, replacement))
+      return false;
     ComPtr<IDXGISwapChain1> next;
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width = w;
@@ -70,13 +92,76 @@ float4 main(float4 pos:SV_Position,float2 uv:TEXCOORD0):SV_Target {
     }
     hdrSurface = hdr;
     swapchain = next;
+    swapchainLease = replacement ? std::make_shared<WindowMediaBudget::Lease>(std::move(replacement)) : nullptr;
     width = w;
     height = h;
     return true;
   }
   bool finish(const RECT &rect) {
-    return SUCCEEDED(swapchain->Present(0, 0)) && SUCCEEDED(visual->SetContent(swapchain.Get())) &&
-           layout(rect);
+    if (FAILED(swapchain->Present(0, 0)) || FAILED(visual->SetContent(swapchain.Get())) || !layout(rect))
+      return false;
+    displayedLease = swapchainLease;
+    return true;
+  }
+  bool initResizeFill() {
+    ComPtr<IDCompositionSurface> fill;
+    auto *composition = gpu->composition.Get();
+    if (FAILED(composition->CreateSurface(1, 1, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                          DXGI_ALPHA_MODE_PREMULTIPLIED, &fill)))
+      return false;
+    {
+      GraphicsLock lock(gpu);
+      ComPtr<IDXGISurface> update;
+      POINT offset{};
+      if (FAILED(fill->BeginDraw(nullptr, IID_PPV_ARGS(&update), &offset)))
+        return false;
+      ComPtr<ID3D11Texture2D> texture;
+      HRESULT result = update.As(&texture);
+      if (SUCCEEDED(result)) {
+        const uint8_t color[] = {GetBValue(ResizePreviewColor), GetGValue(ResizePreviewColor),
+                                 GetRValue(ResizePreviewColor), 255};
+        const D3D11_BOX pixel{UINT(offset.x), UINT(offset.y), 0, UINT(offset.x + 1), UINT(offset.y + 1), 1};
+        gpu->context->UpdateSubresource(texture.Get(), 0, &pixel, color, sizeof(color), 0);
+      }
+      if (FAILED(fill->EndDraw()) || FAILED(result))
+        return false;
+    }
+    for (auto &piece : resizeFillVisuals) {
+      if (!piece && (FAILED(composition->CreateVisual(&piece)) ||
+                     FAILED(root->AddVisual(piece.Get(), FALSE, nullptr)))) {
+        piece.Reset();
+        return false;
+      }
+    }
+    resizeFillSurface = std::move(fill);
+    return true;
+  }
+  bool layoutResizePreview(const RECT &image, const RECT *viewport) {
+    if (!viewport) {
+      if (FAILED(root->SetClip(static_cast<IDCompositionClip *>(nullptr)))) return false;
+      for (auto &piece : resizeFillVisuals)
+        if (piece && FAILED(piece->SetContent(nullptr))) return false;
+      return true;
+    }
+    D2D_RECT_F clip{float(viewport->left), float(viewport->top), float(viewport->right), float(viewport->bottom)};
+    if (FAILED(root->SetClip(clip))) return false;
+    auto fill = resizePreviewFill(*viewport, image);
+    for (size_t i = 0; i < fill.size(); ++i) {
+      const auto &r = fill[i];
+      if (IsRectEmpty(&r)) {
+        if (resizeFillVisuals[i] && FAILED(resizeFillVisuals[i]->SetContent(nullptr))) return false;
+        continue;
+      }
+      if (!resizeFillSurface && !initResizeFill()) return false;
+      D2D_MATRIX_3X2_F matrix{};
+      matrix._11 = float(r.right - r.left);
+      matrix._22 = float(r.bottom - r.top);
+      matrix._31 = float(r.left);
+      matrix._32 = float(r.top);
+      auto *piece = resizeFillVisuals[i].Get();
+      if (FAILED(piece->SetContent(resizeFillSurface.Get())) || FAILED(piece->SetTransform(matrix))) return false;
+    }
+    return true;
   }
   bool shaders() {
     if (vertex && pixel && sampler && constants)
@@ -291,17 +376,42 @@ public:
         planes && SUCCEEDED(p.gpu->device->CreateShaderResourceView(texture.Get(), &view, &chroma));
     return result;
   }
-  bool initialize(HWND hwnd) {
+  bool initialize(HWND hwnd, WindowMediaBudget *account = nullptr, uint32_t owner = 0) {
     window = hwnd;
+    budget = account;
+    mediaWindow = owner;
     gpu = GraphicsDevice::get();
     if (!gpu)
       return false;
     return SUCCEEDED(gpu->composition->CreateTargetForHwnd(hwnd, TRUE, &target)) &&
+           SUCCEEDED(gpu->composition->CreateVisual(&root)) &&
            SUCCEEDED(gpu->composition->CreateVisual(&visual)) &&
-           SUCCEEDED(target->SetRoot(visual.Get())) && SUCCEEDED(gpu->composition->Commit());
+           SUCCEEDED(root->AddVisual(visual.Get(), TRUE, nullptr)) &&
+           SUCCEEDED(target->SetRoot(root.Get())) && SUCCEEDED(gpu->composition->Commit());
+  }
+  WindowMediaBudget::Cost blockedCost() const { return blocked; }
+  bool trimVideoCache() {
+    const bool cached = bool(videoTexture);
+    luma.Reset();
+    chroma.Reset();
+    videoTexture.Reset();
+    videoTextureLease.reset();
+    return cached;
+  }
+  void releaseFrames() {
+    trimVideoCache();
+    if ((previewLayout && !layoutResizePreview(RECT{}, nullptr)) ||
+        FAILED(visual->SetContent(nullptr)) || FAILED(gpu->composition->Commit())) return;
+    swapchain.Reset();
+    swapchainLease.reset();
+    displayedLease.reset();
+    width = height = 0;
+    previewLayout = false;
   }
   bool present(const uint8_t *bgra, UINT w, UINT h, const RECT &rect) {
     GraphicsLock lock(gpu);
+    blocked = {};
+    trimVideoCache();
     if (!surface(w, h))
       return false;
     ComPtr<ID3D11Texture2D> buffer;
@@ -313,7 +423,8 @@ public:
   bool presentVideo(ID3D11Texture2D *texture, UINT subresource, UINT w, UINT h,
                     const std::vector<uint8_t> &alpha, const RECT &rect, bool hdr = false) {
     GraphicsLock lock(gpu);
-    if ((hdr && !HdrCapabilities::active(window)) || !surface(w, h, hdr) || !shaders())
+    blocked = {};
+    if ((hdr && !HdrCapabilities::active(window)) || !shaders())
       return false;
     D3D11_TEXTURE2D_DESC source{};
     texture->GetDesc(&source);
@@ -323,31 +434,36 @@ public:
     D3D11_TEXTURE2D_DESC previous{};
     if (videoTexture)
       videoTexture->GetDesc(&previous);
-    if (!videoTexture || previous.Width != source.Width || previous.Height != source.Height ||
-        previous.Format != source.Format) {
-      videoTexture.Reset();
-      luma.Reset();
-      chroma.Reset();
+    if (videoTexture && (previous.Width != source.Width || previous.Height != source.Height ||
+                         previous.Format != source.Format)) trimVideoCache();
+    if (!videoTexture) {
+      if (!reserveGpu(WindowMediaBudget::videoTextureCost(uint64_t(source.Width) * source.Height, hdr).gpu,
+                      videoTextureLease))
+        return false;
       source.ArraySize = 1;
       source.MipLevels = 1;
       source.Usage = D3D11_USAGE_DEFAULT;
       source.BindFlags = D3D11_BIND_SHADER_RESOURCE;
       source.CPUAccessFlags = 0;
       source.MiscFlags = 0;
-      if (FAILED(gpu->device->CreateTexture2D(&source, nullptr, &videoTexture)))
+      if (FAILED(gpu->device->CreateTexture2D(&source, nullptr, &videoTexture))) {
+        trimVideoCache();
         return false;
+      }
       D3D11_SHADER_RESOURCE_VIEW_DESC view{};
       view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
       view.Texture2D.MipLevels = 1;
       view.Format = hdr ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
-      if (FAILED(gpu->device->CreateShaderResourceView(videoTexture.Get(), &view, &luma)))
+      if (FAILED(gpu->device->CreateShaderResourceView(videoTexture.Get(), &view, &luma))) {
+        trimVideoCache();
         return false;
+      }
       view.Format = hdr ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
-      if (FAILED(gpu->device->CreateShaderResourceView(videoTexture.Get(), &view, &chroma)))
+      if (FAILED(gpu->device->CreateShaderResourceView(videoTexture.Get(), &view, &chroma))) {
+        trimVideoCache();
         return false;
+      }
     }
-    gpu->context->CopySubresourceRegion(videoTexture.Get(), 0, 0, 0, 0, texture, subresource,
-                                        nullptr);
     D3D11_TEXTURE2D_DESC a{};
     a.Width = alpha.empty() ? 1 : w;
     a.Height = alpha.empty() ? 1 : h;
@@ -361,11 +477,20 @@ public:
     data.pSysMem = alpha.empty() ? static_cast<const void *>(&opaque)
                                  : static_cast<const void *>(alpha.data());
     data.SysMemPitch = a.Width * (hdr ? 2 : 1);
+    const uint64_t maskBytes = uint64_t(data.SysMemPitch) * a.Height;
+    WindowMediaBudget::Lease maskLease;
+    if (!reserveGpu(maskBytes, maskLease)) return false;
+    if (!surface(w, h, hdr)) {
+      // The short-lived mask reservation is released upon return, so both must fit at retry.
+      if (!blocked.empty()) blocked.gpu += maskBytes;
+      return false;
+    }
     ComPtr<ID3D11Texture2D> mask;
     ComPtr<ID3D11ShaderResourceView> alphaView;
     if (FAILED(gpu->device->CreateTexture2D(&a, &data, &mask)) ||
         FAILED(gpu->device->CreateShaderResourceView(mask.Get(), nullptr, &alphaView)))
       return false;
+    gpu->context->CopySubresourceRegion(videoTexture.Get(), 0, 0, 0, 0, texture, subresource, nullptr);
     ComPtr<ID3D11Texture2D> back;
     ComPtr<ID3D11RenderTargetView> targetView;
     if (FAILED(swapchain->GetBuffer(0, IID_PPV_ARGS(&back))) ||
@@ -394,9 +519,14 @@ public:
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
     return finish(rect);
   }
-  bool layout(const RECT &r) {
+  bool layout(const RECT &r, const RECT *preview = nullptr) {
     if (!width || !height)
       return true;
+    if (preview || previewLayout) {
+      previewLayout = true;
+      if (!layoutResizePreview(r, preview)) return false;
+      previewLayout = preview != nullptr;
+    }
     D2D_MATRIX_3X2_F matrix{};
     matrix._11 = float(r.right - r.left) / width;
     matrix._22 = float(r.bottom - r.top) / height;

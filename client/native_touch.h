@@ -130,15 +130,17 @@ public:
     return true;
   }
   bool systemMove(uint64_t operation, bool enabled) {
-    if (!interaction || interaction->operation != operation || interaction->kind != "move" ||
+    if (!interaction || interaction->operation != operation ||
+        (interaction->kind != "move" && interaction->kind != "dnd") ||
         !contacts.count(interaction->pointerId)) return false;
     interaction->systemMove = enabled;
     return true;
   }
-  void finishSystemMove(uint64_t operation) {
+  void finishSystemMove(uint64_t operation, std::optional<POINT> screen = {}) {
     // The system loop can consume the release before it reaches our WndProc.
     if (!interaction || interaction->operation != operation || !interaction->systemMove) return;
     auto sample = *interaction;
+    if (screen) sample.screen = *screen;
     sample.phase = "up";
     interaction.reset();
     clearContacts();

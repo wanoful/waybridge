@@ -26,6 +26,8 @@ const CHUNK: usize = 1024;
 const GROUP: usize = 8;
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const MAX_CACHE: usize = 32 * 1024 * 1024;
+const ENDPOINT_LIFETIME: Duration = Duration::from_secs(3);
+const REPAIR_FEEDBACK_GRACE: Duration = Duration::from_millis(20);
 pub const REPAIR: u8 = 6;
 
 fn key(bytes: &[u8]) -> aead::LessSafeKey {
@@ -191,6 +193,18 @@ impl Transport {
     pub fn ready(&self) -> bool {
         self.endpoint.lock().unwrap().is_some()
     }
+    pub fn live_pacing_kbps(&self) -> Option<u64> {
+        if self.cancelled.load(Ordering::Relaxed)
+            || !self
+                .endpoint
+                .lock()
+                .unwrap()
+                .is_some_and(|(_, seen, _)| seen.elapsed() < ENDPOINT_LIFETIME)
+        {
+            return None;
+        }
+        Some(self.pacing.lock().unwrap().kbps())
+    }
     fn observe_pacing(&self, change: Option<Change>) {
         metrics::gauge(
             "udp_pacing_kbps",
@@ -247,31 +261,39 @@ impl Transport {
         }
     }
     pub fn retry(&self, message: u64) -> Option<Vec<u8>> {
+        self.retry_at(message, Instant::now())
+    }
+    fn retry_at(&self, message: u64, now: Instant) -> Option<Vec<u8>> {
         if self.cancelled.load(Ordering::Relaxed) {
             return None;
         }
-        let now = Instant::now();
-        let (repair, penalize) = {
+        let (repair, udp_age) = {
             let mut c = self.cache.lock().unwrap();
             let v = c.frames.get_mut(&message)?;
-            if v.retry.elapsed() < Duration::from_millis(50) {
+            if now.duration_since(v.retry) < Duration::from_millis(50) {
                 return None;
             }
             v.retry = now;
             let repair = repair(message, v.kind, &v.body);
             let pending = c.pending.get_mut(&message)?;
-            // The receiver can request the next message before its paced send
-            // finishes. Still repair it, but do not call that packet loss.
-            let penalize = pending.data_boundary.is_some_and(|sent| sent <= now)
-                && pending.udp
-                && !pending.repaired;
+            let udp_age = pending
+                .data_boundary
+                .filter(|_| pending.udp && !pending.repaired)
+                .and_then(|sent| now.checked_duration_since(sent));
             pending.repaired = true;
-            (repair, penalize)
+            (repair, udp_age)
         };
         metrics::increment("udp_tcp_repair_requests");
-        if penalize {
-            let change = self.pacing.lock().unwrap().repair(now);
-            self.observe_pacing(change);
+        // A receiver can request the next message on its periodic tick before
+        // the last DATA has crossed the network. Repair immediately but ignore
+        // feedback from that brief race when tuning send rate.
+        match udp_age {
+            Some(age) if age >= REPAIR_FEEDBACK_GRACE => {
+                let change = self.pacing.lock().unwrap().repair(now);
+                self.observe_pacing(change);
+            }
+            Some(_) => metrics::increment("udp_repair_feedback_grace"),
+            None => {}
         }
         Some(repair)
     }
@@ -281,7 +303,7 @@ impl Transport {
             .endpoint
             .lock()
             .unwrap()
-            .map(|(a, t, _)| (a, t.elapsed() < Duration::from_secs(3)))
+            .map(|(a, t, _)| (a, t.elapsed() < ENDPOINT_LIFETIME))
             .unwrap();
         let (message, use_udp) = {
             let mut c = self.cache.lock().unwrap();
@@ -438,6 +460,7 @@ mod tests {
         for packet in [make(1, &[3; 32]), make(0, &[2; 32]), vec![0; 1201]] {
             t.bind(&packet, address);
             assert!(!t.ready());
+            assert_eq!(t.live_pacing_kbps(), None);
         }
         let first = make(1, &[2; 32]);
         let mut corrupt = first.clone();
@@ -446,6 +469,7 @@ mod tests {
         assert!(!t.ready());
         t.bind(&first, address);
         assert!(t.ready());
+        assert_eq!(t.live_pacing_kbps(), Some(200_000));
         let old = t.endpoint.lock().unwrap().unwrap();
         t.bind(&first, address);
         assert_eq!(t.endpoint.lock().unwrap().unwrap(), old);
@@ -454,6 +478,14 @@ mod tests {
         assert_eq!(t.endpoint.lock().unwrap().unwrap(), old);
         t.bind(&second, address);
         assert_eq!(t.endpoint.lock().unwrap().unwrap().2, 2);
+
+        *t.endpoint.lock().unwrap() = Some((address, Instant::now() - ENDPOINT_LIFETIME, 2));
+        assert!(t.ready()); // The TCP repair sequence stays in use after UDP expiry.
+        assert_eq!(t.live_pacing_kbps(), None);
+        t.bind(&make(3, &[2; 32]), address);
+        assert_eq!(t.live_pacing_kbps(), Some(200_000));
+        t.cancel();
+        assert_eq!(t.live_pacing_kbps(), None);
     }
     #[test]
     fn only_live_unrepaired_udp_feedback_trains_pacing() {
@@ -543,6 +575,47 @@ mod tests {
             early.ack(message);
         }
         assert_eq!(early.pacing.lock().unwrap().kbps(), 150_000);
+    }
+    #[test]
+    fn repair_feedback_grace_only_delays_rate_adjustment() {
+        let t = transport();
+        let now = Instant::now();
+        for (message, age, expected) in [
+            (1, REPAIR_FEEDBACK_GRACE - Duration::from_millis(1), 200_000),
+            (2, REPAIR_FEEDBACK_GRACE, 150_000),
+        ] {
+            let mut cache = t.cache.lock().unwrap();
+            cache.pending.insert(
+                message,
+                Pending {
+                    bytes: 1,
+                    data_boundary: Some(now - age),
+                    udp: true,
+                    repaired: false,
+                },
+            );
+            cache.pending_bytes += 1;
+            cache.frames.insert(
+                message,
+                Cached {
+                    kind: 2,
+                    body: vec![7],
+                    retry: now - Duration::from_secs(1),
+                },
+            );
+            cache.bytes += 1;
+            drop(cache);
+
+            let repair_packet = repair(message, 2, &[7]);
+            assert_eq!(t.retry_at(message, now), Some(repair_packet.clone()));
+            assert_eq!(t.pacing.lock().unwrap().kbps(), expected);
+            assert_eq!(
+                t.retry_at(message, now + Duration::from_millis(250)),
+                Some(repair_packet)
+            );
+            assert_eq!(t.pacing.lock().unwrap().kbps(), expected);
+            t.ack(message);
+        }
     }
     #[test]
     fn final_data_ack_trains_before_trailing_parity() {

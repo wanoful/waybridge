@@ -1,7 +1,22 @@
 #pragma once
 #include <windows.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
+
+inline constexpr COLORREF ResizePreviewColor = RGB(40, 40, 40);
+
+inline RECT resizePreviewImage(RECT client, int width, int height, UINT dpi) {
+  return {client.left, client.top, client.left + MulDiv(width, dpi, 96),
+          client.top + MulDiv(height, dpi, 96)};
+}
+
+inline std::array<RECT, 2> resizePreviewFill(RECT client, RECT image) {
+  LONG right = std::clamp(image.right, client.left, client.right);
+  LONG bottom = std::clamp(image.bottom, client.top, client.bottom);
+  return {{{right, client.top, client.right, bottom},
+           {client.left, bottom, client.right, client.bottom}}};
+}
 
 inline RECT fitImageRect(RECT client, int width, int height, bool fullscreen, UINT dpi) {
   if (width <= 0 || height <= 0)

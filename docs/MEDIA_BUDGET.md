@@ -1,11 +1,10 @@
-# Linux media resource admission
+# Media resource admission
 
-The first resource-budget implementation covers the Linux capture/encode path.
-It complements the existing 128 MiB queued-raw-frame limit and two presentation
-credits per window. Windows decode/presentation resources and transport/file
-queues retain their existing separate limits; they are not in this account yet.
+Linux capture/encode and Windows decode/presentation have separate budgets.
+They complement the existing 128 MiB queued-raw-frame limit and two presentation
+credits per window. Transport and file queues retain their separate limits.
 
-## Configuration
+## Linux configuration
 
 The normal Linux configuration file accepts an optional section:
 
@@ -106,3 +105,49 @@ NVENC still holds its pool, then destroys the encoder on another thread and
 requires the owner to release exactly once. Registration failure and independent
 HDR primary/fallback pool release are tested too. The regular PNG regression is
 included in `scripts/test.sh`; real CUDA/H.264 paths require the NVIDIA host.
+
+## Windows viewer
+
+The viewer applies these admission limits per process and remote window:
+
+| Resource | Viewer total | Per window | Reserved for the focused window |
+|---|---:|---:|---:|
+| Decoded CPU buffers | 512 MiB | 256 MiB | 128 MiB |
+| Estimated GPU textures and decoder working sets | 1,024 MiB | 720 MiB | 512 MiB |
+| Active and cached hardware decoder slots | 8 | 2 | 1 |
+
+The CPU account covers decoded BGRA and alpha buffers, including a deferred resize
+preview frame. The D3D11 account covers both buffers in each DirectComposition
+swap chain, the reusable NV12/P010 rendering texture, the per-frame alpha texture
+and an estimated Media Foundation decoder working set. The old displayed swap
+chain remains charged through the composition commit for its replacement. A
+decoded sample can retain its decoder allocation after the decoder leaves the
+cache. After presentation, the DirectComposition path releases its decoded
+buffers and sample. GDI retains the decoded BGRA needed for repaints.
+
+While a remote window has focus, new background allocations leave the reserved
+room available as existing allocations are released. The focused window gets up
+to three decode turns before a waiting background window, and its ready frame
+gets presented first. Encoded reference frames stay ordered within each window.
+When a window is minimized or hidden, the viewer releases its presentation
+textures and decoded image. Restoring the window requests a fresh frame through
+the existing visibility update.
+
+When admission fails, the decoder cache releases idle entries and retries. A
+focused decoder that fits its window limit can also reclaim one least-recently
+decoded background decoder. If the decoder or its alpha buffer still cannot be
+admitted, the viewer requests PNG for the affected window for the remainder of
+the connection. The fallback discards the interrupted video epoch. Temporary
+PNG or presentation contention preserves the previous visible picture and returns
+frame credit. The viewer checks deferred work on its two-second status timer and
+requests a refresh when the needed capacity is available. Foreground presentation
+may first trim another window's reusable video upload texture.
+
+Hosted `status.media_budget` reports current and peak CPU reserved bytes,
+estimated GPU bytes and decoder slots, plus cumulative allocation denials. These
+estimates cover Waybridge-owned media buffers. WIC or GDI scratch memory and
+driver/DWM allocations have separate lifetimes and are outside the account.
+
+`scripts/test-windows.sh` includes accounting coverage for contention, a focus
+change, cross-thread sample release, deferred refresh and a largest-size HDR
+swap-chain replacement alongside a resident background window.

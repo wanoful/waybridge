@@ -2,6 +2,10 @@
 #define main base_fixture_main
 #include "test_app.c"
 #undef main
+static uint32_t pending_move_serial;
+static int32_t pending_move_slot;
+static double pending_move_x;
+
 static void client_touch_down(void *data, struct wl_touch *touch, uint32_t serial, uint32_t time,
                               struct wl_surface *surface, int32_t id, wl_fixed_t x, wl_fixed_t y) {
   (void)data; (void)touch; (void)time; (void)surface;
@@ -13,19 +17,35 @@ static void client_touch_down(void *data, struct wl_touch *touch, uint32_t seria
   } else if (px >= windows[0].width / 3.0) {
     xdg_toplevel_move(windows[0].top, seat, serial);
     puts("CLIENT_REQUEST_MOVE");
+  } else if (px >= 12 && px <= 48) {
+    pending_move_serial = serial;
+    pending_move_slot = id;
+    pending_move_x = px;
   }
   fflush(stdout);
 }
 static void client_touch_up(void *d, struct wl_touch *t, uint32_t serial, uint32_t time, int32_t id) {
   (void)d; (void)t; (void)serial; (void)time;
+  if (id == pending_move_slot) pending_move_serial = 0;
   printf("CLIENT_TOUCH_UP %d\n", id); fflush(stdout);
 }
 static void client_touch_motion(void *d, struct wl_touch *t, uint32_t time, int32_t id, wl_fixed_t x, wl_fixed_t y) {
   (void)d; (void)t; (void)time;
-  printf("CLIENT_TOUCH_MOTION %d %.3f %.3f\n", id, wl_fixed_to_double(x), wl_fixed_to_double(y)); fflush(stdout);
+  double px = wl_fixed_to_double(x);
+  printf("CLIENT_TOUCH_MOTION %d %.3f %.3f\n", id, px, wl_fixed_to_double(y));
+  if (pending_move_serial && id == pending_move_slot && px - pending_move_x >= 32) {
+    xdg_toplevel_move(windows[0].top, seat, pending_move_serial);
+    pending_move_serial = 0;
+    puts("CLIENT_REQUEST_MOVE");
+  }
+  fflush(stdout);
 }
 static void client_touch_frame(void *d, struct wl_touch *t) { (void)d; (void)t; puts("CLIENT_TOUCH_FRAME"); fflush(stdout); }
-static void client_touch_cancel(void *d, struct wl_touch *t) { (void)d; (void)t; puts("CLIENT_TOUCH_CANCEL"); fflush(stdout); }
+static void client_touch_cancel(void *d, struct wl_touch *t) {
+  (void)d; (void)t;
+  pending_move_serial = 0;
+  puts("CLIENT_TOUCH_CANCEL"); fflush(stdout);
+}
 static const struct wl_touch_listener client_touch_listener = {
   .down=client_touch_down,.up=client_touch_up,.motion=client_touch_motion,.frame=client_touch_frame,.cancel=client_touch_cancel
 };

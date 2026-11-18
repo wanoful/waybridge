@@ -1,5 +1,6 @@
 #pragma once
 #include "h264_decoder.h"
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -21,9 +22,10 @@ public:
       idle.erase(idle.begin());
     }
   }
-  std::unique_ptr<H264Decoder> acquire(UINT width, UINT height, bool &reused, uint8_t codec = 2) {
+  std::unique_ptr<H264Decoder> acquire(UINT width, UINT height, bool &reused, uint8_t codec = 2,
+                                      uint32_t owner = 0, WindowMediaBudget *budget = nullptr) {
     for (auto it = idle.begin(); it != idle.end(); ++it) {
-      if (!(*it)->matches(width, height, codec))
+      if ((*it)->owner() != owner || !(*it)->matches(width, height, codec))
         continue;
       auto decoder = std::move(*it);
       idle.erase(it);
@@ -34,9 +36,25 @@ public:
       return decoder;
     }
     reused = false;
-    return std::make_unique<H264Decoder>(width, height, codec);
+    std::shared_ptr<WindowMediaBudget::Lease> lease;
+    if (budget) {
+      const auto cost = VideoDecoder::estimatedCost(width, height, codec);
+      auto reservation = budget->acquire(owner, cost);
+      if (!reservation && !idle.empty()) {
+        clear();
+        reservation = budget->acquire(owner, cost);
+      }
+      if (!reservation) return {};
+      lease = std::make_shared<WindowMediaBudget::Lease>(std::move(reservation));
+    }
+    return std::make_unique<H264Decoder>(width, height, codec, owner, std::move(lease));
   }
   void clear() { idle.clear(); }
+  void forget(uint32_t owner) {
+    idle.erase(std::remove_if(idle.begin(), idle.end(), [owner](const auto &entry) {
+                 return entry->owner() == owner;
+               }), idle.end());
+  }
 };
 
 using H264DecoderCache = VideoDecoderCache;

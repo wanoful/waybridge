@@ -17,6 +17,11 @@ disconnect. Wayland applications control their own scroll inertia and
 interpretation of the pinch. Xwayland application gesture support depends on
 Xwayland and the receiving app.
 
+The Windows viewer and the running Linux compositor both negotiate
+`touchpad_v1`. Installing a new Linux binary takes effect when the next
+compositor session starts. A connection to an existing older session can still
+receive Windows mouse-style scroll and zoom events.
+
 Run the Wayland and Windows fixtures with a current checkout.
 
 ```sh
@@ -44,3 +49,7 @@ scale and a normal pinch end. It received no duplicate wheel events. The probe's
 by that process and a title beginning with `Waybridge-touchpad-e2e-`. The Wayland
 fixture takes that title from `WAYBRIDGE_TOUCHPAD_FIXTURE_TITLE`. Physical
 touchpad testing remains separate.
+
+The shipped x64 viewer also passed a synthetic Precision Touchpad pinch into
+native Wayland Chrome. Chrome's visual viewport scale increased from 1 to 2.69
+while its layout width and device pixel ratio stayed fixed.

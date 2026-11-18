@@ -362,6 +362,9 @@ impl Peer {
     pub fn take_capture_refresh(&self, id: u32) -> bool {
         self.queue.lock().unwrap().capture_refresh.remove(&id)
     }
+    pub fn udp_video_rate(&self) -> Option<u64> {
+        self.udp.as_ref()?.live_pacing_kbps()
+    }
     pub fn video_ready(&self, id: u32) -> bool {
         let q = self.queue.lock().unwrap();
         !q.closed

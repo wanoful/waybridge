@@ -90,7 +90,8 @@ maximized window restores it. When a self-decorated window confirms a move,
 the viewer may ask Windows to promote the held primary contact and take over
 its caption move. The viewer enters the system move loop on the genuine
 promoted mouse message for that same contact. The loop owns placement and edge
-Snap once entered. Contact-based placement remains available when conversion
+Snap once entered. The viewer keeps the original touch point over the source
+HWND until Windows delivers that first mouse message. Contact-based placement remains available when conversion
 or loop entry is unavailable. Resize retains its contact-based placement, and
 native Windows frames retain their system handling.
 
@@ -107,6 +108,12 @@ original touch grab across HWNDs without acquiring target keyboard focus. Only
 the initiating contact can finish the operation; a second finger, stale request
 or old slot reused by a later gesture cannot release it. Changing ownership does
 not trigger the ordinary focus policy's blanket touch cancellation.
+
+When an application attaches a toplevel to the drag, Windows can take over its
+movement and edge Snap using the original primary contact. The Wayland drag
+continues delivering motion and drops so the application can reattach the
+toplevel or merge a tab. Touching a different streamed window can focus it and
+start a new gesture on the same press.
 
 Cross-platform DND reuses existing text providers, delayed virtual-file streams,
 read-only file delivery, target revisions and completion acknowledgements.

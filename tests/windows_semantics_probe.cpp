@@ -167,10 +167,15 @@ int main(int argc, char **argv) {
     if (mode == "resize") {
       require(argc > 4, "resize id clientWidth clientHeight");
       RECT r{0, 0, std::stoi(argv[3]), std::stoi(argv[4])};
-      AdjustWindowRectExForDpi(&r, DWORD(GetWindowLongPtrW(hwnd, GWL_STYLE)), FALSE,
-                               DWORD(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)), 96);
+      DWORD style = DWORD(GetWindowLongPtrW(hwnd, GWL_STYLE));
+      if (style & WS_CAPTION)
+        AdjustWindowRectExForDpi(&r, style, FALSE, DWORD(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)), 96);
       SetWindowPos(hwnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
                    SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
+      return 0;
+    }
+    if (mode == "size-begin" || mode == "size-end") {
+      SendMessageW(hwnd, mode == "size-begin" ? WM_ENTERSIZEMOVE : WM_EXITSIZEMOVE, 0, 0);
       return 0;
     }
     if (mode == "move") {

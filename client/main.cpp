@@ -79,6 +79,11 @@ struct {
   HWND systemWindow = nullptr;
   bool entered = false;
 } touchMove;
+struct {
+  TouchOle::Bridge promotion;
+  uint64_t operation = 0;
+  bool mouseReady = false;
+} touchToplevelMove;
 uint64_t touchOlePromotedOperation = 0, touchOleWarning = 0;
 bool touchOleMouseReady = false, touchOlePumping = false;
 ULONGLONG touchOleDeadline = 0;
@@ -127,6 +132,8 @@ std::set<uint8_t> supportedVideoKinds;
 using Clock = std::chrono::steady_clock;
 constexpr UINT_PTR MoveViewportTimer = 2;
 constexpr UINT MoveViewportIntervalMs = 33;
+constexpr UINT_PTR ResizePreviewTimer = 3;
+constexpr UINT ResizePreviewSettleMs = 1200;
 struct ClientStats {
   struct Stage {
     double total = 0, max = 0;
@@ -164,10 +171,12 @@ struct ClientStats {
 double millis(Clock::duration duration) {
   return std::chrono::duration<double, std::milli>(duration).count();
 }
+WindowMediaBudget mediaBudget;
 struct DecodedFrame {
   int width = 0, height = 0, logicalWidth = 0, logicalHeight = 0, originX = 0, originY = 0;
   uint64_t sequence = 0;
   uint8_t codec = 0;
+  WindowMediaBudget::Lease cpuAllocation;
   std::vector<uint8_t> bgra, alpha;
   VideoSurface video;
   Clock::time_point decoded, received;
@@ -221,6 +230,8 @@ struct RemoteWindow {
   int lastResizeWidth = -1, lastResizeHeight = -1;
   bool lastMaximized = false;
   bool sizing = false, resizePending = false;
+  bool resizePreview = false;
+  std::shared_ptr<DecodedFrame> deferredResizeFrame;
   Clock::time_point resizeSent;
   UINT lastDpi = 0;
   int lastHdr = -1;
@@ -243,6 +254,7 @@ RelativeInput relativeInput;
 struct WindowDrag {
   bool active = false, released = false, cancelled = false, touch = false;
   bool moveAttempted = false, moveCompleted = false;
+  uint64_t touchOperation = 0;
   uint32_t source = 0, attached = 0, target = 0;
   int offsetX = 0, offsetY = 0;
 } windowDrag;
@@ -251,6 +263,7 @@ struct WindowDragMove {
   bool entered = false, interrupted = false, buttonUp = false, startFileDrag = false;
 } windowDragMove;
 constexpr UINT StartWindowDragMove = WM_APP + 2;
+constexpr UINT CheckRemoteFocus = WM_APP + 3;
 constexpr UINT_PTR WindowDragTimer = 5, TouchOleTimer = 6, GamepadTimer = 7;
 Json touchInteractionInput(const NativeTouch::InteractionSample &sample);
 
@@ -778,13 +791,21 @@ void decodeLoop() {
   struct State {
     uint32_t epoch = 0;
     uint8_t kind = 0;
+    Clock::time_point lastDecoded;
     std::unique_ptr<H264Decoder> decoder;
     std::map<uint64_t, std::shared_ptr<DecodedFrame>> pending;
   };
   std::map<uint32_t, State> videoStates;
   H264DecoderCache decoderCache;
   std::set<uint32_t> disabled, closed;
+  auto fallbackForBudget = [&](uint32_t id) {
+    videoStates.erase(id);
+    disabled.insert(id);
+    std::cerr << "Media budget requesting PNG fallback for window " << id << '\n';
+    sendJson({{"type", "codec_fallback"}, {"id", id}});
+  };
   uint32_t lastId = 0;
+  unsigned foregroundBurst = 0;
   while (running) {
     EncodedFrame encoded;
     uint32_t id = 0;
@@ -797,11 +818,19 @@ void decodeLoop() {
         break;
       garbage.swap(decoderGarbage);
       if (!frames.empty()) {
-        auto entry = frames.upper_bound(lastId);
-        if (entry == frames.end())
-          entry = frames.begin();
+        auto foreground = frames.find(mediaBudget.focused());
+        auto entry = foreground;
+        if (foreground != frames.end() && frames.size() > 1 && foregroundBurst < 3) {
+          ++foregroundBurst;
+        } else {
+          entry = frames.upper_bound(lastId);
+          if (entry == frames.end()) entry = frames.begin();
+          if (entry == foreground && frames.size() > 1 && ++entry == frames.end())
+            entry = frames.begin();
+          lastId = entry->first;
+          foregroundBurst = 0;
+        }
         id = entry->first;
-        lastId = id;
         encoded = std::move(entry->second.front());
         entry->second.pop_front();
         if (entry->second.empty())
@@ -811,6 +840,8 @@ void decodeLoop() {
     frameWake.notify_all();
     for (auto removed : garbage) {
       videoStates.erase(removed);
+      decoderCache.forget(removed);
+      mediaBudget.clearDeferred(removed);
       disabled.erase(removed);
       closed.insert(removed);
     }
@@ -867,6 +898,7 @@ void decodeLoop() {
             key > 1 || uint64_t(color) + alpha + 60 != bytes.size() || !color)
           throw std::runtime_error("Invalid video dimensions/length");
         auto &state = videoStates[id];
+        state.lastDecoded = started;
         if (!state.decoder || state.epoch != epoch || state.kind != encoded.kind ||
             !state.decoder->matches(cw, ch, encoded.kind)) {
           if (!key)
@@ -875,7 +907,32 @@ void decodeLoop() {
           auto initStarted = Clock::now();
           decoderCache.recycle(std::move(state.decoder));
           bool reused = false;
-          state.decoder = decoderCache.acquire(cw, ch, reused, encoded.kind);
+          state.decoder = decoderCache.acquire(cw, ch, reused, encoded.kind, id, &mediaBudget);
+          if (!state.decoder) {
+            bool discarded;
+            {
+              std::lock_guard<std::mutex> lock(inboxMutex);
+              discarded = decodedFrames.erase(id) != 0;
+            }
+            if (discarded) state.decoder = decoderCache.acquire(cw, ch, reused, encoded.kind, id, &mediaBudget);
+          }
+          if (!state.decoder && id == mediaBudget.focused() &&
+              mediaBudget.fitsRemainingWindow(id, VideoDecoder::estimatedCost(cw, ch, encoded.kind))) {
+            auto oldest = videoStates.end();
+            for (auto it = videoStates.begin(); it != videoStates.end(); ++it) {
+              if (it->first != id && it->second.decoder &&
+                  (oldest == videoStates.end() || it->second.lastDecoded < oldest->second.lastDecoded))
+                oldest = it;
+            }
+            if (oldest != videoStates.end() && id == mediaBudget.focused()) {
+              fallbackForBudget(oldest->first);
+              state.decoder = decoderCache.acquire(cw, ch, reused, encoded.kind, id, &mediaBudget);
+            }
+          }
+          if (!state.decoder) {
+            fallbackForBudget(id);
+            continue;
+          }
           clientStats.record(reused ? "decoder_reuse" : "decoder_create",
                              millis(Clock::now() - initStarted));
           state.epoch = epoch;
@@ -884,6 +941,12 @@ void decodeLoop() {
                     << " decoder active for window " << id << '\n';
         }
         if (alpha) {
+          frame->cpuAllocation = mediaBudget.acquire(
+              id, {uint64_t(width) * height * (VideoDecoder::hdr(encoded.kind) ? 2 : 1), 0, 0});
+          if (!frame->cpuAllocation) {
+            fallbackForBudget(id);
+            continue;
+          }
           auto maskStarted = Clock::now();
           if (!images->decode(bytes.data() + 60 + color, alpha, width, height, true, frame->alpha,
                               VideoDecoder::hdr(encoded.kind)))
@@ -931,6 +994,13 @@ void decodeLoop() {
       if (bytes.size() < 69 || memcmp(bytes.data() + 36, magic, 8) ||
           u32(bytes.data() + 52) != width || u32(bytes.data() + 56) != height)
         continue;
+      const WindowMediaBudget::Cost cost{uint64_t(width) * height * 4, 0, 0};
+      frame->cpuAllocation = mediaBudget.acquire(id, cost);
+      if (!frame->cpuAllocation) {
+        mediaBudget.defer(id, cost, frame->sequence);
+        sendJson({{"type", "frame_ack"}, {"id", id}, {"sequence", frame->sequence}});
+        continue;
+      }
       if (!images->decode(bytes.data() + 36, bytes.size() - 36, width, height, false, frame->bgra))
         continue;
       completed.push_back(frame);
@@ -1579,8 +1649,31 @@ void publishClipboard() {
 RECT imageRect(RemoteWindow *w) {
   RECT r;
   GetClientRect(w->hwnd, &r);
+  if (w->resizePreview)
+    return resizePreviewImage(r, w->width, w->height, w->dpi);
   return fitImageRect(r, w->pixelWidth ? w->pixelWidth : w->width,
                       w->pixelHeight ? w->pixelHeight : w->height, w->state.fullscreen, w->dpi);
+}
+bool matchesClientSize(RemoteWindow *w, int width, int height) {
+  RECT client{};
+  GetClientRect(w->hwnd, &client);
+  return width == MulDiv(client.right, 96, w->dpi) && height == MulDiv(client.bottom, 96, w->dpi);
+}
+bool inResizePreviewFill(RemoteWindow *w, POINT point) {
+  if (!w->resizePreview) return false;
+  RECT client{};
+  GetClientRect(w->hwnd, &client);
+  RECT image = resizePreviewImage(client, w->width, w->height, w->dpi);
+  return PtInRect(&client, point) && !PtInRect(&image, point);
+}
+void layoutWindowImage(RemoteWindow *w) {
+  if (w->presentation) {
+    RECT client{};
+    GetClientRect(w->hwnd, &client);
+    w->presentation->layout(imageRect(w), w->resizePreview ? &client : nullptr);
+  } else {
+    InvalidateRect(w->hwnd, nullptr, FALSE);
+  }
 }
 void refreshCursor();
 void releasePointer(bool notify = true) {
@@ -1597,6 +1690,10 @@ void releasePointer(bool notify = true) {
 void pointer(RemoteWindow *w, LPARAM param) {
   if (relativeInput.active())
     return;
+  if (inResizePreviewFill(w, {GET_X_LPARAM(param), GET_Y_LPARAM(param)})) {
+    sendJson({{"type", "leave"}, {"id", w->id}});
+    return;
+  }
   RECT r = imageRect(w);
   if (r.right <= r.left || r.bottom <= r.top)
     return;
@@ -1654,13 +1751,11 @@ RemoteWindow *windowDragTarget(POINT point) {
   }, reinterpret_cast<LPARAM>(&search));
   return search.target;
 }
-void moveDraggedWindow() {
+void moveDraggedWindow(POINT cursor) {
   auto found = windows.find(windowDrag.attached);
   if (!windowDrag.active || windowDrag.released || windowDrag.moveCompleted || found == windows.end()) return;
   auto *w = found->second.get();
   if (windowDragMove.hwnd == w->hwnd) return;
-  POINT cursor{};
-  if (!GetCursorPos(&cursor)) return;
   POINT client{0, 0};
   ClientToScreen(w->hwnd, &client);
   RECT outer{};
@@ -1669,6 +1764,22 @@ void moveDraggedWindow() {
                cursor.x - MulDiv(windowDrag.offsetX, w->dpi, 96) - (client.x - outer.left),
                cursor.y - MulDiv(windowDrag.offsetY, w->dpi, 96) - (client.y - outer.top),
                0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+bool promotedToplevelMove() {
+  return windowDrag.touch && touchToplevelMove.mouseReady &&
+         touchToplevelMove.operation == windowDrag.touchOperation;
+}
+void syncDraggedWindowPosition() {
+  if (windowDrag.touch && !promotedToplevelMove()) {
+    auto owner = nativeTouch.activeInteraction();
+    if (!owner || owner->operation != windowDrag.touchOperation) return;
+    if (!owner->external) {
+      moveDraggedWindow(owner->screen);
+      return;
+    }
+  }
+  POINT cursor{};
+  if (GetCursorPos(&cursor)) moveDraggedWindow(cursor);
 }
 void stopWindowDragMove() {
   if (!windowDragMove.hwnd || windowDragMove.interrupted) return;
@@ -1679,12 +1790,28 @@ void sendWindowDragMotion(bool release = false) {
   if (!windowDrag.active || windowDrag.released) return;
   if (windowDrag.touch) {
     auto owner = nativeTouch.activeInteraction();
-    if (!owner || owner->kind != "dnd" || !owner->external) return;
+    if (!owner || owner->kind != "dnd" || owner->operation != windowDrag.touchOperation) return;
+    if (promotedToplevelMove()) {
+      if (release && windowDragMove.hwnd) return;
+      auto input = *owner;
+      GetCursorPos(&input.screen);
+      if (release) {
+        nativeTouch.finishSystemMove(input.operation, input.screen);
+      } else {
+        moveDraggedWindow(input.screen);
+        input.phase = "motion";
+        sendJson(touchInteractionInput(input));
+      }
+      return;
+    }
+    if (!owner->external) return;
     FileDrag::maybeClaim();
     if (FileDrag::ownsInput()) return;
-    moveDraggedWindow();
     auto input = *owner; input.phase = release ? "up" : "motion";
-    if (GetCursorPos(&input.screen)) sendJson(touchInteractionInput(input));
+    if (GetCursorPos(&input.screen)) {
+      moveDraggedWindow(input.screen);
+      sendJson(touchInteractionInput(input));
+    }
     if (release) windowDrag.released = true;
     return;
   }
@@ -1697,9 +1824,9 @@ void sendWindowDragMotion(bool release = false) {
       return;
     }
   }
-  moveDraggedWindow();
   POINT point{};
   if (!GetCursorPos(&point)) return;
+  moveDraggedWindow(point);
   auto *target = windowDragTarget(point);
   Json motion = {{"type", "pointer"}, {"id", 0}, {"x", 0}, {"y", 0}};
   windowDrag.target = target ? target->id : 0;
@@ -1748,17 +1875,23 @@ LRESULT CALLBACK windowDragMoveMouse(int code, WPARAM wp, LPARAM lp) {
     windowDragMove.buttonUp = true;
   return CallNextHookEx(nullptr, code, wp, lp);
 }
-void startWindowDragMove() {
-  if (!windowDrag.active || windowDrag.touch || windowDrag.released || windowDrag.moveAttempted ||
-      windowDragMove.hwnd || FileDrag::ownsInput() || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
-    return;
+RemoteWindow *draggedToplevel() {
   auto found = windows.find(windowDrag.attached);
-  if (found == windows.end() || found->second->popup || found->second->state.fullscreen)
+  if (found == windows.end() || found->second->popup || found->second->state.fullscreen ||
+      !IsWindowVisible(found->second->hwnd) || IsIconic(found->second->hwnd)) return nullptr;
+  return found->second.get();
+}
+void startWindowDragMove(std::optional<POINT> promotedPoint = {}) {
+  if (!windowDrag.active || (windowDrag.touch && !promotedToplevelMove()) || windowDrag.released ||
+      windowDrag.moveAttempted || windowDragMove.hwnd || FileDrag::ownsInput() ||
+      (!promotedPoint && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)))
     return;
-  HWND hwnd = found->second->hwnd;
-  if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
+  auto *attached = draggedToplevel();
+  if (!attached) return;
+  HWND hwnd = attached->hwnd;
   POINT cursor{};
-  if (!GetCursorPos(&cursor)) return;
+  if (promotedPoint) cursor = *promotedPoint;
+  else if (!GetCursorPos(&cursor)) return;
 
   windowDrag.moveAttempted = true;
   // The modal loop consumes button-up and Escape. Only a mouse release commits a drop.
@@ -1959,11 +2092,14 @@ void sendResize(RemoteWindow *w, bool coalesceMove) {
             {"fullscreen", w->state.fullscreen},
             {"fullscreen_epoch", w->state.fullscreenEpoch}});
 }
-void acknowledge(RemoteWindow *w) {
-  if (w->frame && w->frame->sequence > w->lastAck) {
-    w->lastAck = w->frame->sequence;
+void acknowledge(RemoteWindow *w, uint64_t sequence) {
+  if (sequence > w->lastAck) {
+    w->lastAck = sequence;
     sendJson({{"type", "frame_ack"}, {"id", w->id}, {"sequence", w->lastAck}});
   }
+}
+void acknowledge(RemoteWindow *w) {
+  if (w->frame) acknowledge(w, w->frame->sequence);
 }
 
 uint32_t cursorRoot(RemoteWindow *w) { return w->popup ? w->root : w->id; }
@@ -1990,6 +2126,13 @@ void sendWindowState(RemoteWindow *w) {
   w->state.stateSent = true;
   w->state.lastVisible = visible;
   w->state.lastMinimized = minimized;
+  if (!visible) {
+    if (w->presentation) w->presentation->releaseFrames();
+    acknowledge(w);
+    w->frame.reset();
+    w->deferredResizeFrame.reset();
+    mediaBudget.clearDeferred(w->id);
+  }
   sendJson({{"type", "window_state"},
             {"id", w->id},
             {"visible", visible},
@@ -2044,9 +2187,119 @@ void reconcileWindows() {
   if (modalFocus && IsWindowEnabled(modalFocus))
     SetForegroundWindow(modalFocus);
 }
+void presentWindowFrame(RemoteWindow *w, const std::shared_ptr<DecodedFrame> &frame) {
+  clientStats.record("ui_queue", millis(Clock::now() - frame->decoded));
+  if (semanticsNegotiated &&
+      (!w->state.mapped || (w->shown && (!IsWindowVisible(w->hwnd) || IsIconic(w->hwnd))))) {
+    acknowledge(w, frame->sequence);
+    return;
+  }
+  auto presentStart = Clock::now();
+  RECT client{};
+  GetClientRect(w->hwnd, &client);
+  const RECT picture = fitImageRect(client, frame->width, frame->height, w->state.fullscreen, w->dpi);
+  const bool video = bool(frame->video.texture);
+  bool presented = false;
+  if (w->presentation) {
+    const auto present = [&] {
+      return video ? w->presentation->presentVideo(frame->video.texture.Get(), frame->video.subresource,
+                                                    frame->width, frame->height, frame->alpha, picture,
+                                                    VideoDecoder::hdr(frame->codec))
+                   : w->presentation->present(frame->bgra.data(), frame->width, frame->height, picture);
+    };
+    presented = present();
+    if (!presented && !w->presentation->blockedCost().empty() && w->id == mediaBudget.focused()) {
+      bool reclaimed = false;
+      for (auto &[id, other] : windows)
+        if (id != w->id && other->presentation)
+          reclaimed |= other->presentation->trimVideoCache();
+      if (reclaimed) presented = present();
+    }
+    if (!presented) {
+      const auto blocked = w->presentation->blockedCost();
+      if (!blocked.empty()) {
+        mediaBudget.defer(w->id, blocked, frame->sequence);
+        acknowledge(w, frame->sequence);
+        return;
+      }
+      if (!video) {
+        std::cerr << "Composition presentation failed; switching to buffered GDI (no transparency)\n";
+        w->presentation.reset();
+        SetWindowLongPtrW(w->hwnd, GWL_EXSTYLE,
+                          GetWindowLongPtrW(w->hwnd, GWL_EXSTYLE) & ~WS_EX_NOREDIRECTIONBITMAP);
+        SetWindowPos(w->hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+      }
+    }
+  }
+  if (presented) {
+    frame->video.release();
+    std::vector<uint8_t>{}.swap(frame->alpha);
+    std::vector<uint8_t>{}.swap(frame->bgra);
+    frame->cpuAllocation.reset();
+  } else if (video) {
+    std::cerr << "Video GPU presentation failed; requesting PNG fallback\n";
+    sendJson({{"type", "codec_fallback"},
+              {"id", w->id},
+              {"codec", VideoDecoder::capability(frame->codec)}});
+    return;
+  }
+  mediaBudget.presented(w->id, frame->sequence);
+  w->width = frame->logicalWidth;
+  w->height = frame->logicalHeight;
+  w->pixelWidth = frame->width;
+  w->pixelHeight = frame->height;
+  w->originX = frame->originX;
+  w->originY = frame->originY;
+  clientStats.record("present", millis(Clock::now() - presentStart));
+  if (w->resizePending && frame->logicalWidth == MulDiv(w->lastResizeWidth, 96, w->dpi) &&
+      frame->logicalHeight == MulDiv(w->lastResizeHeight, 96, w->dpi)) {
+    clientStats.record("resize_to_present", millis(Clock::now() - w->resizeSent));
+    w->resizePending = false;
+  }
+  clientStats.report();
+  w->frame = frame;
+  presentedFrames.fetch_add(1, std::memory_order_relaxed);
+  if (w->presentation)
+    acknowledge(w);
+  if (!w->presentation)
+    InvalidateRect(w->hwnd, nullptr, FALSE);
+  if (!w->shown) {
+    w->shown = true;
+    if (w->state.mapped)
+      ShowWindow(w->hwnd, w->popup || windowDrag.active || nativeActivation.enabled() ? SW_SHOWNOACTIVATE : SW_SHOW);
+    reconcileWindows();
+    if (!w->popup) nativeActivation.shown(w->id, w->hwnd);
+    sendWindowState(w);
+    if (!w->popup && grabbedRoot == w->id)
+      SetCapture(w->hwnd);
+  }
+}
+void clearResizePreview(RemoteWindow *w) {
+  w->resizePreview = false;
+  w->deferredResizeFrame.reset();
+  KillTimer(w->hwnd, ResizePreviewTimer);
+}
+void finishResizePreview(RemoteWindow *w) {
+  auto frame = std::move(w->deferredResizeFrame);
+  clearResizePreview(w);
+  if (frame && (!w->frame || frame->sequence > w->frame->sequence))
+    presentWindowFrame(w, frame);
+  else
+    layoutWindowImage(w);
+}
+void finishWindowSizing(RemoteWindow *w) {
+  w->sizing = false;
+  KillTimer(w->hwnd, 1);
+  sendResize(w);
+  if (w->resizePreview && !SetTimer(w->hwnd, ResizePreviewTimer, ResizePreviewSettleMs, nullptr))
+    finishResizePreview(w);
+}
+
 bool acceptsInput(RemoteWindow *w, LPARAM lp) {
   POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
   ScreenToClient(w->hwnd, &point);
+  if (inResizePreviewFill(w, point)) return true;
   RECT r = imageRect(w);
   if (r.right <= r.left || r.bottom <= r.top)
     return true;
@@ -2167,7 +2420,7 @@ void penWindowInteractionSample(const NativePen::WindowInteractionSample &sample
       {"gesture",sample.gesture},{"tool",sample.tool},{"eraser",sample.eraser},{"cancelled",sample.phase == "cancel"}});
   if (sample.phase == "up" || sample.phase == "cancel" || sample.phase == "end") {
     penWindow.end();
-    if (source) { source->sizing=false; KillTimer(source->hwnd,1); sendResize(source); }
+    if (source) finishWindowSizing(source);
   }
 }
 
@@ -2273,13 +2526,14 @@ bool touchOleMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
   }
   return true;
 }
-void tryTouchMove(const NativeTouch::InteractionSample &sample) {
-  if (touchMove.attempted == sample.operation || touchMove.systemWindow ||
-      sample.hwnd != sample.rootWindow || GetForegroundWindow() != sample.hwnd)
-    return;
+bool tryTouchMove(const NativeTouch::InteractionSample &sample) {
+  if (touchMove.attempted == sample.operation)
+    return GetTickCount64() < touchMove.deadline;
+  if (touchMove.systemWindow || sample.hwnd != sample.rootWindow || GetForegroundWindow() != sample.hwnd)
+    return false;
   auto active = nativeTouch.activeInteraction();
   if (!active || active->operation != sample.operation || !nativeTouch.ownsPointer(sample.pointerId))
-    return;
+    return false;
   touchMove.promotion.reset();
   touchMove.attempted = sample.operation;
   touchMove.deadline = GetTickCount64() + 250;
@@ -2290,6 +2544,7 @@ void tryTouchMove(const NativeTouch::InteractionSample &sample) {
     std::cout << "Touch move promotion " << TouchOle::name(result.code) << " error=" << result.error << std::endl;
   if (!result.promoted())
     touchMove.deadline = 0;
+  return result.promoted();
 }
 bool touchMoveMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
   if ((message != WM_LBUTTONDOWN && message != WM_MOUSEMOVE) || touchMove.systemWindow ||
@@ -2324,6 +2579,40 @@ bool touchMoveMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
   touchMove.promotion.reset();
   return true;
 }
+void tryTouchToplevelMove(const NativeTouch::InteractionSample &sample) {
+  if (touchToplevelMove.operation == sample.operation || !windowDrag.touch ||
+      windowDrag.touchOperation != sample.operation || !draggedToplevel() ||
+      FileDrag::current() || GetForegroundWindow() != sample.rootWindow ||
+      !nativeTouch.systemMove(sample.operation, true))
+    return;
+  touchToplevelMove.operation = sample.operation;
+  auto result = touchToplevelMove.promotion.promote(sample.hwnd, sample.pointerId);
+  if (clientStats.enabled)
+    std::cout << "Touch toplevel drag promotion " << TouchOle::name(result.code) << " error=" << result.error << std::endl;
+  if (!result.promoted()) nativeTouch.systemMove(sample.operation, false);
+}
+bool touchToplevelMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
+  if (!touchToplevelMove.promotion.active() || !nativeTouch.promotedMouse(hwnd, extra))
+    return false;
+  auto owner = nativeTouch.activeInteraction();
+  if (!owner || owner->operation != touchToplevelMove.operation) return false;
+  if (!touchToplevelMove.mouseReady) {
+    if (!touchToplevelMove.promotion.takeMouseReady(hwnd, message, keys, extra)) return false;
+    touchToplevelMove.mouseReady = true;
+    SetTimer(controller, WindowDragTimer, 10, nullptr);
+    DWORD position = GetMessagePos();
+    POINT point{GET_X_LPARAM(position), GET_Y_LPARAM(position)};
+    moveDraggedWindow(point);
+    startWindowDragMove(point);
+    if (promotedToplevelMove() && !windowDrag.released &&
+        (GetAsyncKeyState(VK_LBUTTON) & 0x8000) && GetCapture() != controller)
+      SetCapture(controller);
+    return true;
+  }
+  if (message != WM_MOUSEMOVE && message != WM_LBUTTONUP && message != WM_LBUTTONDOWN) return false;
+  if (message != WM_LBUTTONDOWN) sendWindowDragMotion(message == WM_LBUTTONUP);
+  return true;
+}
 void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
   auto found = windows.find(sample.id);
   RemoteWindow *source = found == windows.end() ? nullptr : found->second.get();
@@ -2337,8 +2626,11 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
       }
       if (sample.kind == "move" && !touchMove.systemWindow) touchMove.attempted = 0;
       source->sizing = true;
+      // The promoted mouse down can use the original touch point. Keep that
+      // point over the source HWND until Windows accepts the move or we fall back.
+      POINT position = sample.kind == "move" ? sample.initialScreen : sample.screen;
       if (!touchWindow.begin(source->hwnd,sample.kind,sample.edge,sample.initialWindow,
-                             sample.initialScreen,sample.screen)) {
+                             sample.initialScreen,position)) {
         auto cancel = sample; cancel.phase = "cancel"; sendJson(touchInteractionInput(cancel));
         nativeTouch.endInteraction(sample.operation);
       }
@@ -2346,23 +2638,18 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
     return;
   }
   if (sample.kind == "dnd" && !sample.external && sample.phase == "motion") {
+    if (promotedToplevelMove()) return;
     if (tryTouchOle(sample)) return;
-    auto attached = windows.find(windowDrag.attached);
-    if (windowDrag.touch && attached != windows.end()) {
-      auto *window = attached->second.get(); POINT client{}; RECT outer{};
-      ClientToScreen(window->hwnd,&client); GetWindowRect(window->hwnd,&outer);
-      SetWindowPos(window->hwnd,nullptr,
-        sample.screen.x-MulDiv(windowDrag.offsetX,window->dpi,96)-(client.x-outer.left),
-        sample.screen.y-MulDiv(windowDrag.offsetY,window->dpi,96)-(client.y-outer.top),
-        0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
-    }
+    if (windowDrag.touch && windowDrag.touchOperation == sample.operation) moveDraggedWindow(sample.screen);
+    sendJson(touchInteractionInput(sample));
+    tryTouchToplevelMove(sample);
+    return;
   }
-  if (manipulating && !sample.systemMove && (sample.phase == "motion" || sample.phase == "up"))
-    touchWindow.update(sample.screen);
-  if (sample.kind == "move" && sample.phase == "motion" && !sample.systemMove)
-    tryTouchMove(sample);
-  if ((sample.phase == "motion" && sample.kind == "dnd" && !sample.external) ||
-      sample.phase == "cancel" || sample.phase == "up")
+  if (manipulating && !sample.systemMove && (sample.phase == "motion" || sample.phase == "up")) {
+    bool pending = sample.kind == "move" && sample.phase == "motion" && tryTouchMove(sample);
+    if (!pending) touchWindow.update(sample.screen);
+  }
+  if (sample.phase == "cancel" || sample.phase == "up")
     sendJson(touchInteractionInput(sample));
   if (sample.phase == "up" && sample.external) {
     auto transfer=FileDrag::current();
@@ -2378,6 +2665,16 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
     }
   }
   if (sample.phase == "up" || sample.phase == "cancel" || sample.phase == "end") {
+    if (sample.kind == "dnd" && windowDrag.touchOperation == sample.operation && !sample.external) {
+      windowDrag.released = true;
+      windowDrag.cancelled |= sample.phase == "cancel";
+    }
+    if (touchToplevelMove.operation == sample.operation) {
+      touchToplevelMove.promotion.reset();
+      touchToplevelMove.operation = 0;
+      touchToplevelMove.mouseReady = false;
+      if (sample.phase != "up") stopWindowDragMove();
+    }
     if (sample.phase != "up" || !sample.external) resetTouchOle(sample.operation);
     if (manipulating) {
       touchWindow.end();
@@ -2389,9 +2686,8 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
           DefWindowProcW(sample.rootWindow, WM_CANCELMODE, 0, 0);
       }
       // Native loop exit already sends the final geometry, including Snap.
-      if (source && !(sample.systemMove && touchMove.entered)) {
-        source->sizing=false; KillTimer(source->hwnd,1); sendResize(source);
-      }
+      if (source && !(sample.systemMove && touchMove.entered))
+        finishWindowSizing(source);
     }
   }
 }
@@ -2432,6 +2728,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   }
   if (touchMoveMouse(hwnd, message, wp, ULONG_PTR(GetMessageExtraInfo()))) return 0;
+  if (touchToplevelMouse(hwnd, message, wp, ULONG_PTR(GetMessageExtraInfo()))) return 0;
   if (touchOleMouse(hwnd,message,wp,ULONG_PTR(GetMessageExtraInfo()))) return 0;
   if ((message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) &&
       nativePenFor(w) && nativePen.promotedMouse(hwnd,ULONG_PTR(GetMessageExtraInfo()))) return 0;
@@ -2462,7 +2759,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
                               !w->sizing && !relativeInput.active() && !FileDrag::ownsInput() &&
                               (!grabbedRoot || touchInteractionNegotiated),
                               w->id,rootWindow ? rootWindow->hwnd : hwnd};
-    if (target.enabled && message == WM_POINTERDOWN && rootWindow) SetFocus(rootWindow->hwnd);
+    if (target.enabled && message == WM_POINTERDOWN && rootWindow && !nativeTouch.ownsInteraction()) {
+      POINTER_INPUT_TYPE kind{};
+      if (GetPointerType(GET_POINTERID_WPARAM(wp), &kind) && kind == PT_TOUCH)
+        SetFocus(rootWindow->hwnd);
+    }
     if (nativeTouch.handle(target,message,wp)) return 0;
   }
   if (GetEnvironmentVariableW(L"WAYBRIDGE_IME_TRACE", nullptr, 0) &&
@@ -2500,7 +2801,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_CANCELMODE:
     nativeTouchpad.cancel(hwnd);
     nativePen.cancel(hwnd);
-    nativeTouch.cancel(hwnd);
+    if (windowDragMove.hwnd != hwnd || !windowDragMove.interrupted || !promotedToplevelMove())
+      nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
       releasePointer();
     break;
@@ -2520,8 +2822,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     break;
   case WM_SHOWWINDOW:
     if (!wp) nativeTouchpad.detach(hwnd);
-    if (!wp) { nativePen.cancel(hwnd); nativeTouch.cancel(hwnd); }
-    sendWindowState(w);
+    if (!wp) {
+      nativePen.cancel(hwnd);
+      if (!promotedToplevelMove()) nativeTouch.cancel(hwnd);
+      if (w->resizePreview) {
+        clearResizePreview(w);
+        layoutWindowImage(w);
+      }
+    }
     break;
   case WM_SYSCOMMAND:
     if ((wp & 0xfff0) == SC_MOVE && w->movePending) {
@@ -2549,8 +2857,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     if (relativeInput.active(hwnd))
       releasePointer();
     if (!w->popup) {
-      // WM_SHOWWINDOW arrives before WS_VISIBLE changes. Observe the final
-      // flags here as well, including hide/show without a size change.
+      // WM_SHOWWINDOW arrives before WS_VISIBLE changes. Only report the final
+      // flags, including hide/show without a size change.
       sendWindowState(w);
       for (auto &[id, popup] : windows)
         if (popup->popup && popup->root == w->id)
@@ -2633,14 +2941,12 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   case WM_EXITSIZEMOVE:
     w->moveOriginValid = false;
-    w->sizing = false;
-    KillTimer(hwnd, 1);
-    sendResize(w);
+    finishWindowSizing(w);
     return 0;
   case WM_DESTROY:
     nativeTouchpad.detach(hwnd);
     nativePen.cancel(hwnd);
-    nativeTouch.cancel(hwnd);
+    if (!promotedToplevelMove()) nativeTouch.cancel(hwnd);
     ApplicationIdentity::clear(hwnd);
     w->dropLifetime.reset();
     if (relativeInput.active(hwnd))
@@ -2659,11 +2965,17 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         HBITMAP bitmap = CreateCompatibleBitmap(dc, client.right, client.bottom);
         auto old = SelectObject(memory, bitmap);
         FillRect(memory, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        RECT r = imageRect(w);
+        if (w->resizePreview) {
+          HBRUSH fill = CreateSolidBrush(ResizePreviewColor);
+          for (const auto &piece : resizePreviewFill(client, r))
+            if (!IsRectEmpty(&piece)) FillRect(memory, &piece, fill);
+          DeleteObject(fill);
+        }
         Gdiplus::Bitmap image(w->frame->width, w->frame->height, w->frame->width * 4,
                               PixelFormat32bppPARGB, w->frame->bgra.data());
         {
           Gdiplus::Graphics g(memory);
-          RECT r = imageRect(w);
           g.DrawImage(&image, int(r.left), int(r.top), int(r.right - r.left),
                       int(r.bottom - r.top));
         }
@@ -2686,6 +2998,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     pollGamepads();
     if (w->popup)
       return 0;
+    mediaBudget.focus(w->id);
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", true}});
     if (touchpadNegotiated) nativeTouchpad.focus(hwnd,w->id);
     updateIme();
@@ -2693,7 +3006,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_KILLFOCUS:
     nativeTouchpad.detach(hwnd);
     nativePen.cancel(); nativeGamepads.focus(0);
-    if (auto owner = nativeTouch.activeInteraction(); !owner || owner->kind != "dnd") nativeTouch.cancel();
+    if (auto owner = nativeTouch.activeInteraction(); !owner || owner->kind != "dnd") nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
       releasePointer();
     if (w->popup)
@@ -2702,7 +3015,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     w->ime.cancel(hwnd);
     w->ime.forwardedKeys.clear();
     DestroyCaret();
-    sendJson({{"type", "focus"}, {"id", w->id}, {"focused", false}});
+    // A focus change inside the viewer is reported by the new WM_SETFOCUS.
+    // Check after activation so the server does not revoke a touch down that
+    // is already waiting for the new window's lease.
+    PostMessageW(controller, CheckRemoteFocus, w->id, 0);
     return 0;
   case WM_IME_SETCONTEXT:
     return DefWindowProcW(hwnd, message, wp,
@@ -2814,7 +3130,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_DPICHANGED: {
     nativeTouchpad.cancel(hwnd);
     nativePen.cancel(hwnd);
-    if (touchMove.systemWindow != hwnd) nativeTouch.cancel(hwnd);
+    if (touchMove.systemWindow != hwnd && !promotedToplevelMove()) nativeTouch.cancel(hwnd);
     if (w->popup) {
       positionPopup(w);
       return 0;
@@ -2839,15 +3155,21 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   }
-  case WM_SIZE:
+  case WM_SIZE: {
     nativeTouchpad.resize(hwnd);
     if (!nativePen.ownsWindowInteraction(hwnd)) nativePen.cancel(hwnd);
     if (!nativeTouch.ownsInteraction(hwnd)) nativeTouch.cancel(hwnd);
     sendWindowState(w);
     if (relativeInput.active(hwnd))
       releasePointer();
-    if (w->presentation)
-      w->presentation->layout(imageRect(w));
+    if (wp != SIZE_RESTORED || w->state.fullscreen) {
+      if (w->resizePreview) clearResizePreview(w);
+    } else if (!w->popup && w->frame && w->sizing &&
+               !matchesClientSize(w, w->width, w->height)) {
+      w->resizePreview = true;
+      KillTimer(hwnd, ResizePreviewTimer);
+    }
+    layoutWindowImage(w);
     if (!w->popup && wp != SIZE_MINIMIZED) {
       if (w->sizing)
         SetTimer(hwnd, 1, 120, nullptr);
@@ -2858,7 +3180,13 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     updateIme();
     return 0;
+  }
   case WM_TIMER:
+    if (wp == ResizePreviewTimer) {
+      if (w->resizePreview && !w->sizing) finishResizePreview(w);
+      else KillTimer(hwnd, ResizePreviewTimer);
+      return 0;
+    }
     if (wp == MoveViewportTimer) {
       if (w->moveViewportPending)
         sendResize(w);
@@ -2943,6 +3271,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     bool down = message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN;
+    if ((down || GetCapture() != hwnd) &&
+        inResizePreviewFill(w, {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)})) return 0;
     uint32_t button = (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)   ? 0x110
                       : (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) ? 0x111
                                                                                : 0x112;
@@ -3026,6 +3356,8 @@ void destroyRemote(uint32_t id) {
   auto found = windows.find(id);
   if (found == windows.end())
     return;
+  mediaBudget.clearDeferred(id);
+  if (mediaBudget.focused() == id) mediaBudget.focus(0);
   if (windowDragMove.hwnd == found->second->hwnd) stopWindowDragMove();
   found->second->dropLifetime.reset();
   if (grabbedRoot == id)
@@ -3147,11 +3479,8 @@ void dispatchNetwork() {
       if (!m.value("active", false)) { endWindowDrag(); continue; }
       if (m.value("input","") == "touch") {
         windowDrag.active = true; windowDrag.touch = true;
-        windowDrag.source = m.value("source",0u); windowDrag.attached = m.value("id",0u);
-        windowDrag.offsetX = m.value("offset_x",0); windowDrag.offsetY = m.value("offset_y",0);
-        continue;
-      }
-      if (!windowDrag.active) {
+        windowDrag.touchOperation = m.value("touch_operation", uint64_t(0));
+      } else if (!windowDrag.active) {
         releasePointer();
         windowDrag = {};
         windowDrag.active = true;
@@ -3167,7 +3496,8 @@ void dispatchNetwork() {
       }
       windowDrag.offsetX = m.value("offset_x", 0);
       windowDrag.offsetY = m.value("offset_y", 0);
-      sendWindowDragMotion(!(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
+      if (!windowDrag.touch || promotedToplevelMove())
+        sendWindowDragMotion(!(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
     } else if (type == "window_icon" && iconsNegotiated) {
       if (!m.contains("id") || !m.at("id").is_number_unsigned() || m.at("id").get<uint64_t>() > UINT32_MAX) continue;
       auto found = windows.find(m.at("id").get<uint32_t>());
@@ -3211,8 +3541,11 @@ void dispatchNetwork() {
       sendWindowState(w);
     } else if (type == "touch_interaction") {
       auto operation = m.value("operation",uint64_t(0));
-      if (m.value("kind","") == "end") nativeTouch.endInteraction(operation);
-      else {
+      if (m.value("kind","") == "end") {
+        if (windowDrag.touch && windowDrag.touchOperation == operation)
+          windowDrag.cancelled |= m.value("cancelled", false);
+        nativeTouch.endInteraction(operation);
+      } else {
         auto source = windows.find(m.value("id",uint32_t(0)));
         if (!touchInteractionNegotiated || source == windows.end() || hostedReadOnly ||
             (source->second->state.fullscreen && m.value("kind","") != "dnd")) {
@@ -3279,7 +3612,7 @@ void dispatchNetwork() {
           continue;
         w->dpi = effectiveDpi(hwnd);
         w->presentation = std::make_unique<Presentation>();
-        if (!w->presentation->initialize(hwnd)) {
+        if (!w->presentation->initialize(hwnd, &mediaBudget, id)) {
           w->presentation.reset();
           SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
                             GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & ~WS_EX_NOREDIRECTIONBITMAP);
@@ -3369,7 +3702,7 @@ void dispatchNetwork() {
         if (!hwnd)
           continue;
         w->presentation = std::make_unique<Presentation>();
-        if (!w->presentation->initialize(hwnd)) {
+        if (!w->presentation->initialize(hwnd, &mediaBudget, id)) {
           w->presentation.reset();
           SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
                             GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & ~WS_EX_NOREDIRECTIONBITMAP);
@@ -3501,73 +3834,33 @@ void dispatchNetwork() {
     if (visual.value("type", "") == "drag_visual_reset") dragVisual.reset();
     else dragVisual.receive(visual);
   }
-  for (auto &[id, frame] : pendingFrames) {
+  auto present = [&](uint32_t id, const auto &frame) {
     auto it = windows.find(id);
     if (it == windows.end())
-      continue;
+      return;
     auto *w = it->second.get();
-    if (w->frame && frame->sequence <= w->frame->sequence)
-      continue;
-    w->width = frame->logicalWidth;
-    w->height = frame->logicalHeight;
-    w->pixelWidth = frame->width;
-    w->pixelHeight = frame->height;
-    w->originX = frame->originX;
-    w->originY = frame->originY;
-    clientStats.record("ui_queue", millis(Clock::now() - frame->decoded));
-    if (semanticsNegotiated &&
-        (!w->state.mapped || (w->shown && (!IsWindowVisible(w->hwnd) || IsIconic(w->hwnd))))) {
-      w->frame = frame;
-      acknowledge(w);
-      continue; // retain/decode in order, return hidden-frame credit
-    }
-    auto presentStart = Clock::now();
-    if (frame->video.texture) {
-      if (!w->presentation ||
-          !w->presentation->presentVideo(frame->video.texture.Get(), frame->video.subresource,
-                                         frame->width, frame->height, frame->alpha, imageRect(w),
-                                         VideoDecoder::hdr(frame->codec))) {
-        std::cerr << "Video GPU presentation failed; requesting PNG fallback\n";
-        sendJson({{"type", "codec_fallback"},
-                  {"id", id},
-                  {"codec", VideoDecoder::capability(frame->codec)}});
-        continue;
+    if ((w->frame && frame->sequence <= w->frame->sequence) ||
+        (w->deferredResizeFrame && frame->sequence <= w->deferredResizeFrame->sequence))
+      return;
+    if (w->resizePreview) {
+      if (!matchesClientSize(w, frame->logicalWidth, frame->logicalHeight)) {
+        w->deferredResizeFrame = frame;
+        // Retain at most one decoded frame for apps that return a different size.
+        acknowledge(w, frame->sequence);
+        return;
       }
-    } else if (w->presentation && !w->presentation->present(frame->bgra.data(), frame->width,
-                                                            frame->height, imageRect(w))) {
-      std::cerr << "Composition presentation failed; switching to buffered GDI (no transparency)\n";
-      w->presentation.reset();
-      SetWindowLongPtrW(w->hwnd, GWL_EXSTYLE,
-                        GetWindowLongPtrW(w->hwnd, GWL_EXSTYLE) & ~WS_EX_NOREDIRECTIONBITMAP);
-      SetWindowPos(w->hwnd, nullptr, 0, 0, 0, 0,
-                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+      clearResizePreview(w);
     }
-    clientStats.record("present", millis(Clock::now() - presentStart));
-    if (w->resizePending && frame->logicalWidth == MulDiv(w->lastResizeWidth, 96, w->dpi) &&
-        frame->logicalHeight == MulDiv(w->lastResizeHeight, 96, w->dpi)) {
-      clientStats.record("resize_to_present", millis(Clock::now() - w->resizeSent));
-      w->resizePending = false;
-    }
-    clientStats.report();
-    w->frame = frame;
-    presentedFrames.fetch_add(1, std::memory_order_relaxed);
-    if (w->presentation)
-      acknowledge(w);
-    if (!w->presentation)
-      InvalidateRect(w->hwnd, nullptr, FALSE);
-    if (!w->shown) {
-      w->shown = true;
-      if (w->state.mapped)
-        ShowWindow(w->hwnd, w->popup || windowDrag.active || nativeActivation.enabled() ? SW_SHOWNOACTIVATE : SW_SHOW);
-      reconcileWindows();
-      if (!w->popup) nativeActivation.shown(w->id, w->hwnd);
-      sendWindowState(w);
-      if (!w->popup && grabbedRoot == w->id)
-        SetCapture(w->hwnd);
-    }
+    presentWindowFrame(w, frame);
+  };
+  auto foreground = pendingFrames.find(mediaBudget.focused());
+  if (foreground != pendingFrames.end()) {
+    present(foreground->first, foreground->second);
+    pendingFrames.erase(foreground);
   }
-  moveDraggedWindow();
-  if (windowDrag.active && !windowDrag.touch && !windowDrag.released && windowDrag.attached &&
+  for (auto &[id, frame] : pendingFrames) present(id, frame);
+  syncDraggedWindowPosition();
+  if (windowDrag.active && (!windowDrag.touch || promotedToplevelMove()) && !windowDrag.released && windowDrag.attached &&
       !windowDrag.moveAttempted && !windowDragMove.hwnd)
     PostMessageW(controller, StartWindowDragMove, 0, 0);
   updateIme();
@@ -3712,9 +4005,17 @@ void publishHostedStatus() {
     wchar_t title[256]{}; GetWindowTextW(w->hwnd,title,256);
     list.push_back({{"id",id},{"title",utf8(title)},{"app_id",w->appId},{"width",w->width},{"height",w->height},
       {"codec",w->frame?(VideoDecoder::videoKind(w->frame->codec)?VideoDecoder::name(w->frame->codec):"PNG"):"等待画面"},
-      {"hardware_decode",bool(w->frame&&w->frame->video.texture)},{"presentation",w->presentation?"D3D11 / DirectComposition":"GDI"}});
+      {"hardware_decode",bool(w->frame && VideoDecoder::videoKind(w->frame->codec))},{"presentation",w->presentation?"D3D11 / DirectComposition":"GDI"}});
   }
   Json status=professionalInputStatus();
+  const auto budget = mediaBudget.snapshot();
+  status["media_budget"] = {{"cpu_reserved_bytes", budget.used.cpu},
+                            {"gpu_estimated_bytes", budget.used.gpu},
+                            {"decoder_slots", budget.used.decoders},
+                            {"peak_cpu_reserved_bytes", budget.highWater.cpu},
+                            {"peak_gpu_estimated_bytes", budget.highWater.gpu},
+                            {"peak_decoder_slots", budget.highWater.decoders},
+                            {"admission_denials", budget.denied}};
   status.update({{"type","status"},{"uptime_ms",GetTickCount64()},{"tcp_bytes",networkBytes.load()},
     {"presented_updates",presentedFrames.load()},{"windows",list},{"background",remoteTray.background()},
     {"touch_supported",touchNegotiated},{"touch_live_supported",touchSettingsNegotiated},
@@ -3778,6 +4079,16 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       startWindowDragMove();
       return 0;
     }
+    if (message == CheckRemoteFocus) {
+      HWND focus = GetFocus();
+      if (std::none_of(windows.begin(), windows.end(), [focus](const auto &entry) {
+            return !entry.second->popup && entry.second->hwnd == focus;
+          })) {
+        mediaBudget.focus(0);
+        sendJson({{"type", "focus"}, {"id", uint32_t(wp)}, {"focused", false}});
+      }
+      return 0;
+    }
     if (windowDrag.active) {
       if (message == WM_MOUSEMOVE) { sendWindowDragMotion(); return 0; }
       if (message == WM_LBUTTONUP) { sendWindowDragMotion(true); return 0; }
@@ -3833,9 +4144,15 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     if (message == WM_TIMER) {
       remoteTray.tick();
-      for (auto &entry : windows)
+      bool refresh = false;
+      for (auto &entry : windows) {
         if (!entry.second->popup)
           sendColorMode(entry.second.get());
+        auto *window = entry.second.get();
+        if (window->state.mapped && (!window->shown || (IsWindowVisible(window->hwnd) && !IsIconic(window->hwnd))))
+          refresh |= mediaBudget.takeRefresh(entry.first);
+      }
+      if (refresh) sendJson({{"type", "refresh"}});
       VirtualFiles::tick();
       sendJson({{"type", "ping"}, {"nonce", GetTickCount64()}});
       clientStats.report();

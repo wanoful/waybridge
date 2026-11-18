@@ -19,15 +19,29 @@ static POINTER_TOUCH_INFO contact(UINT id,POINT point,POINTER_FLAGS flags){
 }
 static bool belongs(HWND window,DWORD process){DWORD actual=0;GetWindowThreadProcessId(window,&actual);return actual==process;}
 int wmain(int argc,wchar_t **argv){
-  HWND previous=GetForegroundWindow(),window=nullptr;Json result;
+  HWND previous=GetForegroundWindow(),window=nullptr,localPeer=nullptr;Json result;
   std::array<POINTER_TOUCH_INFO,2> held{};UINT heldCount=0;
   try{
     bool expectSnap=argc==4&&std::wstring(argv[3])==L"--expect-snap";
     require(argc==3||expectSnap,"expected PID and exact fixture title");DWORD process=wcstoul(argv[1],nullptr,10);
     require(process!=0,"invalid fixture PID");
-    for(int i=0;i<100&&!window;++i){window=FindWindowW(L"WaybridgeRemote",argv[2]);if(!window)Sleep(100);}
-    require(window&&belongs(window,process),"exact production fixture window unavailable");
+    const auto peerTitle=std::wstring(argv[2])+L"-peer";
+    HWND peer=nullptr;
+    for(int i=0;i<100;++i){
+      window=FindWindowW(L"WaybridgeRemote",argv[2]);
+      peer=FindWindowW(L"WaybridgeRemote",peerTitle.c_str());
+      if(IsWindowVisible(window)&&IsWindowVisible(peer))break;
+      Sleep(100);
+    }
+    require(IsWindowVisible(window)&&belongs(window,process),"exact production fixture window unavailable");
+    require(IsWindowVisible(peer)&&belongs(peer,process),"exact second fixture window unavailable");
+    LASTINPUTINFO last{sizeof(last),0};
+    require(GetLastInputInfo(&last)&&DWORD(GetTickCount()-last.dwTime)>30000,"fixture desktop is in use");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    MONITORINFO desktop{};desktop.cbSize=sizeof(desktop);
+    require(GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&desktop),"fixture monitor unavailable");
+    require(SetWindowPos(peer,HWND_TOPMOST,desktop.rcWork.right-260,desktop.rcWork.top+60,220,220,
+                         SWP_NOACTIVATE|SWP_SHOWWINDOW),"could not place the second fixture");
     ShowWindow(window,SW_RESTORE);SetWindowPos(window,HWND_TOPMOST,160,120,0,0,SWP_NOSIZE|SWP_SHOWWINDOW);
     DWORD foregroundThread=GetWindowThreadProcessId(GetForegroundWindow(),nullptr);
     MSG message{};PeekMessageW(&message,nullptr,0,0,PM_NOREMOVE);
@@ -68,9 +82,11 @@ int wmain(int argc,wchar_t **argv){
     // assigns its own pointer identities to the receiving process.
     inject({contact(0,p,down)});Sleep(150);inject({contact(0,q,motion)});Sleep(150);inject({contact(0,q,POINTER_FLAG_UP)});Sleep(250);
     RECT before{};GetWindowRect(window,&before);
-    p=sample(3);q={p.x+90,p.y+45};POINT second{p.x+24,p.y+20};
+    p=sample(3);q={p.x+90,p.y+45};POINT second{100,100};ClientToScreen(peer,&second);
+    require(WindowFromPoint(second)==peer,"second touch fixture is occluded");
     inject({contact(0,p,down)});Sleep(300);
     inject({contact(0,p,motion),contact(1,second,down)});Sleep(100);
+    require(GetForegroundWindow()==window,"secondary touch moved focus during the first window's drag");
     POINT intermediate{p.x+40,p.y+20};
     inject({contact(0,intermediate,motion),contact(1,second,motion)});Sleep(150);
     inject({contact(0,intermediate,motion),contact(1,second,POINTER_FLAG_UP)});Sleep(100);
@@ -92,6 +108,45 @@ int wmain(int argc,wchar_t **argv){
             abs((resized.bottom-resized.top)-(before.bottom-before.top)-50)<=3,"touch resize dimensions incorrect");
     // The next independent normal touch proves the lease/contact state recovers.
     p=sample(1);inject({contact(0,p,down)});Sleep(100);inject({contact(0,p,POINTER_FLAG_UP)});Sleep(150);
+    localPeer=CreateWindowW(L"STATIC",L"Waybridge touch focus fixture",WS_OVERLAPPEDWINDOW,
+                            0,0,200,120,nullptr,nullptr,nullptr,nullptr);
+    require(localPeer!=nullptr,"local focus fixture unavailable");
+    for(auto previousFocus : {peer,localPeer}) {
+      ShowWindow(previousFocus,SW_SHOWNOACTIVATE);
+      SetForegroundWindow(previousFocus);
+      Sleep(150);
+      require(GetForegroundWindow()==previousFocus,"fixture lost the previous foreground window");
+      GetWindowRect(window,&before);
+      p=sample(3);q={p.x+65,p.y+38};
+      inject({contact(0,p,down)});Sleep(250);
+      inject({contact(0,q,motion)});Sleep(200);
+      inject({contact(0,q,POINTER_FLAG_UP)});Sleep(250);
+      GetWindowRect(window,&moved);
+      result[previousFocus==peer?"remote_focus_handoff":"local_focus_handoff"]={
+        {"before",rect(before)},{"after",rect(moved)},{"foreground",GetForegroundWindow()==window}};
+      require(GetForegroundWindow()==window&&abs(moved.left-before.left-65)<=3&&
+              abs(moved.top-before.top-38)<=3,"first touch did not both focus and move the fixture");
+    }
+    GetWindowRect(window,&before);
+    require(SetWindowPos(peer,HWND_TOPMOST,before.left-70,before.top-60,
+                         before.right-before.left+150,before.bottom-before.top+110,SWP_NOACTIVATE),
+            "could not place the second fixture behind the first");
+    require(SetWindowPos(window,HWND_TOPMOST,0,0,before.right-before.left+30,before.bottom-before.top-40,
+                         SWP_NOMOVE|SWP_NOACTIVATE),"could not resize the fixture");
+    SetForegroundWindow(window);Sleep(650);
+    GetWindowRect(window,&before);
+    p={24,145};ClientToScreen(window,&p);
+    require(GetForegroundWindow()==window&&WindowFromPoint(p)==window,"edge touch is outside the foreground fixture");
+    inject({contact(0,p,down)});Sleep(120);
+    for(int dx : {36,45,54,63,72,81}) {
+      q={p.x+dx,p.y+dx/2};inject({contact(0,q,motion)});Sleep(75);
+      require(GetForegroundWindow()==window,"promoted touch activated the window behind the drag");
+    }
+    inject({contact(0,q,POINTER_FLAG_UP)});Sleep(400);
+    GetWindowRect(window,&moved);
+    result["resize_then_edge_drag"]={{"before",rect(before)},{"after",rect(moved)},
+                                     {"foreground",GetForegroundWindow()==window}};
+    require(GetForegroundWindow()==window&&moved.left>before.left+55,"edge touch failed to move the resized window");
     if(expectSnap){
       BOOL arranging=FALSE;
       require(SystemParametersInfoW(SPI_GETWINARRANGING,0,&arranging,0)&&arranging,"Windows Snap must be enabled for this opt-in probe");
@@ -140,6 +195,7 @@ int wmain(int argc,wchar_t **argv){
     result["ok"]=true;result["production_pid"]=process;
   }catch(const std::exception &error){result["ok"]=false;result["error"]=error.what();result["win32_error"]=GetLastError();}
   if(heldCount){for(UINT i=0;i<heldCount;++i)held[i].pointerInfo.pointerFlags=POINTER_FLAG_UP|POINTER_FLAG_CANCELED;InjectTouchInput(heldCount,held.data());}
+  if(localPeer)DestroyWindow(localPeer);
   if(previous&&IsWindow(previous))SetForegroundWindow(previous);
   std::cout<<result.dump()<<'\n';return result.value("ok",false)?0:1;
 }

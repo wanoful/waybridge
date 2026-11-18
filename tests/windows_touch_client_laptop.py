@@ -40,21 +40,23 @@ def main():
 
     def remote(code, check=True):
         encoded = base64.b64encode(code.encode('utf-16-le')).decode()
-        result = subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', args.host,
+        result = subprocess.run(['ssh', *ssh_options, args.host,
                                  'powershell -NoProfile -NonInteractive -EncodedCommand ' + encoded],
                                 capture_output=True, text=True, errors='replace', timeout=35)
         if check:
             assert result.returncode == 0, result.stdout + result.stderr
         return result.stdout.strip()
 
-    destination = remote('[IO.Path]::GetTempPath()').rstrip('\\') + '\\' + key
-    quoted = destination.replace("'", "''")
     children = []
     evidence = ROOT/'build/tests/touch-client-laptop'
     evidence.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='wb-touch-client-') as directory, \
             SessionFixture(Path(directory)/'fixture') as fixture, \
             (evidence/'server.log').open('w+') as server_log, (evidence/'app.log').open('w+') as app_log:
+        ssh_options = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ControlMaster=auto',
+                       '-o', 'ControlPersist=15', '-o', f'ControlPath={directory}/ssh']
+        destination = remote('[IO.Path]::GetTempPath()').rstrip('\\') + '\\' + key
+        quoted = destination.replace("'", "''")
         runtime = Path(fixture.env['XDG_RUNTIME_DIR'])
         token = 'touch-client-' + uuid.uuid4().hex
         token_path = runtime/'touch-token'
@@ -77,16 +79,16 @@ def main():
             assert server.poll() is None and (runtime/'touch-client-0').exists(), (evidence/'server.log').read_text()
             app = subprocess.Popen([str(build/'app')], env=env, stdout=app_log, stderr=app_log)
             children.append(app)
+            peer = subprocess.Popen([str(build/'app')], env={**env, 'WAYBRIDGE_TOUCH_FIXTURE_TITLE': key+'-peer'},
+                                    stdout=app_log, stderr=app_log)
+            children.append(peer)
             remote("[IO.Directory]::CreateDirectory('" + quoted + "') | Out-Null")
             for source, name in [(args.client, 'viewer.exe'), (build/'driver.exe', 'driver.exe')]:
-                subprocess.run(['scp', '-q', str(source), args.host + ':' + destination.replace('\\', '/') + '/' + name],
+                subprocess.run(['scp', '-q', *ssh_options, str(source), args.host + ':' + destination.replace('\\', '/') + '/' + name],
                                check=True, timeout=35)
             remote_port = int(remote('$l=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$l.Start();$p=$l.LocalEndpoint.Port;$l.Stop();$p'))
-            tunnel = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', '-o', 'ExitOnForwardFailure=yes', '-N', '-R',
-                                       f'127.0.0.1:{remote_port}:127.0.0.1:{port}', args.host], stdout=server_log, stderr=server_log)
-            children.append(tunnel)
-            time.sleep(.3)
-            assert tunnel.poll() is None
+            subprocess.run(['ssh', *ssh_options, '-O', 'forward', '-R',
+                            f'127.0.0.1:{remote_port}:127.0.0.1:{port}', args.host], check=True, timeout=20)
             remote(r'''
 $ErrorActionPreference='Stop';$root='@ROOT@';$name='@KEY@'
 $run=@'
@@ -95,6 +97,7 @@ $env:WAYBRIDGE_DPI='96';$env:WAYBRIDGE_NO_AUDIO='1';$env:WAYBRIDGE_STATS='1'
 Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public static class Foreground { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd); }'
 $previous=[Foreground]::GetForegroundWindow()
 try {
+ if (Get-Process LogonUI,waybridge-client -ErrorAction SilentlyContinue | Where-Object {$_.SessionId -eq (Get-Process -Id $PID).SessionId}) {throw 'Locked desktop or live viewer'}
  $worker=Start-Process ($root+'\viewer.exe') -NoNewWindow -ArgumentList @('127.0.0.1','@PORT@','@TOKEN@','--touch') -PassThru -RedirectStandardOutput ($root+'\viewer.txt') -RedirectStandardError ($root+'\viewer-err.txt')
  Start-Sleep -Seconds 2
  $driverArgs=@([string]$worker.Id,'@KEY@')
@@ -123,20 +126,22 @@ Start-ScheduledTask -TaskName $name
                     result = json.loads(inventory)
                     assert result['ok'] is True, result
                     text = (evidence/'app.log').read_text()
-                    assert text.count('CLIENT_TOUCH_DOWN 0 ') == (5 if args.expect_snap else 4), text
+                    assert text.count('CLIENT_TOUCH_DOWN 0 ') == (8 if args.expect_snap else 7), text
                     # The second down can arrive before the first move handoff
                     # has reached Windows. Its own move request then races the
                     # active operation. The driver checks that it cannot move
                     # or release the first finger's HWND.
                     secondary = text.count('CLIENT_TOUCH_DOWN 1 ')
                     assert secondary in (0, 1) and text.count('CLIENT_TOUCH_DOWN ') == (
-                        (5 if args.expect_snap else 4) + secondary), text
-                    assert text.count('CLIENT_REQUEST_MOVE\n') == (2 if args.expect_snap else 1) + secondary, text
+                        (8 if args.expect_snap else 7) + secondary), text
+                    assert text.count('CLIENT_REQUEST_MOVE\n') == (5 if args.expect_snap else 4) + secondary, text
                     assert text.count('CLIENT_REQUEST_RESIZE\n') == 1, text
                     assert text.count('CLIENT_TOUCH_UP 0\n') == 2 and 'CLIENT_TOUCH_MOTION ' in text, text
-                    assert app.poll() is None and server.poll() is None
+                    assert app.poll() is None and peer.poll() is None and server.poll() is None
                     print(json.dumps(result, indent=2))
                     print('PASS: real PT_TOUCH through production client -> live wl_touch, owner-preserving xdg move/resize, second-finger isolation and fresh touch recovery')
+                    print('PASS: first touch both focuses and moves a streamed window from remote and local foreground')
+                    print('PASS: a delayed move after resize keeps touch focus over an overlapping window')
                     if args.expect_snap:
                         print('PASS: app-confirmed single-contact move triggered Windows edge Snap')
                     return
@@ -144,6 +149,7 @@ Start-ScheduledTask -TaskName $name
             raise AssertionError('Production touch injection timed out; see ' + str(evidence))
         finally:
             remote("$root='" + quoted + "';$name='" + key + "';Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue|Unregister-ScheduledTask -Confirm:$false;Get-CimInstance Win32_Process|Where-Object{$_.ExecutablePath -and $_.ExecutablePath.StartsWith($root+'\\',[StringComparison]::OrdinalIgnoreCase)}|ForEach-Object{Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue};Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue", check=False)
+            subprocess.run(['ssh', *ssh_options, '-O', 'exit', args.host], capture_output=True, timeout=10)
             for child in reversed(children):
                 if child.poll() is None:
                     child.terminate()

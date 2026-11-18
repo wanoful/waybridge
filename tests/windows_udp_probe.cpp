@@ -90,6 +90,9 @@ SOCKET connectTo(const char *port) {
   if (connect(s, a->ai_addr, int(a->ai_addrlen))) {
     closesocket(s);
     s = INVALID_SOCKET;
+  } else {
+    int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&one), sizeof(one));
   }
   freeaddrinfo(a);
   return s;

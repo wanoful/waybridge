@@ -1,6 +1,7 @@
 #pragma once
 #include "graphics.h"
 #include "media_foundation.h"
+#include "media_budget.h"
 #include "h264_bitstream.h"
 #include "video_capability_samples.h"
 #include "hdr_capability_samples.h"
@@ -16,17 +17,27 @@
 #include <vector>
 
 struct VideoSurface {
+  // A retained sample can keep the decoder's D3D11 output pool alive.
+  std::shared_ptr<WindowMediaBudget::Lease> allocation;
   ComPtr<IMFSample> sample;
   ComPtr<ID3D11Texture2D> texture;
   UINT subresource = 0;
   uint64_t sequence = 0;
+
+  void release() {
+    texture.Reset();
+    sample.Reset();
+    allocation.reset();
+  }
 };
 class VideoDecoder {
+  std::shared_ptr<WindowMediaBudget::Lease> allocation;
   std::shared_ptr<GraphicsDevice> gpu;
   ComPtr<IMFTransform> transform;
   ComPtr<IMFDXGIDeviceManager> manager;
   UINT width, height;
   uint8_t kind;
+  uint32_t window;
   void check(HRESULT hr, const char *where) {
     if (FAILED(hr))
       throw std::runtime_error(std::string(where) + " failed: " + std::to_string(unsigned(hr)));
@@ -71,6 +82,7 @@ class VideoDecoder {
       ComPtr<IMFDXGIBuffer> dxgi;
       check(buffer.As(&dxgi), "Video hardware texture");
       VideoSurface frame;
+      frame.allocation = allocation;
       frame.sample = sample;
       check(dxgi->GetResource(IID_PPV_ARGS(&frame.texture)), "Video texture resource");
       check(dxgi->GetSubresourceIndex(&frame.subresource), "Video texture slice");
@@ -86,6 +98,11 @@ public:
     return width == w && height == h && kind == codec;
   }
   uint64_t pixels() const { return uint64_t(width) * height; }
+  uint32_t owner() const { return window; }
+  static WindowMediaBudget::Cost estimatedCost(UINT w, UINT h, uint8_t codec) {
+    // Estimate the decoder working set, including reference and output surfaces.
+    return WindowMediaBudget::decoderCost(uint64_t(w) * h, hdr(codec));
+  }
   void restart() {
     check(transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0), "Video flush epoch");
     check(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "Video restart epoch");
@@ -153,8 +170,9 @@ public:
       return false;
     }
   }
-  VideoDecoder(UINT w, UINT h, uint8_t codec = 2)
-      : gpu(GraphicsDevice::get()), width(w), height(h), kind(codec) {
+  VideoDecoder(UINT w, UINT h, uint8_t codec = 2, uint32_t owner = 0,
+               std::shared_ptr<WindowMediaBudget::Lease> lease = {})
+      : allocation(std::move(lease)), gpu(GraphicsDevice::get()), width(w), height(h), kind(codec), window(owner) {
     if (!gpu || !gpu->hardware)
       throw std::runtime_error("D3D11 hardware device unavailable");
     if (kind == 2) {

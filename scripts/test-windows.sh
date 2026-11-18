@@ -9,6 +9,7 @@ cargo build --workspace --locked
 cmake -S client -B build/windows -G Ninja -DCMAKE_TOOLCHAIN_FILE=mingw.cmake -DCMAKE_BUILD_TYPE=Release
 cmake --build build/windows --target waybridge-client
 python3 tests/windows_monitor_smoke.py
+python3 tests/windows_resize_preview_smoke.py
 python3 tests/windows_app_icon_smoke.py
 python3 tests/windows_touch_smoke.py
 python3 tests/windows_pen_smoke.py
@@ -22,6 +23,8 @@ python3 tests/windows_drop_lifetime_smoke.py
 python3 tests/windows_text_drag_lifetime_smoke.py
 c++ -std=c++17 -Wall -Wextra -Werror -pthread tests/ordered_sender_probe.cpp -o build/tests/ordered-sender-probe
 build/tests/ordered-sender-probe
+c++ -std=c++17 -Wall -Wextra -Werror -pthread tests/windows_media_budget_probe.cpp -o build/tests/windows-media-budget-probe
+build/tests/windows-media-budget-probe
 python3 tests/windows_tls_smoke.py
 python3 tests/udp_adaptive_smoke.py
 python3 tests/windows_direct_smoke.py

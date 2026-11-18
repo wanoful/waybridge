@@ -78,6 +78,9 @@ struct Session {
     encoder: Option<nvenc::Encoder>,
     lease: Option<Lease>,
     touched: Instant,
+    bitrate: u32,
+    rate_since: Instant,
+    recovery_since: Option<Instant>,
     failed: bool,
     epoch: u32,
     force_idr: bool,
@@ -88,6 +91,52 @@ struct Session {
 const MAX_IDLE_ENCODERS: usize = 2;
 const MAX_IDLE_PIXELS: u64 = 4 * 1024 * 1024;
 const MAX_RAW_BYTES: usize = 128 * 1024 * 1024;
+const ACTIVE_VIDEO_WINDOW: Duration = Duration::from_secs(2);
+const MIN_ENCODER_KBPS: u64 = 1_000;
+const BACKOFF_INTERVAL: Duration = Duration::from_millis(500);
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
+
+fn target_bitrate(configured: u32, pacing: Option<u64>, active_windows: usize) -> u32 {
+    let Some(pacing) = pacing else {
+        return configured;
+    };
+    // Budget some headroom for FEC, headers, alpha and bitrate bursts.
+    let share = pacing.saturating_mul(3) / 4 / active_windows.max(1) as u64;
+    share.max(MIN_ENCODER_KBPS).min(u64::from(configured)) as u32
+}
+
+fn next_bitrate(current: u32, target: u32, held: Duration) -> u32 {
+    if target < current
+        && held >= BACKOFF_INTERVAL
+        && (current - target >= current / 10 || held >= RECOVERY_INTERVAL)
+    {
+        target
+    } else if target > current && held >= RECOVERY_INTERVAL {
+        target.min(current.saturating_add((current / 5).max(500)))
+    } else {
+        current
+    }
+}
+
+impl Session {
+    fn choose_bitrate(&mut self, target: u32, now: Instant) -> u32 {
+        if self.failed {
+            return self.bitrate;
+        }
+        if self.encoder.is_none() {
+            return target;
+        }
+        // A brief transport recovery can be followed by another backoff.
+        // Wait for sustained headroom before spending another encoder restart.
+        let since = if target > self.bitrate {
+            *self.recovery_since.get_or_insert(now)
+        } else {
+            self.recovery_since = None;
+            self.rate_since
+        };
+        next_bitrate(self.bitrate, target, now.duration_since(since))
+    }
+}
 
 impl Queue {
     fn fits(&self, bytes: usize) -> bool {
@@ -232,20 +281,47 @@ impl Encoder {
                 }
                 let mut queue_wait = frame.enqueued.elapsed();
                 if use_video {
+                    let now = Instant::now();
                     let same_owner = |s: &Session| {
                         s.owner
                             .upgrade()
                             .is_some_and(|peer| Arc::ptr_eq(&peer, &frame.peer))
                     };
+                    let pacing = frame.peer.udp_video_rate();
+                    let active_windows = 1 + if pacing.is_some() {
+                        sessions
+                            .iter()
+                            .filter(|(id, s)| {
+                                **id != frame.id
+                                    && s.encoder.is_some()
+                                    && now.duration_since(s.touched) < ACTIVE_VIDEO_WINDOW
+                                    && same_owner(s)
+                            })
+                            .count()
+                    } else {
+                        0
+                    };
+                    let target = target_bitrate(bitrate, pacing, active_windows);
+                    let (selected_bitrate, rate_changed) = sessions
+                        .get_mut(&frame.id)
+                        .filter(|s| same_owner(s))
+                        .map_or((target, false), |s| {
+                            let selected = s.choose_bitrate(target, now);
+                            (selected, s.bitrate != selected)
+                        });
                     let recreate = sessions.get(&frame.id).is_none_or(|s| {
                         s.width != frame.width
                             || s.height != frame.height
                             || s.codec != selected_codec
                             || s.input_key != frame.input_key()
                             || !same_owner(s)
-                    });
+                    }) || rate_changed;
                     if recreate {
                         epoch = epoch.wrapping_add(1);
+                        // Release obsolete bitrate variants before acquiring a lease.
+                        idle.retain(|(id, s)| {
+                            *id != frame.id || (same_owner(s) && s.bitrate == selected_bitrate)
+                        });
                         let cached = idle.iter().position(|(id, s)| {
                             *id == frame.id
                                 && s.width == frame.width
@@ -256,7 +332,10 @@ impl Encoder {
                         });
                         let mut next = cached.map(|index| idle.remove(index).unwrap().1);
                         if let Some(previous) = sessions.remove(&frame.id) {
-                            if previous.encoder.is_some() && same_owner(&previous) {
+                            if previous.encoder.is_some()
+                                && same_owner(&previous)
+                                && previous.bitrate == selected_bitrate
+                            {
                                 idle.push_back((frame.id, previous));
                                 trim_idle(&mut idle);
                             }
@@ -278,13 +357,18 @@ impl Encoder {
                             owner: Arc::downgrade(&frame.peer),
                             encoder: None,
                             lease: None,
-                            touched: Instant::now(),
+                            touched: now,
+                            bitrate: selected_bitrate,
+                            rate_since: now,
+                            recovery_since: None,
                             failed: false,
                             epoch,
                             force_idr: true,
                         });
                         next.epoch = epoch;
                         next.force_idr = true;
+                        next.rate_since = now;
+                        next.recovery_since = None;
                         sessions.insert(frame.id, next);
                     }
                     let session = sessions.get_mut(&frame.id).unwrap();
@@ -309,7 +393,7 @@ impl Encoder {
                                         frame.width,
                                         frame.height,
                                         fps,
-                                        bitrate,
+                                        session.bitrate,
                                         gpu,
                                     )
                                 } else {
@@ -318,7 +402,7 @@ impl Encoder {
                                         frame.width,
                                         frame.height,
                                         fps,
-                                        bitrate,
+                                        session.bitrate,
                                     )
                                 }
                             };
@@ -338,6 +422,10 @@ impl Encoder {
                                         height = frame.height,
                                         codec = selected_codec.name(),
                                         input = if frame.gpu.is_some() { "cuda" } else { "cpu" },
+                                        bitrate_kbps = session.bitrate,
+                                        udp_pacing_kbps = pacing,
+                                        active_windows,
+                                        epoch = session.epoch,
                                         "NVENC ultra-low-latency encoder active"
                                     );
                                 }
@@ -415,6 +503,7 @@ impl Encoder {
                             Ok((color, key)) => {
                                 session.force_idr = false;
                                 metrics::record("nvenc", started.elapsed());
+                                metrics::gauge("video_target_kbps", session.bitrate as usize);
                                 let mask = if alpha.is_empty() {
                                     vec![]
                                 } else {
@@ -628,4 +717,33 @@ fn png(
     PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive)
         .write_image(bytes, width, height, kind)?;
     Ok(png)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_video_share_reserves_headroom_and_caps_each_window() {
+        assert_eq!(target_bitrate(30_000, None, 3), 30_000);
+        assert_eq!(target_bitrate(30_000, Some(80_000), 1), 30_000);
+        assert_eq!(target_bitrate(30_000, Some(80_000), 3), 20_000);
+        assert_eq!(target_bitrate(30_000, Some(8_000), 1), 6_000);
+        assert_eq!(target_bitrate(30_000, Some(8_000), 2), 3_000);
+        assert_eq!(target_bitrate(30_000, Some(1_000), 3), 1_000);
+        assert_eq!(target_bitrate(2_000, Some(20_000), 1), 2_000);
+    }
+
+    #[test]
+    fn video_rate_changes_have_hysteresis_and_recover_in_steps() {
+        let ms = Duration::from_millis;
+        assert_eq!(next_bitrate(6_000, 4_500, ms(499)), 6_000);
+        assert_eq!(next_bitrate(6_000, 4_500, ms(500)), 4_500);
+        assert_eq!(next_bitrate(6_000, 5_950, ms(500)), 6_000);
+        assert_eq!(next_bitrate(6_000, 5_950, ms(2_000)), 5_950);
+        assert_eq!(next_bitrate(4_500, 6_000, ms(1_999)), 4_500);
+        assert_eq!(next_bitrate(4_500, 6_000, ms(2_000)), 5_400);
+        assert_eq!(next_bitrate(5_400, 6_000, ms(2_000)), 6_000);
+        assert_eq!(next_bitrate(1_000, 3_000, ms(2_000)), 1_500);
+    }
 }
