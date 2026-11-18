@@ -2,6 +2,8 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Markup;
 using Microsoft.UI.Xaml.XamlTypeInfo;
 using System.Runtime.CompilerServices;
+using System.Security;
+using Waybridge.Control.Core;
 
 namespace Waybridge.Control;
 
@@ -14,16 +16,39 @@ internal static class Program
         StartupDiagnostics.Install();
         try
         {
+            AppLaunchLink? launchLink = null;
+            if (args.Length > 0 && (args[0] != "--launch-link" || args.Length != 2 ||
+                !AppLaunchLink.TryParse(args[1], out launchLink)))
+            {
+                TrayIcon.ShowLinkError("应用链接无效。请在 Waybridge 中重新复制应用链接或创建快捷方式。");
+                Environment.ExitCode = 2;
+                return;
+            }
             StartupDiagnostics.Write("acquiring single-instance mutex");
             instance = new Mutex(true, @"Local\Waybridge.ControlCenter", out bool first);
-            if (!first) { StartupDiagnostics.Write("another control center is running; forwarding activation"); TrayIcon.ShowExisting(); return; }
-            StartGui();
+            if (!first)
+            {
+                StartupDiagnostics.Write("another control center is running; forwarding activation");
+                if (launchLink is null) TrayIcon.ShowExisting();
+                else if (!TrayIcon.ForwardLaunchLink(launchLink))
+                {
+                    TrayIcon.ShowLinkError("Waybridge 暂时无法接收应用链接，请稍后重试。");
+                    Environment.ExitCode = 1;
+                }
+                return;
+            }
+            try { AppShortcuts.RegisterProtocol(); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or SecurityException)
+            {
+                StartupDiagnostics.Write("unable to register the Waybridge URI protocol: " + error.Message);
+            }
+            StartGui(launchLink);
             StartupDiagnostics.Write("application loop exited normally");
         }
         catch (Exception error) { StartupDiagnostics.Fatal("Program.Main", error); Environment.ExitCode = 1; }
     }
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void StartGui()
+    private static void StartGui(AppLaunchLink? launchLink)
     {
         StartupDiagnostics.Write("initializing WinRT COM wrappers");
         WinRT.ComWrappersSupport.InitializeComWrappers();
@@ -34,7 +59,7 @@ internal static class Program
             SynchronizationContext.SetSynchronizationContext(
                 new Microsoft.UI.Dispatching.DispatcherQueueSynchronizationContext(
                     Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread()));
-            new ControlApplication();
+            new ControlApplication(null, launchLink);
         });
     }
 }
@@ -44,11 +69,15 @@ public sealed class ControlApplication : Application, IXamlMetadataProvider
     private MainWindow? window;
     private XamlControlsXamlMetaDataProvider? metadata;
     private readonly string? stateDirectory;
+    private readonly AppLaunchLink? launchLink;
     private readonly HashSet<string> observedTypes = [];
     private XamlControlsXamlMetaDataProvider Metadata => metadata ??= new();
-    public ControlApplication(string? stateDirectory = null)
+    public ControlApplication(string? stateDirectory = null) : this(stateDirectory, null) { }
+
+    internal ControlApplication(string? stateDirectory, AppLaunchLink? launchLink)
     {
         this.stateDirectory = stateDirectory;
+        this.launchLink = launchLink;
         StartupDiagnostics.Write("WinUI Application constructed");
         UnhandledException += (_, args) => StartupDiagnostics.Fatal("WinUI unhandled exception", args.Exception);
     }
@@ -65,6 +94,11 @@ public sealed class ControlApplication : Application, IXamlMetadataProvider
         StartupDiagnostics.Write("XamlControlsResources loaded and merged");
         StartupDiagnostics.Write("creating MainWindow");
         window = new MainWindow(stateDirectory);
+        if (launchLink is not null)
+        {
+            window.QueueLaunchLink(launchLink);
+            return;
+        }
         StartupDiagnostics.Write("activating MainWindow");
         window.Activate();
         StartupDiagnostics.Write("MainWindow activated");

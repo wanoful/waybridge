@@ -106,11 +106,8 @@ internal sealed partial class MainWindow
                             {
                                 if (!result.TryGetProperty(id, out var value)) continue;
                                 if (value.ValueKind != JsonValueKind.Object) { missingIcons.Add(id); continue; }
-                                string hash = value.GetProperty("sha256").GetString() ?? "";
-                                string encoded = value.GetProperty("png").GetString() ?? "";
-                                if (!ValidIconHash(hash) || encoded.Length > MaxLauncherPng / 3 * 4) continue;
-                                byte[] bytes = Convert.FromBase64String(encoded);
-                                if (!ValidLauncherPng(bytes, hash)) continue;
+                                byte[]? bytes = DecodeLauncherIcon(value, out string hash);
+                                if (bytes is null) continue;
                                 await DisplayIconAsync(generation, id, bytes);
                                 if (generation != iconGeneration) break;
                                 await SaveIconAsync(profile, id, hash, bytes);
@@ -199,6 +196,15 @@ internal sealed partial class MainWindow
     }
 
     private static bool ValidIconHash(string hash) => hash.Length == 64 && hash.All(Uri.IsHexDigit);
+
+    private static byte[]? DecodeLauncherIcon(JsonElement value, out string hash)
+    {
+        hash = value.GetProperty("sha256").GetString() ?? "";
+        string encoded = value.GetProperty("png").GetString() ?? "";
+        if (!ValidIconHash(hash) || encoded.Length > MaxLauncherPng / 3 * 4) return null;
+        byte[] bytes = Convert.FromBase64String(encoded);
+        return ValidLauncherPng(bytes, hash) ? bytes : null;
+    }
 
     private static bool ValidLauncherPng(byte[] bytes, string hash) => bytes.Length is >= 33 and <= MaxLauncherPng
         && bytes.AsSpan(0, 8).SequenceEqual(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 })

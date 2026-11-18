@@ -23,15 +23,15 @@ public sealed class EngineChannel : IAsyncDisposable
     [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool AllowSetForegroundWindow(uint pid);
-    private bool GrantForeground()
+    private bool GrantForeground(bool shellActivation = false)
     {
         if (!OperatingSystem.IsWindows()) return false;
         GetWindowThreadProcessId(GetForegroundWindow(), out uint owner);
-        return owner == Environment.ProcessId && AllowSetForegroundWindow((uint)process.Id);
+        return (shellActivation || owner == Environment.ProcessId) && AllowSetForegroundWindow((uint)process.Id);
     }
     public Task ActivateWindowAsync(uint id, CancellationToken cancellationToken = default) =>
         SendAsync(new { type = "focus_window", id, foreground = GrantForeground() }, cancellationToken);
-    public async Task<LaunchActivation?> PrepareActivationAsync(string? app, CancellationToken token)
+    public async Task<LaunchActivation?> PrepareActivationAsync(string? app, CancellationToken token, bool shellActivation = false)
     {
         if (!activation) return null;
         string request = Guid.NewGuid().ToString("N");
@@ -41,7 +41,7 @@ public sealed class EngineChannel : IAsyncDisposable
         timeout.CancelAfter(TimeSpan.FromSeconds(5));
         try
         {
-            await SendAsync(new { type = "activation_prepare", request_id = request, app = app ?? "", foreground = GrantForeground() }, timeout.Token);
+            await SendAsync(new { type = "activation_prepare", request_id = request, app = app ?? "", foreground = GrantForeground(shellActivation) }, timeout.Token);
             return new LaunchActivation(request, await pending.Task.WaitAsync(timeout.Token));
         }
         finally { activations.TryRemove(request, out _); }

@@ -91,6 +91,7 @@ internal sealed partial class MainWindow : Window
     private ConnectionProfile selected = NewProfile();
     private ContentDialog? activeDialog;
     private bool loading, initialized, quitting, busy, connecting;
+    private Task? initialization;
     private ulong lastBytes, lastUpdates, lastTick;
     private string receiveDirectory = "";
     private readonly IntPtr hwnd;
@@ -142,7 +143,7 @@ internal sealed partial class MainWindow : Window
                     Receive(message);
             });
         };
-        tray = new(action => UI(() => TrayAction(action)));
+        tray = new(action => UI(() => TrayAction(action)), QueueLaunchLink);
         root.RowDefinitions.Add(new() { Height = GridLength.Auto });
         root.RowDefinitions.Add(new() { Height = GridLength.Auto });
         root.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
@@ -193,7 +194,7 @@ internal sealed partial class MainWindow : Window
         };
         Content = root;
         UpdateMode();
-        root.Loaded += async (_, _) => await GuardAsync(InitializeAsync);
+        root.Loaded += async (_, _) => await GuardAsync(() => initialization ??= InitializeAsync(refreshCatalog: true));
     }
     private void UI(Action action) => DispatcherQueue.TryEnqueue(() => { try { action(); } catch (Exception error) { Error(error); } });
     private void Error(Exception error) { notice.Severity = InfoBarSeverity.Error; notice.Title = "操作未完成"; notice.Message = error.Message; notice.IsOpen = true; }
@@ -409,7 +410,7 @@ internal sealed partial class MainWindow : Window
         content.Children.Add(export); content.Children.Add(logs);
         return content;
     }
-    private async Task InitializeAsync()
+    private async Task InitializeAsync(bool refreshCatalog)
     {
         if (initialized) return;
         var saved = await store.LoadAsync();
@@ -432,7 +433,7 @@ internal sealed partial class MainWindow : Window
         initialized = true;
         Load(initial ?? NewProfile());
         SetDirectoryLayout();
-        if (initial is not null) await RefreshApplicationsAsync();
+        if (refreshCatalog && initial is not null) await RefreshApplicationsAsync();
     }
     private void UpdateMode()
     {
@@ -935,7 +936,7 @@ internal sealed partial class MainWindow : Window
     {
         await GuardAsync(async () =>
         {
-            if (action is "show" or "diagnostics") { TrayIcon.ShowWindow(hwnd, 9); Activate(); }
+            if (action is "show" or "diagnostics") ShowControlCenter();
             if (action == "diagnostics") ShowPage("diagnostics");
             if (action == "connect") await ConnectOrDisconnectAsync();
             if (action == "mute") await QuickSettingAsync(audioSetting: true);

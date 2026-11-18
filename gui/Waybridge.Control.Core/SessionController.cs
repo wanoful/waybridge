@@ -204,13 +204,13 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
 
     public async Task LaunchAsync(string? app = null, string[]? argv = null, Guid? expectedProfileId = null,
         CancellationToken cancellationToken = default, string? action = null, string? cwd = null,
-        string[]? extraArgv = null, bool launchWithExec = false)
+        string[]? extraArgv = null, bool launchWithExec = false, bool shellActivation = false)
     {
         var current = RequireConnection(expectedProfileId);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, current.Closed);
         timeout.CancelAfter(TimeSpan.FromSeconds(15));
         timeout.Token.ThrowIfCancellationRequested();
-        var activation = await current.Worker.PrepareActivationAsync(app, timeout.Token);
+        var activation = await current.Worker.PrepareActivationAsync(app, timeout.Token, shellActivation);
         timeout.Token.ThrowIfCancellationRequested();
         var result = await current.Server.CallAsync(LaunchRequest("launch", current.Session, app, argv, action, cwd,
             extraArgv, launchWithExec, activation?.Token), timeout.Token);

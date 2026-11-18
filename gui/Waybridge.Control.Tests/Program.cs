@@ -136,6 +136,10 @@ if (args is ["--direct-smoke"])
             desktopPreview.GetProperty("extra_argv")[0].GetString() == "中文文字", "direct Desktop Action preview failed");
         await controller.LaunchAsync(app: launcherApp.Id, action: "NewWindow", expectedProfileId: directProfile.Id,
             cancellationToken: deadline.Token);
+        string appLink = AppLaunchLink.Create(directProfile.Id, launcherApp.Id).ToString();
+        if (!AppLaunchLink.TryParse(appLink, out var target)) throw new Exception("could not resolve the paired application's link");
+        await controller.LaunchAsync(app: target.AppId, expectedProfileId: target.ProfileId,
+            cancellationToken: deadline.Token, shellActivation: true);
         string controllerMarker = Path.Combine(directRuntime,"controller-marker");
         string[] command = ["python3", "-I", "-c", "import pathlib,sys;pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",
             controllerMarker, "controller 你好"];
@@ -199,6 +203,20 @@ try
     await Reject<ArgumentException>(() => { (directProfile with { Port = 0 }).Validate(); return Task.CompletedTask; });
     await Reject<ArgumentException>(() => { _ = new DirectAgent(directProfile with { CertificateSha256 = "" }, new string('b',64)); return Task.CompletedTask; });
     Console.WriteLine("PASS: TLS profile validates host, port, pin and session name");
+
+    var launchLink = AppLaunchLink.Create(profile.Id, "org.example.中文 桌面.desktop");
+    string launchUrl = launchLink.ToString();
+    Check(AppLaunchLink.TryParse(launchUrl, out var parsedLink) && parsedLink == launchLink,
+        "application links must retain the exact profile and Unicode desktop ID");
+    foreach (var invalidLink in new[] { launchUrl + "?argv=other", launchUrl + "#test", launchUrl + "/extra",
+        launchUrl + "=", launchUrl + "\n", launchUrl.Replace("://launch/", "://open/"),
+        $"waybridge://launch/{Guid.Empty:N}/ZGlzcGxheS5kZXNrdG9w",
+        $"waybridge://launch/{profile.Id:N}/A", $"waybridge://launch/{profile.Id:N}/_w",
+        $"waybridge://launch/{profile.Id:N}/" + new string('A', AppLaunchLink.MaxLength) })
+        Check(!AppLaunchLink.TryParse(invalidLink, out _), "invalid application link was accepted");
+    foreach (var invalidApp in new[] { "argv", ".desktop", "../test.desktop", "test\\app.desktop", "test\0.desktop", new string('桌', 400) + ".desktop" })
+        await Reject<ArgumentException>(() => { _ = AppLaunchLink.Create(profile.Id, invalidApp); return Task.CompletedTask; });
+    Console.WriteLine("PASS: app launch links round-trip Unicode and reject malformed targets and extra parameters");
 
     var defaultSettings = new ClientSettings { Files = false };
     Check(!defaultSettings.Files && defaultSettings.DragText, "file sharing defaults must not disable text drags");

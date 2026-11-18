@@ -1,6 +1,6 @@
 # Waybridge Client Launcher 与 Server TUI 重构设计规格
 
-当前实现包括 WinUI 主启动器、八类客户端设置、TLS 单连接路径和 Linux 管理 TUI。主启动器具备全局栏、应用墙、应用菜单和 TLS 批量图标。原型阶段可同步更新两端，使用新版时可重新添加设备并配对。Avalonia 迁移、粘贴配对口令和快捷启动窗按后续阶段推进。
+当前实现包括 WinUI 主启动器、八类客户端设置、TLS 单连接路径和 Linux 管理 TUI。主启动器具备全局栏、应用墙、应用菜单、应用链接、Windows 快捷方式和 TLS 批量图标。原型阶段可同步更新两端，使用新版时可重新添加设备并配对。Avalonia 迁移和粘贴配对口令按后续阶段推进。
 
 ## 1. 目标与核心决策
 
@@ -12,7 +12,7 @@
 | Client 构建方式 | 保持在 Linux 上交叉发布 `win-x64` 与 `win-arm64` 便携包。迁移验收后清理原有 PRI 提取与 manifest 拼接脚本 |
 | Client 核心复用 | 复用 `Waybridge.Control.Core`、Windows 凭据管理器和系统托盘，按新版连接流程更新回归测试 |
 | Client 连接方式 | 仅通过认证加密的 Waybridge TLS 接入 Linux 用户服务。移除内置 SSH 和原始会话隧道模式 |
-| Client 形态 | **双形态 App Launcher**：完整应用墙主窗口（Full Launcher）+ 随呼随用悬浮启动窗（Quick Launcher） |
+| Client 形态 | **应用墙与系统快捷方式**：控制中心管理远端应用，`waybridge://` 链接和 Windows 开始菜单、桌面快捷方式直接启动 |
 | 图标与目录 | 扩展 `applications` 元数据，新增 `app_icons` 批量 PNG 接口，控制中心缓存并显示应用原图 |
 | 配对体验 | 首版沿用一次性配对码与完整带外指纹核对，后续支持粘贴可信来源的 `wbpair://` 口令 |
 | Server 管理界面 | **`waybridge-service tui`**（Rust `ratatui` + `crossterm`），支持在线/离线双态运行 |
@@ -152,13 +152,11 @@
      * 扩展 `SessionController.cs`（暴露 `AppIconsAsync`、`LaunchPlanAsync`、`ClickToLaunchAsync` 等协调方法，并支持带 `action`/`uris`/`argv`/`cwd` 的启动）。
    * `Waybridge.Control/`（Avalonia 桌面项目）：
      * `Views/MainWindow.axaml(.cs)`：完整应用墙与控制中心；
-     * `Views/QuickLauncherWindow.axaml(.cs)`：随呼随用悬浮启动窗；
      * `Views/PairingWizardDialog.axaml(.cs)`：分步 TLS 配对；
      * `Views/SettingsView.axaml(.cs)`：分栏设置中心；
      * `Views/ActivityDrawer.axaml(.cs)`：文件传输活动与诊断延迟面板；
      * `ViewModels/`：严格分离状态、命令与跨线程调度（UI Dispatcher）；
      * `Services/DesktopNotifications.cs`：先验证通知替代方案，包括便携包应用身份、激活注册以及通知动作回到正确会话。迁移时复用现有通知协议与生命周期规则；
-     * `Services/GlobalHotkeyService.cs`：Win32 `RegisterHotKey` 封装与冲突检测；
      * `IconBranding.cs`：将自定义角标规范化为 64×64。原生 Windows 窗口和托盘在目标像素尺寸合成角标。
 
 ### 5.2 本地存储与缓存策略
@@ -167,7 +165,7 @@ TLS 连接配置、Launcher 状态和图标缓存各自持久化。
 
 * **`%LOCALAPPDATA%\Waybridge\profiles.json`**：保存 TLS 地址、证书指纹、设备标识和连接偏好，按需简化 `ConnectionProfile` / `ClientSettings`。
 * **`%LOCALAPPDATA%\Waybridge\launcher.json`**：
-  * 全局字段：`hotkey`（默认 `"Ctrl+Alt+Space"`，可为空表示禁用）、`view_mode`（`"grid"` / `"list"`）、`close_to_tray`、`quick_launcher_autohide`。
+  * 全局偏好保存布局、选中工作站、主题和关闭到托盘。
   * 按 `profile_id` 隔离：`pinned_apps`（有序 `desktop_id` 数组）、`recent_apps`（最近启动与时间戳，上限 32 条）、`command_history`（自定义 `argv` + `cwd` 历史，上限 20 条）、`cached_applications`（上次拉取的扩展应用目录快照）。
 * **`%LOCALAPPDATA%\Waybridge\cache\icons\`**：
   * 原始图标缓存：`raw/<sha256>.png`，由启动器各页共享。
@@ -201,13 +199,11 @@ TLS 连接配置、Launcher 状态和图标缓存各自持久化。
    * **设置中心**分「画面」「声音」「输入设备」「共享与权限」「网络」「连接」「桌面集成」「常规」。显示当前正在编辑的连接或全局范围，并按实际能力标注实时、重连或新建会话生效。触控、笔、手柄的总开关与本机识别、远端支持、焦点和实际转发状态直接可见。压感、死区和逐应用兼容覆盖放入高级设置。离线编辑可保存，在线应用在收到确认后显示生效结果，保留自动化探针依赖的行为。
    * **文件传输与诊断**：文件发送按钮、接收目录快捷打开与传输记录；RTT / TCP 接收速率 / 呈现更新数 / 解码与呈现阶段耗时仪表，以及日志导出（不导出令牌、剪贴板或通知正文）。
 
-### 5.4 Quick Launcher（悬浮启动窗）规格
+### 5.4 应用链接与系统快捷方式
 
-* **窗口机制**：随应用生命周期创建并保活（`ShowInTaskbar = false`、`Topmost = true`、无系统边框圆角 + Windows 11 `Mica`/`Acrylic` 背景）；弹出时定位到当前鼠标指针所在显示器的水平居中偏上位置（约工作区顶部 25% 处），支持隐藏/显示零闪烁。
-* **触发与关闭**：
-  * **全局热键**：默认 `Ctrl + Alt + Space`（Win32 `RegisterHotKey`），支持在设置页修改组合键或关闭；若热键被系统或其他软件占用，不报错弹窗，而在设置页热键旁显示“当前热键已被占用”。
-  * **系统托盘联动**：左键单击托盘图标呼出 Quick Launcher；右键托盘弹出菜单（打开完整控制台 / 呼出快速启动器 / 连接或断开 / 切换静音 / 诊断 / 退出）。
-  * **交互**：呼出自动聚焦顶部搜索框，展示「Running 窗口」+「搜索结果或 Pinned/Recent Top 8」；支持上下方向键高亮、回车启动（同步触发 Click-to-Launch）并立即隐藏；按 `Esc` 或窗口失焦时自动隐藏；右上角提供“展开完整控制台”图标按钮。
+* 应用卡片菜单提供复制链接、添加到 Windows 开始菜单和创建桌面快捷方式。开始菜单入口放在 Waybridge 文件夹下。
+* 链接格式为 `waybridge://launch/<配对配置 UUID>/<Base64URL 编码的 UTF-8 Desktop ID>`。控制中心据此查找本机的配对配置，再按目录中的应用身份启动。
+* 已运行的控制中心接收外部请求，初次启动则在后台初始化。启动沿用 Click-to-Launch。切换正在查看的工作站需要用户确认，远端会话与应用保留。错误在控制中心显示。
 
 ---
 
@@ -216,6 +212,5 @@ TLS 连接配置、Launcher 状态和图标缓存各自持久化。
 1. **客户端主窗口、设置与便携包验证。** 收敛为单一 TLS 路径，清理内置 SSH、原始会话隧道及其配置。使用现有配对和应用目录，先交付接回会话、搜索启动、切回窗口和完整设置。并行验证最小 Avalonia 便携包，通过后再迁移 Windows 系统集成与构建脚本。运行新版直连链路和 Windows UI 自动化回归。
 2. **服务端 TUI 和配置编辑并行推进。** 验收本机和 SSH 终端里的在线／离线切换、配对、受控会话操作、日志、配置来源与生效阶段、草稿校验与应用启动预览。
 3. **主启动器和目录。** 交付顶部全局栏、网格和紧凑列表、固定与最近、运行窗口与后台区、应用上下文操作。通过 TLS 扩展目录元数据和批量图标，验证响应预算与缺失图标回退。粘贴配对口令单独验收完整指纹匹配、一次性使用和过期。
-4. **Quick Launcher 与托盘／热键打磨。**
-   * 实现 `QuickLauncherWindow` 隐藏保活、多显示器跟随居中、Win32 全局热键及冲突降级、左键托盘触发与键盘导航。
-   * 验收：Windows 实机验证热键响应、失焦自动隐藏、未连接状态 Click-to-Launch 连贯性及高 DPI 呈现。
+4. **应用链接与 Windows 快捷方式。**
+   * 按已配对工作站和 Desktop ID 创建快捷方式，验证 Windows 外部呼出、已运行实例转发和未连接时的自动连接。

@@ -94,6 +94,11 @@ internal sealed partial class MainWindow
             menu.Items.Add(new MenuFlyoutSeparator());
             bool pinned = launcherPreferences.Pinned.GetValueOrDefault(profileId)?.Any(value => value.Id == app.Id) == true;
             menu.Items.Add(ActionItem(pinned ? "取消固定" : "固定到顶部", () => TogglePinAsync(app)));
+            var shortcuts = new MenuFlyoutSubItem { Text = "应用链接与快捷方式", IsEnabled = paired };
+            shortcuts.Items.Add(ActionItem("复制应用链接", () => CopyApplicationLinkAsync(app)));
+            shortcuts.Items.Add(ActionItem("添加到开始菜单", () => SaveApplicationShortcutAsync(app, desktop: false)));
+            shortcuts.Items.Add(ActionItem("创建桌面快捷方式", () => SaveApplicationShortcutAsync(app, desktop: true)));
+            menu.Items.Add(shortcuts);
             var touch = new MenuFlyoutSubItem { Text = "触控模式" };
             string mode = launcherPreferences.AppTouchModes.GetValueOrDefault(profileId)?.GetValueOrDefault(app.Id) ?? "";
             foreach (var (value, label) in new[] { ("", "自动选择"), ("native", "优先原生触控"), ("mouse", "鼠标兼容") })
@@ -186,9 +191,15 @@ internal sealed partial class MainWindow
     {
         var profile = selected;
         if (!await ConnectForLaunchAsync(profile)) return;
-        await controller.LaunchAsync(app: app.Id, action: action, expectedProfileId: profile.Id);
-        await RememberLaunchAsync(profile, app);
+        await LaunchForProfileAsync(profile, app.Id, app, action);
     }, canCancelConnect: true);
+
+    private async Task LaunchForProfileAsync(ConnectionProfile profile, string appId, RemoteApplication? app,
+                                             string? action = null, bool shellActivation = false)
+    {
+        await controller.LaunchAsync(app: appId, action: action, expectedProfileId: profile.Id, shellActivation: shellActivation);
+        if (app is not null) await RememberLaunchAsync(profile, app);
+    }
 
     private async Task RememberLaunchAsync(ConnectionProfile profile, RemoteApplication app)
     {

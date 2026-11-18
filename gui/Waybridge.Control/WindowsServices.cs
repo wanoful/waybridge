@@ -65,10 +65,12 @@ internal sealed class CredentialStore : ISecretStore
 
 internal sealed class TrayIcon : IDisposable
 {
-    private const uint Callback = 0x8000 + 37, ShowMessage = 0x8000 + 38;
+    private const uint Callback = 0x8000 + 37, ShowMessage = 0x8000 + 38, CopyDataMessage = 0x004a;
+    private const uint LaunchLinkData = 0x57424c4b;
     private readonly WndProc callback;
     private readonly IntPtr hwnd;
     private readonly Action<string> action;
+    private readonly Action<AppLaunchLink>? launchLink;
     private bool connected;
     private const string ClassName = "WaybridgeControlCenterTray";
     private delegate IntPtr WndProc(IntPtr hwnd, uint message, IntPtr wp, IntPtr lp);
@@ -90,6 +92,7 @@ internal sealed class TrayIcon : IDisposable
         public uint InfoFlags; public Guid Guid; public IntPtr BalloonIcon;
     }
     [StructLayout(LayoutKind.Sequential)] private struct Point { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] private struct CopyData { public nuint Kind; public uint Bytes; public IntPtr Value; }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern ushort RegisterClassW(ref WindowClass wc);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr CreateWindowExW(uint ex, string name, string title, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
     [DllImport("user32.dll")] private static extern IntPtr DefWindowProcW(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
@@ -106,13 +109,19 @@ internal sealed class TrayIcon : IDisposable
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr GetModuleHandleW(string? name);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string name, string? title);
     [DllImport("user32.dll")] private static extern bool PostMessageW(IntPtr hwnd, uint message, IntPtr wp, IntPtr lp);
+    [DllImport("user32.dll")] private static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, IntPtr wp,
+        ref CopyData data, uint flags, uint timeout, out nuint result);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] private static extern bool AllowSetForegroundWindow(uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)] private static extern int MessageBoxW(
+        IntPtr owner, string text, string title, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern uint RegisterWindowMessageW(string name);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int command);
     private NotifyData data;
     private readonly uint taskbarCreated = RegisterWindowMessageW("TaskbarCreated");
-    public TrayIcon(Action<string> action)
+    public TrayIcon(Action<string> action, Action<AppLaunchLink>? launchLink = null)
     {
-        this.action = action; callback = Procedure;
+        this.action = action; this.launchLink = launchLink; callback = Procedure;
         var wc = new WindowClass { ClassName = ClassName, Instance = GetModuleHandleW(null),
             Procedure = Marshal.GetFunctionPointerForDelegate(callback) };
         RegisterClassW(ref wc);
@@ -128,6 +137,31 @@ internal sealed class TrayIcon : IDisposable
         var existing = FindWindowExW(IntPtr.Zero, IntPtr.Zero, ClassName, null);
         if (existing != IntPtr.Zero) PostMessageW(existing, ShowMessage, IntPtr.Zero, IntPtr.Zero);
     }
+    public static bool ForwardLaunchLink(AppLaunchLink link)
+    {
+        var deadline = Environment.TickCount64 + 5000;
+        IntPtr existing;
+        while ((existing = FindWindowExW(IntPtr.Zero, IntPtr.Zero, ClassName, null)) == IntPtr.Zero)
+        {
+            if (Environment.TickCount64 >= deadline) return false;
+            Thread.Sleep(50);
+        }
+        string url = link.ToString();
+        IntPtr buffer = Marshal.StringToHGlobalUni(url);
+        try
+        {
+            var data = new CopyData { Kind = LaunchLinkData, Bytes = (uint)(url.Length * sizeof(char)), Value = buffer };
+            GetWindowThreadProcessId(existing, out uint owner);
+            if (owner != 0) AllowSetForegroundWindow(owner);
+            return SendMessageTimeoutW(existing, CopyDataMessage, IntPtr.Zero, ref data, 0x3, 1500, out nuint result)
+                != IntPtr.Zero && result == 1;
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+    public static void ShowLinkError(string message) => MessageBoxW(IntPtr.Zero, message, "Waybridge 应用链接", 0x30);
+    public static bool ConfirmLinkSwitch(string current, string target) =>
+        MessageBoxW(IntPtr.Zero, $"要切换到「{target}」来启动此应用吗？\n\n「{current}」会断开查看，远端应用会保留。",
+            "切换 Waybridge 工作站", 0x10124) == 6; // Yes/No, with No as the default.
     public void Update(bool value)
     {
         connected = value; data.Tip = value ? "Waybridge · 已连接" : "Waybridge · 未连接";
@@ -137,6 +171,19 @@ internal sealed class TrayIcon : IDisposable
     {
         if (message == taskbarCreated) { Shell_NotifyIconW(0, ref data); return IntPtr.Zero; }
         if (message == ShowMessage) { action("show"); return IntPtr.Zero; }
+        if (message == CopyDataMessage && launchLink is not null && lp != IntPtr.Zero)
+        {
+            var incoming = Marshal.PtrToStructure<CopyData>(lp);
+            if (incoming.Kind == LaunchLinkData && incoming.Bytes is > 0 and <= AppLaunchLink.MaxLength * sizeof(char) &&
+                incoming.Bytes % sizeof(char) == 0 && incoming.Value != IntPtr.Zero &&
+                Marshal.PtrToStringUni(incoming.Value, (int)incoming.Bytes / sizeof(char)) is { } url &&
+                AppLaunchLink.TryParse(url, out var link))
+            {
+                launchLink(link);
+                return new IntPtr(1);
+            }
+            return IntPtr.Zero;
+        }
         if (message == Callback)
         {
             uint evt = unchecked((uint)lp.ToInt64()) & 0xffff;
