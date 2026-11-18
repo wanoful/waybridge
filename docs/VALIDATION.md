@@ -346,6 +346,53 @@ Reports are `build/diagnostics/media-backpressure-{png,h264}.json`; their `.log`
 and `-app.log` companions contain diagnostics and callback evidence. The
 before-change capture trace is `build/diagnostics/media-backpressure-baseline.log`.
 
+## 16:10 / 175% DPI game fullscreen — 2026-11-18
+
+The physical ARM64 Windows viewer uses a 2560x1600 monitor at DPI 168. Before
+the fix, Cyberpunk 2077 in borderless mode did not set the EWMH fullscreen bit:
+the native HWND was cascaded to (156,156)-(2715,1756), with a 2559x1600 client
+area. Manifold Garden used native fullscreen but its streamed width was also
+2559; startup logs showed intermediate 2559x1488 sizes.
+
+Managed X11 screen bounds now round physical-to-logical dimensions consistently
+with XWM and the native viewer. Monitor-sized undecorated normal X11 application
+requests at the output origin receive native fullscreen placement even without
+an EWMH fullscreen request; maximized, transient, decorated and popup windows
+are excluded. Native replies do not themselves add the EWMH bit for inferred
+borderless placement. Superseded fullscreen-epoch resize replies are discarded
+before changing scale or geometry. Native resize/viewport messages retain full
+monitor dimensions separately from work-area dimensions.
+
+After installing the release compositor and ARM64 viewer and starting a new
+session, both actual games reached their title/menu screens. A DPI-aware native
+probe reports HWND and client rectangles (0,0)-(2560,1600) at DPI 168 for both.
+Both encoder streams are 2560x1600; switching between their native windows keeps
+those bounds. XRandR retains the single 2560x1600 output. This verifies display
+placement and dimensions, not sustained gameplay or performance.
+
+Checks passed:
+
+- `x11_pointer_smoke.py --fractional-screen`: actual GLFW client, 2560x1600
+  monitor versus 2560x1488 work area at 175%, exact full-size frames and edge
+  pointer input. The pre-fix executable fails this added resolution check.
+  Also covers borderless fullscreen without EWMH, return to normal placement,
+  and normally decorated screen-sized windows.
+- Existing unbounded and `--bounded-screen` X11 pointer/DPI/RandR/lock checks.
+- `window_semantics_smoke.py`, including rejection of an old normal-size reply
+  after a newer fullscreen request.
+- `windows_semantics_smoke.py`: native fullscreen, minimize/restore, constraints,
+  input regions and lifecycle, plus 16:9 letterboxing on a 16:10 viewport.
+- `windows_monitor_smoke.py`: production PE viewer sends 2560x1600 monitor fields
+  through normal/fullscreen/restored resize replies at DPI 168 in private Wine.
+- Workspace Rust tests (51 passed, 2 explicitly ignored), formatting and Clippy;
+  Linux release and Windows ARM64/x64 builds. Vendored Smithay emits its existing
+  three compiler warnings.
+
+The installed Linux compositor and Windows ARM64 client were replaced after
+backing up the old binaries. The control-center UI automation provider cannot
+bind its window (`no longer belongs to Microsoft.Windows.AdministrativeTools`),
+so physical verification used a temporary SSH-forwarded diagnostic viewer.
+
 ## X11 CSD movement and native fullscreen — 2026-11-17
 
 X11 CSD ConfigureRequest movement now hands the gesture to the independent

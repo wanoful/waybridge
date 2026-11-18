@@ -1356,6 +1356,19 @@ impl App {
             }
             "viewport" => self.update_viewport(id, &value),
             "resize" if self.windows.iter().any(|w| w.id == id && w.mapped) => {
+                // A normal-size reply can already be in flight when a game
+                // requests fullscreen. Do not configure that obsolete size:
+                // Wine/Unity may treat it as another display-mode change.
+                if self.semantics_enabled()
+                    && value["fullscreen_epoch"].as_u64().is_some_and(|epoch| {
+                        self.windows
+                            .iter()
+                            .any(|w| w.id == id && epoch != w.state.fullscreen_epoch)
+                    })
+                {
+                    tracing::debug!(id, epoch = ?value["fullscreen_epoch"], "ignoring superseded fullscreen resize");
+                    return;
+                }
                 let started = Instant::now();
                 self.update_viewport(id, &value);
                 self.set_scale(
@@ -1388,7 +1401,19 @@ impl App {
                                 .iter()
                                 .find(|w| w.id == id)
                                 .is_some_and(|w| w.state.fullscreen);
-                            let _ = x.set_fullscreen(fullscreen);
+                            // Borderless placement is a native presentation
+                            // state; do not turn it into an application EWMH
+                            // mode change merely by acknowledging its size.
+                            if x.is_fullscreen()
+                                || !x11::borderless_fullscreen(
+                                    x,
+                                    x.geometry(),
+                                    &self.output,
+                                    self.default_scale,
+                                )
+                            {
+                                let _ = x.set_fullscreen(fullscreen);
+                            }
                         }
                         let mut geometry = x.geometry();
                         geometry.size = (width, height).into();

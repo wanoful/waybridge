@@ -8,6 +8,7 @@ fi
 cargo build --workspace --locked
 cmake -S client -B build/windows -G Ninja -DCMAKE_TOOLCHAIN_FILE=mingw.cmake -DCMAKE_BUILD_TYPE=Release
 cmake --build build/windows --target waybridge-client
+python3 tests/windows_monitor_smoke.py
 python3 tests/windows_app_icon_smoke.py
 python3 tests/windows_touch_smoke.py
 python3 tests/windows_pen_smoke.py

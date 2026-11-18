@@ -213,6 +213,7 @@ struct RemoteWindow {
   UINT lastDpi = 0;
   int lastHdr = -1;
   int lastWorkWidth = 0, lastWorkHeight = 0, lastWorkX = INT_MIN, lastWorkY = INT_MIN;
+  int lastMonitorWidth = 0, lastMonitorHeight = 0;
 };
 std::map<uint32_t, std::unique_ptr<RemoteWindow>> windows;
 Json imeStatus;
@@ -1803,6 +1804,8 @@ void sendResize(RemoteWindow *w) {
   GetMonitorInfoW(MonitorFromWindow(w->hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
   int workWidth = monitor.rcWork.right - monitor.rcWork.left,
       workHeight = monitor.rcWork.bottom - monitor.rcWork.top;
+  int monitorWidth = monitor.rcMonitor.right - monitor.rcMonitor.left,
+      monitorHeight = monitor.rcMonitor.bottom - monitor.rcMonitor.top;
   POINT origin{};
   ClientToScreen(w->hwnd, &origin);
   int workX = MulDiv(monitor.rcWork.left - origin.x, 96, w->dpi),
@@ -1814,6 +1817,7 @@ void sendResize(RemoteWindow *w) {
                                w->state.lastFullscreenEpoch != w->state.fullscreenEpoch));
   if (rect.right <= 0 || rect.bottom <= 0 ||
       (!resized && w->lastWorkWidth == workWidth && w->lastWorkHeight == workHeight &&
+       w->lastMonitorWidth == monitorWidth && w->lastMonitorHeight == monitorHeight &&
        w->lastWorkX == workX && w->lastWorkY == workY))
     return;
   w->lastWorkX = workX;
@@ -1826,6 +1830,8 @@ void sendResize(RemoteWindow *w) {
   w->lastDpi = w->dpi;
   w->lastWorkWidth = workWidth;
   w->lastWorkHeight = workHeight;
+  w->lastMonitorWidth = monitorWidth;
+  w->lastMonitorHeight = monitorHeight;
   if (resized) {
     w->resizePending = true;
     w->resizeSent = Clock::now();
@@ -1835,6 +1841,8 @@ void sendResize(RemoteWindow *w) {
             {"width", MulDiv(rect.right, 96, w->dpi)},
             {"height", MulDiv(rect.bottom, 96, w->dpi)},
             {"dpi", w->dpi},
+            {"monitor_width", monitorWidth},
+            {"monitor_height", monitorHeight},
             {"work_width", workWidth},
             {"work_height", workHeight},
             {"work_x", workX},

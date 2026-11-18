@@ -259,6 +259,28 @@ pub fn info(
     }
     json!({"type":"window","id":id,"title":x.title(),"app_id":x.class(),"width":size.w,"height":size.h,"scale":scale,"parent":parent.map(|(_,id)|id),"decoration":if !x.is_decorated() && !x.is_override_redirect(){"server"}else{"client"},"x11":true})
 }
+// Legacy borderless games can cover the output without an EWMH fullscreen
+// request. Preserve that placement in the independent native viewer. Ordinary
+// CSD windows, maximized work areas, dialogs and popups remain independent.
+pub(super) fn borderless_fullscreen(
+    window: &X11Surface,
+    geometry: Rectangle<i32, Logical>,
+    output: &Output,
+    scale: f64,
+) -> bool {
+    let pixels = output.current_mode().unwrap().size;
+    let width = (f64::from(pixels.w) / scale).round() as i32;
+    let height = (f64::from(pixels.h) / scale).round() as i32;
+    window.is_decorated()
+        && !window.is_override_redirect()
+        && !window.is_maximized()
+        && window.is_transient_for().is_none()
+        && window
+            .window_type()
+            .is_none_or(|kind| kind == smithay::xwayland::xwm::WmWindowType::Normal)
+        && geometry == Rectangle::from_size((width, height).into())
+}
+
 impl App {
     pub(super) fn x11_geometry(
         &self,
@@ -272,8 +294,10 @@ impl App {
         // clips absolute pointer input to its shared root screen: an invisible
         // off-screen X11 position must not make a visible native button inert.
         let pixels = self.output.current_mode().unwrap().size;
-        let width = (f64::from(pixels.w) / self.default_scale).floor().max(1.0) as i32;
-        let height = (f64::from(pixels.h) / self.default_scale).floor().max(1.0) as i32;
+        // Match XWM's physical -> logical rounding and the viewer's MulDiv.
+        // Flooring 2560 / 1.75 truncates a 2560px fullscreen game to 2559px.
+        let width = (f64::from(pixels.w) / self.default_scale).round().max(1.0) as i32;
+        let height = (f64::from(pixels.h) / self.default_scale).round().max(1.0) as i32;
         geometry.size.w = geometry.size.w.clamp(1, width);
         geometry.size.h = geometry.size.h.clamp(1, height);
         geometry.loc.x = geometry.loc.x.clamp(0, width - geometry.size.w);
@@ -306,6 +330,32 @@ impl App {
                 "fullscreen_epoch":remote.state.fullscreen_epoch});
             if self.semantics_enabled() {
                 self.control(message);
+            }
+        }
+    }
+    fn x11_borderless_fullscreen(
+        &mut self,
+        window: &X11Surface,
+        geometry: Rectangle<i32, Logical>,
+    ) {
+        if window.is_fullscreen() {
+            return;
+        }
+        let fullscreen = borderless_fullscreen(window, geometry, &self.output, self.default_scale);
+        if let Some(remote) = self
+            .windows
+            .iter_mut()
+            .find(|w| w.window.x11_surface() == Some(window))
+        {
+            if remote.state.fullscreen != fullscreen {
+                tracing::debug!(
+                    id = remote.id,
+                    fullscreen,
+                    ?geometry,
+                    "X11 borderless fullscreen placement"
+                );
+                remote.state.fullscreen(fullscreen);
+                remote.dirty = true;
             }
         }
     }
@@ -360,7 +410,17 @@ impl App {
             id,
             icon: app_icon::WindowIcon::default(),
             state: window_semantics::State {
-                fullscreen: surface.is_fullscreen(),
+                fullscreen: surface.is_fullscreen()
+                    || borderless_fullscreen(
+                        &surface,
+                        self.x11
+                            .geometries
+                            .get(&surface.window_id())
+                            .copied()
+                            .unwrap_or_else(|| surface.geometry()),
+                        &output,
+                        self.default_scale,
+                    ),
                 ..Default::default()
             },
             window: Window::new_x11_window(surface),
@@ -585,6 +645,10 @@ impl XwmHandler for App {
         if let Some(h) = h {
             r.size.h = h.clamp(1, 8192) as i32;
         }
+        // Only application geometry requests infer this state. A native resize
+        // acknowledgement/ConfigureNotify must not re-enter fullscreen after
+        // an explicit unfullscreen request.
+        self.x11_borderless_fullscreen(&window, r);
         let _ = window.configure(self.x11_geometry(&window, r));
     }
     fn configure_notify(
@@ -608,6 +672,14 @@ impl XwmHandler for App {
         }
     }
     fn property_notify(&mut self, _: XwmId, window: X11Surface, property: WmWindowProperty) {
+        if matches!(
+            property,
+            WmWindowProperty::MotifHints
+                | WmWindowProperty::WindowType
+                | WmWindowProperty::TransientFor
+        ) {
+            self.x11_borderless_fullscreen(&window, window.geometry());
+        }
         if let Some(w) = self
             .windows
             .iter_mut()

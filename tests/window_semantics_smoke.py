@@ -65,6 +65,14 @@ def main():
             full_info=viewer.metadata(a,lambda v:v["fullscreen"])
             resize(1100,700,True,epoch=request["fullscreen_epoch"]);frame(1100,700)
             wait(lambda:"SEM_CONFIGURE 1 1100 700 1 0" in Path(log.name).read_text())
+            # A reply to the initial normal window can arrive after fullscreen.
+            # It must not make the application switch back to that old size.
+            resize(500,300,False,epoch=request['fullscreen_epoch']-1)
+            viewer.send(type='ping',nonce='superseded-normal-size')
+            viewer.until(lambda k,v:k=='control' and v.get('type')=='pong')
+            assert viewer.geometry[a][:2]==(1100,700),viewer.geometry[a]
+            time.sleep(.1)
+            assert 'SEM_CONFIGURE 1 500 300' not in Path(log.name).read_text()
             key(30);viewer.until(lambda k,v:k=="control" and v["type"]=="window_action" and v["action"]=="unfullscreen")
             restored=viewer.metadata(a,lambda v:not v["fullscreen"])
             resize(800,600,True,epoch=full_info["fullscreen_epoch"])

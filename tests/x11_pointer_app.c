@@ -1,6 +1,7 @@
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_X11
 #include <GLFW/glfw3native.h>
+#include <X11/Xatom.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -60,6 +61,9 @@ int main(void) {
       if(c=='c'&&game){glfwDestroyWindow(game);game=NULL;puts("GAME_CLOSED");}
       if(c=='o'){glfwSetWindowPos(launcher,-283,591);puts("OFFSCREEN_REQUEST");}
       if(c=='m'&&game){glfwMaximizeWindow(game);puts("MAXIMIZE_REQUEST");}
+      if((c=='b'||c=='d')&&game){const GLFWvidmode *mode=glfwGetVideoMode(glfwGetPrimaryMonitor());glfwSetWindowAttrib(game,GLFW_DECORATED,c=='d');glfwSetWindowPos(game,0,0);glfwSetWindowSize(game,mode->width,mode->height);puts(c=='b'?"BORDERLESS_REQUEST":"DECORATED_SCREEN_REQUEST");}
+      if(c=='n'&&game){glfwSetWindowSize(game,640,480);glfwSetWindowPos(game,430,210);puts("NORMAL_REQUEST");}
+      if(c=='s'&&game){Display *d=glfwGetX11Display();Atom type,full=XInternAtom(d,"_NET_WM_STATE_FULLSCREEN",False);int format;unsigned long count,left;unsigned char *bytes=NULL;int found=0;XGetWindowProperty(d,glfwGetX11Window(game),XInternAtom(d,"_NET_WM_STATE",False),0,32,False,XA_ATOM,&type,&format,&count,&left,&bytes);if(type==XA_ATOM&&format==32)for(unsigned long i=0;i<count;i++)if(((Atom*)bytes)[i]==full)found=1;if(bytes)XFree(bytes);printf("EWMH_FULLSCREEN %d\n",found);}
       if(c=='f'&&game){GLFWmonitor *monitor=glfwGetPrimaryMonitor();const GLFWvidmode *mode=glfwGetVideoMode(monitor);glfwSetWindowMonitor(game,monitor,0,0,mode->width,mode->height,mode->refreshRate);puts("FULLSCREEN_REQUEST");}
       if(c=='q')glfwSetWindowShouldClose(launcher,GLFW_TRUE);
     }
