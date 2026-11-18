@@ -236,27 +236,41 @@ int wmain() {
     nativeTouch.state({{"generation",12},{"id",Id},{"enabled",true}}); input.enabled=true;
     SetFocus(touchTarget->hwnd); nativeTouch.sample(input,WM_POINTERDOWN,502,first);
     gesture=touchWire.back().at("gesture").get<uint64_t>();
-    require(nativeTouch.beginInteraction({{"operation",32},{"kind","dnd"},{"id",Id},
-      {"generation",12},{"gesture",gesture},{"slot",0}},touchTarget->hwnd),"production touch DND rejected");
-    require(nativeTouch.externalInteraction(32,true),"external owner not retained");
-    auto returned=std::make_shared<FileDrag::Transfer>(); returned->id=51; returned->touchOperation=32;
+    controls.push_back({{"type","touch_interaction"},{"operation",32},{"kind","move"},{"edge",nullptr},
+      {"id",Id},{"generation",12},{"gesture",gesture},{"slot",0}});
+    touchInteractionNegotiated=true;
+    dispatchNetwork();
+    require(nativeTouch.ownsInteraction(),"production dispatcher rejected server move with null edge");
+    POINT move{first.x+45,first.y+30};
+    nativeTouch.sample(input,WM_POINTERUPDATE,502,move);
+    RECT moved{}; GetWindowRect(touchTarget->hwnd,&moved);
+    require(moved.left==resized.left+45 && moved.top==resized.top+30,"production touch move did not follow contact");
+    nativeTouch.sample(input,WM_POINTERUP,502,move);
+    require(!nativeTouch.ownsInteraction() && !touchTarget->sizing,"production move retained contact ownership");
+    nativeTouch.state({{"generation",13},{"id",Id},{"enabled",true}});
+    SetFocus(touchTarget->hwnd); nativeTouch.sample(input,WM_POINTERDOWN,503,move);
+    gesture=touchWire.back().at("gesture").get<uint64_t>();
+    require(nativeTouch.beginInteraction({{"operation",33},{"kind","dnd"},{"id",Id},{"edge",nullptr},
+      {"generation",13},{"gesture",gesture},{"slot",0}},touchTarget->hwnd),"production touch DND rejected");
+    require(nativeTouch.externalInteraction(33,true),"external owner not retained");
+    auto returned=std::make_shared<FileDrag::Transfer>(); returned->id=51; returned->touchOperation=33;
     { std::lock_guard<std::mutex> lock(FileDrag::activeMutex); FileDrag::active=returned; }
-    touchOlePromotedOperation=32; touchOleMouseReady=true;
+    touchOlePromotedOperation=33; touchOleMouseReady=true;
     FileDrag::remoteHitTest=[](POINT point){return windowDragTarget(point) != nullptr;};
-    SetCursorPos(first.x,first.y);
+    SetCursorPos(move.x,move.y);
     auto started=GetTickCount64();
     require(!touchOleMouse(touchTarget->hwnd,WM_MOUSEMOVE,MK_LBUTTON,0xff515780) &&
       GetTickCount64()-started < 500 && nativeTouch.ownsInteraction(),
       "returned remote motion was consumed by an unclaimed OLE wait");
     require(!returned->done, "remote return was misclassified as a local OLE target");
     returned->claimed=true; // Real claim is sent, but remote ready has not arrived.
-    nativeTouch.sample(input,WM_POINTERUP,502,first);
+    nativeTouch.sample(input,WM_POINTERUP,503,move);
     require(!nativeTouch.ownsInteraction(), "UP before ready retained native owner");
     require(returned->done, "UP before ready did not cancel the pending transfer");
     require(!touchOlePromotedOperation, "UP before ready retained promotion state");
     { std::lock_guard<std::mutex> lock(FileDrag::activeMutex); FileDrag::active.reset(); }
     nativeTouch=NativeTouch{}; resetTouchOle(); FileDrag::remoteHitTest={}; destroyRemote(Id);
-    std::cout << "PASS: production touch resize survives WM_SIZE and releases sizing; returned motion bypasses unclaimed OLE wait and UP-before-ready cancels promptly\n";
+    std::cout << "PASS: production touch null-edge move, resize through WM_SIZE, and DND cancel before OLE readiness\n";
 
     // The production pen callback also receives synchronous WM_SIZE while it
     // owns a native resize. That message must not cancel its own held tip.

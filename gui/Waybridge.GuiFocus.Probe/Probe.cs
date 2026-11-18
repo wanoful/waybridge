@@ -262,20 +262,23 @@ internal static class GuiFocusProbe
         Receive(window, new { type = "local_settings_applied", settings = new { read_only = true },
             pen_supported = true, pen_enabled = true, pen_native_active = false, pen_hardware_available = false, pen_live_supported = true,
             gamepad_supported = true, gamepad_enabled = true, gamepad_live_supported = true, gamepad_devices = Array.Empty<object>(),
+            gamepad_local_count = 0,
             rumble_supported = false, pen_error = "", gamepad_error = "" });
         Check(penState.Text.Contains("未检测到可用的手写笔", StringComparison.Ordinal) &&
-            gamepadState.Text.Contains("未检测到已连接的手柄", StringComparison.Ordinal) &&
+            gamepadState.Text.Contains("Windows 未检测到已连接的 XInput 手柄", StringComparison.Ordinal) &&
             penState.Text.Contains("只读模式已暂停", StringComparison.Ordinal) && gamepadState.Text.Contains("只读模式已暂停", StringComparison.Ordinal),
             "missing hardware/readonly professional state was hidden");
         Receive(window, new { type = "local_settings_applied", settings = new { read_only = false },
             pen_supported = true, pen_enabled = true, pen_native_active = true, pen_hardware_available = true,
             gamepad_supported = true, gamepad_enabled = true,
+            gamepad_local_count = 1,
             gamepad_devices = new[] { new { userindex = 0, connected = true, name = "Private test controller" } },
             rumble_supported = true, pen_error = "", gamepad_error = "" });
         Check(penState.Text.Contains("当前应用已接入压感手写笔", StringComparison.Ordinal) &&
-            gamepadState.Text.Contains("Private test controller", StringComparison.Ordinal) && !penState.Text.Contains("只读模式已暂停", StringComparison.Ordinal),
+            gamepadState.Text.Contains("Windows 已识别 1 个手柄", StringComparison.Ordinal) &&
+            gamepadState.Text.Contains("远端设备：Private test controller", StringComparison.Ordinal) && !penState.Text.Contains("只读模式已暂停", StringComparison.Ordinal),
             "available professional device state failed to recover");
-        Receive(window, new { type = "local_settings_applied", gamepad_enabled = true, gamepad_active = false });
+        Receive(window, new { type = "gamepad_state", gamepad_enabled = true, gamepad_active = false, gamepad_devices = Array.Empty<object>() });
         Check(gamepadState.Text.Contains("当前连接手柄转发已开启", StringComparison.Ordinal) &&
             gamepadState.Text.Contains("请先聚焦远端窗口", StringComparison.Ordinal), "background focus lease was confused with the saved gamepad preference");
         Receive(window, new { type = "local_settings_applied", pen_error = "测试笔设备不可用", gamepad_error = "测试手柄不可用" });

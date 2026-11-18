@@ -52,6 +52,7 @@ internal sealed class MainWindow : Window
     private bool inputDeviceReadOnly;
     private string penError = "", gamepadError = "";
     private List<string>? connectedGamepads;
+    private int? localGamepadCount;
     private sealed record TouchApplication(string Id, string Name);
     private readonly ComboBox touchApplication = new() { DisplayMemberPath = "Name", MinWidth = 220, PlaceholderText = "连接后选择应用" };
     private readonly ComboBox touchAppMode = Combo(["自动选择", "优先原生触控", "鼠标兼容（长按右键、拖选）"]);
@@ -695,7 +696,8 @@ internal sealed class MainWindow : Window
         inputDeviceStatusProfile = null;
         penActive = penSupported = penNativeActive = penLiveSupported = penHardwareAvailable = null;
         gamepadActive = gamepadActiveLease = gamepadSupported = gamepadLiveSupported = rumbleSupported = null;
-        inputDeviceReadOnly = false; penError = gamepadError = ""; connectedGamepads = null;
+        inputDeviceReadOnly = false; penError = gamepadError = "";
+        connectedGamepads = null; localGamepadCount = null;
     }
     private void ReceiveInputDeviceStatus(JsonElement message)
     {
@@ -719,6 +721,8 @@ internal sealed class MainWindow : Window
             penError = penFailure.GetString() ?? "";
         if (message.TryGetProperty("gamepad_error", out var gamepadFailure) && gamepadFailure.ValueKind == JsonValueKind.String)
             gamepadError = gamepadFailure.GetString() ?? "";
+        if (message.TryGetProperty("gamepad_local_count", out var local))
+            localGamepadCount = local.ValueKind == JsonValueKind.Number && local.TryGetInt32(out int count) && count is >= 0 and <= 4 ? count : null;
         if (message.TryGetProperty("gamepad_devices", out var devices) && devices.ValueKind == JsonValueKind.Array)
         {
             connectedGamepads = [];
@@ -766,10 +770,15 @@ internal sealed class MainWindow : Window
                 else if (penNativeActive == true) penText += "当前应用已接入压感手写笔。";
                 else if (penNativeActive == false) penText += "等待支持手写笔的应用接入。";
             }
-            if (gamepadActive == true && gamepadSupported != false && connectedGamepads is not null)
-                gamepadText += connectedGamepads.Count == 0 ? "未检测到已连接的手柄。" : "已连接：" + string.Join("、", connectedGamepads) + "。";
-            if (gamepadActive == true && gamepadActiveLease == false && connectedGamepads?.Count > 0 && !inputDeviceReadOnly)
-                gamepadText += "当前未向远端应用发送手柄输入，请先聚焦远端窗口。";
+            if (gamepadActive == true)
+            {
+                if (localGamepadCount == 0) gamepadText += "Windows 未检测到已连接的 XInput 手柄。请检查蓝牙或 USB 连接。";
+                else if (localGamepadCount is int count) gamepadText += $"Windows 已识别 {count} 个手柄。";
+                if (connectedGamepads?.Count > 0)
+                    gamepadText += "远端设备：" + string.Join("、", connectedGamepads) + "。";
+                else if (gamepadSupported == true && localGamepadCount > 0 && !inputDeviceReadOnly)
+                    gamepadText += gamepadActiveLease == false ? "请先聚焦远端窗口。" : "正在等待 Linux 创建设备。";
+            }
             if (gamepadActive == true && selected.Settings.GamepadRumble && rumbleSupported == false)
                 gamepadText += "当前连接不支持震动反馈。";
             if (penError.Length > 0) penText += "手写笔暂不可用：" + penError;
@@ -785,7 +794,8 @@ internal sealed class MainWindow : Window
     {
         if (desktopNotifications.Receive(message)) return;
         string? type = message.GetProperty("type").GetString();
-        if (type is "status" or "local_settings_applied") { ReceiveTouchStatus(message); ReceiveInputDeviceStatus(message); }
+        if (type is "status" or "local_settings_applied") ReceiveTouchStatus(message);
+        if (type is "status" or "local_settings_applied" or "gamepad_state") ReceiveInputDeviceStatus(message);
         if (type == "notification_status") { Inform(message.GetProperty("message").GetString() ?? "通知服务状态已更新"); return; }
         if (type == "connected" && message.TryGetProperty("hardware_codecs", out var supported))
         {

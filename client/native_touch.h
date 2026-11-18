@@ -134,6 +134,16 @@ public:
       if (emit) emit({{"type","touch_interaction_ack"},{"operation",operation},{"accepted",accepted}});
       return accepted;
     };
+    std::string kind = message.value("kind",std::string());
+    uint32_t resizeEdge = 0;
+    if (kind == "resize") {
+      auto edge = message.find("edge");
+      if (edge == message.end() || !edge->is_number_integer()) return ack(false);
+      auto value = edge->get<int64_t>();
+      if (value != 1 && value != 2 && value != 4 && value != 5 && value != 6 &&
+          value != 8 && value != 9 && value != 10) return ack(false);
+      resizeEdge = uint32_t(value);
+    }
     if (interaction && interaction->operation == operation) {
       const auto &active = *interaction;
       return ack(contacts.count(active.pointerId) && sourceRoot == active.rootWindow &&
@@ -141,9 +151,8 @@ public:
                  message.value("generation",uint64_t(0)) == active.generation &&
                  message.value("id",uint32_t(0)) == active.id &&
                  message.value("slot",uint32_t(10)) == active.slot &&
-                 message.value("kind",std::string()) == active.kind);
+                 kind == active.kind && resizeEdge == active.edge);
     }
-    std::string kind = message.value("kind",std::string());
     uint64_t requestedGesture = message.value("gesture",uint64_t(0));
     uint32_t slot = message.value("slot",uint32_t(10));
     auto contact = std::find_if(contacts.begin(),contacts.end(),[&](const auto &entry) { return entry.second.slot == slot; });
@@ -159,7 +168,8 @@ public:
     InteractionSample sample;
     sample.operation = operation; sample.gesture = gesture; sample.generation = generation;
     sample.id = owner.id; sample.targetId = destination(held.target); sample.slot = slot;
-    sample.edge = message.value("edge",uint32_t(0)); sample.pointerId = contact->first;
+    // Move and DND have no resize edge; the server serializes it as null.
+    sample.edge = resizeEdge; sample.pointerId = contact->first;
     sample.kind = kind; sample.phase = "begin"; sample.hwnd = held.target.hwnd;
     sample.rootWindow = root(held.target); sample.screen = held.screen;
     sample.initialScreen = held.initialScreen; sample.initialWindow = held.initialWindow;

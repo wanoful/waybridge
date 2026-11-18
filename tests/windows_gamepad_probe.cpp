@@ -8,6 +8,7 @@ using Json = nlohmann::json;
 static std::array<bool, 4> connected{};
 static std::array<XINPUT_GAMEPAD, 4> physical{};
 static std::array<unsigned, 4> reads{};
+static unsigned inventories = 0;
 struct Motor {
   DWORD slot;
   WORD strong, weak;
@@ -19,6 +20,10 @@ static DWORD WINAPI readState(DWORD slot, XINPUT_STATE *out) {
     return ERROR_DEVICE_NOT_CONNECTED;
   out->Gamepad = physical.at(slot);
   return ERROR_SUCCESS;
+}
+static DWORD WINAPI readCapabilities(DWORD slot, DWORD, XINPUT_CAPABILITIES *) {
+  ++inventories;
+  return connected.at(slot) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 static DWORD WINAPI setState(DWORD slot, XINPUT_VIBRATION *value) {
   motors.push_back({slot, value->wLeftMotorSpeed, value->wRightMotorSpeed});
@@ -41,14 +46,14 @@ static Json feedback(uint64_t generation, uint32_t slot, uint64_t incarnation) {
 }
 int main() {
   std::vector<Json> packets;
-  NativeGamepad pad([&](const Json &v) { packets.push_back(v); }, readState, setState);
+  NativeGamepad pad([&](const Json &v) { packets.push_back(v); }, readState, setState, readCapabilities);
   ULONGLONG now = GetTickCount64() + 10;
   check(motors.empty(), "constructor touched unrelated motors");
   pad.configure(true, false, true, 15);
   pad.focus(7);
   pad.state(lease(1, 7));
   pad.poll(now);
-  check(reads[0] == 0 && motors.empty(), "default OFF captured input");
+  check(reads[0] == 0 && inventories == 0 && motors.empty(), "default OFF accessed gamepads");
   check(pad.status()["gamepad_enabled"] == false, "OFF preference status");
   connected[0] = connected[3] = true;
   physical[0].wButtons = XINPUT_GAMEPAD_A;
@@ -81,6 +86,8 @@ int main() {
   check(reads[0] == 2 && !pad.status()["gamepad_active"].get<bool>() &&
             pad.status()["gamepad_enabled"] == true,
         "blur changed preference or polled background");
+  check(pad.status()["gamepad_local_count"] == 2 && pad.status()["gamepad_devices"].empty(),
+        "local presence was confused with forwarded devices");
   pad.feedback(feedback(1, 3, 1));
   check(motors.size() == 2, "background rumble accepted");
   pad.focus(7);
@@ -106,7 +113,8 @@ int main() {
   unsigned before = reads[0];
   pad.configure(true, false, false, 15);
   pad.poll(now + 2000);
-  check(reads[0] == before, "disabled adapter read physical state");
+  check(reads[0] == before && pad.status()["gamepad_local_count"].is_null(),
+        "disabled adapter read or retained physical state");
   pad.disconnect();
   check(motors.size() == 6, "cleanup zeroed unrelated motors");
   XINPUT_GAMEPAD raw{};

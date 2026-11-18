@@ -18,6 +18,7 @@ public:
   using Json = nlohmann::json;
   using GetState = DWORD(WINAPI *)(DWORD, XINPUT_STATE *);
   using SetState = DWORD(WINAPI *)(DWORD, XINPUT_VIBRATION *);
+  using GetCapabilities = DWORD(WINAPI *)(DWORD, DWORD, XINPUT_CAPABILITIES *);
 
 private:
   struct Slot {
@@ -29,6 +30,7 @@ private:
   HMODULE library = nullptr;
   GetState get = nullptr;
   SetState set = nullptr;
+  GetCapabilities capabilities = nullptr;
   std::function<void(const Json &)> emit;
   std::array<Slot, 4> slots{};
   bool negotiated = false, requested = false, rumble = true;
@@ -37,6 +39,8 @@ private:
   uint32_t focusId = 0, leaseId = 0;
   uint64_t generation = 0;
   ULONGLONG nextPoll = 0;
+  ULONGLONG nextInventory = 0;
+  int localCount = -1;
   std::string backend, error;
   Json serverDevices = Json::array();
   void send(const Json &message) {
@@ -117,13 +121,32 @@ private:
     return result;
   }
 
+  void inventory(ULONGLONG now) {
+    if (!negotiated || !requested || !capabilities || now < nextInventory)
+      return;
+    nextInventory = now + 500;
+    int count = 0;
+    for (DWORD i = 0; i < slots.size(); ++i) {
+      XINPUT_CAPABILITIES device{};
+      DWORD result = capabilities(i, XINPUT_FLAG_GAMEPAD, &device);
+      if (result == ERROR_SUCCESS)
+        ++count;
+      else if (result != ERROR_DEVICE_NOT_CONNECTED) {
+        localCount = -1;
+        return;
+      }
+    }
+    localCount = count;
+  }
+
 public:
   explicit NativeGamepad(std::function<void(const Json &)> sender = {}, GetState mockGet = nullptr,
-                         SetState mockSet = nullptr)
+                         SetState mockSet = nullptr, GetCapabilities mockCapabilities = nullptr)
       : emit(std::move(sender)) {
     if (mockGet || mockSet) {
       get = mockGet;
       set = mockSet;
+      capabilities = mockCapabilities;
       backend = "test-api";
       return;
     }
@@ -137,6 +160,7 @@ public:
         library = module;
         get = read;
         set = write;
+        capabilities = address<GetCapabilities>(module, "XInputGetCapabilities");
         while (*name)
           backend.push_back(char(*name++));
         break;
@@ -156,8 +180,11 @@ public:
   bool supported() const { return get && set; }
   void configure(bool capability, bool enabled, bool motors, int percent) {
     bool changed = negotiated != capability || requested != enabled;
-    if (changed)
+    if (changed) {
       reset(true);
+      nextInventory = 0;
+      localCount = -1;
+    }
     if (rumble && !motors)
       for (DWORD i = 0; i < slots.size(); ++i)
         stopMotor(i);
@@ -229,6 +256,7 @@ public:
     }
   }
   void poll(ULONGLONG now = GetTickCount64()) {
+    inventory(now);
     for (DWORD i = 0; i < slots.size(); ++i)
       if (slots[i].motorOwned && now >= slots[i].motorDeadline)
         stopMotor(i);
@@ -279,6 +307,7 @@ public:
     return {{"gamepad_supported", negotiated && supported() && (!haveState || serverSupported)},
             {"gamepad_enabled", negotiated && requested},
             {"gamepad_active", active()},
+            {"gamepad_local_count", localCount < 0 ? Json(nullptr) : Json(localCount)},
             {"gamepad_devices", serverDevices},
             {"rumble_supported", negotiated && supported() && serverSupported},
             {"gamepad_error", supported() ? error : "系统没有可用的 XInput；手柄转发不可用"},
@@ -290,5 +319,7 @@ public:
     generation = 0;
     focusId = leaseId = 0;
     serverDevices = Json::array();
+    nextInventory = 0;
+    localCount = -1;
   }
 };

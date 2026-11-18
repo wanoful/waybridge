@@ -108,10 +108,12 @@ int main(){
   takeover.sample(target,WM_POINTERUPDATE,101,moved);
   RECT originalWindow{};GetWindowRect(window,&originalWindow);
   auto start=[&](uint64_t operation,uint64_t physical,uint32_t slot=0,const char *kind="move"){
-    return NativeTouch::Json{{"operation",operation},{"kind",kind},{"id",7},{"generation",10},{"gesture",physical},{"slot",slot},{"edge",8}};
+    // Match serde_json Option::None on the actual server wire: move/DND carry null.
+    NativeTouch::Json edge=std::string(kind)=="resize"?NativeTouch::Json(8):NativeTouch::Json(nullptr);
+    return NativeTouch::Json{{"operation",operation},{"kind",kind},{"id",7},{"generation",10},{"gesture",physical},{"slot",slot},{"edge",edge}};
   };
   require(takeover.beginInteraction(start(1,firstGesture),window),"valid operation rejected");
-  require(ackBeforeBegin&&events.size()==1&&events.back().pointerId==101,"ack/owner ordering");
+  require(ackBeforeBegin&&events.size()==1&&events.back().pointerId==101&&events.back().edge==0,"null-edge move ACK/owner ordering");
   require(events.back().initialScreen.x==first.x&&events.back().screen.x==moved.x&&
           events.back().initialWindow.left==originalWindow.left&&events.back().initialWindow.right==originalWindow.right,
           "takeover lost physical press geometry");
@@ -140,7 +142,8 @@ int main(){
   uint64_t secondGesture=wire.back()["gesture"];
   require(secondGesture!=firstGesture,"new gesture reused old identity");
   require(!takeover.beginInteraction(start(2,firstGesture),window),"old gesture took over reused slot");
-  require(takeover.beginInteraction(start(2,secondGesture),window),"fresh gesture rejected after stale start");
+  auto withoutEdge=start(2,secondGesture);withoutEdge.erase("edge");
+  require(takeover.beginInteraction(withoutEdge,window),"move with omitted edge rejected after stale start");
   require(!takeover.beginInteraction(start(1,firstGesture),window)&&takeover.activeInteraction()->operation==2,"stale operation replaced active operation");
   // External native-to-OLE handoff tolerates OS capture changes and keeps the
   // operation token after UP, without pretending a released pointer is held.
@@ -162,6 +165,12 @@ int main(){
   takeover.sample(target,WM_POINTERUP,105,first);
   require(!takeover.beginInteraction(start(3,releasedGesture),window),"down/up before ACK resurrected contact");
   takeover.sample(target,WM_POINTERDOWN,106,first);uint64_t cancelGesture=wire.back()["gesture"];
+  for(const auto &edge:NativeTouch::Json::array({nullptr,0,3,12,-1,8.5,"8",uint64_t(-1)})) {
+    auto invalid=start(3,cancelGesture,0,"resize");invalid["edge"]=edge;
+    require(!takeover.beginInteraction(invalid,window)&&!takeover.ownsInteraction()&&!wire.back().value("accepted",true),"malformed resize edge accepted");
+  }
+  auto missingResize=start(3,cancelGesture,0,"resize");missingResize.erase("edge");
+  require(!takeover.beginInteraction(missingResize,window),"resize missing edge accepted");
   require(takeover.beginInteraction(start(3,cancelGesture,0,"resize"),window),"resize start");
   wireCount=wire.size();eventCount=events.size();takeover.enabled(false);
   require(events.size()==eventCount+1&&events.back().phase=="cancel"&&wire.size()==wireCount&&!takeover.ownsInteraction(),"policy cancel duplicated or lost operation cancel");
@@ -175,7 +184,7 @@ int main(){
   require(events.size()==eventCount+1&&events.back().phase=="end"&&wire.size()==wireCount&&!takeover.ownsInteraction(),"server revoke echoed operation cancel");
   takeover.state({{"generation",13},{"id",7},{"enabled",true}});
   takeover.sample(target,WM_POINTERDOWN,108,first);auto capturedStart=start(5,wire.back()["gesture"],0,"dnd");capturedStart["generation"]=13;
-  require(takeover.beginInteraction(capturedStart,window),"captured DND start");
+  require(takeover.beginInteraction(capturedStart,window)&&events.back().edge==0,"null-edge captured DND start");
   eventCount=events.size();wireCount=wire.size();takeover.sample(ineligible,WM_POINTERCAPTURECHANGED,108,first);
   require(events.size()==eventCount+1&&events.back().phase=="cancel"&&wire.size()==wireCount&&!takeover.ownsInteraction(),"owning native capture loss failed to cancel exactly once");
   // Concrete popup coordinates use the root lease, including a first queued
@@ -195,7 +204,7 @@ int main(){
   require(popupWire[0]["gesture"]==popupWire[1]["gesture"]&&popupWire[0]["gesture"]!=popupWire[2]["gesture"],"queued taps reused gesture identity");
   DestroyWindow(popup);DestroyWindow(elsewhere);
   DestroyWindow(window);
-  std::cout<<"PASS: native touch lease/popup geometry, distinct queued gestures, takeover ACK ordering, exact owning contact, second-finger isolation, focus-independent motion/up, stale operations, down/up-before-ACK, external capture/UP/completion, policy/server cancel and touch-only mouse suppression\n";
+  std::cout<<"PASS: native touch lease/popup geometry, distinct queued gestures, real null/omitted move/DND edges, malformed resize rejection, takeover ACK ordering, exact owning contact, second-finger isolation, focus-independent motion/up, stale operations, down/up-before-ACK, external capture/UP/completion, policy/server cancel and touch-only mouse suppression\n";
   return 0;
  }catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}
 }
