@@ -111,6 +111,11 @@ public:
     dpi = std::clamp<UINT>(dpi, 96, 384);
     return create(std::clamp(GetSystemMetricsForDpi(largeIcon ? SM_CXICON : SM_CXSMICON, dpi), 8, 128));
   }
+  std::vector<uint8_t> originalPng(UINT edge = 64) const {
+    edge = std::clamp<UINT>(edge, 8, 128);
+    const auto &master = pixels.empty() ? IconBadge::defaultPixels(true) : pixels;
+    return IconBadge::png(IconBadge::resize(master, 128, int(edge)), edge);
+  }
   std::vector<uint8_t> badgedPng(UINT edge = 64) const {
     edge = std::clamp<UINT>(edge, 8, 128);
     return IconBadge::png(IconBadge::compose(pixels, int(edge)), edge);

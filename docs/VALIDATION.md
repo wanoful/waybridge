@@ -1,5 +1,21 @@
 # Validation
 
+## Launcher layout refinement — 2026-11-18
+
+On the physical Windows x64 laptop, a private catalog with over 80 entries verified aligned toolbar controls, a reserved left navigation rail, a directory header that pinned and released in the same scroll viewport, and equal icon coordinates for one- and two-line titles. The successful settings acknowledgement updated the settings view without opening the banner. The loaded PNG replaced its placeholder. An application launched from its tile appeared only on the separate Running page. The test used UI Automation without physical input injection.
+
+## Full Launcher — 2026-11-18
+
+- Isolated Windows x64 UI Automation verified globally placed search, keyword-based catalog results, grid and compact list switching, the command mode, a 128-pixel icon received over TLS, the pin action and a native remote window created by launching the test application from its tile.
+- Private authenticated TLS icon tests cover exact installed desktop IDs, SHA-256, response bounds and missing icons. Catalog and launch tests cover localized metadata, Desktop Actions, literal transient arguments, working directories and preview without execution. The private Linux binaries were built together because the TLS service uses the compositor's icon resolver.
+
+## Launcher and service administration — 2026-11-18
+
+- The Windows launcher and eight settings categories use WinUI in the first package. WinUI x64 UI Automation on the physical Windows laptop exercised offline input settings, save/reload and effective status. An isolated TLS test then invoked the actual launcher button and observed a matching native remote HWND for a GIO-launched Qt fixture. The foreground-transfer probe requires an unlocked desktop and stopped before injecting input at the lock screen.
+- The TLS-only Core tests and direct integration passed with a private TLS service, compositor and worker fixture. They checked pairing, certificate mismatch, retained session, revocation and cancellation or rejection of a launch for the wrong active profile. The existing Desktop Entry override regressions also passed.
+- Isolated terminal tests exercised offline recovery by correcting an invalid saved FPS and preserving its TOML comment, previewing and saving application overrides and Portal settings, and reading logs and ending a session by its verified process identity. The online terminal displayed the full fingerprint and generated a one-use code for real pinned TLS pairing, then revoked the disposable device. The Release gateway passed session admission, launch plan, config limits, live policy, retained-session and revocation checks with an actual compositor. User-unit operations were kept out of the private fixture.
+- The separate Avalonia proof used Avalonia 12.1.6 and FluentAvaloniaUI 3.1.0 in .NET 10 self-contained x64 and ARM64 publishes. The x64 package started on the laptop, registered a tray icon, accepted a UI Automation invocation, wrote a silent OS notification into history and received a simulated button action through the registered COM activator. Real notification clicks through to a Linux session and ARM64 execution are pending. Probe evidence is in `build/avalonia-preview/windows-x64.log`.
+
 ## Pen and gamepad integration — 2026-11-18
 
 Implementation `4cd03a1` is installed on both ends. Linux user-service PID102010
@@ -1182,8 +1198,8 @@ provider or installed Waybridge process was replaced for these tests.
   takeover. No host desktop activation environment was modified.
 - `/usr/bin/python3 tests/native_notifications_smoke.py` exercised the real PE
   worker under a private Wine/Xvfb prefix: GUI-readiness handshake, host-pipe
-  notification/action round trip, Chinese metadata, native badged placeholder
-  PNG, replacement revision rejection, native read-only gating, live opt-out,
+  notification/action round trip, Chinese metadata, placeholder and unbadged
+  application PNG, replacement revision rejection, native read-only gating, live opt-out,
   no body logging and clean worker teardown. This is IPC/protocol evidence,
   not Wine execution of Windows AppNotifications.
 - `tests/windows_host_control_probe.cpp` includes an actual unread pipe and

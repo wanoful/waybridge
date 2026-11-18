@@ -29,7 +29,10 @@ def main():
         application_directory = root / "data/applications"
         application_directory.mkdir(parents=True)
         (application_directory / "waybridge-direct-smoke.desktop").write_text(
-            "[Desktop Entry]\nType=Application\nName=Waybridge Direct Test 应用\nExec=/usr/bin/true\n")
+            "[Desktop Entry]\nType=Application\nName=Waybridge Direct Test 应用\nExec=/usr/bin/true\n"
+            "GenericName=Direct editor\nComment=Desktop metadata fixture\nCategories=Development;\n"
+            "Keywords=launcher;\nStartupWMClass=WaybridgeDirect\nActions=NewWindow;\n"
+            "\n[Desktop Action NewWindow]\nName=Open a window\nComment=Open a new editor\nExec=/usr/bin/true\n")
         env = os.environ.copy()
         env.update(XDG_RUNTIME_DIR=str(runtime), XDG_DATA_HOME=str(root / "data"),
                    XDG_CONFIG_HOME=str(root / "config"), XDG_STATE_HOME=str(root / "app-state"),

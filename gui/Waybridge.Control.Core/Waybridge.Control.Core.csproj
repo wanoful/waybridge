@@ -5,7 +5,4 @@
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
-  <ItemGroup>
-    <EmbeddedResource Include="../../scripts/session-control.py" LogicalName="Waybridge.SessionControl" />
-  </ItemGroup>
 </Project>

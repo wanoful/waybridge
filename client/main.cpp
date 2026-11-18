@@ -3766,7 +3766,7 @@ int wmain(int argc, wchar_t **argv) {
       if (!iconDecoder) iconDecoder = std::make_unique<ImageDecoder>();
       icon.update(unbase64(message["png"].get<std::string>()), *iconDecoder);
     }
-    auto png = icon.badgedPng(64);
+    auto png = icon.originalPng();
     message["png"] = png.empty() ? Json(nullptr) : Json(base64(png.data(), png.size()));
   };
   remoteTray.attach(controller,sendJson,[](const Json &event){hostControl.emit(event);});

@@ -1,4 +1,5 @@
 mod storage;
+mod tui;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -43,7 +44,7 @@ const HELPER: &str = include_str!("../../scripts/session-control.py");
     about = "Secure direct entry point for same-user Waybridge sessions"
 )]
 struct Args {
-    /// Replace the XDG user configuration file for serve and configuration checks.
+    /// Replace the XDG user configuration file for serve, configuration checks and offline TUI.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Validate configuration without creating identity/state or starting listeners.
@@ -81,6 +82,8 @@ enum Action {
     Revoke {
         client_id: String,
     },
+    /// Manage the service, sessions, pairing and settings in a terminal.
+    Tui,
 }
 
 struct Shared {
@@ -90,8 +93,10 @@ struct Shared {
     compositor: String,
     python: String,
     config_path: Option<PathBuf>,
+    configuration: Value,
     changed: watch::Sender<u64>,
     rpc_slots: Semaphore,
+    icon_slots: Semaphore,
 }
 
 fn locations(args: &Args) -> Result<(PathBuf, PathBuf)> {
@@ -171,6 +176,10 @@ fn lock_state(directory: &Path) -> Result<fs::File> {
 }
 
 async fn read_request<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Value> {
+    read_object(reader, MAX_REQUEST).await
+}
+
+async fn read_object<R: AsyncBufRead + Unpin>(reader: &mut R, limit: usize) -> Result<Value> {
     let mut bytes = Vec::new();
     loop {
         let available = reader.fill_buf().await?;
@@ -179,8 +188,8 @@ async fn read_request<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Value> 
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let used = newline.map_or(available.len(), |position| position + 1);
-        if bytes.len() + used > MAX_REQUEST {
-            bail!("request exceeds 65536-byte limit");
+        if bytes.len() + used > limit {
+            bail!("JSON line exceeds {limit}-byte limit");
         }
         bytes.extend_from_slice(&available[..used]);
         reader.consume(used);
@@ -236,7 +245,12 @@ fn authenticated(shared: &Shared, request: &Value) -> bool {
 }
 
 async fn helper(shared: &Shared, request: &Value) -> Result<Value> {
-    let _slot = timeout(Duration::from_secs(2), shared.rpc_slots.acquire())
+    let slots = if request["op"] == "app_icons" {
+        &shared.icon_slots
+    } else {
+        &shared.rpc_slots
+    };
+    let _slot = timeout(Duration::from_secs(2), slots.acquire())
         .await
         .context("session manager is busy")??;
     let mut request = request.clone();
@@ -250,12 +264,16 @@ async fn helper(shared: &Shared, request: &Value) -> Result<Value> {
     }
     map.insert("binary".into(), Value::String(shared.compositor.clone()));
     map.insert("id".into(), json!(1));
+    run_helper(&shared.python, &request).await
+}
+
+async fn run_helper(python: &str, request: &Value) -> Result<Value> {
     let mut bytes = serde_json::to_vec(&request)?;
     if bytes.len() >= MAX_REQUEST {
         bail!("session request exceeds limit");
     }
     bytes.push(b'\n');
-    let mut command = Command::new(&shared.python);
+    let mut command = Command::new(python);
     command
         .args(["-I", "-c", HELPER])
         .stdin(Stdio::piped())
@@ -328,7 +346,7 @@ async fn remote(
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let op = request["op"].as_str().unwrap_or("");
     if op == "hello" {
-        return write_response(&mut connection, &id, Ok(json!({"version":1,"certificate_sha256":shared.certificate_sha256,"features":["pairing","sessions","launch","applications","stream","revoke"]}))).await;
+        return write_response(&mut connection, &id, Ok(json!({"version":1,"certificate_sha256":shared.certificate_sha256,"features":["pairing","sessions","launch","applications","app_icons","stream","revoke"]}))).await;
     }
     if op == "pair" {
         let result = (|| {
@@ -455,7 +473,14 @@ async fn remote(
     }
     if !matches!(
         op,
-        "list" | "ensure" | "info" | "applications" | "launch" | "launch-plan" | "end"
+        "list"
+            | "ensure"
+            | "info"
+            | "applications"
+            | "app_icons"
+            | "launch"
+            | "launch-plan"
+            | "end"
     ) {
         return write_response(
             &mut connection,
@@ -488,7 +513,7 @@ async fn local(shared: Arc<Shared>, connection: UnixStream) -> Result<()> {
     let mut connection = BufReader::new(connection);
     let request = timeout(HANDSHAKE_TIMEOUT, read_request(&mut connection)).await??;
     let id = request.get("id").cloned().unwrap_or(Value::Null);
-    let result = (|| -> Result<Value> {
+    let result = async {
         match request["op"].as_str().unwrap_or("") {
             "pair" => {
                 let expires = request["expires"]
@@ -505,13 +530,32 @@ async fn local(shared: Arc<Shared>, connection: UnixStream) -> Result<()> {
                 )
             }
             "status" => Ok(
-                json!({"version":1,"certificate_sha256":shared.certificate_sha256,"listen":shared.listen}),
+                json!({"version":1,"certificate_sha256":shared.certificate_sha256,"listen":shared.listen,
+                    "pid":std::process::id(),"configuration":shared.configuration,
+                    "config_home":tui::config_home()}),
             ),
             "clients" => Ok(shared.store.lock().unwrap().clients()),
             "revoke" => revoke(&shared, &request),
+            "sessions" => helper(&shared, &json!({"op":"list"})).await,
+            "end_session" => {
+                let session = text_field(&request, "session")?;
+                let pid = request["pid"].as_u64().context("missing session PID")?;
+                let started = text_field(&request, "started")?;
+                helper(&shared, &json!({"op":"end","session":session,"expected_pid":pid,"expected_started":started})).await
+            }
+            "session_log" => {
+                let session = text_field(&request, "session")?;
+                helper(&shared, &json!({"op":"local-session-log","session":session})).await
+            }
+            "override_catalog" => helper(&shared, &json!({"op":"local-override-catalog"})).await,
+            "preview_override" => {
+                let app = text_field(&request, "app")?;
+                let draft = request["draft"].as_str().context("missing desktop override draft")?;
+                helper(&shared, &json!({"op":"local-preview-override","app":app,"draft":draft,"context":request["context"]})).await
+            }
             _ => bail!("Unknown local operation"),
         }
-    })();
+    }.await;
     write_response(
         &mut connection,
         &id,
@@ -527,6 +571,7 @@ async fn serve(
     compositor: String,
     python: String,
     config_path: Option<PathBuf>,
+    configuration: Value,
 ) -> Result<()> {
     storage::private_directory(&state)?;
     storage::private_directory(&runtime)?;
@@ -540,13 +585,13 @@ async fn serve(
     };
     let (cert, key) = identity(&state)?;
     let certificate_sha256 = storage::fingerprint(&cert);
-    let configuration = rustls::ServerConfig::builder()
+    let tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
             vec![CertificateDer::from(cert)],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
         )?;
-    let acceptor = TlsAcceptor::from(Arc::new(configuration));
+    let acceptor = TlsAcceptor::from(Arc::new(tls));
     let listener = TcpListener::bind(&listen)
         .await
         .context("binding TLS listener")?;
@@ -573,8 +618,10 @@ async fn serve(
         compositor,
         python,
         config_path,
+        configuration,
         changed,
         rpc_slots: Semaphore::new(4),
+        icon_slots: Semaphore::new(2),
     });
     let ready = json!({"version":1,"listen":shared.listen,"certificate_sha256":shared.certificate_sha256,"control_socket":socket});
     storage::atomic_private(&runtime.join("ready.json"), &serde_json::to_vec(&ready)?)?;
@@ -650,6 +697,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         let (state, runtime) = locations(&args)?;
+        let report = configuration.report();
         let service = configuration.config.service;
         // A selected explicit file remains mandatory. The default XDG file
         // remains optional and is discovered identically by helper children.
@@ -664,21 +712,34 @@ async fn main() -> Result<()> {
             service.compositor,
             service.python,
             config_path,
+            report,
         )
         .await;
     }
     let action = args.command.as_ref().context(
-        "specify serve, pair, status, clients or revoke (or --check-config/--print-config)",
+        "specify serve, tui, pair, status, clients or revoke (or --check-config/--print-config)",
     )?;
     let (_, runtime) = locations(&args)?;
+    if matches!(action, Action::Tui) {
+        return tui::run(runtime, args.config, args.runtime_dir.is_none()).await;
+    }
     let request = match action {
         Action::Pair { expires } => json!({"op":"pair","expires":expires}),
         Action::Status => json!({"op":"status"}),
         Action::Clients => json!({"op":"clients"}),
         Action::Revoke { client_id } => json!({"op":"revoke","revoke_client_id":client_id}),
-        Action::Serve { .. } => unreachable!(),
+        Action::Serve { .. } | Action::Tui => unreachable!(),
     };
-    let metadata = fs::symlink_metadata(&runtime)?;
+    let response = admin_request(&runtime, &request).await?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    if response["ok"] != true {
+        bail!("local administration request failed");
+    }
+    Ok(())
+}
+
+async fn admin_request(runtime: &Path, request: &Value) -> Result<Value> {
+    let metadata = fs::symlink_metadata(runtime)?;
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::getuid() }
         || metadata.permissions().mode() & 0o077 != 0
@@ -688,16 +749,21 @@ async fn main() -> Result<()> {
     let mut connection = UnixStream::connect(runtime.join("control.sock"))
         .await
         .context("service is not running")?;
-    let mut bytes = serde_json::to_vec(&request)?;
+    if connection.peer_cred()?.uid() != unsafe { libc::getuid() } {
+        bail!("local service UID does not match");
+    }
+    let mut bytes = serde_json::to_vec(request)?;
+    if bytes.len() >= MAX_REQUEST {
+        bail!("administration request exceeds limit");
+    }
     bytes.push(b'\n');
     connection.write_all(&bytes).await?;
     let mut reader = BufReader::new(connection);
-    let response = timeout(HANDSHAKE_TIMEOUT, read_request(&mut reader)).await??;
-    println!("{}", serde_json::to_string_pretty(&response)?);
-    if response["ok"] != true {
-        bail!("local administration request failed");
-    }
-    Ok(())
+    timeout(
+        HANDSHAKE_TIMEOUT,
+        read_object(&mut reader, MAX_RESPONSE + 1),
+    )
+    .await?
 }
 
 #[cfg(test)]

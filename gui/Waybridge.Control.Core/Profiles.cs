@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -62,31 +64,27 @@ public sealed record ConnectionProfile
 {
     public Guid Id { get; set; } = Guid.NewGuid();
     public string Name { get; set; } = "Linux 工作站";
-    public string Mode { get; set; } = "ssh";
     public string Host { get; set; } = "";
-    public int SshPort { get; set; } = 22;
-    public string User { get; set; } = "";
-    public string IdentityFile { get; set; } = "";
+    public int Port { get; set; } = 49092;
     public string CertificateSha256 { get; set; } = "";
     public string ClientId { get; set; } = "";
-    public string ServerBinary { get; set; } = "waybridge";
     public string Session { get; set; } = "waybridge-0";
     public string SessionMode { get; set; } = "auto";
-    public int Port { get; set; } = 49090;
     public bool AutoReconnect { get; set; } = true;
     public ClientSettings Settings { get; set; } = new();
+    internal string Address => Host.StartsWith('[') && Host.EndsWith(']') ? Host[1..^1] : Host;
     public void Validate()
     {
         if (Id == Guid.Empty || string.IsNullOrWhiteSpace(Name) || Name.Length > 100) throw new ArgumentException("请输入连接名称");
-        if (Mode is not ("ssh" or "tunnel" or "direct")) throw new ArgumentException("无效的连接方式");
-        if (!Regex.IsMatch(Host, @"^[a-zA-Z0-9\[\]][a-zA-Z0-9_.:\[\]-]{0,252}$")) throw new ArgumentException("请输入主机名、SSH config 别名或 IP 地址");
-        if (User.Length > 64 || (User.Length > 0 && !Regex.IsMatch(User, @"^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$"))) throw new ArgumentException("无效的 SSH 用户名");
-        if (SshPort is < 1 or > 65535 || Port is < 0 or > 65535 || (Mode != "ssh" && Port == 0)) throw new ArgumentException("无效的端口");
+        if (Host is null || (!Regex.IsMatch(Host, @"\A[a-zA-Z0-9][a-zA-Z0-9_.-]{0,252}\z") &&
+            !(Address.AsSpan().IndexOfAny('[', ']') < 0 && IPAddress.TryParse(Address, out var ip) &&
+                ip.AddressFamily == AddressFamily.InterNetworkV6)))
+            throw new ArgumentException("请输入主机名或 IP 地址");
+        if (Port is < 1 or > 65535) throw new ArgumentException("无效的端口");
         if (CertificateSha256.Length > 0 && (CertificateSha256.Length != 64 || !CertificateSha256.All(Uri.IsHexDigit))) throw new ArgumentException("无效的 SHA-256 证书指纹");
         if (ClientId.Length > 256 || ClientId.Any(char.IsWhiteSpace)) throw new ArgumentException("无效的客户端标识");
-        if (!Regex.IsMatch(Session, @"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")) throw new ArgumentException("会话名称仅允许字母、数字、下划线与连字符");
+        if (!Regex.IsMatch(Session, @"\A[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\z")) throw new ArgumentException("会话名称仅允许字母、数字、下划线与连字符");
         if (SessionMode is not ("auto" or "attach" or "new")) throw new ArgumentException("无效的会话策略");
-        if (string.IsNullOrWhiteSpace(ServerBinary) || ServerBinary.Length > 4096 || ServerBinary.Contains('\0')) throw new ArgumentException("请输入 Linux 服务端路径");
         Settings.Validate();
     }
 }
@@ -138,6 +136,14 @@ public interface ISecretStore
     void Delete(Guid profile);
 }
 
-public sealed record RemoteSession(string Name, int Pid, string Started, int Port, bool Created);
-public sealed record RemoteApplication(string Id, string Name, string Icon);
-public sealed record TrustRequest(string Host, int Port, IReadOnlyList<string> Fingerprints);
+public sealed record RemoteDesktopAction(string Id, string Name, string Comment = "");
+
+public sealed record RemoteApplication(string Id, string Name, string Icon)
+{
+    public string GenericName { get; init; } = "";
+    public string Comment { get; init; } = "";
+    public IReadOnlyList<string> Categories { get; init; } = [];
+    public IReadOnlyList<string> Keywords { get; init; } = [];
+    public IReadOnlyList<RemoteDesktopAction> Actions { get; init; } = [];
+    public string StartupWmClass { get; init; } = "";
+}

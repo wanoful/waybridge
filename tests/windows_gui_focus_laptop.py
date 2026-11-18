@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Opt-in actual WinUI click -> management SSH -> GIO -> native foreground test.
+"""Opt-in actual WinUI click -> TLS -> GIO -> native foreground test.
 
-Runs only an independently named GUI binary, temporary profile/key/known_hosts,
-private sshd and SessionFixture bus/HOME. Never attaches to an installed session.
+Runs an independently named GUI binary with a temporary paired profile, private
+TLS service, and SessionFixture bus/HOME. SSH forwards the isolated TLS listener
+and deploys only the probe files. Never attaches to an installed session.
 """
 import argparse
 import base64
 import json
 import os
 from pathlib import Path
-import pwd
 import shutil
 import signal
-import socket
 import subprocess
 import tempfile
 import time
@@ -27,11 +26,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', required=True)
     parser.add_argument('--publish-directory', type=Path, default=ROOT/'build/gui-focus-probe-x64')
+    parser.add_argument('--uia-only', action='store_true', help='invoke the actual WinUI buttons and verify a native window without sending pointer or keyboard input')
     args = parser.parse_args()
     publish = args.publish_directory.resolve(strict=True)
     assert (publish/'Waybridge.GuiFocus.Probe.exe').is_file()
     key = 'Waybridge-gui-focus-probe-' + uuid.uuid4().hex[:12]
     logfile = ROOT/'build/tests/gui-focus-laptop.log'
+    logfile.parent.mkdir(parents=True, exist_ok=True)
     def remote(code, check=True):
         encoded = base64.b64encode(code.encode('utf-16-le')).decode()
         result = subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10',args.host,
@@ -47,63 +48,66 @@ def main():
         for path in publish.rglob('*'):
             if path.is_file(): zipped.write(path,path.relative_to(publish))
         zipped.write(ROOT/'build/windows/waybridge-client.exe','waybridge-client.exe')
+        if args.uia_only:
+            zipped.writestr('uia-only', 'invoke accessibility controls without input injection\n')
     with tempfile.TemporaryDirectory(prefix='wb-gui-focus-') as directory, SessionFixture(Path(directory)/'fixture') as fixture:
         root = Path(directory)
-        for name in ('host','identity'):
-            subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-f',str(root/name)],check=True)
-        with socket.socket() as free:
-            free.bind(('127.0.0.1',0)); linux_port = free.getsockname()[1]
         windows_port = int(remote('$l=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0);$l.Start();$p=$l.LocalEndpoint.Port;$l.Stop();$p'))
-        env = {k:v for k,v in fixture.env.items() if k in ('DBUS_SYSTEM_BUS_ADDRESS','DBUS_SESSION_BUS_ADDRESS','HOME',
-            'XDG_RUNTIME_DIR','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_CACHE_HOME','XDG_STATE_HOME','WAYBRIDGE_TEST_SESSION_FIXTURE')}
+        env = fixture.env.copy()
         env.update(QT_QPA_PLATFORM='wayland',QT_WAYLAND_DISABLE_WINDOWDECORATION='1',XDG_DATA_DIRS=str(root/'empty'))
-        def quote(value): return '"'+value.replace('\\','\\\\').replace('"','\\"')+'"'
-        (root/'sshd_config').write_text(f'''Port {linux_port}
-ListenAddress 127.0.0.1
-HostKey {root/'host'}
-PidFile {root/'sshd.pid'}
-AuthorizedKeysFile {root/'identity.pub'}
-StrictModes no
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-UsePAM no
-SetEnv {' '.join(k+'='+quote(v) for k,v in env.items())}
-LogLevel ERROR
-''')
+        runtime = Path(env['XDG_RUNTIME_DIR'])/'entry'
+        service = [str(ROOT/'target/debug/waybridge-service'), '--state-dir', str(root/'state'), '--runtime-dir', str(runtime)]
         binary = root/'server'
         binary.write_text('#!/bin/sh\nexec '+str(ROOT/'target/debug/waybridge')+' --no-audio --no-xwayland "$@"\n')
         binary.chmod(0o700)
         apps = Path(fixture.env['XDG_DATA_HOME'])/'applications'; apps.mkdir(parents=True)
-        (apps/'org.waybridge.FocusProbe.desktop').write_text('[Desktop Entry]\nType=Application\nName=Waybridge isolated focus fixture\nExec='+str(ROOT/'build/tests/qt-focus-app')+'\nStartupNotify=false\n')
-        hostkey = (root/'host.pub').read_text().split()
+        icon = Path(fixture.env['XDG_DATA_HOME'])/'pixmaps/waybridge-focus.png'
+        icon.parent.mkdir(parents=True)
+        shutil.copyfile(ROOT/'assets/branding/waybridge.png', icon)
+        (apps/'org.waybridge.FocusProbe.desktop').write_text(
+            '[Desktop Entry]\nType=Application\nName=Waybridge isolated focus fixture\nExec='+str(ROOT/'build/tests/qt-focus-app')+
+            '\nStartupNotify=false\nIcon=waybridge-focus\nCategories=Development;\nKeywords=launcherprobefixture;\n')
+        if args.uia_only:
+            for index in range(80):
+                title = f'App {index:02}'
+                if index == 1:
+                    title += ' Wrap SecondLine'
+                elif index % 2:
+                    title += ' with a long name that wraps over more than two lines'
+                (apps/f'launcher-tile-{index:02}.desktop').write_text(
+                    f'[Desktop Entry]\nType=Application\nName={title}\nExec=/usr/bin/true\nIcon=waybridge-focus\n')
         profile_id = str(uuid.uuid4())
-        profile = dict(id=profile_id,name='Disposable GUI focus fixture',mode='ssh',host='127.0.0.1',ssh_port=windows_port,
-            user=pwd.getpwuid(os.getuid()).pw_name,identity_file=destination+'\\identity',server_binary=str(binary),
-            session='gui-focus-'+uuid.uuid4().hex[:8],session_mode='auto',port=0,auto_reconnect=False,
+        profile = dict(id=profile_id,name='Disposable GUI focus fixture',host='127.0.0.1',port=windows_port,
+            session='gui-focus-'+uuid.uuid4().hex[:8],session_mode='auto',auto_reconnect=False,
             settings=dict(codec='png',fps=30,audio=False,notifications=False,tray=False,clipboard='off',files=False))
         children = []
         with logfile.open('w+') as log:
             try:
-                sshd = subprocess.Popen([shutil.which('sshd'),'-D','-e','-f',str(root/'sshd_config')],stdout=log,stderr=log);children.append(sshd)
-                for _ in range(80):
-                    assert sshd.poll() is None, 'temporary sshd failed'
-                    try:
-                        with socket.create_connection(('127.0.0.1',linux_port),timeout=.1): break
-                    except OSError: time.sleep(.05)
+                daemon = subprocess.Popen([*service, 'serve', '--listen', '127.0.0.1:0', '--compositor', str(binary)],
+                                          env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+                children.append(daemon)
+                ready_path = runtime/'ready.json'
+                deadline = time.monotonic()+15
+                while not ready_path.exists():
+                    assert daemon.poll() is None, 'private TLS service failed'
+                    assert time.monotonic() < deadline, 'private TLS service timed out'
+                    time.sleep(.05)
+                ready = json.loads(ready_path.read_text())
+                profile['certificate_sha256'] = ready['certificate_sha256']
+                linux_port = int(ready['listen'].rsplit(':', 1)[1])
                 tunnel = subprocess.Popen(['ssh','-o','BatchMode=yes','-o','ExitOnForwardFailure=yes','-N',
                     '-R',f'127.0.0.1:{windows_port}:127.0.0.1:{linux_port}',args.host],stdout=log,stderr=log);children.append(tunnel)
                 subprocess.run(['scp','-q',str(archive),args.host+':'+(destination+'.zip').replace('\\','/')],check=True,timeout=150)
                 remote("Expand-Archive -LiteralPath '"+destination+".zip' -DestinationPath '"+destination+"'; New-Item -ItemType Directory -Path '"+destination+"\\state' | Out-Null")
-                own = {'profiles.json':json.dumps([profile]),'known_hosts':f'[127.0.0.1]:{windows_port} {hostkey[0]} {hostkey[1]}\n',
-                       'profile-id.txt':profile_id}
+                assert tunnel.poll() is None, 'private TLS forward failed'
+                pairing = json.loads(subprocess.check_output([*service, 'pair', '--expires', '180'], env=env))['result']
+                own = {'profiles.json':json.dumps([profile]), 'profile-id.txt':profile_id, 'pair-code.txt':pairing['pair_code']}
                 for name,text in own.items():
                     path = root/name;path.write_text(text)
-                    sub = '/state/' if name in ('profiles.json','known_hosts') else '/'
+                    sub = '/state/' if name == 'profiles.json' else '/'
                     subprocess.run(['scp','-q',str(path),args.host+':'+destination.replace('\\','/')+sub+name],check=True,timeout=30)
-                subprocess.run(['scp','-q',str(root/'identity'),args.host+':'+destination.replace('\\','/')+'/identity'],check=True,timeout=30)
                 setup = r'''
 $ErrorActionPreference='Stop'; $root='@ROOT@';$name='@NAME@'
-$identity=$root+'\identity'; & icacls.exe $identity /inheritance:r /grant:r ($env:USERNAME+':R') | Out-Null
 $run=@'
 $ErrorActionPreference='Stop';$root=$PSScriptRoot
 try {
@@ -132,7 +136,11 @@ Start-ScheduledTask -TaskName $name
                     log.write('\nLINUX '+path.name+'\n'+path.read_text(errors='replace'));log.flush()
                 print(result)
                 assert result.splitlines()[0].strip()=='0', 'GUI focus test failed; see '+str(logfile)
-                print('PASS actual WinUI UI/SSH/GIO/native worker foreground, second process and Qt modal restoration')
+                if args.uia_only:
+                    assert 'PASS actual WinUI UIA Invoke' in result
+                    print('PASS actual WinUI UIA/TLS/GIO/native worker window')
+                else:
+                    print('PASS actual WinUI UI/TLS/GIO/native worker foreground, second process and Qt modal restoration')
             finally:
                 remote("$root='"+destination+"';Get-ScheduledTask -TaskName '"+key+"' -ErrorAction SilentlyContinue|Unregister-ScheduledTask -Confirm:$false;Get-CimInstance Win32_Process|Where-Object{$_.ExecutablePath -and $_.ExecutablePath.StartsWith($root+'\\',[StringComparison]::OrdinalIgnoreCase)}|ForEach-Object{Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue};Remove-Item -Recurse -Force -LiteralPath $root -ErrorAction SilentlyContinue;Remove-Item -Force -LiteralPath ($root+'.zip') -ErrorAction SilentlyContinue",check=False)
                 for descriptor in Path(fixture.env['XDG_RUNTIME_DIR']).glob('gui-focus-*.session.json'):

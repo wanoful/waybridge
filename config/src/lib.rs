@@ -261,13 +261,17 @@ pub fn user_config_path(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<Pat
 }
 
 impl Loaded {
-    pub fn load(explicit: Option<&Path>) -> Result<Self> {
-        let path = explicit.map(Path::to_path_buf).or_else(|| {
+    pub fn selected_path(explicit: Option<&Path>) -> Option<PathBuf> {
+        explicit.map(Path::to_path_buf).or_else(|| {
             user_config_path(
                 std::env::var_os("XDG_CONFIG_HOME").as_deref(),
                 std::env::var_os("HOME").as_deref(),
             )
-        });
+        })
+    }
+
+    pub fn load(explicit: Option<&Path>) -> Result<Self> {
+        let path = Self::selected_path(explicit);
         Self::load_path(path.as_deref(), explicit.is_some())
     }
 
@@ -282,6 +286,42 @@ impl Loaded {
             })
             .transpose()
             .context("resolving configuration path")?;
+        let document = match &path {
+            Some(path) => match fs::read_to_string(path) {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !explicit => None,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading configuration {}", path.display()))
+                }
+            },
+            None if explicit => bail!("explicit configuration path is missing"),
+            None => None,
+        };
+        Self::from_document(path, explicit, document.as_deref())
+    }
+
+    /// Parse a proposed document using the same defaults, validation and diagnostics as startup.
+    pub fn from_document(
+        path: Option<PathBuf>,
+        explicit: bool,
+        text: Option<&str>,
+    ) -> Result<Self> {
+        let parsed = Self::parse_document(path, explicit, text)?;
+        parsed
+            .config
+            .validate()
+            .context("validating configuration")?;
+        Ok(parsed)
+    }
+
+    /// Read configuration fields for a draft editor, including values that
+    /// fail semantic validation. Use from_document before applying them.
+    pub fn parse_document(
+        path: Option<PathBuf>,
+        explicit: bool,
+        text: Option<&str>,
+    ) -> Result<Self> {
         let mut sources = BTreeMap::new();
         let mut config = Config::default();
         collect_sources(
@@ -290,40 +330,28 @@ impl Loaded {
             &json!({"kind":"default"}),
             &mut sources,
         );
-        let mut file_loaded = false;
-        if let Some(path) = path.as_deref() {
-            match fs::read_to_string(path) {
-                Ok(text) => {
-                    // TOML's normal formatted error embeds source lines and
-                    // values. Keep diagnostics useful without echoing a secret
-                    // accidentally written into an unsupported field.
-                    config = toml::from_str(&text)
-                        .map_err(|error| safe_parse_error(&text, path, error))?;
-                    let document: toml::Value = toml::from_str(&text)
-                        .map_err(|error| safe_parse_error(&text, path, error))?;
-                    collect_sources(
-                        "",
-                        &serde_json::to_value(document)?,
-                        &json!({"kind":"file","path":path}),
-                        &mut sources,
-                    );
-                    file_loaded = true;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound && !explicit => {}
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("reading configuration {}", path.display()))
-                }
-            }
+        if let Some(text) = text {
+            let path = path
+                .as_deref()
+                .context("configuration document has no path")?;
+            // TOML diagnostics may include values, so report only the location and error kind.
+            config = toml::from_str(text).map_err(|error| safe_parse_error(text, path, error))?;
+            let document: toml::Value =
+                toml::from_str(text).map_err(|error| safe_parse_error(text, path, error))?;
+            collect_sources(
+                "",
+                &serde_json::to_value(document)?,
+                &json!({"kind":"file","path":path}),
+                &mut sources,
+            );
         } else if explicit {
-            bail!("explicit configuration path is missing");
+            bail!("explicit configuration document is missing");
         }
-        config.validate().context("validating configuration")?;
         Ok(Self {
             config,
             path,
             explicit,
-            file_loaded,
+            file_loaded: text.is_some(),
             sources,
         })
     }
@@ -356,7 +384,7 @@ impl Loaded {
             let phase = if key.starts_with("service.") { "service_restart" } else { "new_session" };
             (key.clone(), json!({"phase":phase,"runtime_request":matches!(key.as_str(), "session.fps" | "session.bitrate" | "session.codec" | "session.hdr")}))
         }).collect();
-        json!({"valid":true,"config_file":{"path":self.path,"explicit":self.explicit,"loaded":self.file_loaded},
+        json!({"valid":self.config.validate().is_ok(),"config_file":{"path":self.path,"explicit":self.explicit,"loaded":self.file_loaded},
             "values":self.config,"sources":self.sources,"apply":apply,
             "notes":["allowed_codecs limits codec requests after resolving auto; PNG safety fallback remains available when session video is disabled",
                 "service-managed sessions allocate their own loopback listener and socket name",

@@ -1,6 +1,4 @@
 using System.IO.Pipes;
-using System.Buffers.Binary;
-using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Authentication;
 using System.Text;
@@ -68,7 +66,7 @@ if (args is ["--direct-smoke"])
     string pairingCode = bootstrap.GetProperty("pair_code").GetString()!;
     string directRuntime = bootstrap.GetProperty("runtime").GetString()!;
     string sessionName = bootstrap.GetProperty("session").GetString()!;
-    var unpaired = new ConnectionProfile { Mode = "direct", Host = bootstrap.GetProperty("host").GetString()!,
+    var unpaired = new ConnectionProfile { Host = bootstrap.GetProperty("host").GetString()!,
         Port = bootstrap.GetProperty("port").GetInt32(), CertificateSha256 = bootstrap.GetProperty("certificate_sha256").GetString()!,
         Session = sessionName, Settings = new ClientSettings {Codec = "png", Audio = false} };
     Check(!Environment.GetCommandLineArgs().Any(argument => argument.Contains(pairingCode, StringComparison.Ordinal)), "pair code leaked to argv");
@@ -112,7 +110,7 @@ if (args is ["--direct-smoke"])
     var restored = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
     int connections = 0, bootstraps = 0;
     string appHost = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!, "Waybridge.Control.Tests" + (OperatingSystem.IsWindows() ? ".exe" : ""));
-    await using (var controller = new SessionController(settingsDirectory,appHost,_ => throw new Exception("direct connection unexpectedly requested SSH trust")))
+    await using (var controller = new SessionController(appHost))
     {
         controller.Message += message => {
             if (message.GetProperty("type").GetString() == "bootstrap_verified")
@@ -125,9 +123,31 @@ if (args is ["--direct-smoke"])
         await controller.ConnectAsync(directProfile with {SessionMode="attach"},credentials.ClientToken);
         await firstTransport.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Check(controller.Connected && controller.CurrentSession == sessionName,"direct controller did not attach");
-        Check((await controller.ApplicationsAsync()).Any(app => app.Id == "waybridge-direct-smoke.desktop"),"direct controller application catalog failed");
+        var launcherApp = (await controller.ApplicationsAsync(directProfile.Id)).Single(app => app.Id == "waybridge-direct-smoke.desktop");
+        Check(launcherApp.GenericName == "Direct editor" && launcherApp.Comment == "Desktop metadata fixture" &&
+            launcherApp.Categories.SequenceEqual(["Development"]) && launcherApp.Keywords.SequenceEqual(["launcher"]) &&
+            launcherApp.StartupWmClass == "WaybridgeDirect" &&
+            launcherApp.Actions.SequenceEqual([new RemoteDesktopAction("NewWindow", "Open a window", "Open a new editor")]),
+            "direct controller application catalog metadata failed");
+        var desktopPreview = await controller.PreviewLaunchAsync(app: launcherApp.Id, action: "NewWindow", cwd: directRuntime,
+            extraArgv: ["中文文字"], expectedProfileId: directProfile.Id, cancellationToken: deadline.Token);
+        Check(desktopPreview.GetProperty("action").GetString() == "NewWindow" &&
+            desktopPreview.GetProperty("cwd").GetString() == directRuntime &&
+            desktopPreview.GetProperty("extra_argv")[0].GetString() == "中文文字", "direct Desktop Action preview failed");
+        await controller.LaunchAsync(app: launcherApp.Id, action: "NewWindow", expectedProfileId: directProfile.Id,
+            cancellationToken: deadline.Token);
         string controllerMarker = Path.Combine(directRuntime,"controller-marker");
-        await controller.LaunchAsync(argv:["python3","-I","-c","import pathlib,sys;pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",controllerMarker,"controller 你好"]);
+        string[] command = ["python3", "-I", "-c", "import pathlib,sys;pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",
+            controllerMarker, "controller 你好"];
+        await Reject<InvalidOperationException>(() => controller.LaunchAsync(argv: command, expectedProfileId: Guid.NewGuid()));
+        await Reject<OperationCanceledException>(() => controller.LaunchAsync(argv: command, expectedProfileId: directProfile.Id,
+            cancellationToken: new CancellationToken(true)));
+        Check(!File.Exists(controllerMarker), "cancelled or stale host launch reached the session");
+        var commandPreview = await controller.PreviewLaunchAsync(argv: command, cwd: directRuntime,
+            expectedProfileId: directProfile.Id, cancellationToken: deadline.Token);
+        Check(!File.Exists(controllerMarker) && commandPreview.GetProperty("cwd").GetString() == directRuntime,
+            "literal command preview executed or lost working directory");
+        await controller.LaunchAsync(argv: command, cwd: directRuntime, expectedProfileId: directProfile.Id, cancellationToken: deadline.Token);
         for (int i=0;i<100 && !File.Exists(controllerMarker);i++) await Task.Delay(25,deadline.Token);
         Check(File.ReadAllText(controllerMarker)=="controller 你好","controller direct launch failed");
         await controller.SendEngineAsync(new {type="crash"});
@@ -135,7 +155,8 @@ if (args is ["--direct-smoke"])
         Check(bootstraps >= 2 && controller.Connected,"direct controller did not repeat private transport bootstrap on reconnect");
         Check((await direct.CallAsync(new {op="info",session=sessionName},deadline.Token)).GetProperty("pid").GetInt32() == pid,"engine restart replaced remote session");
         await controller.DisconnectAsync();
-        Check(!controller.IsRunning && !controller.Connected,"direct controller did not disconnect");
+        Check(!controller.IsRunning && !controller.Connected && controller.ActiveProfileId is null,
+            "direct controller did not disconnect or clear the previous host");
         var attached = await direct.CallAsync(new {op="ensure",session=sessionName,mode="attach"},deadline.Token);
         Check(!attached.GetProperty("created").GetBoolean() && attached.GetProperty("pid").GetInt32() == pid,"viewer disconnect killed direct session");
         Check(controller.Logs.All(line => !line.Contains(credentials.ClientToken,StringComparison.Ordinal) && !line.Contains(sessionSecret,StringComparison.Ordinal)),"direct credentials leaked to diagnostics");
@@ -158,80 +179,32 @@ if (args is ["--direct-smoke"])
     Console.WriteLine("PASS: direct controller privately bootstraps native transport, reconnects retained session, ends explicitly, keeps credentials out of profiles/logs and enforces revocation");
     return;
 }
-if (args is ["--ssh-smoke", var sshPort, var identityFile, var serverBinary, var runtime])
-{
-    using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-    var sshProfile = new ConnectionProfile { Host = "127.0.0.1", User = Environment.UserName,
-        SshPort = int.Parse(sshPort), IdentityFile = identityFile, ServerBinary = serverBinary };
-    string settingsDirectory = Path.Combine(runtime, "control center 你好");
-    int prompts = 0;
-    await Reject<OperationCanceledException>(async () => await SshAgent.StartAsync(sshProfile, settingsDirectory,
-        _ => Task.FromResult(false), deadline.Token));
-    Check(!File.Exists(Path.Combine(settingsDirectory, "known_hosts")), "rejected host persisted");
-    int pid;
-    await using (var agent = await SshAgent.StartAsync(sshProfile, settingsDirectory, request =>
-    {
-        prompts++;
-        Check(request.Fingerprints.Any(f => f.StartsWith("ssh-ed25519 SHA256:", StringComparison.Ordinal)), "missing host fingerprint");
-        return Task.FromResult(true);
-    }, deadline.Token))
-    {
-        var session = await agent.CallAsync(new { op = "ensure", session = "gui-ssh-test", binary = serverBinary,
-            port = 0, codec = "png", audio = false, xwayland = false }, deadline.Token);
-        pid = session.GetProperty("pid").GetInt32();
-        await using (var tunnel = await agent.TunnelAsync(sshProfile, settingsDirectory, session.GetProperty("port").GetInt32(), deadline.Token))
-        {
-            using var viewer = new TcpClient();
-            await viewer.ConnectAsync("127.0.0.1", tunnel.Port, deadline.Token);
-            byte[] hello = Encoding.UTF8.GetBytes("\0" + JsonSerializer.Serialize(new { type = "hello", version = 3, token = session.GetProperty("token").GetString() }));
-            byte[] header = new byte[4]; BinaryPrimitives.WriteInt32BigEndian(header, hello.Length);
-            await viewer.GetStream().WriteAsync(header, deadline.Token);
-            await viewer.GetStream().WriteAsync(hello, deadline.Token);
-            await viewer.GetStream().ReadExactlyAsync(header, deadline.Token);
-            int size = BinaryPrimitives.ReadInt32BigEndian(header);
-            Check(size is > 1 and < 65536, "invalid tunneled handshake");
-            byte[] response = new byte[size]; await viewer.GetStream().ReadExactlyAsync(response, deadline.Token);
-            Check(response[0] == 0 && JsonDocument.Parse(response.AsMemory(1)).RootElement.GetProperty("type").GetString() == "hello", "tunneled handshake failed");
-        }
-        await agent.CallAsync(new { op = "launch", session = "gui-ssh-test", binary = serverBinary,
-            argv = new[] { "python3", "-c", "import pathlib,sys;pathlib.Path(sys.argv[1]).write_text(sys.argv[2])", Path.Combine(runtime,"ssh-marker"), "你好 ; $(literal)" } }, deadline.Token);
-        for (int i = 0; i < 100 && !File.Exists(Path.Combine(runtime,"ssh-marker")); i++) await Task.Delay(25, deadline.Token);
-        Check(File.ReadAllText(Path.Combine(runtime,"ssh-marker")) == "你好 ; $(literal)", "SSH literal launch failed");
-    }
-    await using (var agent = await SshAgent.StartAsync(sshProfile, settingsDirectory, _ => throw new Exception("known host prompted again"), deadline.Token))
-    {
-        var attached = await agent.CallAsync(new { op = "ensure", session = "gui-ssh-test", mode = "attach" }, deadline.Token);
-        Check(attached.GetProperty("pid").GetInt32() == pid && !attached.GetProperty("created").GetBoolean(), "SSH disconnect killed remote session");
-        await agent.CallAsync(new { op = "end", session = "gui-ssh-test" }, deadline.Token);
-    }
-    Check(prompts == 1, "unexpected trust prompt count");
-    Console.WriteLine("PASS: real OpenSSH rejection/TOFU/strict reuse, embedded Python RPC, authenticated forwarding, Unicode literal launch, retained session and explicit shutdown");
-    return;
-}
 string directory = Path.Combine(Path.GetTempPath(), "waybridge-core-tests-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
 try
 {
-    var profile = new ConnectionProfile { Host = "linux.example", User = "tester", ServerBinary = "/opt/My App/waybridge's binary" };
+    var profile = new ConnectionProfile { Host = "linux.example" };
     profile.Validate();
-    foreach (var host in new[] { "-oProxyCommand=evil", "x;touch /tmp/evil", "u@host", "x\nbad" })
+    Check(profile.Port == 49092, "new profiles must default to the Waybridge TLS endpoint");
+    foreach (string host in new[] { "::1", "[::1]", "2001:db8::1" }) (profile with { Host = host }).Validate();
+    foreach (var host in new[] { "--not-a-host", "host;other", "u@host", "x\nbad", "host\n", "[[::1]]", "127.0.0.1:49092" })
         await Reject<ArgumentException>(() => { (profile with { Host = host }).Validate(); return Task.CompletedTask; });
-    foreach (string session in new[] { "../other", "/tmp/session", "x;rm", "bad\nname" })
+    foreach (string session in new[] { "../other", "/tmp/session", "x;rm", "bad\nname", "session\n" })
         await Reject<ArgumentException>(() => { (profile with { Session = session }).Validate(); return Task.CompletedTask; });
     await Reject<ArgumentException>(() => { new ClientSettings { Fps = 10000 }.Validate(); return Task.CompletedTask; });
     Check(new ClientSettings { Codec = "auto", Hdr = true }.ServerCodec == "auto", "GUI must preserve auto/HDR policy for the shared server resolver");
-    var directProfile = profile with { Mode = "direct", Port = 49092, CertificateSha256 = new string('a', 64), ClientId = "paired-client" };
+    var directProfile = profile with { CertificateSha256 = new string('a', 64), ClientId = "paired-client" };
     directProfile.Validate();
     await Reject<ArgumentException>(() => { (directProfile with { CertificateSha256 = "bad-pin" }).Validate(); return Task.CompletedTask; });
     await Reject<ArgumentException>(() => { (directProfile with { Port = 0 }).Validate(); return Task.CompletedTask; });
     await Reject<ArgumentException>(() => { _ = new DirectAgent(directProfile with { CertificateSha256 = "" }, new string('b',64)); return Task.CompletedTask; });
-    Console.WriteLine("PASS: profile validation rejects option, shell and session-path injection");
+    Console.WriteLine("PASS: TLS profile validates host, port, pin and session name");
 
-    var legacySettings = JsonSerializer.Deserialize<ClientSettings>("{\"files\":false}", ProfileStore.Json)!;
-    Check(!legacySettings.Files && legacySettings.DragText, "legacy file sharing must not disable text drags");
-    Check(!legacySettings.Touch && legacySettings.TouchModes.Count == 0, "profiles without touch fields must retain mouse-compatible defaults");
-    Check(!legacySettings.Pen && legacySettings.PenPressureGamma == 1 && !legacySettings.Gamepads &&
-        legacySettings.GamepadRumble && legacySettings.GamepadDeadzone == 15, "legacy profiles enabled professional input or changed calibration defaults");
+    var defaultSettings = new ClientSettings { Files = false };
+    Check(!defaultSettings.Files && defaultSettings.DragText, "file sharing defaults must not disable text drags");
+    Check(!defaultSettings.Touch && defaultSettings.TouchModes.Count == 0, "touch must default to mouse-compatible mode");
+    Check(!defaultSettings.Pen && defaultSettings.PenPressureGamma == 1 && !defaultSettings.Gamepads &&
+        defaultSettings.GamepadRumble && defaultSettings.GamepadDeadzone == 15, "new profiles must use independent opt-in and calibration defaults");
     foreach (double invalid in new[] { .249, 4.001, double.NaN, double.PositiveInfinity, double.NegativeInfinity })
         await Reject<ArgumentException>(() => { new ClientSettings { PenPressureGamma = invalid }.Validate(); return Task.CompletedTask; });
     foreach (int invalid in new[] { -1, 51 })
@@ -269,17 +242,6 @@ try
     using (var saved = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(directory, "profiles.json"))))
         Check(saved.RootElement[0].GetProperty("settings").GetProperty("touch").ValueKind == JsonValueKind.False,
             "disabled touch was not persisted as an explicit false setting");
-    // Exercise a whole old profile through ProfileStore, rather than only a
-    // deserialized ClientSettings object, then upgrade it through a normal save.
-    await File.WriteAllTextAsync(Path.Combine(directory, "profiles.json"), JsonSerializer.Serialize(new[] { new {
-        id = profile.Id, name = profile.Name, host = profile.Host,
-        settings = new { ime = false, read_only = true, files = false } } }, ProfileStore.Json));
-    var oldProfile = (await new ProfileStore(directory).LoadAsync()).Single();
-    Check(!oldProfile.Settings.Touch && !oldProfile.Settings.Ime && oldProfile.Settings.ReadOnly && !oldProfile.Settings.Files,
-        "loading an old profile changed its saved policies or enabled native touch");
-    await store.SaveAsync([oldProfile with { Settings = oldProfile.Settings with { Touch = true } }]);
-    Check((await store.LoadAsync()).Single().Settings.Touch, "old profile could not save the native touch opt-in");
-    Console.WriteLine("PASS: native touch opt-in/off and legacy profiles persist independently from IME, read-only and file sharing");
     var professional = touchProfile with { Settings = touchProfile.Settings with {
         Pen = true, PenPressureGamma = 1.75, Gamepads = true, GamepadRumble = false, GamepadDeadzone = 27 } };
     await store.SaveAsync([professional]);
@@ -299,10 +261,7 @@ try
     Check(!professionalDisabled.Settings.Pen && !professionalDisabled.Settings.Gamepads && professionalDisabled.Settings.GamepadRumble &&
         professionalDisabled.Settings.GamepadDeadzone == 27 && professionalDisabled.Settings.ReadOnly,
         "disabling gamepad lost saved calibration or input policies");
-    Check(!oldProfile.Settings.Pen && !oldProfile.Settings.Gamepads && oldProfile.Settings.PenPressureGamma == 1 &&
-        oldProfile.Settings.GamepadDeadzone == 15 && oldProfile.Settings.GamepadRumble, "whole legacy profile changed professional input defaults");
-    Console.WriteLine("PASS: pen/gamepad disk persistence, legacy defaults, independent opt-in/calibration/rumble, and finite bounded calibration validation");
-
+    Console.WriteLine("PASS: independent touch, pen and gamepad policies and bounded calibration persist");
     using var bytes = new MemoryStream(Encoding.UTF8.GetBytes("{\"value\":\"中文😀\"}\n{\"id\":2}\n"));
     var lines = new JsonLines(bytes, 1024);
     Check((await lines.ReadAsync(default))!.Value.GetProperty("value").GetString() == "中文😀", "unicode framing");
@@ -311,24 +270,6 @@ try
     await Reject<IOException>(async () => { using var huge = new MemoryStream(new byte[1024]); await new JsonLines(huge, 1024).ReadAsync(default); });
     await Reject<IOException>(async () => { using var partial = new MemoryStream(Encoding.UTF8.GetBytes("{\"a\":1}")); await new JsonLines(partial).ReadAsync(default); });
     Console.WriteLine("PASS: UTF-8/coalesced JSON framing rejects oversized and incomplete messages");
-
-    var ssh = SshAgent.Arguments(profile, Path.Combine(directory, "host keys"));
-    Check(ssh.Contains("BatchMode=yes") && ssh.Contains("StrictHostKeyChecking=yes"), "SSH trust disabled");
-    Check(ssh[^1] == "tester@linux.example", "SSH destination changed");
-    string quoted = SshAgent.PosixQuote("a'b\nc");
-    Check(quoted == "'a'\"'\"'b\nc'", "remote quoting");
-    Console.WriteLine("PASS: SSH argv preserves host verification and literal remote command quoting");
-
-    string bootstrap = (string)typeof(SshAgent).GetField("BootstrapCommand", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
-    Check(bootstrap.Length < 1024 && !bootstrap.Contains("import configparser", StringComparison.Ordinal), "SSH loader grew into Windows argv payload");
-    using (var embedded = typeof(SshAgent).Assembly.GetManifestResourceStream("Waybridge.SessionControl")!)
-    using (var source = new StreamReader(embedded))
-    {
-        string management = Convert.ToBase64String(Encoding.UTF8.GetBytes(await source.ReadToEndAsync()));
-        Check(!bootstrap.Contains(management, StringComparison.Ordinal), "management payload leaked into argv");
-        Check(management.Length <= 1024 * 1024, "management script exceeds bounded bootstrap frame");
-    }
-    Console.WriteLine("PASS: constant-size SSH loader keeps management script outside Windows command line");
 
     var observed = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
     await using (var engine = await EngineChannel.StartAsync("dotnet", "127.0.0.1", 49090, "test-secret-" + new string('a', 40),
@@ -436,21 +377,5 @@ try
     }
     Console.WriteLine("PASS: cancellation of a silent connected worker is bounded and terminates it without waiting for live stderr EOF");
 
-    string appHost = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!, "Waybridge.Control.Tests" + (OperatingSystem.IsWindows() ? ".exe" : ""));
-    await using (var controller = new SessionController(directory, appHost, _ => Task.FromResult(false)))
-    {
-        int connections = 0;
-        var restored = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        controller.ConnectionChanged += value => { if (value && Interlocked.Increment(ref connections) == 2) restored.TrySetResult(); };
-        await controller.ConnectAsync(new ConnectionProfile { Host = "127.0.0.1", Mode = "tunnel", AutoReconnect = true }, "test-secret-" + new string('b', 40));
-        Check(controller.Connected && controller.IsRunning, "controller failed to connect");
-        await controller.SendEngineAsync(new { type = "crash" });
-        await restored.Task.WaitAsync(TimeSpan.FromSeconds(12));
-        Check(controller.Connected, "controller failed to reconnect");
-        await controller.DisconnectAsync();
-        Check(!controller.IsRunning && !controller.Connected, "controller failed to stop");
-        Check(controller.Logs.All(line => !line.Contains("test-secret-")), "secret leaked to diagnostic log");
-    }
-    Console.WriteLine("PASS: controller reconnects after engine death and explicitly disconnects without leaking credentials");
 }
 finally { Directory.Delete(directory, true); }

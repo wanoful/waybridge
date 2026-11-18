@@ -78,10 +78,15 @@ def main():
             server(**record)
             received=until('notification');assert received['summary']==record['summary']
             icon=Image.open(io.BytesIO(base64.b64decode(received['png']))).convert('RGBA')
-            assert icon.size==(64,64) and icon.getbbox(), 'native worker must supply badged placeholder icon'
+            assert icon.size==(64,64) and icon.getbbox(), 'native worker must supply a placeholder icon'
             command(**{**record,'type':'notification_feedback','action':'default'})
             action=incoming('notification_feedback');assert action['id']==17 and action['revision']==1 and action['action']=='default'
-            record['revision']=2;server(**record);until('notification')
+            image=io.BytesIO()
+            Image.new('RGBA',(128,128),(255,0,0,255)).save(image, format='PNG')
+            record['revision']=2
+            server(**{**record, 'png':base64.b64encode(image.getvalue()).decode()})
+            icon=Image.open(io.BytesIO(base64.b64decode(until('notification')['png']))).convert('RGBA')
+            assert icon.size==(64,64) and icon.getextrema()==((255,255),(0,0),(0,0),(255,255)), 'notification artwork gained a badge'
             # Old action cannot cross a replacement; the only feedback below is
             # from the current revision, even with an otherwise matching token.
             command(**{**record,'type':'notification_feedback','revision':1,'action':'default'})
@@ -97,7 +102,7 @@ def main():
             command(type='disconnect');connection.shutdown(socket.SHUT_RDWR);connection.close()
             native.stdin.close();native.wait(timeout=15);assert native.returncode==0, native.returncode
             assert '只存在于内存的内容' not in (root/'worker.log').read_text()
-            print('PASS: real PE notifications_v1 negotiation, native badged placeholder PNG, private IPC notification/action round-trip, stale replacement rejection, live opt-out, no body logging')
+            print('PASS: real PE notifications_v1 negotiation, unbadged notification PNG, private IPC notification/action round-trip, stale replacement rejection, live opt-out, no body logging')
         except BaseException:
             print('Native worker failure:', (root/'worker.log').read_text() if (root/'worker.log').exists() else 'no worker log')
             raise

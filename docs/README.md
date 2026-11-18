@@ -24,7 +24,7 @@ M2 首轮已接入只读文件交付、SNI 应用托盘/后台入口、原生通
 
 ## Windows GUI 控制中心
 
-**C# / WinUI 3 控制中心**提供原生 ARM64 和 x64 便携包。支持 TLS 直连配对、客户端撤销、可选 SSH、连接配置、自动启动/接入会话、应用目录、实时画面设置、输入共享、文件传输活动、托盘与诊断；视频继续由独立 C++ worker 处理。
+**C# / WinUI 3 控制中心**提供原生 ARM64 和 x64 便携包。使用 Waybridge TLS 配对、连接、管理会话和启动远端应用。控制中心提供画面、输入及共享设置、文件活动、托盘与诊断，视频由独立 C++ worker 处理。
 
 解压 `build/Waybridge-Control-win-{arm64,x64}.zip` 的整个目录后运行 `Waybridge.Control.exe`。Linux 先构建并启动用户级入口，在另一个本机终端生成一次性配对码：
 
@@ -35,7 +35,7 @@ cargo build --release --workspace --locked
 ./target/release/waybridge-service pair --expires 120
 ```
 
-GUI 选择「认证加密直连」，填写 Linux LAN/VPN 地址及端口 `49092`，从可信 Linux 终端核对并填写 `certificate_sha256` 指纹和一次性配对码，再配对、连接。客户端令牌保存到 Windows 凭据管理器，指纹变化会拒绝连接。默认服务监听 `0.0.0.0:49092`，可用 `--listen` 绑定具体 LAN/VPN 地址。安装可选用户单元、信任撤销及协议细节见 [service README](SERVICE.md)，GUI 与 SSH 兼容模式见 [GUI README](GUI.md)。
+在 GUI 添加设备，填写 Linux LAN/VPN 地址及端口 `49092`，从可信 Linux 终端核对并填写完整 `certificate_sha256` 指纹和一次性配对码，再配对、连接。客户端令牌保存到 Windows 凭据管理器，指纹变化会拒绝连接。默认服务监听 `0.0.0.0:49092`，可用 `--listen` 绑定具体 LAN/VPN 地址。用户服务、信任撤销及协议细节见 [服务说明](SERVICE.md)，客户端操作见 [控制中心](GUI.md)。
 
 Linux 接收跨端文件需要 `fusermount3` 和允许当前用户访问的 `/dev/fuse`（发行版通常在 `fuse3` 软件包中）。首次完整接收时创建只读导出视图；不可用时该批传输报错，窗口串流继续运行。Windows 临时目录需要正常 NTFS DACL 支持。经 Dolphin/Explorer 复制到用户选择位置的新副本正常可写；原位修改交付缓存会失败，不自动回传。Wine 目前将此 DACL 映射成可传播的 READONLY 属性，因此拒绝实体文件剪贴板下载；只读虚拟流拖出及 Windows→Linux 上传可继续验证。
 

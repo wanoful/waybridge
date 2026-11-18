@@ -177,6 +177,9 @@ struct Args {
     /// Run the explicitly selected freedesktop notification provider (user service).
     #[arg(long, conflicts_with = "launch")]
     notification_provider: bool,
+    /// Resolve catalog-selected application icons from a private JSON request on stdin.
+    #[arg(long, conflicts_with_all = ["launch", "notification_provider", "check_config", "print_config", "check_hdr", "check_session", "command"])]
+    resolve_app_icons: bool,
     /// Absolute working directory for an application (defaults to HOME).
     #[arg(long)]
     cwd: Option<PathBuf>,
@@ -219,6 +222,7 @@ impl Args {
         let mut args = Self::from_arg_matches(&matches)?;
         let explicit_socket = matches.value_source("socket") == Some(ValueSource::CommandLine);
         let mut loaded = if args.notification_provider
+            || args.resolve_app_icons
             || (args.launch && explicit_socket && !args.check_config && !args.print_config)
         {
             // Attaching to a named existing session does not create or change
@@ -2622,6 +2626,9 @@ fn main() -> Result<()> {
     let (args, configuration) = Args::configured()?;
     if args.notification_provider {
         return desktop_notifications::run_provider();
+    }
+    if args.resolve_app_icons {
+        return app_icon::launcher_icons();
     }
     if args.print_config {
         println!("{}", serde_json::to_string_pretty(&configuration.report())?);

@@ -705,8 +705,8 @@ and each action key/label, 1024 for summary and 8192 for body. Invalid/oversized
 requests fail explicitly. Icons use standard image-data/image-path, app icon or
 desktop-entry lookup; only local files/theme entries are read, never remote
 image URLs. Raw images are bounded to 256×256; normalized PNGs to 128×128 and
-32 KiB. The native worker adds the configured remote-source badge and supplies
-a badged placeholder when needed before passing a 64×64 PNG to the GUI.
+32 KiB. The native worker scales the original icon to 64×64 before passing it
+to the GUI and supplies a plain placeholder if no icon is available.
 
 The provider's 0700 session directory holds 0600 Unix datagram sockets. A random
 provider instance and per-viewer binding prevent stale IPC actions. Heartbeats

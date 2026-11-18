@@ -42,11 +42,11 @@ def main():
 
     destination = remote('[IO.Path]::GetTempPath()').rstrip('\\') + '\\' + key
     profile_id = str(uuid.uuid4())
-    profile = dict(id=profile_id, name='Disposable touch settings fixture', mode='tunnel', host='127.0.0.1',
-                   port=49090, auto_reconnect=False,
+    profile = dict(id=profile_id, name='Disposable touch settings fixture', host='127.0.0.1',
+                   port=49092, auto_reconnect=False,
                    settings=dict(codec='png', fps=30, audio=False, notifications=False, tray=False,
                                  clipboard='off', files=False, drag_text=False, ime=False, read_only=True))
-    # Omit touch/pen/gamepad fields to verify previous-version defaults.
+    # Omit touch/pen/gamepad fields to exercise the default settings.
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as bundle:
         for path in publish.rglob('*'):
             if path.is_file() and path.name != 'waybridge-client.exe':

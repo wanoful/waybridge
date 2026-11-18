@@ -1,6 +1,6 @@
 # Waybridge Control Center
 
-Linux 会话默认共享原有应用与钱包数据。创建前须注销同一用户的本地桌面，锁屏不够；自动连接优先接回已有 Waybridge，会拒绝第二个新会话。启动后再从其他 DM 登录交给该 DM，见 [会话策略](SESSION_POLICY.md)。TLS 使用服务端的新版启动助手；使用 SSH 模式时需重新构建控制中心，以更新内嵌的 `session-control.py`。
+Linux 会话默认共享原有应用与钱包数据。创建前须注销同一用户的本地桌面，锁屏不够。自动连接优先接回已有 Waybridge，会拒绝第二个新会话。启动后再从其他 DM 登录交给该 DM，见 [会话策略](SESSION_POLICY.md)。
 
 C# / .NET 10 + WinUI 3 控制中心，配套独立的 C++ 串流内核。提供 ARM64 与 x64 便携包。视频解码、DirectComposition、远端窗口、IME、音频和 OLE 仍由原生内核处理，GUI 只通过当前用户专用 named pipe 管理连接和设置。
 
@@ -8,24 +8,23 @@ C# / .NET 10 + WinUI 3 控制中心，配套独立的 C++ 串流内核。提供 
 
 1. 解压 **整个 ZIP**，运行 `Waybridge.Control.exe`。WoA 使用 `win-arm64` 包。
 2. .NET 与 Windows App SDK 已随包提供，无需另装。如果机器缺少 Visual C++ v14 运行库，先运行包内对应架构的 `vc_redist.arm64.exe` / `vc_redist.x64.exe`。来源为 [Microsoft 官方下载](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist)。
-3. Linux 构建 `cargo build --release --workspace --locked`，启动 `./target/release/waybridge-service serve --compositor "$PWD/target/release/waybridge"`。需要 Python 3.11+、GIO 及合成器运行依赖；直连模式无需 Windows OpenSSH。标准组件生命周期的安装见 [桌面集成](INTEGRATION.md)。
+3. Linux 构建 `cargo build --release --workspace --locked`，启动 `./target/release/waybridge-service serve --compositor "$PWD/target/release/waybridge"`。需要 Python 3.11+、GIO 及合成器运行依赖。标准组件生命周期的安装见 [桌面集成](INTEGRATION.md)。
 4. 在 Linux 另一个可信终端运行 `./target/release/waybridge-service pair --expires 120`，取得一次性配对码与 `certificate_sha256` 指纹。不要把网络端自行报告的指纹当作信任依据。
-5. GUI 选择「认证加密直连」，填写 LAN/VPN 地址、服务端口 `49092`、核对过的证书指纹和一次性配对码，点击「配对此设备」。客户端令牌保存在 Windows 凭据管理器；证书变化会拒绝连接。Linux 可用 `waybridge-service clients` / `revoke CLIENT_ID` 撤销信任，GUI 也可在断开后撤销当前设备。
-6. 选择「已有会话优先」并连接。在「远端应用」刷新并启动应用；「启动终端」默认运行 `ghostty`。关闭查看端保留应用，重新连接可接回仍存活的会话。服务部署与授权范围见 [服务说明](SERVICE.md)。
+5. 在 Windows 添加设备，填写 LAN/VPN 地址、服务端口 `49092`、核对过的完整证书指纹和一次性配对码。客户端令牌保存在 Windows 凭据管理器。换证书后需用可信来源重新核对和配对。Linux 可用 `waybridge-service clients` / `revoke CLIENT_ID` 撤销信任，GUI 也可在断开后撤销当前设备。
+6. 使用默认会话策略连接。搜索并启动一个应用，或从正在运行的窗口列表切回。关闭查看端会保留应用，重新连接可接回仍存活的会话。服务部署与授权范围见 [服务说明](SERVICE.md)。
 
-兼容 SSH 模式：Windows 安装系统可选功能 OpenSSH 客户端，Linux 提供 SSH 服务。选择「内置 SSH」，填写 SSH 用户、私钥（或使用 ssh-agent）和 Linux 服务端绝对路径。使用 OpenSSH 密钥认证，首次核对主机 SHA256 指纹；没有交互式密码和键盘认证。加密私钥先执行 `ssh-add <私钥路径>`。
-已有 SSH 隧道也可在 GUI 使用：选择「已有 SSH 隧道」、填写 `127.0.0.1`、本地转发端口和令牌。这一模式没有远端应用目录、启动或结束会话功能。可选保存令牌到 Windows 凭据管理器；JSON 配置不保存令牌。
-
-内置 SSH 模式的会话端口可以填 `0` 自动分配；直连端口是 TLS 用户入口端口，通常为 `49092`。接入旧会话需要其服务端已更新到带连接描述信息的版本。一次只允许一个查看端。选择「创建独立会话」时自动使用唯一名称，成功后保存实际名称，供后续接入。
+Windows 控制中心通过 TLS 接入用户服务。仅能通过 SSH 到达 Linux 时，可用系统 SSH 转发 TLS 入口，再在控制中心填写本地转发地址和端口，核对 Linux 服务的完整指纹。例如在服务也监听 Linux 本地 `49092` 时，使用 `ssh -N -L 127.0.0.1:49092:127.0.0.1:49092 user@linux-host`。UDP 媒体需要独立可达。
 
 ## 页面与行为
 
-- **设备与连接**：保存多个连接，TLS 指纹与配对/撤销、可选 SSH 密钥认证、自动启动或接入会话、断线重连。
-- **远端应用**：搜索 Linux 已安装的 desktop 应用并启动；自动应用用户明确配置的 [Waybridge desktop 覆写](CONFIGURATION.md)。查看当前远端窗口并切换焦点；启动请求已提交与窗口实际出现分别处理。
-- **画面与声音**：编码、FPS、每窗口码率、跟随 Windows 或手动 DPI、音量、输出设备、UDP、实验性 HDR、CPU/CUDA 输入。编码/FPS/码率/缩放/音量实时应用；输出设备和 UDP 需要重连；HDR 与 GPU 输入还取决于新建服务端时的设置。
-- **输入与共享**：远端图标角标、只读、IME、原生多点触控、压感手写笔、游戏手柄及震动、剪贴板方向、剪贴板图片、文字拖放、文件目录共享。文字拖放默认开启，独立于剪贴板与文件共享；关闭后禁止跨端文字拖入/拖出。只读同时在服务端拒绝输入并释放按键、鼠标锁定、触点、笔及虚拟手柄。
-- **文件传输**：发送文件/目录到远端剪贴板，显示传输活动，打开最近完成的本地接收目录。可继续直接拖放。首版为活动记录，尚无逐文件进度、暂停/续传和统一取消按钮。
-- **诊断**：实际编码、GPU 解码/呈现路径、网络 RTT、解码排队/解码/UI 排队/呈现时长、TCP 接收速率与窗口更新次数，支持导出。数据来自原生内核；不把这些分项之和称为端到端延迟。UDP 流量不计入 TCP 接收速率。
+- **顶部工作站栏**显示工作站及连接状态，底部显示当前会话名。顶部可切换只读、调整远端音量、查看 RTT 和实际画面路径，也可打开传输面板或设置。切换工作站会断开当前连接，远端应用继续运行。
+- **全局搜索**用 `Ctrl+K` 或 `/` 聚焦，输入应用名、关键字或窗口标题后按 Enter 启动或切回。以 `>` 开头在当前工作站运行命令，可指定 Linux 工作目录，并以 Tab 补全最近命令。参数作为字面值传给 Linux 进程。
+- **远端应用**首页从固定与最近一直滚动到全部应用。滚过目录标题后，刷新、分类和布局切换留在视口顶部。网格和紧凑列表都展示原始应用图标，应用名称最多两行，超长文本在第二行末尾显示省略号。点击已配对工作站的应用会在需要时先接入会话。应用卡片的 `…` 和右键菜单提供固定、Desktop Actions、触控策略和自定义启动预览。应用启动沿用 Linux 上的 [Waybridge desktop 覆写](CONFIGURATION.md)。
+- **运行中**在固定左侧导航栏单独显示远端窗口和后台应用。可以切回窗口、恢复后台应用或打开其菜单。
+- **文件传输**从顶部打开抽屉，可发送文件和目录、查看活动及打开接收目录。关闭抽屉时，顶部徽标显示未查看的传输活动。
+- **诊断**显示正在使用的编码、解码和呈现路径，以及 RTT、TCP 接收速率、窗口更新次数和各阶段耗时。可导出诊断。TCP 接收速率仅统计 TCP，耗时指标分别反映对应阶段。
+
+左侧导航的 **设置** 分为「画面」「声音」「输入设备」「共享与权限」「网络」「连接」「桌面集成」「常规」。在「常规」切换浅色、深色或跟随 Windows 后，控制中心与标题栏立即更新。常规设置作用于整个控制中心，其他设置按工作站分别保存。支持实时变更的页面提供「应用到当前连接」。实际帧率、码率和编码参数在「画面」页更新。输出设备等依赖重连的设置提供「保存并重新连接」。首次启用 UDP、HDR 或更换服务端颜色输入时，可能需要建立适用的新会话。
 
 点击关闭按钮会收起到系统托盘；再次启动会唤回已有控制中心。托盘可连接/断开、切换静音、打开诊断和退出。**断开或退出仅停止本地 worker 与网络连接，远端应用保留。** 「结束远端会话」另外确认后结束同用户拥有且进程身份仍匹配的会话。
 
@@ -33,15 +32,13 @@ C# / .NET 10 + WinUI 3 控制中心，配套独立的 C++ 串流内核。提供 
 
 远端窗口保留 Linux 应用原图标，系统标题栏、任务栏和 Alt+Tab 的图标在右上角叠加 Waybridge 标记。没有原图时使用灰色应用占位图。应用自己绘制在内容区的图标不改动。任务栏按连接配置和应用设置独立身份；同应用窗口可归组，固定与重启动作暂未提供。控制中心及其托盘使用蓝底拱桥主图标。
 
-在「输入与共享 → 远端图标角标」选择 PNG、JPEG、BMP 或 ICO 图片，可为当前连接替换默认角标；点击「应用到当前连接」立即生效。图片限 8 MiB、8192×8192 且不超过 1600 万像素，导入时保持比例并规范为 64×64 透明 PNG，存入连接配置，因此删除原图片不会影响角标。「使用 Waybridge 图标」恢复默认。这个外观设置只保留在 Windows，不改 Linux 主题或应用文件。品牌矢量源位于 `assets/branding/`；`python3 scripts/build-branding.py` 使用 rsvg-convert 与 Pillow 重建已提交的 PNG、ICO 与原生嵌入资源，常规构建无需这两项生成工具。
+在「桌面集成 → 远端图标角标」选择 PNG、JPEG、BMP 或 ICO 图片，可为当前连接的 Windows 窗口和通知区托盘图标更换角标。点击「应用到当前连接」立即生效。「使用 Waybridge 图标」恢复默认。图片限 8 MiB、8192×8192 且不超过 1600 万像素，导入时保持比例并规范为 64×64 透明 PNG，存入连接配置。品牌矢量源位于 `assets/branding/`。需要更新品牌时，`python3 scripts/build-branding.py` 使用 rsvg-convert 与 Pillow 重建 PNG、ICO 与原生嵌入资源。
 
-在「输入与共享 → 原生多点触控（实验）」启用 Windows 原生触摸。每个连接单独保存；「保存设置」可在断开时使用，「应用到当前连接」立即切换并保存。关闭会取消当前触点并恢复鼠标兼容，重新开启使用新的输入代次。开启后自动检测应用是否接入原生触控，没有接入则使用鼠标兼容；无需逐应用设置。「应用触控模式」可为兼容异常的应用保存覆盖，鼠标兼容支持系统长按右键与拖选。旧配置缺少该字段时默认关闭，不再读取环境变量。旧服务端不支持实时切换时界面会提示重连。设备与应用范围见 [专业输入](INPUT_DEVICES.md)。
+在「输入设备」启用原生多点触控、压感笔或手柄。「保存设置」可在断开时使用，「应用到当前连接」立即请求切换并保存。触控默认自动检测应用是否接入原生触控，其余使用鼠标兼容。展开「震动、压感曲线和应用兼容」可按应用调整策略，鼠标兼容支持长按右键与拖选。设备与应用范围见 [专业输入](INPUT_DEVICES.md)。
 
-配置位于 `%LOCALAPPDATA%\Waybridge\profiles.json`，保存直连证书指纹与客户端标识，不保存令牌。客户端令牌和可选手动隧道令牌位于 Windows 凭据管理器；SSH 主机信任记录为同目录 `known_hosts`。Linux 会话日志在 `$XDG_RUNTIME_DIR/waybridge-control-center/<会话>.log`。诊断不导出会话令牌或剪贴板正文。
+配置位于 `%LOCALAPPDATA%\Waybridge\profiles.json`，保存 TLS 证书指纹与客户端标识。客户端令牌位于 Windows 凭据管理器。Linux 会话日志在 `$XDG_RUNTIME_DIR/waybridge-control-center/<会话>.log`。诊断排除会话令牌和剪贴板正文。首次启用 UDP 或 HDR 时请选择新建服务端会话。
 
-SSH config 的 User/IdentityFile/HostName 等设置由系统 OpenSSH 解析，界面端口会覆盖 SSH config 的 Port。首次指纹获取目前使用直接 `ssh-keyscan`，仅能经 ProxyJump/ProxyCommand 到达的主机需要先把核对过的主机密钥加入上述 `known_hosts`。UDP 媒体需要额外直达 Linux UDP 端口，并填写可直达地址；SSH 不转发 UDP。首次启用 UDP 或 HDR 请选择新建服务端会话。
-
-「压感手写笔（实验）」和「游戏手柄（实验）」同样按连接保存，可实时应用，旧配置默认关闭。笔支持压感曲线（0.25–4，默认 1）；手柄提供震动开关和摇杆死区（0–50%，默认 15%）。状态区分别显示支持、请求启用、实际活动、设备数量及后端错误；没有前台输入租约时不会显示为正在转发。范围见 [笔输入](PEN.md) 和 [手柄](GAMEPADS.md)。
+高级输入设置还包括笔压曲线（0.25–4，默认 1）、震动和摇杆死区（0–50%，默认 15%）。设备状态区区分本机发现、远端支持、请求开启、前台输入与实际转发，并显示后端错误。范围见 [笔输入](PEN.md) 和 [手柄](GAMEPADS.md)。
 
 ## 从源码构建
 
@@ -61,7 +58,6 @@ GUI 使用 C# 创建真实 WinUI 控件，没有自定义 XAML 资源。程序�
 dotnet run --project gui/Waybridge.Control.Tests -c Release
 python tests/gui_session_smoke.py
 python tests/gui_direct_smoke.py  # 实际 TLS 服务与 .NET 管理、私有 worker 启动契约
-python tests/gui_ssh_smoke.py  # 需本机 OpenSSH server，可用普通用户运行独立测试实例
 python tests/gui_native_smoke.py  # 需 Wine / Xvfb；测试真实 C++ named-pipe 链路
 ```
 

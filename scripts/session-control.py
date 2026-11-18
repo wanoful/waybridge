@@ -21,6 +21,11 @@ import uuid
 
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+ACTION_ID = re.compile(r"[A-Za-z0-9-]{1,128}")
+# A full catalog has at most 1024 entries. Budget each JSON item below 3 KiB
+# so the helper and TLS responses stay within their 4 MiB envelope.
+CATALOG_ENTRY_BYTES = 3072
+DESKTOP_FILE_BYTES = 65536
 
 def name(value):
     if not isinstance(value, str) or not NAME.fullmatch(value):
@@ -141,6 +146,25 @@ def owned_log(session):
     return os.fdopen(fd, "ab", buffering=0)
 
 
+def recent_log(session, limit=16_384):
+    directory = RUNTIME / "waybridge-control-center"
+    metadata = directory.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        raise ValueError("Session control directory must be private and owned by this user")
+    path = directory / (name(session) + ".log")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        meta = os.fstat(stream.fileno())
+        if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid() or meta.st_mode & 0o077:
+            raise ValueError("Invalid session log")
+        offset = max(0, meta.st_size - limit)
+        stream.seek(offset)
+        data = stream.read(limit)
+        if offset and b"\n" in data:
+            data = data.split(b"\n", 1)[1]
+        return data.decode("utf-8", errors="replace")
+
+
 def ensure(request):
     session = name(request.get("session", "waybridge-0"))
     mode = request.get("mode", "auto")
@@ -233,11 +257,66 @@ def xdg_directory(key, fallback, environment=None):
     return Path(value) if value and Path(value).is_absolute() else Path(fallback)
 
 
+def desktop_locale_keys(environment):
+    locale = next((environment.get(key) for key in ("LC_ALL", "LC_MESSAGES", "LANG") if environment.get(key)), "")
+    locale, _, modifier = locale.partition("@")
+    locale = locale.split(".", 1)[0]
+    language = locale.split("_", 1)[0]
+    if not language or language in ("C", "POSIX"):
+        return ()
+    candidates = [locale + "@" + modifier, locale, language + "@" + modifier, language] if modifier else [locale, language]
+    return tuple(dict.fromkeys(candidates))
+
+
+def localized_desktop_value(entry, key, locales):
+    for locale in locales:
+        localized = entry.get(f"{key}[{locale}]")
+        if localized:
+            return localized
+    return entry.get(key, "")
+
+
+def desktop_display_text(value, byte_limit, *, list_value=False):
+    try:
+        value = desktop_unescape(value, list_value=list_value)
+    except ValueError:
+        return ""
+    clean = "".join(char if char.isprintable() else " " for char in value).strip()
+    return clean.encode("utf-8")[:byte_limit].decode("utf-8", errors="ignore")
+
+
+def desktop_list(value):
+    # Escape pairs stay together so escaped semicolons in Keywords are not
+    # confused with separators. The string decoder validates each item.
+    return re.findall(r"(?:\\[\s\S]|[^;\\])+|\\\Z", value)
+
+
+def display_list(value):
+    items = (desktop_display_text(part, 96, list_value=True) for part in desktop_list(value)[:32])
+    return list(dict.fromkeys(item for item in items if item))
+
+
+def application_actions(config, entry, locales):
+    actions = []
+    for action in dict.fromkeys(entry.get("Actions", "").split(";")[:32]):
+        section = "Desktop Action " + action
+        if not ACTION_ID.fullmatch(action) or section not in config:
+            continue
+        details = config[section]
+        label = desktop_display_text(localized_desktop_value(details, "Name", locales), 160)
+        if not label or not (details.get("Exec") or entry.getboolean("DBusActivatable", fallback=False)):
+            continue
+        comment = desktop_display_text(localized_desktop_value(details, "Comment", locales), 192)
+        actions.append({"id": action, "name": label, "comment": comment})
+    return actions
+
+
 def app_catalog(environment=None):
     environment = os.environ if environment is None else environment
     home = Path(environment.get("HOME", str(Path.home())))
     directories = [xdg_directory("XDG_DATA_HOME", home / ".local/share", environment)]
     directories += [Path(p) for p in (environment.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if Path(p).is_absolute()]
+    locales = desktop_locale_keys(environment)
     apps, seen = [], set()
     for directory in directories:
         if len(apps) >= 1024:
@@ -247,27 +326,60 @@ def app_catalog(environment=None):
             continue
         for path in sorted(directory.rglob("*.desktop")):
             app_id = str(path.relative_to(directory)).replace("/", "-")
-            if app_id in seen:
+            if app_id in seen or any(not char.isprintable() for char in app_id) or len(app_id.encode("utf-8")) > 1024:
                 continue
             seen.add(app_id)
             try:
-                if path.stat().st_size > 65536:
-                    continue
-                config = configparser.ConfigParser(interpolation=None, strict=False)
-                config.read(path, encoding="utf-8")
+                config = desktop_config(path)
                 entry = config["Desktop Entry"]
                 if entry.get("Type") != "Application" or entry.getboolean("Hidden", fallback=False) or entry.getboolean("NoDisplay", fallback=False):
                     continue
-                if entry.get("TryExec") and not shutil.which(entry["TryExec"]):
+                if entry.get("TryExec") and not shutil.which(desktop_unescape(entry["TryExec"]), path=environment.get("PATH", os.defpath)):
                     continue
                 if not entry.get("Exec") and not entry.getboolean("DBusActivatable", fallback=False):
                     continue
-                apps.append(dict(id=app_id, name=entry.get("Name", app_id)[:256], icon=entry.get("Icon", "")[:512], path=str(path)))
+                icon = entry.get("Icon", "")
+                apps.append(dict(
+                    id=app_id, path=str(path), icon=icon if len(icon.encode("utf-8")) <= 4096 else "",
+                    name=desktop_display_text(localized_desktop_value(entry, "Name", locales), 256) or desktop_display_text(app_id, 256),
+                    generic_name=desktop_display_text(localized_desktop_value(entry, "GenericName", locales), 160),
+                    comment=desktop_display_text(localized_desktop_value(entry, "Comment", locales), 320),
+                    categories=display_list(entry.get("Categories", "")),
+                    keywords=display_list(localized_desktop_value(entry, "Keywords", locales)),
+                    startup_wm_class=desktop_display_text(entry.get("StartupWMClass", ""), 256),
+                    actions=application_actions(config, entry, locales),
+                ))
             except (OSError, UnicodeError, KeyError, ValueError, configparser.Error):
                 continue
             if len(apps) >= 1024:
                 break
     return sorted(apps, key=lambda item: item["name"].casefold())
+
+
+def public_application(app):
+    icon = desktop_display_text(app["icon"], 256)
+    result = dict(id=app["id"], name=app["name"], icon="" if any(char in icon for char in "/\\:") else icon)
+
+    def byte_size(item):
+        return len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    # Put the earliest Desktop Actions and classification tags first when an
+    # unusually large entry uses up the optional metadata space.
+    for key in ("startup_wm_class", "generic_name", "comment", "categories", "actions", "keywords"):
+        value = app[key]
+        if not value:
+            continue
+        result[key] = value
+        if isinstance(value, list):
+            size = byte_size(result)
+            count = len(value)
+            while count and size > CATALOG_ENTRY_BYTES:
+                count -= 1
+                size -= byte_size(value[count]) + (1 if count else 0)
+            result[key] = value[:count]
+        if not result[key] or byte_size(result) > CATALOG_ENTRY_BYTES:
+            del result[key]
+    return result
 
 
 
@@ -378,8 +490,15 @@ else:
 def desktop_config(path):
     config = configparser.ConfigParser(interpolation=None, strict=False)
     config.optionxform = str
-    with Path(path).open(encoding="utf-8") as stream:
-        config.read_file(stream)
+    # An applications directory may contain a link to a non-regular file.
+    # Reject it before reading, and bound the read even if a writer races it.
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("Desktop Entry must be a regular file")
+        data = stream.read(DESKTOP_FILE_BYTES + 1)
+    if len(data) > DESKTOP_FILE_BYTES:
+        raise ValueError("Desktop Entry exceeds size limit")
+    config.read_string(data.decode("utf-8"), source=str(path))
     return config
 
 
@@ -444,6 +563,10 @@ def desktop_override(app_id, config_home):
         raise ValueError("Desktop override exceeds size limit")
     with path.open("rb") as stream:
         config = tomllib.load(stream)
+    return validate_override(config), str(path)
+
+
+def validate_override(config):
     if config.keys() - {"version", "default", "actions"} or type(config.get("version")) is not int or config["version"] != 1:
         raise ValueError("Desktop override requires version=1 and only default/actions tables")
     override_table(config.get("default", {}))
@@ -454,12 +577,14 @@ def desktop_override(app_id, config_home):
         if not re.fullmatch(r"[A-Za-z0-9-]+", action):
             raise ValueError("Invalid desktop action ID")
         override_table(table)
-    return config, str(path)
+    return config
 
 
-def desktop_unescape(value):
+def desktop_unescape(value, *, list_value=False):
     # Desktop Entry string escaping precedes Exec argument parsing.
     mapping = {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}
+    if list_value:
+        mapping[";"] = ";"
     result, index = [], 0
     while index < len(value):
         char = value[index]
@@ -543,13 +668,49 @@ def session_environment(saved):
     return environment
 
 
-def launch_plan(request, saved):
+def local_application_context():
+    sessions = list_sessions()
+    if len(sessions) > 1:
+        raise ValueError("Application settings need a single active Waybridge session")
+    session = sessions[0] if sessions else None
+    saved = descriptor(session["name"]) if session else {}
+    if session and (saved["pid"] != session["pid"] or str(saved["started"]) != session["started"]):
+        raise ValueError("The Waybridge session changed. Refresh the application catalog.")
+    environment = session_environment(saved)
+    home = Path(environment.get("HOME", str(Path.home())))
+    config_home = xdg_directory("XDG_CONFIG_HOME", home / ".config", environment)
+    return saved, {"session": session, "config_home": str(config_home)}
+
+
+def desktop_request_options(request, table):
+    requested_cwd = request.get("cwd")
+    requested_args = request.get("extra_argv")
+    launch_mode = request.get("launch_mode")
+    if requested_cwd is None and requested_args is None and launch_mode is None:
+        return table
+    merged = dict(table)
+    if requested_cwd is not None:
+        merged["cwd"] = requested_cwd
+        merged["clear"] = [field for field in merged.get("clear", []) if field != "cwd"]
+    if requested_args is not None:
+        arguments = string_array(requested_args, "extra_argv")
+        if arguments:
+            merged["extra_argv"] = [*merged.get("extra_argv", []), *arguments]
+    if launch_mode is not None:
+        if launch_mode != "exec":
+            raise ValueError("A launch request can only select exec mode")
+        merged["launch_mode"] = "exec"
+    return override_table(merged)
+
+
+def launch_plan(request, saved, draft=None):
     environment = session_environment(saved)
     home = environment.get("HOME", str(Path.home()))
     if request.get("app"):
-        if request.get("argv") is not None or any(key in request for key in ("cwd", "env", "unset_env")):
-            raise ValueError("Desktop launches use their scoped override for cwd/env; argv is a separate launch mode")
-        app = next((app for app in app_catalog(environment) if app["id"] == request["app"]), None)
+        if request.get("argv") is not None or any(key in request for key in ("env", "unset_env")):
+            raise ValueError("Desktop launches use their scoped override for env; argv is a separate launch mode")
+        app_id = text_value(request["app"], "app", 1024, nonempty=True)
+        app = next((app for app in app_catalog(environment) if app["id"] == app_id), None)
         if not app:
             raise ValueError("Application is not in the installed desktop catalog")
         config = desktop_config(app["path"])
@@ -557,13 +718,19 @@ def launch_plan(request, saved):
         action = request.get("action")
         if action is not None:
             text_value(action, "action", 256, nonempty=True)
-            if action not in entry.get("Actions", "").split(";") or "Desktop Action " + action not in config:
+            if not ACTION_ID.fullmatch(action) or action not in entry.get("Actions", "").split(";") or "Desktop Action " + action not in config:
                 raise ValueError("Unknown desktop action")
-        overlay, overlay_path = desktop_override(app["id"], xdg_directory("XDG_CONFIG_HOME", Path(home) / ".config", environment))
+        config_home = xdg_directory("XDG_CONFIG_HOME", Path(home) / ".config", environment)
+        if draft is None:
+            overlay, overlay_path = desktop_override(app["id"], config_home)
+        else:
+            overlay = draft
+            overlay_path = str(config_home / "waybridge/desktop-overrides" / (app["id"] + ".toml"))
         unknown_actions = set(overlay.get("actions", {})) - set(entry.get("Actions", "").split(";"))
         if unknown_actions:
             raise ValueError("Override contains unknown desktop actions: " + ", ".join(sorted(unknown_actions)))
         table = overlay.get("actions", {}).get(action, {}) if action else overlay.get("default", {})
+        table = desktop_request_options(request, table)
         selected = config["Desktop Action " + action] if action else entry
         changes = table.get("clear", [])
         for field, key in [("exec", "Exec"), ("name", "Name"), ("icon", "Icon")]:
@@ -623,7 +790,7 @@ def launch_plan(request, saved):
         plan = dict(kind="desktop", desktop_id=app["id"], source=app["path"], override=overlay_path,
                     override_section="actions." + action if action else "default", action=action,
                     launch_mode=mode, activation="dbus" if dbus else "exec", cwd=cwd,
-                    cwd_source="override" if "cwd" in table or "cwd" in changes else "desktop" if entry.get("Path") else "HOME",
+                    cwd_source="request" if request.get("cwd") is not None else "override" if "cwd" in table or "cwd" in changes else "desktop" if entry.get("Path") else "HOME",
                     exec=selected.get("Exec"), name=desktop_unescape(selected.get("Name", "")),
                     icon=desktop_unescape(selected.get("Icon", "")), terminal=entry.getboolean("Terminal", fallback=False),
                     extra_argv=table.get("extra_argv", []), env_keys=sorted(updates), unset_env=unset,
@@ -636,19 +803,20 @@ def launch_plan(request, saved):
         for key in unset:
             environment.pop(key, None)
         return plan, environment, config
-    if request.get("action") is not None or "uris" in request:
-        raise ValueError("action/uris require an installed desktop application")
+    if any(request.get(field) is not None for field in ("action", "uris", "extra_argv", "launch_mode")):
+        raise ValueError("action/uris/extra_argv/launch_mode require an installed desktop application")
     argv = string_array(request.get("argv"), "argv")
     if not argv or not argv[0]:
         raise ValueError("Launch requires a nonempty argument array")
     updates, unset = environment_override(request)
-    cwd = text_value(request.get("cwd", home), "cwd", nonempty=True)
+    requested_cwd = request.get("cwd")
+    cwd = text_value(home if requested_cwd is None else requested_cwd, "cwd", nonempty=True)
     if not Path(cwd).is_absolute() or not Path(cwd).is_dir():
         raise ValueError("cwd must be an existing absolute directory")
     environment.update(updates)
     for key in unset:
         environment.pop(key, None)
-    return dict(kind="argv", argv=argv, cwd=cwd, cwd_source="request" if "cwd" in request else "HOME",
+    return dict(kind="argv", argv=argv, cwd=cwd, cwd_source="request" if requested_cwd is not None else "HOME",
                 env_keys=sorted(updates), unset_env=unset, readiness="not-observed"), environment, None
 
 
@@ -742,6 +910,40 @@ def launch_application(request, saved, session, diagnostic=False):
     return result
 
 
+def launcher_app_icons(request):
+    ids = request.get("apps")
+    if not isinstance(ids, list) or len(ids) > 24:
+        raise ValueError("Expected at most 24 application IDs")
+    for app_id in ids:
+        text_value(app_id, "application ID", limit=1024, nonempty=True)
+        if (len(app_id.encode()) > 1024 or not app_id.endswith(".desktop") or "/" in app_id or "\\" in app_id or
+                any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in app_id)):
+            raise ValueError("Invalid desktop application ID")
+    if len(set(ids)) != len(ids):
+        raise ValueError("Application IDs in a batch must be distinct")
+    if not ids:
+        return {"icons": {}, "omitted": []}
+    # The requested IDs only select entries from this service's installed
+    # catalog. Icon paths, theme names and command arguments stay server-side.
+    catalog = {app["id"]: app.get("icon") for app in app_catalog()}
+    selections = {}
+    for app_id in ids:
+        icon = catalog.get(app_id)
+        if icon and (len(icon.encode()) > 4096 or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in icon)):
+            icon = None
+        selections[app_id] = icon or None
+    binary = resolve_program(request.get("binary", "waybridge"))
+    try:
+        completed = subprocess.run(
+            [binary, "--resolve-app-icons"],
+            input=json.dumps(selections, ensure_ascii=False, separators=(",", ":")).encode(),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError("Application icon resolver unavailable") from None
+    return json.loads(completed.stdout)
+
+
 def dispatch(request):
     operation = request.get("op")
     if operation == "hello":
@@ -750,8 +952,43 @@ def dispatch(request):
         return list_sessions()
     if operation == "ensure":
         return ensure(request)
+    if operation == "app_icons":
+        return launcher_app_icons(request)
     if operation == "applications":
-        return [{k: v for k, v in app.items() if k != "path"} for app in app_catalog()]
+        return [public_application(app) for app in app_catalog()]
+    if operation == "local-override-catalog":
+        saved, context = local_application_context()
+        apps = app_catalog(session_environment(saved))
+        return {"context": context, "apps": [public_application(app) for app in apps]}
+    if operation == "local-preview-override":
+        # This preview is exposed only through the same-user Unix socket or
+        # the local TUI. It analyzes a draft without writing or launching it.
+        draft = validate_override(tomllib.loads(text_value(request.get("draft"), "draft", limit=32768)))
+        app = text_value(request.get("app"), "app", limit=1024, nonempty=True)
+        saved, context = local_application_context()
+        if request.get("context") != context:
+            raise ValueError("The application environment changed. Refresh the application catalog.")
+        primary, _, _ = launch_plan({"app": app}, saved, draft)
+        actions = {}
+        for action in draft.get("actions", {}):
+            actions[action], _, _ = launch_plan({"app": app, "action": action}, saved, draft)
+        return {"default": primary, "actions": actions}
+    if operation == "local-session-log":
+        return {"log": recent_log(request.get("session"))}
+    if operation == "local-validate-portal":
+        draft = text_value(request.get("draft"), "draft", limit=32768)
+        preferences = configparser.ConfigParser(interpolation=None, delimiters=("=",))
+        preferences.optionxform = str
+        preferences.read_string(draft, source="Portal draft")
+        if "preferred" not in preferences:
+            raise ValueError("Portal preferences require a [preferred] section")
+        for key, backends in preferences["preferred"].items():
+            if key != "default" and not key.startswith("org.freedesktop.impl.portal."):
+                raise ValueError("Use default or an org.freedesktop.impl.portal interface name")
+            names = backends.removesuffix(";").split(";")
+            if any(not re.fullmatch(r"\*|[A-Za-z0-9_.-]+", name.strip()) for name in names):
+                raise ValueError("Use semicolon-separated Portal backend identifiers")
+        return {"valid": True}
     session = name(request.get("session", "waybridge-0"))
     saved = descriptor(session)
     if operation == "info":
@@ -759,6 +996,8 @@ def dispatch(request):
     if operation in ("launch", "launch-plan"):
         return launch_application(request, saved, session, diagnostic=operation == "launch-plan")
     if operation == "end":
+        if "expected_pid" in request and (saved["pid"] != request["expected_pid"] or str(saved["started"]) != request.get("expected_started")):
+            raise ValueError("Selected Waybridge session was replaced")
         # pidfd pins process identity across the /proc check and signal.
         fd = os.pidfd_open(saved["pid"])
         try:
@@ -783,7 +1022,7 @@ def main():
             request_id = request.get("id")
             result = dispatch(request)
             reply = dict(id=request_id, ok=True, result=result)
-        except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError, configparser.Error) as error:
             reply = dict(id=request_id, ok=False, error=str(error)[:2048])
         sys.stdout.write(json.dumps(reply, ensure_ascii=False, separators=(",", ":")) + "\n")
         sys.stdout.flush()

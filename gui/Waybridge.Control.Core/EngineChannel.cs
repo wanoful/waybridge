@@ -29,7 +29,8 @@ public sealed class EngineChannel : IAsyncDisposable
         GetWindowThreadProcessId(GetForegroundWindow(), out uint owner);
         return owner == Environment.ProcessId && AllowSetForegroundWindow((uint)process.Id);
     }
-    public Task ActivateWindowAsync(uint id) => SendAsync(new { type = "focus_window", id, foreground = GrantForeground() });
+    public Task ActivateWindowAsync(uint id, CancellationToken cancellationToken = default) =>
+        SendAsync(new { type = "focus_window", id, foreground = GrantForeground() }, cancellationToken);
     public async Task<LaunchActivation?> PrepareActivationAsync(string? app, CancellationToken token)
     {
         if (!activation) return null;

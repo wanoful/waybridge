@@ -215,12 +215,29 @@ def main():
                 desktop_marker, desktop_script = root / "desktop-result", root / "desktop-fixture"
                 desktop_script.write_text('#!/bin/sh\nprintf "%s\\n" "$PYTHONHOME" > "$1"\npwd >> "$1"\n')
                 desktop_script.chmod(0o700)
+                action_marker, action_script = root / "action-result.json", root / "desktop-action"
+                action_script.write_text(f'#!{sys.executable}\nimport json, os, pathlib, sys\n'
+                                         f'pathlib.Path({str(action_marker)!r}).write_text(json.dumps([os.getcwd(), *sys.argv[1:]]))\n')
+                action_script.chmod(0o700)
                 (applications / desktop_id).write_text(
-                    f"[Desktop Entry]\nType=Application\nName=Controlled launch\nExec={desktop_script} {desktop_marker}\n")
+                    f"[Desktop Entry]\nType=Application\nName=Controlled launch\nGenericName=Test editor\n"
+                    f"Comment=Searchable editor fixture\nCategories=Development;Utility;\nKeywords=checker;view\\;new;\n"
+                    f"StartupWMClass=WaybridgeControlled\nIcon={root / 'private-icon.svg'}\n"
+                    f"Actions=OpenNew;Missing;NoExec;\nExec={desktop_script} {desktop_marker}\n"
+                    f"\n[Desktop Action OpenNew]\nName=Open a new window\nComment=Create a window\nExec={action_script} stock\n"
+                    "\n[Desktop Action NoExec]\nName=Disabled action\n")
+                catalog = rpc({"op": "applications", **credentials})
+                application = next(app for app in catalog["result"] if app["id"] == desktop_id)
+                assert application["generic_name"] == "Test editor" and application["comment"] == "Searchable editor fixture"
+                assert application["categories"] == ["Development", "Utility"] and application["keywords"] == ["checker", "view;new"]
+                assert application["startup_wm_class"] == "WaybridgeControlled"
+                assert application["actions"] == [{"id": "OpenNew", "name": "Open a new window", "comment": "Create a window"}]
+                assert not application["icon"] and "path" not in application and "exec" not in application
                 overrides = root / "config/waybridge/desktop-overrides"
                 overrides.mkdir(parents=True)
-                (overrides / (desktop_id + ".toml")).write_text(
-                    f'version = 1\n[default]\ncwd = "{root}"\n[default.env]\nPYTHONHOME = "/application-only-python-home"\n')
+                override = overrides / (desktop_id + ".toml")
+                override.write_text(f'version = 1\n[default]\ncwd = "{root}"\n[default.env]\n'
+                                    'PYTHONHOME = "/application-only-python-home"\n[actions.OpenNew]\nextra_argv = ["saved"]\n')
                 desktop_plan = rpc({"op": "launch-plan", "session": actual["name"], "app": desktop_id, **credentials})
                 assert desktop_plan["ok"] and desktop_plan["result"]["env_keys"] == ["PYTHONHOME"], desktop_plan
                 assert not desktop_marker.exists()
@@ -233,6 +250,29 @@ def main():
                         raise TimeoutError("TLS desktop override did not launch the application")
                     time.sleep(.02)
                 assert desktop_marker.read_text().splitlines() == expected_desktop_result
+                action_cwd = root / "action 工作目录"
+                action_cwd.mkdir()
+                extra = ["unicode 你好", "$(literal);%f", ""]
+                options = {"session": actual["name"], "app": desktop_id, "action": "OpenNew",
+                           "cwd": str(action_cwd), "extra_argv": extra, **credentials}
+                saved = override.read_bytes()
+                action_plan = rpc({"op": "launch-plan", **options})
+                assert action_plan["ok"], action_plan
+                action_result = action_plan["result"]
+                assert action_result["cwd_source"] == "request" and action_result["cwd"] == str(action_cwd)
+                assert action_result["extra_argv"] == ["saved", *extra] and not action_marker.exists()
+                assert not rpc({"op": "launch-plan", **options, "cwd": "relative"})["ok"]
+                assert not rpc({"op": "launch-plan", **options, "action": "Missing"})["ok"]
+                action_launch = rpc({"op": "launch", **options})
+                assert action_launch["ok"], action_launch
+                expected_action = [str(action_cwd), "saved", *extra, "stock"]
+                deadline = time.monotonic() + 5
+                while not action_marker.exists():
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("TLS Desktop Action did not launch the application")
+                    time.sleep(.02)
+                assert json.loads(action_marker.read_text()) == expected_action
+                assert override.read_bytes() == saved, "single-use launch options edited the saved override"
                 with connect() as connection:
                     connection.sendall(json.dumps({"op": "stream", "session": actual["name"], **credentials}).encode() + b"\n")
                     assert receive_json(connection)["result"]["stream_ready"]

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 from app_icon_smoke import fixtures, wait, ROOT, KEYS
+from session_fixture import SessionFixture
 
 def xicons(display):
     # Wine cannot export process-local HICON handles through cross-process
@@ -59,8 +60,9 @@ def main():
     subprocess.run(["x86_64-w64-mingw32-g++","-std=c++17","-static","-O2","-DUNICODE","-D_UNICODE","-DWINVER=0x0A00","-D_WIN32_WINNT=0x0A00","-Iclient","tests/windows_icon_probe.cpp","-o","build/tests/windows-icon-probe.exe","-lole32","-lwindowscodecs","-luuid","-lgdi32","-lshell32"],cwd=ROOT,check=True)
     prefix=ROOT/"build/wine-app-icons";prefix.mkdir(mode=0o700,parents=True,exist_ok=True)
     processes=[]
-    with tempfile.TemporaryDirectory(prefix="waybridge-native-icons-") as runtime,open(ROOT/"build/tests/windows-app-icons.log","w+") as log:
+    with tempfile.TemporaryDirectory(prefix="waybridge-native-icons-") as runtime, SessionFixture(Path(runtime)/"bus") as session, open(ROOT/"build/tests/windows-app-icons.log","w+") as log:
         env=fixtures(runtime);env.update(XDG_RUNTIME_DIR=runtime,WAYLAND_DISPLAY="native-icons-0")
+        env.update({key: session.env[key] for key in ("DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS")})
         read_fd,write_fd=os.pipe();xvfb=subprocess.Popen(["Xvfb","-displayfd",str(write_fd),"-screen","0","1920x1200x24","-nolisten","tcp"],pass_fds=[write_fd],stdout=log,stderr=log);processes.append(xvfb);os.close(write_fd)
         with os.fdopen(read_fd) as pipe:display=":"+pipe.readline().strip()
         wine_env={**os.environ,"DISPLAY":display,"WINEPREFIX":str(prefix),"WINEDEBUG":"-all","WINEDLLOVERRIDES":"winemenubuilder.exe=d;mscoree,mshtml=","WAYBRIDGE_GDI":"1","WAYBRIDGE_DPI":"168","WAYBRIDGE_PNG":"1","WAYBRIDGE_ICON_TRACE":"1"}

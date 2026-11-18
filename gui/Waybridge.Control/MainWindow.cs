@@ -3,19 +3,27 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using Microsoft.UI;
+using Microsoft.UI.Text;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Waybridge.Control.Core;
 using Windows.Storage.Pickers;
+using Windows.System;
 
 namespace Waybridge.Control;
 
-internal sealed class MainWindow : Window
+internal sealed partial class MainWindow : Window
 {
     private readonly Grid root = new();
-    private readonly NavigationView navigation = new() { PaneDisplayMode = NavigationViewPaneDisplayMode.Auto, IsBackButtonVisible = NavigationViewBackButtonVisible.Collapsed, IsSettingsVisible = false };
+    private readonly NavigationView navigation = new()
+    {
+        PaneDisplayMode = NavigationViewPaneDisplayMode.LeftCompact, CompactPaneLength = 52, IsPaneOpen = false,
+        IsPaneToggleButtonVisible = false, IsBackButtonVisible = NavigationViewBackButtonVisible.Collapsed,
+        IsSettingsVisible = false, AlwaysShowHeader = false
+    };
     private readonly Dictionary<string, UIElement> pages = new();
     private readonly TextBlock status = new() { Text = "未连接", TextWrapping = TextWrapping.Wrap };
     private readonly InfoBar notice = new() { IsOpen = false, IsClosable = true };
@@ -25,16 +33,12 @@ internal sealed class MainWindow : Window
     private readonly DesktopNotifications desktopNotifications;
     private readonly TrayIcon tray;
     private readonly ObservableCollection<ConnectionProfile> profiles = [];
-    private readonly ComboBox profilePicker = new() { DisplayMemberPath = "Name", MinWidth = 220, HorizontalAlignment = HorizontalAlignment.Stretch };
-    private readonly TextBox name = new(), host = new(), user = new(), identity = new(), binary = new(), session = new(), udpHost = new();
-    private readonly TextBox fingerprint = new(), clientId = new() { IsReadOnly = true };
-    private readonly PasswordBox pairCode = new();
-    private readonly Button pair = Button("配对此设备"), revoke = Button("撤销此设备配对");
-    private readonly PasswordBox token = new();
-    private readonly CheckBox remember = new() { Content = "使用 Windows 凭据管理器保存令牌" };
-    private readonly ComboBox connectionMode = Combo(["认证加密直连", "内置 SSH", "已有 SSH 隧道"]);
-    private readonly ComboBox sessionMode = Combo(["已有会话优先，未运行时启动", "仅接入已有会话", "创建独立会话"]);
-    private readonly NumberBox sshPort = Number(22, 1, 65535), remotePort = Number(49090, 0, 65535);
+    private readonly ComboBox profilePicker = new() { DisplayMemberPath = "Name", MinWidth = 156, MaxWidth = 320, PlaceholderText = "选择工作站", HorizontalAlignment = HorizontalAlignment.Stretch };
+    private readonly TextBox name = new(), host = new(), session = new(), udpHost = new();
+    private readonly TextBox fingerprint = new() { IsReadOnly = true };
+    private readonly Button revoke = Button("撤销此设备配对");
+    private readonly ComboBox sessionMode = Combo(["优先接回，必要时新建", "仅接回已有会话", "仅新建会话"]);
+    private readonly NumberBox remotePort = Number(49092, 1, 65535);
     private readonly ToggleSwitch reconnect = Toggle(true), audio = Toggle(true), files = Toggle(true), dragText = Toggle(true), images = Toggle(true), readOnly = Toggle(false), ime = Toggle(true), udp = Toggle(false), hdr = Toggle(false);
     private readonly ToggleSwitch notifications = Toggle(true);
     private readonly ToggleSwitch touch = Toggle(false);
@@ -67,13 +71,15 @@ internal sealed class MainWindow : Window
     private readonly ComboBox output = new() { MinWidth = 220 };
     private readonly NumberBox fps = Number(60, 1, 120), bitrate = Number(30, 1, 200);
     private readonly Slider volume = new() { Minimum = 0, Maximum = 100, Value = 100, StepFrequency = 1, MinWidth = 200 };
-    private readonly Button connect = Button("连接", true), end = Button("结束远端会话"), save = Button("保存连接");
-    private readonly Button addProfile = Button("新建"), deleteProfile = Button("删除");
+    private readonly Button connect = Button("连接", true), end = Button("结束远端会话");
+    private readonly Button addProfile = Button("添加设备"), deleteProfile = Button("移除此设备");
     private string badgePng = "";
     private readonly Image badgePreview = new() { Width = 32, Height = 32 };
     private readonly TextBlock actual = new() { Text = "实际编码／解码／呈现：等待连接", TextWrapping = TextWrapping.Wrap };
-    private readonly TextBox applicationSearch = new() { PlaceholderText = "搜索已安装应用" };
-    private readonly ListView applicationList = new() { SelectionMode = ListViewSelectionMode.Single, MaxHeight = 430 };
+    private readonly TextBlock appliedVideo = Muted("");
+    private readonly TextBlock diagnosticMediaPath = Text("等待连接");
+    private readonly TextBox applicationSearch = new() { PlaceholderText = "搜索应用和窗口 · Ctrl+K" };
+    private readonly ItemsRepeater applicationList = new();
     private readonly ListView windowList = new() { SelectionMode = ListViewSelectionMode.None, MaxHeight = 280 };
     private readonly ToggleSwitch remoteTray = Toggle(true);
     private readonly TextBlock trayStatus = new() { Text = "托盘：等待连接", TextWrapping = TextWrapping.Wrap };
@@ -84,7 +90,7 @@ internal sealed class MainWindow : Window
     private IReadOnlyList<RemoteApplication> applications = [];
     private ConnectionProfile selected = NewProfile();
     private ContentDialog? activeDialog;
-    private bool loading, quitting, busy;
+    private bool loading, initialized, quitting, busy, connecting;
     private ulong lastBytes, lastUpdates, lastTick;
     private string receiveDirectory = "";
     private readonly IntPtr hwnd;
@@ -99,51 +105,94 @@ internal sealed class MainWindow : Window
         double density = GetDpiForWindow(hwnd) / 96.0;
         var work = DisplayArea.GetFromWindowId(appWindow.Id, DisplayAreaFallback.Nearest).WorkArea;
         appWindow.Resize(new Windows.Graphics.SizeInt32(Math.Min(work.Width - 40, (int)(1050*density)), Math.Min(work.Height - 40, (int)(780*density))));
-        appWindow.Closing += (_, args) => { if (!quitting) { args.Cancel = true; TrayIcon.ShowWindow(hwnd, 0); } };
+        appWindow.Closing += (_, args) =>
+        {
+            if (quitting) return;
+            args.Cancel = true;
+            if (launcherPreferences.CloseToTray) TrayIcon.ShowWindow(hwnd, 0);
+            else TrayAction("quit");
+        };
         try { SystemBackdrop = new MicaBackdrop(); } catch (COMException) { }
         string directory = stateDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Waybridge");
         store = new(directory);
-        controller = new(directory, Path.Combine(AppContext.BaseDirectory, "waybridge-client.exe"), ConfirmHostAsync);
+        controller = new(Path.Combine(AppContext.BaseDirectory, "waybridge-client.exe"));
         desktopNotifications = new(request => controller.SendEngineAsync(request), message => UI(() => Inform(message)));
         controller.Status += text => UI(() => status.Text = text);
         controller.ConnectionChanged += connected => UI(() =>
         {
             desktopNotifications.ConnectionChanged(connected);
             TouchConnectionChanged(connected);
-            if (!connected) { backgroundList.Items.Clear(); trayStatus.Text = "托盘：未连接"; }
-            connect.Content = connected ? "断开连接" : (busy || controller.IsRunning) ? "取消连接" : "连接";
-            end.IsEnabled = connected && selected.Mode is "ssh" or "direct";
+            if (!connected)
+            {
+                ResetConnectionView();
+                if (!controller.IsRunning) liveSettings = null;
+            }
             tray?.Update(connected);
             UpdateMode();
-            if (!connected) { actual.Text = "实际编码／解码／呈现：等待连接"; lastTick = lastBytes = lastUpdates = 0; }
         });
         controller.Log += _ => UI(() => logs.Text = string.Join(Environment.NewLine, controller.Logs));
-        controller.Message += message => { if (!desktopNotifications.Receive(message)) UI(() => Receive(message)); };
+        controller.Message += message =>
+        {
+            if (desktopNotifications.Receive(message)) return;
+            var profileId = controller.ActiveProfileId;
+            string? sessionName = controller.CurrentSession;
+            UI(() =>
+            {
+                if (profileId == selected.Id && profileId == controller.ActiveProfileId && sessionName == controller.CurrentSession)
+                    Receive(message);
+            });
+        };
         tray = new(action => UI(() => TrayAction(action)));
+        root.RowDefinitions.Add(new() { Height = GridLength.Auto });
         root.RowDefinitions.Add(new() { Height = GridLength.Auto });
         root.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
         root.RowDefinitions.Add(new() { Height = GridLength.Auto });
-        notice.Margin = new Thickness(12, 8, 12, 0); root.Children.Add(notice);
-        Grid.SetRow(navigation, 1); root.Children.Add(navigation);
-        var footer = new Grid { Padding = new Thickness(18, 10, 18, 10), ColumnSpacing = 16 };
+        root.Children.Add(LauncherHeader());
+        notice.Margin = new Thickness(12, 6, 12, 0); Grid.SetRow(notice, 1); root.Children.Add(notice);
+        transferDrawer.Content = navigation;
+        transferDrawer.Pane = new ScrollViewer { Content = TransfersPage(), Padding = new Thickness(16), HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        Grid.SetRow(transferDrawer, 2); root.Children.Add(transferDrawer);
+        var footer = new Grid { Padding = new Thickness(18, 7, 18, 9), ColumnSpacing = 12 };
         footer.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
         footer.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
         footer.Children.Add(status);
-        var architecture = Text($"{RuntimeInformation.ProcessArchitecture} · 关闭窗口时收起到托盘", 12);
-        Grid.SetColumn(architecture, 1); footer.Children.Add(architecture); Grid.SetRow(footer, 2); root.Children.Add(footer);
-        Content = root;
-        AddPage("connection", "设备与连接", "\uE968", ConnectionPage());
-        AddPage("apps", "远端应用", "\uE71D", ApplicationsPage());
-        AddPage("display", "画面与声音", "\uE713", DisplayPage());
-        AddPage("input", "输入与共享", "\uE765", InputPage());
-        AddPage("files", "文件传输", "\uE8B7", TransfersPage());
+        Grid.SetColumn(sessionStatus, 1);
+        footer.Children.Add(sessionStatus);
+        Grid.SetRow(footer, 3); root.Children.Add(footer);
+        AddPage("apps", "远端应用", "\uE71D", ApplicationsPage(), scroll: false);
+        AddPage("running", "运行中", "\uE768", RunningPage());
         AddPage("diagnostics", "诊断", "\uE9D9", DiagnosticsPage());
+        navigation.MenuItems.Add(new NavigationViewItemHeader { Content = "设置" });
+        AddPage("display", "画面", "\uE7F4", DisplayPage());
+        AddPage("audio", "声音", "\uE767", AudioPage());
+        AddPage("input", "输入设备", "\uE765", InputPage());
+        AddPage("sharing", "共享与权限", "\uE72E", SharingPage());
+        AddPage("network", "网络", "\uE968", NetworkPage());
+        AddPage("connection", "连接", "\uE77B", ConnectionPage());
+        AddPage("desktop", "桌面集成", "\uE737", DesktopPage());
+        AddPage("general", "常规", "\uE713", GeneralPage());
         navigation.SelectionChanged += (_, args) =>
         {
             if (args.SelectedItem is NavigationViewItem item && item.Tag is string id)
-            { navigation.Content = pages[id]; navigation.Header = item.Content; }
+                navigation.Content = pages[id];
         };
         navigation.SelectedItem = navigation.MenuItems[0];
+        var searchShortcut = new KeyboardAccelerator { Key = VirtualKey.K, Modifiers = VirtualKeyModifiers.Control };
+        searchShortcut.Invoked += (_, args) =>
+        {
+            DispatcherQueue.TryEnqueue(() => applicationSearch.Focus(FocusState.Keyboard));
+            args.Handled = true;
+        };
+        root.KeyboardAccelerators.Add(searchShortcut);
+        root.KeyDown += (_, args) =>
+        {
+            if (args.Key != VirtualKey.Divide && (int)args.Key != 191) return;
+            if (FocusManager.GetFocusedElement(root.XamlRoot) is TextBox or PasswordBox or RichEditBox or NumberBox) return;
+            applicationSearch.Focus(FocusState.Keyboard);
+            args.Handled = true;
+        };
+        Content = root;
+        UpdateMode();
         root.Loaded += async (_, _) => await GuardAsync(InitializeAsync);
     }
     private void UI(Action action) => DispatcherQueue.TryEnqueue(() => { try { action(); } catch (Exception error) { Error(error); } });
@@ -165,10 +214,11 @@ internal sealed class MainWindow : Window
     private static NumberBox Number(double value, double min, double max) => new()
     { Value = value, Minimum = min, Maximum = max, SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Compact, MinWidth = 150 };
     private static ToggleSwitch Toggle(bool value) => new() { IsOn = value, OnContent = "开启", OffContent = "关闭" };
-    private static ConnectionProfile NewProfile() => new() { Mode = "direct", Port = 49092 };
+    private static ConnectionProfile NewProfile() => new();
     private static Button Button(string label, bool primary = false)
     {
         var result = new Button { Content = label, MinHeight = 36 };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(result, label);
         if (primary && Application.Current.Resources.TryGetValue("AccentButtonStyle", out var style)) result.Style = (Style)style;
         return result;
     }
@@ -192,7 +242,12 @@ internal sealed class MainWindow : Window
         grid.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
         grid.RowDefinitions.Add(new() { Height = GridLength.Auto });
         grid.RowDefinitions.Add(new() { Height = GridLength.Auto });
-        grid.Children.Add(Column(Text(title), Text(description, 12)));
+        var label = Text(title);
+        label.FontWeight = FontWeights.SemiBold;
+        var labels = new StackPanel { Spacing = 3 };
+        labels.Children.Add(label);
+        if (description.Length > 0) labels.Children.Add(Muted(description));
+        grid.Children.Add(labels);
         control.VerticalAlignment = VerticalAlignment.Center; control.MaxWidth = 360;
         Grid.SetColumn(control, 1); grid.Children.Add(control);
         bool compact = false;
@@ -205,113 +260,21 @@ internal sealed class MainWindow : Window
             Grid.SetColumnSpan(control, compact ? 2 : 1);
             control.Margin = compact ? new Thickness(0, 10, 0, 0) : new Thickness(0);
         };
-        var border = new Border { CornerRadius = new CornerRadius(8), Child = grid };
-        if (Application.Current.Resources.TryGetValue("CardBackgroundFillColorDefaultBrush", out var brush)) border.Background = (Brush)brush;
-        return border;
+        return Card(grid);
     }
     private static UIElement Field(string label, Microsoft.UI.Xaml.Controls.Control field)
     {
         field.HorizontalAlignment = HorizontalAlignment.Stretch; field.MaxWidth = double.PositiveInfinity;
-        return Column(Text(label), field);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(field, label);
+        return new StackPanel { Spacing = 5, Children = { Text(label), field } };
     }
-    private void AddPage(string id, string title, string glyph, UIElement page)
+    private void AddPage(string id, string title, string glyph, UIElement page, bool scroll = true)
     {
-        pages[id] = new ScrollViewer { Content = page, Padding = new Thickness(24, 10, 24, 24), HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
-        navigation.MenuItems.Add(new NavigationViewItem
-        { Content = title, Tag = id, Icon = new FontIcon { Glyph = glyph, FontFamily = new FontFamily("Segoe Fluent Icons") } });
-    }
-    private UIElement ConnectionPage()
-    {
-        profilePicker.ItemsSource = profiles;
-        profilePicker.SelectionChanged += (_, _) => { if (!loading && profilePicker.SelectedItem is ConnectionProfile profile) Load(profile); };
-        addProfile.Click += (_, _) => { var profile = NewProfile(); profiles.Add(profile); profilePicker.SelectedItem = profile; };
-        deleteProfile.Click += async (_, _) => await GuardAsync(async () =>
-        {
-            if (controller.Connected) throw new InvalidOperationException("删除连接前请先断开");
-            secrets.Delete(selected.Id); profiles.Remove(selected);
-            if (profiles.Count == 0) profiles.Add(NewProfile());
-            profilePicker.SelectedIndex = 0; await store.SaveAsync(profiles);
-        });
-        connectionMode.SelectionChanged += (_, _) =>
-        {
-            if (!loading)
-            {
-                if (connectionMode.SelectedIndex == 0 && remotePort.Value == 49090) remotePort.Value = 49092;
-                UpdateMode();
-            }
-        };
-        name.PlaceholderText = "连接名称"; host.PlaceholderText = "Linux 主机名或 IP";
-        user.PlaceholderText = "留空使用 SSH 配置中的用户"; identity.PlaceholderText = "留空使用 ssh-agent / OpenSSH 默认身份";
-        binary.PlaceholderText = "waybridge 或 Linux 可执行文件完整路径";
-        session.PlaceholderText = "waybridge-0"; token.PlaceholderText = "配对后自动填入；已有隧道模式填写会话令牌";
-        fingerprint.PlaceholderText = "Linux 配对命令显示的 SHA-256 证书指纹";
-        pairCode.PlaceholderText = "Linux 服务生成的一次性配对码";
-        var help = Text("直连模式先核对 Linux 服务的证书指纹并配对，之后直接连接局域网或 VPN 地址。SSH 模式继续使用 Windows OpenSSH 与 ssh-agent。", 12);
-        pair.Click += async (_, _) => await GuardAsync(async () =>
-        {
-            var profile = ReadEditor();
-            if (profile.Mode != "direct" || controller.IsRunning) throw new InvalidOperationException("请先断开连接并选择直连模式");
-            busy = true; connect.IsEnabled = false; UpdateMode();
-            try
-            {
-                var credentials = await DirectAgent.PairAsync(profile, pairCode.Password, Environment.MachineName);
-                clientId.Text = credentials.ClientId;
-                token.Password = credentials.ClientToken;
-                pairCode.Password = "";
-                remember.IsChecked = true;
-                await SaveAsync();
-                Inform("配对成功，可以连接。客户端凭据已保存到 Windows 凭据管理器。");
-            }
-            finally { busy = false; connect.IsEnabled = true; UpdateMode(); }
-        });
-        revoke.Click += async (_, _) => await GuardAsync(async () =>
-        {
-            var profile = ReadEditor();
-            if (profile.Mode != "direct" || controller.IsRunning) throw new InvalidOperationException("请先断开连接再撤销配对");
-            busy = true; connect.IsEnabled = false; UpdateMode();
-            try
-            {
-                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-                await new DirectAgent(profile, token.Password).CallAsync(new { op = "revoke", revoke_client_id = profile.ClientId }, timeout.Token);
-                secrets.Delete(profile.Id); clientId.Text = ""; token.Password = ""; remember.IsChecked = false;
-                await SaveAsync(); Inform("此设备的配对已撤销。");
-            }
-            finally { busy = false; connect.IsEnabled = true; UpdateMode(); }
-        });
-        connect.Click += async (_, _) => await GuardAsync(ConnectOrDisconnectAsync);
-        save.Click += async (_, _) => await GuardAsync(SaveAsync);
-        end.IsEnabled = false;
-        end.Click += async (_, _) => await GuardAsync(async () =>
-        {
-            if (await ConfirmAsync("结束远端会话？", "这会关闭该会话中的 Linux 应用。仅断开连接则会保留应用。", "结束会话")) await controller.EndSessionAsync();
-        });
-        return Column(Actions(profilePicker, addProfile, deleteProfile), Field("连接名称", name), Field("连接方式", connectionMode),
-            Field("主机地址", host), Row("SSH 端口", "内置 SSH 使用此端口", sshPort),
-            Field("SSH 用户名", user), Field("私钥文件（可选）", identity), help,
-            Field("Linux 服务端程序", binary), Field("会话名称", session),
-            Row("会话策略", "直连与内置 SSH 都可创建或接入会话", sessionMode),
-            Row("服务端口", "直连默认 49092；SSH 新建会话可填 0；已有隧道填本地转发端口", remotePort),
-            Field("服务端证书指纹", fingerprint), Field("一次性配对码", pairCode), Actions(pair, revoke), Field("客户端标识", clientId),
-            Field("客户端凭据／会话令牌", token), remember, Row("自动重连", "连接恢复后重新接入原会话，保留 Linux 应用", reconnect),
-            Actions(connect, save, end));
-    }
-    private UIElement DisplayPage()
-    {
-        var apply = Button("应用到当前连接", true); apply.Click += async (_, _) => await GuardAsync(ApplyAsync);
-        var restart = Button("断开并重新连接"); restart.Click += async (_, _) => await GuardAsync(async () => { await SaveAsync(); await controller.DisconnectAsync(); await ConnectOrDisconnectAsync(); });
-        return Column(
-            Row("视频编码", "实际编码由硬件能力与服务端共同决定", codec),
-            Row("帧率上限", "实时应用，范围 1–120 FPS", fps),
-            Row("每窗口视频码率（Mbps）", "实时应用；多个活动窗口会分别消耗带宽", bitrate),
-            Row("应用内容缩放", "原生 Wayland 跟随每个 Windows 窗口；X11 共享应用密度", scale),
-            Row("播放远端声音", "关闭时即时静音；首次启用音频可能需要重连", audio),
-            Row("音量", "只影响当前远端会话", volume),
-            Row("输出设备", "更换输出设备后重新连接", output),
-            Row("UDP 媒体", "需要可直达的 Linux UDP 端口，不经过 SSH 转发；重连生效", udp),
-            Field("UDP 主机（可选）", udpHost),
-            Row("实验性 HDR", "需要服务端明确启用与兼容显示／解码器；重连生效", hdr),
-            Row("服务端颜色输入", "只在创建新 Linux 会话时生效", gpu),
-            actual, Actions(apply, restart));
+        pages[id] = scroll ? new ScrollViewer { Content = page, Padding = new Thickness(26, 20, 26, 24), HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled } : page;
+        var item = new NavigationViewItem { Content = title, Tag = id, Icon = Glyph(glyph) };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(item, title);
+        ToolTipService.SetToolTip(item, title);
+        navigation.MenuItems.Add(item);
     }
     private UIElement BadgeEditor()
     {
@@ -328,7 +291,7 @@ internal sealed class MainWindow : Window
             await UpdateBadgePreviewAsync();
         });
         reset.Click += async (_, _) => { badgePng = ""; await GuardAsync(UpdateBadgePreviewAsync); };
-        return Column(Row("远端图标角标", "保留应用图标，在右上角标记来源；随当前连接保存，可实时应用", badgePreview), Actions(choose, reset));
+        return Column(Row("远端图标角标", "用于 Windows 窗口和托盘的远端应用图标。随连接保存，可实时应用。", badgePreview), Actions(choose, reset));
     }
     private async Task UpdateBadgePreviewAsync()
     {
@@ -338,8 +301,6 @@ internal sealed class MainWindow : Window
     }
     private UIElement InputPage()
     {
-        var saveSettings = Button("保存设置"); saveSettings.Click += async (_, _) => await GuardAsync(SaveAsync);
-        var apply = Button("应用到当前连接", true); apply.Click += async (_, _) => await GuardAsync(ApplyAsync);
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(touch, "NativeTouchToggle");
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(touch, "原生多点触控");
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(touchStatus, "NativeTouchStatus");
@@ -347,8 +308,6 @@ internal sealed class MainWindow : Window
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(touchApplication, "TouchApplication");
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(touchAppMode, "TouchApplicationMode");
         touchApplication.SelectionChanged += (_, _) => LoadTouchApplicationMode();
-        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(saveSettings, "InputSettingsSave");
-        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(apply, "InputSettingsApply");
         foreach (var (control, id, label) in new[] { (pen, "NativePenToggle", "压感手写笔"),
                      (gamepads, "GamepadToggle", "游戏手柄"), (gamepadRumble, "GamepadRumbleToggle", "手柄震动") })
         {
@@ -365,47 +324,45 @@ internal sealed class MainWindow : Window
         penPressureGamma.SmallChange = .25;
         penPressureGamma.ValueChanged += (_, _) => { if (!loading) UpdateInputDeviceStatus(); };
         gamepadDeadzone.ValueChanged += (_, _) => { if (!loading) UpdateInputDeviceStatus(); };
-        return Column(BadgeEditor(), Row("剪贴板方向", "可分别限制 Windows 与 Linux 间的数据同步", clipboard),
-            Row("剪贴板图片", "文本同步保持独立", images),
-            Row("文字拖放", "双向文字拖放，独立于剪贴板与文件共享", dragText),
-            Row("文件与目录共享", "控制文件与目录的剪贴板、拖入与拖出", files),
-            Row("桌面通知", "Linux 应用通知与动作，遵循 Windows 通知设置及免打扰", notifications),
-            Row("远端应用托盘", "在 Windows 通知区域显示应用托盘，关闭主窗口后仍可从后台列表恢复", remoteTray),
-            Row("只读模式", "暂停远端输入，释放按键、鼠标锁定、手写笔和手柄", readOnly),
-            Row("Windows 本地 IME", "使用本地候选窗口与远端预编辑", ime),
-            Row("原生多点触控（实验）", "向支持触控的 Linux 应用发送最多十点触摸；关闭时使用鼠标兼容模式。按连接保存，可立即应用。", touch),
-            touchStatus,
-            Row("应用触控模式", "默认自动选择：应用接入触控时使用原生输入，否则使用鼠标兼容。可为有兼容问题的应用单独覆盖，随连接保存。", touchApplication),
-            Row("所选应用的输入方式", "通常保留自动选择。原生触控的长按与选字由应用处理，鼠标兼容支持系统长按右键和拖选。", touchAppMode),
-            Row("压感手写笔（实验）", "向支持手写笔的绘图应用发送压力、倾斜和橡皮擦输入；按连接保存，可立即应用。", pen),
-            Row("笔压力度曲线", "1 为线性；小于 1 时轻压更明显，大于 1 时需要更用力。范围 0.25–4。", penPressureGamma),
-            penStatus,
-            Row("游戏手柄（实验）", "将 Windows 连接的手柄提供给当前 Linux 会话；只在开启此设置后转发。", gamepads),
-            Row("手柄震动", "允许游戏向当前连接的手柄发送震动反馈", gamepadRumble),
-            Row("摇杆死区（%）", "忽略摇杆中心附近的小幅偏移，减少漂移；范围 0%–50%。", gamepadDeadzone),
-            gamepadStatus,
-            Row("紧急释放鼠标", "游戏捕获鼠标时可随时释放", Text("Ctrl + Alt + Shift + F12")), Actions(saveSettings, apply));
-    }
-    private UIElement ApplicationsPage()
-    {
-        var refresh = Button("刷新应用"); refresh.Click += async (_, _) => await GuardAsync(RefreshApplicationsAsync);
-        var terminal = Button("启动终端", true); terminal.Click += async (_, _) => await GuardAsync(() => controller.LaunchAsync(argv: ["ghostty"]));
-        var launch = Button("启动选中应用"); launch.Click += async (_, _) => await GuardAsync(async () =>
+        var advanced = new Expander
         {
-            if (applicationList.SelectedItem is ListViewItem { Tag: RemoteApplication app }) await controller.LaunchAsync(app: app.Id);
-        });
-        applicationSearch.TextChanged += (_, _) => FilterApplications();
-        return Column(Text("从 Linux 已安装应用中选择，启动到当前私有会话。"), Actions(refresh, terminal, launch),
-            applicationSearch, applicationList, Text("当前远端窗口", 18), windowList,
-            Text("后台应用", 18), trayStatus, backgroundList);
+            Header = "震动、压感曲线和应用兼容",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            Content = Column(
+                Row("手柄震动", "允许游戏向当前连接的手柄发送震动反馈。", gamepadRumble),
+                Row("摇杆死区（%）", "忽略摇杆中心附近的小幅偏移。", gamepadDeadzone),
+                Row("笔压力度曲线", "1 为线性。小于 1 时轻压更明显。", penPressureGamma),
+                Row("应用触控模式", "选择运行中的应用。默认按应用支持情况自动切换。", touchApplication),
+                Row("所选应用的输入方式", "鼠标兼容支持系统长按右键和拖选。", touchAppMode))
+        };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(advanced, "InputSettingsAdvanced");
+        return SettingsPage("输入设备",
+            Row("原生多点触控（实验）", "实时应用。支持触控的应用使用原生输入，其余应用使用鼠标兼容。", touch),
+            touchStatus,
+            Row("压感手写笔（实验）", "实时应用。转发压感、倾斜和橡皮擦。", pen),
+            penStatus,
+            Row("游戏手柄（实验）", "实时应用。向此 Linux 会话转发 Windows 手柄。", gamepads),
+            gamepadStatus,
+            Row("Windows 本地 IME", "使用本地候选窗口与远端预编辑。", ime),
+            advanced,
+            SettingsActions(includeApply: true, automation: true),
+            Row("紧急释放鼠标", "游戏捕获鼠标时可使用", Text("Ctrl + Alt + Shift + F12")));
     }
     private UIElement TransfersPage()
     {
         var send = Button("发送文件", true);
         var folder = Button("发送目录");
         var receive = Button("打开只读接收文件夹");
+        var close = IconButton("关闭传输面板", "\uE711");
+        close.Click += (_, _) => transferDrawer.IsPaneOpen = false;
+        var title = new Grid { ColumnSpacing = 8, Children = { Heading("文件传输") } };
+        title.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
+        title.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
+        Grid.SetColumn(close, 1); title.Children.Add(close);
         send.Click += async (_, _) => await GuardAsync(async () =>
         {
+            if (!controller.Connected) throw new InvalidOperationException("请先连接工作站");
             var picker = new FileOpenPicker(); picker.FileTypeFilter.Add("*");
             WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
             var picked = await picker.PickMultipleFilesAsync();
@@ -413,6 +370,7 @@ internal sealed class MainWindow : Window
         });
         folder.Click += async (_, _) => await GuardAsync(async () =>
         {
+            if (!controller.Connected) throw new InvalidOperationException("请先连接工作站");
             var picker = new FolderPicker(); picker.FileTypeFilter.Add("*");
             WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
             var picked = await picker.PickSingleFolderAsync();
@@ -425,11 +383,13 @@ internal sealed class MainWindow : Window
             Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
             return Task.CompletedTask;
         });
-        return Column(Text("也可以直接在 Windows 与远端窗口之间拖放文件或目录。接收项为只读输入；需要编辑并保存时，先复制到自己选择的文件夹。"), Actions(send, folder, receive), transfers);
+        return Column(title, Actions(send, folder, receive),
+            Muted("也可以直接在 Windows 与远端窗口间拖放文件。编辑前请将收到的只读文件复制到自己的文件夹。"),
+            Heading("传输记录", 17), transfers);
     }
     private UIElement DiagnosticsPage()
     {
-        var content = new StackPanel { Spacing = 10 };
+        var content = new StackPanel { Spacing = 10, Children = { Heading("诊断"), Card(Column(Heading("当前画面路径", 17), diagnosticMediaPath), new Thickness(15)) } };
         foreach (var (key, label) in new[] { ("rtt", "网络往返 RTT"), ("rate", "TCP 接收速率"), ("updates", "窗口呈现更新（合计）"),
             ("decode_queue","解码排队"), ("decode","视频解码"), ("ui_queue","UI 排队"), ("present","呈现提交") })
         { var value = Text("等待采集"); metrics[key] = value; content.Children.Add(Row(label, "", value)); }
@@ -451,42 +411,70 @@ internal sealed class MainWindow : Window
     }
     private async Task InitializeAsync()
     {
+        if (initialized) return;
         var saved = await store.LoadAsync();
-        loading = true;
-        foreach (var profile in saved) profiles.Add(profile);
-        if (profiles.Count == 0) profiles.Add(NewProfile());
-        loading = false; profilePicker.SelectedIndex = 0;
+        try { launcherPreferences = await LauncherPreferences.LoadAsync(store.DirectoryPath); }
+        catch (Exception error) when (error is IOException or JsonException) { Inform("启动器偏好不可用：" + error.Message); }
         try
         {
             var found = await Windows.Devices.Enumeration.DeviceInformation.FindAllAsync(Windows.Media.Devices.MediaDevice.GetAudioRenderSelector());
             foreach (var device in found) audioDevices.Add((device.Id, device.Name));
         }
         catch (Exception error) { Inform("音频设备列表不可用：" + error.Message); }
-        output.ItemsSource = audioDevices.Select(d => d.Name).ToList(); Load(selected);
+        loading = true;
+        theme.SelectedIndex = launcherPreferences.Theme switch { "light" => 1, "dark" => 2, _ => 0 };
+        closeToTray.IsOn = launcherPreferences.CloseToTray;
+        ApplyLauncherTheme();
+        output.ItemsSource = audioDevices.Select(d => d.Name).ToList();
+        foreach (var profile in saved) profiles.Add(profile);
+        var initial = profiles.FirstOrDefault(profile => profile.Id == launcherPreferences.SelectedProfile) ?? profiles.FirstOrDefault();
+        profilePicker.SelectedItem = initial;
+        initialized = true;
+        Load(initial ?? NewProfile());
+        SetDirectoryLayout();
+        if (initial is not null) await RefreshApplicationsAsync();
     }
     private void UpdateMode()
     {
-        bool direct = connectionMode.SelectedIndex == 0, ssh = connectionMode.SelectedIndex == 1;
-        bool editable = !busy && !controller.IsRunning;
-        addProfile.IsEnabled = deleteProfile.IsEnabled = editable;
-        reconnect.IsEnabled = editable;
-        profilePicker.IsEnabled = name.IsEnabled = host.IsEnabled = connectionMode.IsEnabled = remotePort.IsEnabled = editable;
-        user.IsEnabled = identity.IsEnabled = binary.IsEnabled = sshPort.IsEnabled = ssh && editable;
-        session.IsEnabled = sessionMode.IsEnabled = (ssh || direct) && editable;
-        fingerprint.IsEnabled = pairCode.IsEnabled = pair.IsEnabled = revoke.IsEnabled = clientId.IsEnabled = direct && editable;
-        token.IsEnabled = remember.IsEnabled = !ssh && editable;
+        bool hasProfile = profiles.Count > 0;
+        bool editable = initialized && !busy && !controller.IsRunning;
+        bool live = controller.Connected && controller.ActiveProfileId == selected.Id;
+        addProfile.IsEnabled = editable;
+        deleteProfile.IsEnabled = editable && hasProfile;
+        profilePicker.IsEnabled = initialized && !busy && hasProfile;
+        name.IsEnabled = host.IsEnabled = remotePort.IsEnabled = hasProfile && editable;
+        reconnect.IsEnabled = session.IsEnabled = sessionMode.IsEnabled = hasProfile && !busy;
+        revoke.IsEnabled = paired && editable;
+        end.IsEnabled = !busy && live;
+        connect.IsEnabled = initialized && (!busy || (connecting && controller.IsRunning && !live));
+        connect.Content = live ? "断开" : controller.IsRunning ? "取消连接" : paired ? "连接" : "配对";
+        foreach (var button in saveButtons) button.IsEnabled = initialized && hasProfile && !busy;
+        foreach (var button in applyButtons) button.IsEnabled = !busy && live;
+        foreach (var button in reconnectButtons) button.IsEnabled = paired && !busy && live;
+        foreach (var scope in profileScopes) scope.Text = hasProfile ? $"此连接 · {selected.Name}" : "添加工作站后可保存连接设置。";
+        pairedStatus.Text = paired ? "此 Windows 设备已通过 TLS 配对。" : "此设备需要配对。";
+        UpdateLauncherActions();
     }
     private void Load(ConnectionProfile profile)
     {
-        if (selected.Id != profile.Id) { ResetTouchStatus(); ResetInputDeviceStatus(); touchApplicationNames.Clear(); }
+        bool changedProfile = selected.Id != profile.Id;
+        if (changedProfile)
+        {
+            ResetTouchStatus(); ResetInputDeviceStatus(); touchApplicationNames.Clear();
+            InvalidateCatalog();
+            ResetConnectionView();
+            transfers.Items.Clear(); receiveDirectory = "";
+            MarkTransferSeen();
+            commandDirectory.Text = "";
+            status.Text = "未连接";
+        }
         loading = true; selected = profile;
-        name.Text = profile.Name; host.Text = profile.Host; user.Text = profile.User; identity.Text = profile.IdentityFile;
-        binary.Text = profile.ServerBinary; session.Text = profile.Session; sshPort.Value = profile.SshPort; remotePort.Value = profile.Port;
-        connectionMode.SelectedIndex = profile.Mode switch { "direct" => 0, "ssh" => 1, _ => 2 };
-        fingerprint.Text = profile.CertificateSha256; clientId.Text = profile.ClientId; pairCode.Password = "";
+        name.Text = profile.Name; host.Text = profile.Host;
+        session.Text = profile.Session; remotePort.Value = profile.Port;
+        fingerprint.Text = profile.CertificateSha256;
+        paired = profile.ClientId.Length > 0 && profile.CertificateSha256.Length == 64 && !string.IsNullOrEmpty(secrets.Read(profile.Id));
         sessionMode.SelectedIndex = Array.IndexOf(new[] { "auto", "attach", "new" }, profile.SessionMode);
         reconnect.IsOn = profile.AutoReconnect;
-        token.Password = secrets.Read(profile.Id) ?? ""; remember.IsChecked = token.Password.Length > 0;
         var settings = profile.Settings;
         touchModes = new(settings.TouchModes, StringComparer.Ordinal);
         RefreshTouchApplications();
@@ -508,6 +496,7 @@ internal sealed class MainWindow : Window
         notifications.IsOn = settings.Notifications;
         desktopNotifications.SharingChanged(settings.Notifications);
         loading = false; UpdateMode(); UpdateTouchStatus(); UpdateInputDeviceStatus();
+        if (changedProfile) FilterApplications();
     }
     private ConnectionProfile ReadEditor()
     {
@@ -527,66 +516,95 @@ internal sealed class MainWindow : Window
         };
         var result = selected with
         {
-            Name = name.Text.Trim(), Host = host.Text.Trim(), User = user.Text.Trim(), IdentityFile = identity.Text.Trim(),
-            ServerBinary = binary.Text.Trim(), Session = session.Text.Trim(), SshPort = checked((int)sshPort.Value), Port = checked((int)remotePort.Value),
-            Mode = connectionMode.SelectedIndex switch { 0 => "direct", 1 => "ssh", _ => "tunnel" },
-            CertificateSha256 = fingerprint.Text.Trim().ToLowerInvariant(), ClientId = clientId.Text.Trim(),
+            Name = name.Text.Trim(), Host = host.Text.Trim(), Session = session.Text.Trim(), Port = checked((int)remotePort.Value),
             SessionMode = new[] { "auto", "attach", "new" }[Math.Max(0, sessionMode.SelectedIndex)],
             AutoReconnect = reconnect.IsOn, Settings = settings
         };
         result.Validate(); return result;
     }
-    private async Task SaveAsync()
+    private Task SaveAsync() => RunOperationAsync(async () =>
     {
         var profile = ReadEditor();
-        if (profile.Mode is "tunnel" or "direct" && remember.IsChecked == true && token.Password.Length > 0) secrets.Write(profile.Id, token.Password);
-        else secrets.Delete(profile.Id);
+        await StoreProfileAsync(profile);
+        Inform("连接设置已保存。");
+    });
+    private async Task StoreProfileAsync(ConnectionProfile profile)
+    {
         int index = profiles.ToList().FindIndex(saved => saved.Id == profile.Id);
         if (index < 0) throw new InvalidOperationException("当前连接配置已不存在，请重新选择连接");
+        var previous = profiles[index];
+        await store.SaveAsync(profiles.Select(saved => saved.Id == profile.Id ? profile : saved));
         loading = true; profiles[index] = profile; profilePicker.SelectedIndex = index; loading = false;
-        selected = profile; await store.SaveAsync(profiles); Inform("连接设置已保存。"); UpdateTouchStatus(); UpdateInputDeviceStatus();
+        selected = profile;
+        paired = profile.ClientId.Length > 0 && profile.CertificateSha256.Length == 64 && !string.IsNullOrEmpty(secrets.Read(profile.Id));
+        if (previous.Host != profile.Host || previous.Port != profile.Port || previous.ClientId != profile.ClientId)
+        {
+            InvalidateCatalog();
+            FilterApplications();
+            _ = GuardAsync(RefreshApplicationsAsync);
+        }
+        UpdateMode(); UpdateTouchStatus(); UpdateInputDeviceStatus();
     }
     private async Task ConnectOrDisconnectAsync()
     {
-        if (controller.IsRunning || busy)
+        if (busy)
         {
-            await controller.DisconnectAsync(); busy = false; connect.Content = "连接"; return;
-        }
-        var profile = ReadEditor();
-        busy = true; connect.Content = "取消连接"; notice.IsOpen = false; UpdateMode();
-        desktopNotifications.SharingChanged(profile.Settings.Notifications);
-        try
-        {
-            await controller.ConnectAsync(profile, token.Password); connect.Content = "断开连接";
-            if (profile.Mode is "ssh" or "direct" && controller.CurrentSession is { } actualSession)
+            if (connecting && controller.IsRunning && !controller.Connected)
             {
-                session.Text = actualSession; sessionMode.SelectedIndex = 0;
-                await SaveAsync();
+                connect.IsEnabled = false;
+                await controller.DisconnectAsync();
             }
-            await RefreshApplicationsAsync();
+            return;
         }
-        finally { busy = false; if (!controller.Connected) connect.Content = "连接"; UpdateMode(); }
+        if (controller.IsRunning) await RunOperationAsync(controller.DisconnectAsync);
+        else if (!paired) await PairDeviceAsync();
+        else await RunOperationAsync(() => ConnectProfileAsync(selected), canCancelConnect: true);
     }
-    private async Task ApplyAsync()
+    private async Task ConnectProfileAsync(ConnectionProfile profile)
+    {
+        string credential = secrets.Read(profile.Id) ?? throw new InvalidOperationException("此设备需要重新配对");
+        notice.IsOpen = false;
+        liveSettings = SettingsWithLauncherTouch(profile.Settings);
+        desktopNotifications.SharingChanged(profile.Settings.Notifications);
+        var connection = controller.ConnectAsync(profile with { Settings = liveSettings }, credential);
+        UpdateMode();
+        await connection;
+        if (controller.Connected && controller.ActiveProfileId == profile.Id && controller.CurrentSession is { } actualSession &&
+            (profile.Session != actualSession || profile.SessionMode == "new"))
+        {
+            var updated = profile with { Session = actualSession, SessionMode = profile.SessionMode == "new" ? "auto" : profile.SessionMode };
+            await StoreProfileAsync(updated);
+            session.Text = updated.Session;
+            sessionMode.SelectedIndex = updated.SessionMode == "attach" ? 1 : 0;
+        }
+        _ = GuardAsync(RefreshApplicationsAsync);
+    }
+    private Task ApplyAsync() => RunOperationAsync(async () =>
     {
         var profile = ReadEditor();
-        if (controller.ActiveProfileId != profile.Id) throw new InvalidOperationException("当前连接属于另一个配置，请先选择该连接");
-        await controller.ApplyAsync(profile.Settings); await SaveAsync();
+        var requested = SettingsWithLauncherTouch(profile.Settings);
+        await controller.ApplyAsync(requested, expectedProfileId: profile.Id);
+        liveSettings = requested;
         desktopNotifications.SharingChanged(profile.Settings.Notifications);
-    }
-    private async Task RefreshApplicationsAsync()
+        await StoreProfileAsync(profile);
+    });
+    private async Task RunOperationAsync(Func<Task> operation, bool canCancelConnect = false)
     {
-        applications = await controller.ApplicationsAsync(); FilterApplications();
-        if (applications.Count == 0) Inform("应用目录需要直连或内置 SSH 会话；已有隧道模式仍可在远端终端启动应用。");
-    }
-    private void FilterApplications()
-    {
-        applicationList.Items.Clear();
-        foreach (var app in applications.Where(a => a.Name.Contains(applicationSearch.Text, StringComparison.OrdinalIgnoreCase)))
-            applicationList.Items.Add(new ListViewItem { Content = Text(app.Name), Tag = app });
+        if (busy || quitting) return;
+        busy = true; connecting = canCancelConnect; UpdateMode();
+        try { await operation(); }
+        finally
+        {
+            busy = false; connecting = false; UpdateMode();
+            if (launcherTouchPending) _ = GuardAsync(ApplyLauncherTouchAsync);
+        }
     }
     private void UpdateBackground(JsonElement items)
     {
+        string snapshot = items.GetRawText();
+        if (snapshot == backgroundSnapshot && backgroundReadOnly == inputDeviceReadOnly) return;
+        backgroundSnapshot = snapshot;
+        backgroundReadOnly = inputDeviceReadOnly;
         backgroundList.Items.Clear();
         foreach (var item in items.EnumerateArray())
         {
@@ -596,13 +614,19 @@ internal sealed class MainWindow : Window
             if (title.Length == 0) title = item.GetProperty("app_id").GetString() ?? id;
             string state = item.TryGetProperty("status", out var value) ? value.GetString() ?? "" : "";
             var restore = Button("打开／恢复");
-            restore.IsEnabled = !readOnly.IsOn;
+            restore.IsEnabled = !inputDeviceReadOnly;
             restore.Click += async (_, _) => await GuardAsync(() => controller.SendEngineAsync(new { type = "tray_action", id, epoch, generation, action = "activate" }));
             var menu = Button("应用菜单");
-            menu.IsEnabled = !readOnly.IsOn;
+            menu.IsEnabled = !inputDeviceReadOnly;
             menu.Click += async (_, _) => await GuardAsync(() => controller.SendEngineAsync(new { type = "tray_action", id, epoch, generation, action = "menu" }));
-            backgroundList.Items.Add(Row(title, state == "NeedsAttention" ? "应用需要注意" : "通过应用菜单正常退出", Actions(restore, menu)));
+            string appId = item.TryGetProperty("app_id", out var appKey) ? appKey.GetString() ?? "" : "";
+            var caption = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = {
+                LauncherMark(MatchWindowApplication(appId), 28), Heading(title, 14) } };
+            backgroundList.Items.Add(Card(Column(caption,
+                state == "NeedsAttention" ? Muted("应用需要注意") : Muted("后台运行"), Actions(restore, menu)), new Thickness(12)));
         }
+        backgroundSection.Visibility = backgroundList.Items.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        UpdateDockVisibility();
     }
     private void RefreshTouchApplications()
     {
@@ -819,8 +843,9 @@ internal sealed class MainWindow : Window
                 inputDeviceReadOnly = TouchFlag(message, "read_only") ?? inputDeviceReadOnly;
                 UpdateTouchStatus(); UpdateInputDeviceStatus();
                 string reason = message.TryGetProperty("fallback_reason", out var fallback) && fallback.GetString() == "session_video_disabled"
-                    ? " 当前会话启动时限定 PNG；请新建使用视频编码的会话。" : "";
-                Inform($"服务端已应用：{message.GetProperty("fps")} FPS，{message.GetProperty("bitrate").GetInt32()/1000.0:g} Mbps/窗口，{message.GetProperty("codec")}。实际画面路径见诊断。" + reason);
+                    ? "\n当前会话使用 PNG。启用视频编码需要新建会话。" : "";
+                appliedVideo.Text = $"{message.GetProperty("fps")} FPS · {message.GetProperty("bitrate").GetInt32()/1000.0:g} Mbps/窗口 · {message.GetProperty("codec")}" + reason;
+                appliedVideo.Visibility = Visibility.Visible;
             }
             else Inform("服务端未接受设置：" + message.GetProperty("message").GetString());
         }
@@ -830,6 +855,7 @@ internal sealed class MainWindow : Window
             var stages = message.GetProperty("stages");
             foreach (var pair in new[] { ("control_rtt","rtt"), ("decode_queue","decode_queue"), ("ui_queue","ui_queue"), ("present","present") })
                 if (stages.TryGetProperty(pair.Item1, out var value)) metrics[pair.Item2].Text = $"{value.GetProperty("avg_ms").GetDouble():F2} ms 平均 / {value.GetProperty("max_ms").GetDouble():F2} ms 最大";
+            if (stages.TryGetProperty("control_rtt", out var rtt)) quickRtt.Text = $"{rtt.GetProperty("avg_ms").GetDouble():0.#} ms";
             foreach (var stage in stages.EnumerateObject())
                 if (stage.Name.EndsWith("_decode", StringComparison.Ordinal) && stage.Name != "alpha_decode")
                     metrics["decode"].Text = $"{stage.Value.GetProperty("avg_ms").GetDouble():F2} ms · {stage.Name}";
@@ -845,24 +871,26 @@ internal sealed class MainWindow : Window
             lastTick = tick; lastBytes = bytes; lastUpdates = updates;
             if (message.TryGetProperty("background", out var background)) UpdateBackground(background);
             if (controller.ActiveProfileId == selected.Id) touchApplicationNames.Clear();
-            windowList.Items.Clear();
-            var descriptions = new List<string>();
+            var windows = new List<RemoteWindow>();
             foreach (var window in message.GetProperty("windows").EnumerateArray())
             {
                 uint id = window.GetProperty("id").GetUInt32();
-                if (controller.ActiveProfileId == selected.Id && window.TryGetProperty("app_id", out var inputApp) &&
-                    inputApp.GetString() is { Length: > 0 } applicationId)
-                    touchApplicationNames[applicationId] = window.TryGetProperty("title", out var appTitle)
-                        ? $"{appTitle.GetString()} · {applicationId}" : applicationId;
+                string applicationId = window.TryGetProperty("app_id", out var inputApp) ? inputApp.GetString() ?? "" : "";
                 string title = window.TryGetProperty("title", out var titleValue) ? titleValue.GetString() ?? $"窗口 {id}" : $"窗口 {id}";
-                string description = $"{title} · {window.GetProperty("codec")} · {(window.GetProperty("hardware_decode").GetBoolean() ? "GPU 解码" : "PNG/非视频")} · {window.GetProperty("presentation")}";
-                descriptions.Add(description);
-                var focus = Button("切换");
-                focus.Click += async (_, _) => await GuardAsync(() => controller.ActivateWindowAsync(id));
-                windowList.Items.Add(Row(description, $"{window.GetProperty("width")} × {window.GetProperty("height")} 逻辑像素", focus));
+                if (controller.ActiveProfileId == selected.Id && applicationId.Length > 0) touchApplicationNames[applicationId] = $"{title} · {applicationId}";
+                string path = $"{window.GetProperty("codec")} · {(window.GetProperty("hardware_decode").GetBoolean() ? "GPU 解码" : "PNG/非视频")} · {window.GetProperty("presentation")}";
+                windows.Add(new(id, title, applicationId, path, $"{window.GetProperty("width")} × {window.GetProperty("height")}"));
             }
             if (controller.ActiveProfileId == selected.Id) RefreshTouchApplications();
-            actual.Text = descriptions.Count > 0 ? string.Join('\n', descriptions) : "已连接，等待远端应用窗口";
+            if (!remoteWindows.SequenceEqual(windows))
+            {
+                remoteWindows = windows.ToArray();
+                RenderWindows();
+                _ = GuardAsync(ApplyLauncherTouchAsync);
+            }
+            actual.Text = diagnosticMediaPath.Text = windows.Count > 0
+                ? string.Join('\n', windows.Select(window => $"{window.Title} · {window.Path}"))
+                : "已连接，等待远端应用窗口";
         }
         else if (type == "transfer")
         {
@@ -885,24 +913,16 @@ internal sealed class MainWindow : Window
             if (message.TryGetProperty("bytes", out var b)) text += $" · {b} bytes";
             transfers.Items.Insert(0, Text(text));
             while (transfers.Items.Count > 100) transfers.Items.RemoveAt(transfers.Items.Count - 1);
+            MarkTransferActivity();
         }
-    }
-    private Task<bool> ConfirmHostAsync(TrustRequest request)
-    {
-        var result = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        UI(async () =>
-        {
-            try { result.TrySetResult(await ConfirmAsync("首次连接此 SSH 主机", $"{request.Host}:{request.Port}\n请核对服务器主机指纹：\n\n" + string.Join('\n', request.Fingerprints), "信任并连接")); }
-            catch (Exception error) { result.TrySetException(error); }
-        });
-        return result.Task;
     }
     private async Task<bool> ConfirmAsync(string title, string description, string primary)
     {
         if (activeDialog is not null) throw new InvalidOperationException("请先关闭当前对话框");
         activeDialog = new ContentDialog
         {
-            XamlRoot = root.XamlRoot, Title = title, Content = Text(description), PrimaryButtonText = primary,
+            XamlRoot = root.XamlRoot, RequestedTheme = root.RequestedTheme,
+            Title = title, Content = Text(description), PrimaryButtonText = primary,
             CloseButtonText = "取消", DefaultButton = ContentDialogButton.Close
         };
         try { return await activeDialog.ShowAsync() == ContentDialogResult.Primary; }
@@ -913,12 +933,12 @@ internal sealed class MainWindow : Window
         await GuardAsync(async () =>
         {
             if (action is "show" or "diagnostics") { TrayIcon.ShowWindow(hwnd, 9); Activate(); }
-            if (action == "diagnostics") navigation.SelectedItem = navigation.MenuItems[5];
+            if (action == "diagnostics") ShowPage("diagnostics");
             if (action == "connect") await ConnectOrDisconnectAsync();
-            if (action == "mute") { audio.IsOn = !audio.IsOn; if (controller.Connected) await ApplyAsync(); }
+            if (action == "mute") await QuickSettingAsync(audioSetting: true);
             if (action == "quit")
             {
-                quitting = true; activeDialog?.Hide(); await desktopNotifications.DisposeAsync(); await controller.DisposeAsync(); tray.Dispose();
+                quitting = true; activeDialog?.Hide(); InvalidateCatalog(); await desktopNotifications.DisposeAsync(); await controller.DisposeAsync(); tray.Dispose();
                 Close(); Application.Current.Exit();
             }
         });

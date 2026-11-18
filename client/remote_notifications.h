@@ -21,8 +21,8 @@ class RemoteNotifications {
   }
 public:
   void inputReadOnly(bool value) { readOnly = value; }
-  // Parent integration may supply a NativeIcon badgedPng callback. This is also
-  // used for the placeholder when the source notification has no application icon.
+  // The parent normalizes notification artwork and supplies a placeholder
+  // when the source notification has no application icon.
   std::function<void(Json &)> decorate;
   RemoteNotifications(std::function<void(Json)> event, std::function<void(Json)> send)
     : publish(std::move(event)), transmit(std::move(send)) {}

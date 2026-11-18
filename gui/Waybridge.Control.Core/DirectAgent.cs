@@ -22,6 +22,8 @@ public sealed class DirectAgent
 
     public DirectAgent(ConnectionProfile profile, string clientToken)
     {
+        profile = profile with { };
+        profile.Validate();
         RequirePin(profile.CertificateSha256);
         if (string.IsNullOrWhiteSpace(profile.ClientId) || clientToken.Length is < 32 or > 4096 || clientToken.Any(char.IsWhiteSpace))
             throw new ArgumentException("请先配对此 Linux 服务，或恢复已保存的客户端凭据");
@@ -33,6 +35,8 @@ public sealed class DirectAgent
 
     public static async Task<DirectCredentials> PairAsync(ConnectionProfile profile, string code, string label, CancellationToken token = default)
     {
+        profile = profile with { };
+        profile.Validate();
         RequirePin(profile.CertificateSha256);
         if (code.Length is < 16 or > 4096 || code.Any(char.IsWhiteSpace)) throw new ArgumentException("请输入 Linux 服务生成的配对码");
         if (string.IsNullOrWhiteSpace(label) || System.Text.Encoding.UTF8.GetByteCount(label) > 128) throw new ArgumentException("设备名称过长");
@@ -65,7 +69,7 @@ public sealed class DirectAgent
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
         deadline.CancelAfter(TimeSpan.FromSeconds(40));
         using var client = new TcpClient { NoDelay = true };
-        await client.ConnectAsync(profile.Host.Trim('[', ']'), profile.Port, deadline.Token);
+        await client.ConnectAsync(profile.Address, profile.Port, deadline.Token);
         byte[] expected = Convert.FromHexString(profile.CertificateSha256);
         using var tls = new SslStream(client.GetStream(), false, (_, certificate, _, _) =>
             certificate is not null && CryptographicOperations.FixedTimeEquals(expected, SHA256.HashData(certificate.GetRawCertData())));
@@ -74,7 +78,7 @@ public sealed class DirectAgent
             handshake.CancelAfter(TimeSpan.FromSeconds(10));
             await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
             {
-                TargetHost = profile.Host.Trim('[', ']'),
+                TargetHost = profile.Address,
                 EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                 CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
                 AllowRenegotiation = false

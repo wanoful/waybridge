@@ -1,12 +1,13 @@
 //! Bounded background desktop/icon-theme lookup. No filesystem or SVG work on the compositor.
 use crate::network::Event;
+use anyhow::{ensure, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use image::{codecs::png::PngEncoder, ImageEncoder, RgbaImage};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::unix::process::CommandExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -37,6 +38,12 @@ pub struct RawIcon {
 }
 pub const MAX_PNG: usize = 96 * 1024;
 const MAX_INPUT: u64 = 2 * 1024 * 1024;
+const LAUNCHER_ICON_BATCH: usize = 24;
+const DESKTOP_ID_BYTES: usize = 1024;
+const LAUNCHER_INPUT_BYTES: u64 = 256 * 1024;
+// Reserve response envelope space, including the remote's echoed RPC ID.
+const LAUNCHER_OUTPUT_BYTES: usize = 4 * 1024 * 1024 - 128 * 1024;
+const LAUNCHER_WORK_TIME: Duration = Duration::from_secs(4);
 type Icon = Option<Arc<Vec<u8>>>;
 type Ini = BTreeMap<String, BTreeMap<String, String>>;
 
@@ -287,6 +294,81 @@ fn unescape(value: &str) -> String {
     out
 }
 
+/// Private helper input maps installed Desktop IDs to their catalog-selected
+/// Icon fields. The session helper supplies these fields, including null for
+/// unknown entries. The TLS request can select IDs only.
+pub fn launcher_icons() -> Result<()> {
+    let mut input = Vec::new();
+    io::stdin()
+        .lock()
+        .take(LAUNCHER_INPUT_BYTES + 1)
+        .read_to_end(&mut input)?;
+    ensure!(
+        input.len() as u64 <= LAUNCHER_INPUT_BYTES,
+        "launcher icon request exceeds input limit"
+    );
+    let requests: BTreeMap<String, Option<String>> = serde_json::from_slice(&input)?;
+    ensure!(
+        requests.len() <= LAUNCHER_ICON_BATCH
+            && requests.keys().all(|id| {
+                id.len() <= DESKTOP_ID_BYTES
+                    && id.ends_with(".desktop")
+                    && !id.contains(['/', '\\'])
+                    && !id.chars().any(char::is_control)
+            }),
+        "invalid launcher icon batch"
+    );
+    let result = resolve_launcher_icons(requests)?;
+    let mut output = io::stdout().lock();
+    output.write_all(&result)?;
+    output.write_all(b"\n")?;
+    Ok(())
+}
+
+fn resolve_launcher_icons(requests: BTreeMap<String, Option<String>>) -> Result<Vec<u8>> {
+    let resolver = Resolver::environment();
+    let started = Instant::now();
+    let mut icons = serde_json::Map::new();
+    let mut omitted = Vec::new();
+    let mut cache = BTreeMap::<String, Value>::new();
+    // Account for each ID whether it becomes a result key or an omitted item.
+    let mut size = 64;
+    for id in requests.keys() {
+        size += serde_json::to_vec(id)?.len() + 2;
+    }
+    for (id, name) in requests {
+        if started.elapsed() >= LAUNCHER_WORK_TIME {
+            omitted.push(id);
+            continue;
+        }
+        let rendered: &Value = match name {
+            Some(name) => cache.entry(name.clone()).or_insert_with(|| {
+                resolver
+                    .entry_icon(&name)
+                    .and_then(|path| load(&path))
+                    .map(|png| {
+                        let hash = ring::digest::digest(&ring::digest::SHA256, &png);
+                        let hash: String =
+                            hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+                        json!({"sha256":hash,"png":B64.encode(png)})
+                    })
+                    .unwrap_or(Value::Null)
+            }),
+            None => &Value::Null,
+        };
+        let rendered_size = serde_json::to_vec(rendered)?.len();
+        if size + rendered_size > LAUNCHER_OUTPUT_BYTES {
+            omitted.push(id);
+        } else {
+            size += rendered_size;
+            icons.insert(id, rendered.clone());
+        }
+    }
+    Ok(serde_json::to_vec(
+        &json!({"icons":icons,"omitted":omitted}),
+    )?)
+}
+
 /// Tray icon names use the same bounded theme lookup/decoder as window icons.
 pub fn tray_icon(name: &str, extra: &str) -> Option<Vec<u8>> {
     if name.len() > 4096 || name.chars().any(char::is_control) {
@@ -452,15 +534,15 @@ impl Resolver {
         if entry.get("Hidden").is_some_and(|s| s == "true") {
             return None;
         }
-        let name = unescape(entry.get("Icon")?);
+        self.entry_icon(entry.get("Icon")?)
+    }
+    fn entry_icon(&self, name: &str) -> Option<PathBuf> {
+        let name = unescape(name);
         if name.len() > 4096 || name.chars().any(char::is_control) {
             return None;
         }
         if Path::new(&name).is_absolute() {
             return regular_image(PathBuf::from(name));
-        }
-        if !relative(&name) || name.contains('/') || name.contains('\\') {
-            return None;
         }
         self.named(&name)
     }

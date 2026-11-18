@@ -180,6 +180,25 @@ the service or change login persistence settings automatically. It also installs
 independent Waybridge session targets, refuses to overwrite modified units, and
 installs the static Portal default only with explicit `--portal-directory`.
 Component selection and lifecycle examples are in [desktop integration](INTEGRATION.md).
+
+## Terminal management
+
+Run `waybridge-service tui` as the Linux user who owns the service. Use a local terminal or allocate a TTY over SSH. To manage an isolated instance, pass the same `--runtime-dir` as `serve`. In offline mode, the editor uses the XDG configuration path or an explicit `--config FILE`. The online view obtains the running configuration and its source from the local administration socket.
+
+| Keys | Action |
+|---|---|
+| `1`–`4`, `Tab`, `Shift+Tab` | Switch between overview and pairing, sessions and logs, trusted devices, and settings |
+| `p` on overview | Show an expiring one-use pairing code and the full certificate fingerprint |
+| `h` or `u` on overview | Check the environment, or start/restart the matching user service when available |
+| `x` in sessions or devices | Preview and confirm ending the selected session or revoking the selected device |
+| `c`, `a`, `i` in settings | Open main configuration, application overrides, or desktop components |
+| `Enter`, `s`, `y` in settings | Edit, validate and preview the change, then confirm saving. Use `Ctrl+S` to finish a multiline draft |
+| `q` or `Ctrl+C` | Leave the terminal interface |
+
+The main editor covers `[service]`, `[session]`, `[limits]`, and `[media_budget]`. The save preview reports when changes take effect. Restarting the service is a separate action. Application overrides use the [Waybridge TOML grammar](CONFIGURATION.md#waybridge-专用-desktop-覆写) with a launch-plan preview before saving. Desktop components expose the Waybridge Portal preferences and the optional notification provider user unit.
+
+## Smoke test
+
 The smoke test
 uses temporary state, private runtime directories, actual loopback TLS and no
 real credentials. Its optional compositor mode adds a real v3 handshake through

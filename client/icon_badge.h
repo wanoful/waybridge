@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cmath>
 
-// Shared by remote windows, tray entries and notification images. Masters remain
+// Badges are composed for remote Windows window and tray icons. Masters remain
 // unmodified; all composition happens at the final destination's pixel size.
 namespace IconBadge {
 struct State {
