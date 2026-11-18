@@ -31,7 +31,7 @@ public:
     HWND hwnd = nullptr, rootWindow = nullptr;
     POINT screen{}, initialScreen{};
     RECT initialWindow{};
-    bool external = false;
+    bool external = false, systemMove = false;
   };
 private:
   struct Contact {
@@ -95,7 +95,8 @@ private:
       return true;
     }
     if (message == WM_POINTERDOWN) return true;
-    if (message == WM_POINTERCAPTURECHANGED && interaction->external && !canceled) return true;
+    if (message == WM_POINTERCAPTURECHANGED &&
+        (interaction->external || interaction->systemMove) && !canceled) return true;
     if (!contacts.count(pointer)) return true;
     InteractionSample sample = *interaction;
     sample.screen = screen;
@@ -127,6 +128,21 @@ public:
         (!external && !contacts.count(interaction->pointerId))) return false;
     interaction->external = external;
     return true;
+  }
+  bool systemMove(uint64_t operation, bool enabled) {
+    if (!interaction || interaction->operation != operation || interaction->kind != "move" ||
+        !contacts.count(interaction->pointerId)) return false;
+    interaction->systemMove = enabled;
+    return true;
+  }
+  void finishSystemMove(uint64_t operation) {
+    // The system loop can consume the release before it reaches our WndProc.
+    if (!interaction || interaction->operation != operation || !interaction->systemMove) return;
+    auto sample = *interaction;
+    sample.phase = "up";
+    interaction.reset();
+    clearContacts();
+    report(sample);
   }
   bool beginInteraction(const Json &message, HWND sourceRoot) {
     uint64_t operation = message.value("operation",uint64_t(0));

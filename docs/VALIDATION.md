@@ -413,6 +413,13 @@ fullscreen, plus exact restoration of the previous normal/maximized placement.
 Its geometry probes cover 2559/2561-pixel sources on a 2560x1600 viewport and
 retained 16:9 letterboxing on a 16:10 display.
 
+Pure movement keeps the HWND and its popups at the current position. During
+interactive movement, same-monitor work-area offsets share a 33 ms trailing
+update. Display changes, real resizes and the end of the move send the current
+geometry immediately. Linux publishes a Wayland output mode only when the mode
+changes. In the private Wine monitor regression, 49 placements emitted four
+to six viewport messages and preserved both the paused and final positions.
+
 The opt-in `windows_game_laptop.py --host laptop` test drives the production x64
 viewer with real Windows mouse input. Both ConfigureRequest and `--ewmh` move a
 fixture HWND by exactly the requested 120x80 pixels. `--hmcl` also passes with the

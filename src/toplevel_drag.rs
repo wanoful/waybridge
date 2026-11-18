@@ -125,8 +125,8 @@ impl App {
             }
         }
         let pointer = self.seat.get_pointer().unwrap();
-        // Clearing the DnD target before releasing the grab produces cancelled,
-        // rather than accidentally dropping into the last accepted target.
+        // Clear focus and revoke the grab before synthesizing button releases.
+        // A toplevel drag can complete even without a drop target.
         pointer.motion(
             self,
             None,
@@ -136,8 +136,8 @@ impl App {
                 time: self.time(),
             },
         );
-        self.release_input();
         pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), self.time());
+        self.release_input();
         self.window_drag.ended();
         self.data_drop.native = None;
         self.stop_drag_visual();

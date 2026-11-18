@@ -32,6 +32,7 @@ mod shutdown;
 mod stream_config;
 mod toplevel_drag;
 mod touch;
+mod touchpad;
 mod transfer;
 mod transfer_worker;
 mod udp;
@@ -90,6 +91,7 @@ use smithay::{
         },
         output::{OutputHandler, OutputManagerState},
         pointer_constraints::PointerConstraintsState,
+        pointer_gestures::PointerGesturesState,
         relative_pointer::RelativePointerManagerState,
         seat::WaylandFocus,
         selection::{
@@ -337,10 +339,12 @@ struct App {
     tray: Option<desktop_tray::Tray>,
     relative: relative_input::RelativeInput,
     touch: touch::Touch,
+    touchpad: touchpad::Touchpad,
     pen: pen::Pen,
     gamepads: gamepad::Gamepads,
     _tablet_manager: smithay::wayland::tablet_manager::TabletManagerState,
     _relative_manager: RelativePointerManagerState,
+    _pointer_gestures: PointerGesturesState,
     _constraints: PointerConstraintsState,
     ime: ime::Ime,
     drag_sink: Option<drag::Sink>,
@@ -682,6 +686,7 @@ impl App {
         self.pointer_window = Some(id);
         let pointer = self.seat.get_pointer().unwrap();
         let hit = hit.map(|(s, p)| (self.pointer_focus(s), p));
+        self.touchpad_focus(hit.as_ref().map(|(focus, _)| focus));
         pointer.motion(
             self,
             hit,
@@ -1023,11 +1028,12 @@ impl App {
     }
     fn release_input(&mut self) {
         self.cancel_pen();
-        self.gamepads.policy(None, false);
+        self.gamepads.release_focus();
         for message in self.gamepads.poll() {
             self.control(message);
         }
         self.cancel_touch();
+        self.cancel_touchpad();
         self.release_keys();
         let pointer = self.seat.get_pointer().unwrap();
         for button in std::mem::take(&mut self.pressed_buttons) {
@@ -1161,6 +1167,7 @@ impl App {
                 self.sync_gamepads();
             }
             "touch" => self.touch_message(&value),
+            "touchpad" => self.touchpad_message(id, &value),
             "touch_interaction_ack" => self.touch_interaction_ack(&value),
             "touch_interaction_input" => self.touch_interaction_input(&value),
             "touch_enabled" => {
@@ -1200,6 +1207,7 @@ impl App {
                     value["touch_interaction_v1"] == true,
                 );
                 self.pen_negotiate(value["pen_v1"] == true, value["pen_enabled"] == true);
+                self.touchpad.negotiate(value["touchpad_v1"] == true);
                 self.gamepads.negotiate(
                     value["gamepad_v1"] == true,
                     value["gamepad_enabled"] == true,
@@ -1248,6 +1256,7 @@ impl App {
                     && !self.external_drag_input() =>
             {
                 self.relative_hit(None);
+                self.cancel_touchpad();
                 self.pointer_window = None;
                 self.cursor.dirty = true;
                 let p = self.seat.get_pointer().unwrap();
@@ -2603,6 +2612,7 @@ impl smithay::wayland::xdg_toplevel_icon::XdgToplevelIconHandler for App {
 smithay::delegate_xdg_toplevel_icon!(App);
 smithay::delegate_xdg_shell!(App);
 smithay::delegate_xdg_decoration!(App);
+smithay::delegate_pointer_gestures!(App);
 smithay::delegate_data_device!(App);
 smithay::delegate_data_control!(App);
 
@@ -2867,10 +2877,12 @@ fn main() -> Result<()> {
         _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<App>(&dh),
         relative: relative_input::RelativeInput::default(),
         touch: touch::Touch::default(),
+        touchpad: touchpad::Touchpad::default(),
         pen: pen::Pen::default(),
         gamepads: gamepad::Gamepads::default(),
         _tablet_manager: smithay::wayland::tablet_manager::TabletManagerState::new::<App>(&dh),
         _relative_manager: RelativePointerManagerState::new::<App>(&dh),
+        _pointer_gestures: PointerGesturesState::new::<App>(&dh),
         _constraints: PointerConstraintsState::new::<App>(&dh),
         ime: ime::Ime::new(&dh),
         drag_sink: None,
@@ -3007,6 +3019,7 @@ fn main() -> Result<()> {
             app.poll_window_drag();
             app.sync_pointer_lock();
             app.sync_touch();
+            app.sync_touchpad();
             app.sync_pen();
             app.sync_gamepads();
             app.pump_outbound()?;
@@ -3034,6 +3047,7 @@ fn main() -> Result<()> {
                         }
                         app.x11.grab = None;
                         app.release_input();
+                        app.touchpad = touchpad::Touchpad::default();
                         app.peer = Some(peer);
                         app.cursor.dirty = true;
                         app.configure_capabilities();
@@ -3204,6 +3218,7 @@ fn main() -> Result<()> {
                         app.end_outbound(false);
                         app.drag_enabled = false;
                         app.release_input();
+                        app.touchpad = touchpad::Touchpad::default();
                         app.encoder.reset();
                         app.focus(None);
                         app.transfers.cancel();
@@ -3423,12 +3438,11 @@ impl App {
     fn update_viewport(&mut self, id: u32, value: &Value) {
         if let Some(remote) = self.windows.iter_mut().find(|w| w.id == id) {
             if !remote.window.is_x11() {
-                remote.output.change_current_state(
-                    monitor_mode(value, remote.output.current_mode().unwrap().refresh),
-                    None,
-                    None,
-                    None,
-                );
+                let current = remote.output.current_mode();
+                let mode = current.and_then(|mode| monitor_mode(value, mode.refresh));
+                if mode.is_some() && mode != current {
+                    remote.output.change_current_state(mode, None, None, None);
+                }
             }
             if let (Some(x), Some(y), Some(w), Some(h)) = (
                 value["work_x"].as_i64(),

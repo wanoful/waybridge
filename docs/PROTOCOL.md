@@ -70,6 +70,8 @@ Native Wayland decoration requests are honored: ServerSide remains the default, 
 
 Opt-in `toplevel_drag_v1:true` enables cross-HWND client DnD and `xdg-toplevel-drag-v1`. Server `toplevel_drag` carries `active:true`, `source` (origin window ID), `id` (attached toplevel ID or zero), and surface-geometry-local `offset_x/y`. While active, capture survives origin closure and focus changes are deferred; the attached HWND moves with the cursor and is excluded from drag targeting. Route ordinary pointer/button packets to the native window actually under the cursor, mapping its displayed image to logical coordinates. Use `id:0` for no target, including release outside all windows. Deliver the last motion before button-up, then keep the state until server `active:false`. No-target normal release completes the window move; `toplevel_drag_cancel` (Escape/capture loss/disconnect) explicitly cancels. Detached surface unmap clears the attachment, allowing reattachment. Internal drag state excludes relative pointer locks. The same capture messages are reused for native X11 drags. XDND and native OLE data transfers use the independent source/offer lifecycle described below; the toplevel attachment protocol itself remains Wayland-only.
 
+For an attached, visible toplevel in a mouse drag, the Windows viewer can enter the system window-move loop so Windows handles placement and Snap. The Wayland data-device grab stays active and receives motion for the windows beneath the pointer. If the attached toplevel changes or disappears, the viewer ends the system move and continues the same Wayland drag. A normal mouse release lets Windows finish placement before the viewer forwards the drop.
+
 Frame body: u32 window ID, u32 pixel width, u32 pixel height, u64 frame sequence, i32 logical width, i32 logical height, i32 surface-local origin x, i32 surface-local origin y, then PNG bytes (36-byte header). All integers are big-endian. PNG contains **straight** RGBA; the GLES and Windows composition surfaces use premultiplied alpha. Dimensions are bounded to 8192 per axis and 16,777,216 total pixels before framebuffer allocation/Windows decode.
 
 Top-level geometry excludes invisible CSD shadows and **never includes popups**. Each popup has its own frame/ID, preserving its surface-tree alpha and margins. The origin belongs to the displayed frame and must accompany pointer/drop messages so asynchronous geometry changes cannot shift hit testing. Raw frames and completed display frames use bounded latest-frame queues. All encoded video packets are delivered/decoded in order; dependent P frames must never be dropped as if they were independent images. Backpressure retains the latest raw update and limits queued encoded access units to two per window. Viewers advertising `frame_ack:true` additionally limit total outstanding frames to two per window, including frames already written into TCP buffers. Client `frame_ack` carries `id` and cumulative `sequence`; send after presentation submission (or buffered GDI paint). PNG replacement cancels credits for unsent independent frames; Video reference access units remain ordered. Fallback and closed windows clear their credits. Control messages have priority. Encoding and decoding run outside the compositor/UI event loops.
@@ -902,7 +904,29 @@ server focus. `gamepad_state` grants `id` and `generation`, plus `supported`,
 `requested`, `enabled`, `devices`, `rumble_supported` and `error`. `gamepad`
 snapshots bind `id`, `generation`, `slot` (0–3), `device_generation`,
 `sequence`, `connected`, `buttons`, signed `lx/ly/rx/ry` and byte `lt/rt`.
+`device_generation` identifies a physical attachment and `sequence` increases
+for its lifetime. A focus change neutralizes the existing virtual devices.
+Connected snapshots require the current focus lease. A `connected:false`
+detach can use an issued generation of the current connection while unfocused.
+It must match the current device in that slot and advance its sequence.
 `gamepad_rumble` echoes generation, slot and device generation, with 16-bit
-`strong`/`weak` and a bounded `duration_ms` heartbeat. Revoke/disconnect
-neutralizes and destroys owned devices; stale feedback cannot vibrate a new
-incarnation. See [GAMEPADS.md](GAMEPADS.md).
+`strong`/`weak` and a bounded `duration_ms` heartbeat. Rumble playback is
+gated by the active focus lease. Read-only, disable and disconnect destroy
+owned devices. See [GAMEPADS.md](GAMEPADS.md).
+
+## Optional Precision Touchpad gestures
+
+The viewer advertises `touchpad_v1:true` when Windows Direct Manipulation is
+available. The server echoes the agreed boolean. Gestures are scoped to the
+focused visible window and its current pointer focus, subject to read-only
+and grabs.
+
+`{"type":"touchpad","id":7,"gesture":1,"phase":"begin","kind":"scroll"}`
+starts a gesture. IDs increase within each viewer connection. An `update` for
+the same window and gesture carries finite `dx` and `dy` in logical pixels for
+scroll, or an absolute `scale` relative to begin for `pinch`. An `end` or
+`cancel` retires the gesture. Scroll emits `wl_pointer` finger-source axes and
+axis-stop events. Pinch emits a Wayland two-finger pinch with zero translation
+and rotation. Wheel messages remain a separate pointer source.
+
+See [touchpad behavior and verification](TOUCHPAD.md).

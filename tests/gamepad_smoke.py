@@ -71,14 +71,16 @@ class GamepadViewer(Viewer):
         self.send(type='ping', nonce=nonce)
         self.until(lambda k, v: k == 'control' and v.get('type') == 'pong' and v['nonce'] == nonce)
 
+    def wait_state(self, predicate):
+        if not predicate(self.state):
+            self.until(lambda k, v: k == 'control' and v.get('type') == 'gamepad_state' and predicate(v))
+        return self.state
+
     def lease(self, window):
         self.send(type='gamepad_focus', id=window)
         self.send(type='focus', id=window, focused=True)
         self.barrier()
-        if not (self.state.get('enabled') and self.state.get('id') == window):
-            self.until(lambda k, v: k == 'control' and v.get('type') == 'gamepad_state'
-                       and v.get('enabled') and v.get('id') == window)
-        return dict(self.state)
+        return dict(self.wait_state(lambda v: v.get('enabled') and v.get('id') == window))
 
     def sample(self, lease, incarnation, sequence, **changes):
         value = dict(type='gamepad', id=lease['id'], generation=lease['generation'],
@@ -86,14 +88,14 @@ class GamepadViewer(Viewer):
                      buttons=0x1001, lx=12345, ly=32767, rx=-30000, ry=-32768, lt=80, rt=255)
         self.send(**{**value, **changes})
 
-    def device(self, incarnation):
+    def device(self, incarnation, slot=0):
         self.barrier()
         def ready():
             return next((d for d in self.state.get('devices', [])
-                         if d['slot'] == 0 and d['device_generation'] == incarnation), None)
+                         if d['slot'] == slot and d['device_generation'] == incarnation), None)
         if not ready():
             self.until(lambda k, v: k == 'control' and v.get('type') == 'gamepad_state'
-                       and any(d['slot'] == 0 and d['device_generation'] == incarnation
+                       and any(d['slot'] == slot and d['device_generation'] == incarnation
                                for d in v.get('devices', [])))
         return ready()
 
@@ -103,7 +105,7 @@ def open_own(device, host_pid):
     assert re.fullmatch(r'input[0-9]+', sysname), device
     directory = Path('/sys/devices/virtual/input') / sysname
     assert directory.joinpath('name').read_text().strip() == device['name']
-    assert device['name'].startswith(f'Waybridge Gamepad 1 [{host_pid}-'), device
+    assert device['name'].startswith(f'Waybridge Gamepad {device["slot"] + 1} [{host_pid}-'), device
     assert directory.joinpath('phys').read_text().startswith(f'waybridge/{host_pid}/'), device
     deadline = time.monotonic() + 3
     denied = False
@@ -225,8 +227,13 @@ def run():
                 assert viewer.state['devices'] == [], 'mismatched-focus snapshot created a device'
                 lease = viewer.lease(first)
                 viewer.sample(lease, 11, 1)
-                fd, directory = open_own(viewer.device(11), host.pid)
+                first_device = viewer.device(11)
+                fd, directory = open_own(first_device, host.pid)
                 readers.append(fd)
+                viewer.sample(lease, 21, 1, slot=1)
+                other_device = viewer.device(21, 1)
+                other_fd, other_directory = open_own(other_device, host.pid)
+                readers.append(other_fd)
                 assert held(fd, 0x130) and axis(fd, 0) == 12345 and axis(fd, 1) == -32767
                 assert axis(fd, 4) == 32767 and axis(fd, 17) == -1
                 drain(fd)
@@ -243,26 +250,45 @@ def run():
                 assert drain(fd) == [] and held(fd, 0x131), 'invalid/stale input changed evdev'
                 viewer.send(type='gamepad_focus', id=0)
                 viewer.barrier()
-                removed(directory, fd)
-                assert not viewer.state['enabled'] and viewer.state['devices'] == []
+                assert not viewer.state['enabled'] and viewer.state['devices'] == [first_device, other_device]
+                assert not any(buttons(fd)) and all(axis(fd, code) == 0 for code in (0, 1, 2, 3, 4, 5, 16, 17))
+                assert not any(buttons(other_fd)), 'the second slot retained a held button while blurred'
                 assert any(v.get('type') == 'gamepad_rumble' and v.get('slot') == 0
                            and v.get('device_generation') == 11 and v.get('strong') == 0
                            and v.get('weak') == 0 for v in viewer.controls)
-                newer = viewer.lease(first)
+                viewer.sample(lease, 21, 2, slot=1, connected=False)
+                viewer.barrier()
+                removed(other_directory, other_fd)
+                viewer.wait_state(lambda v: v['devices'] == [first_device])
+                newer = viewer.lease(other)
                 assert newer['generation'] > lease['generation']
-                viewer.sample(newer, 12, 1, buttons=0, lx=0, ly=0, rx=0, ry=0, lt=0, rt=0)
-                fd, directory = open_own(viewer.device(12), host.pid)
-                readers.append(fd)
-                assert not any(buttons(fd)) and all(axis(fd, code) == 0 for code in (0, 1, 2, 3, 4, 5, 16, 17))
-                viewer.sample(newer, 12, 2)
+                viewer.sample(lease, 11, 2, connected=False)
+                viewer.sample(newer, 11, 2)
+                viewer.sample(lease, 11, 3)
+                viewer.barrier()
+                assert viewer.device(11) == first_device and directory.exists(), 'focus switch changed device identity'
+                assert not any(buttons(fd)), 'old or repeated input was applied after refocus'
+                viewer.sample(newer, 11, 3)
                 viewer.barrier()
                 assert held(fd, 0x130)
+                viewer.send(type='gamepad_focus', id=0)
+                viewer.send(type='gamepad_enabled', enabled=False)
+                viewer.barrier()
+                removed(directory, fd)
+                viewer.wait_state(lambda v: not v['requested'] and not v['enabled'] and not v['devices'])
+                viewer.send(type='gamepad_enabled', enabled=True)
+                restored = viewer.lease(first)
+                viewer.sample(restored, 12, 1)
+                fd, directory = open_own(viewer.device(12), host.pid)
+                readers.append(fd)
+                assert held(fd, 0x130)
+                viewer.send(type='gamepad_focus', id=0)
                 viewer.send(type='stream_config', request_id=81, codec='png', fps=30,
                             bitrate=12000, read_only=True)
                 viewer.barrier()
                 removed(directory, fd)
-                assert not viewer.state['enabled'] and viewer.state['devices'] == []
-                viewer.sample(newer, 12, 3)
+                viewer.wait_state(lambda v: v['requested'] and not v['enabled'] and not v['devices'])
+                viewer.sample(restored, 12, 2)
                 viewer.barrier()
                 assert viewer.state['devices'] == [], 'read-only snapshot created a device'
                 viewer.send(type='stream_config', request_id=82, codec='png', fps=30,
@@ -272,12 +298,27 @@ def run():
                 fd, directory = open_own(viewer.device(13), host.pid)
                 readers.append(fd)
                 assert held(fd, 0x130)
+                viewer.send(type='gamepad_focus', id=0)
+                viewer.barrier()
+                assert directory.exists() and not any(buttons(fd))
+                viewer.sock.close()
+                removed(directory, fd)
+                viewer = GamepadViewer(port, token, enabled=True)
+                reconnected = viewer.lease(first)
+                viewer.sample(reconnected, 13, 1)
+                new_device = viewer.device(13)
+                assert new_device['sysname'] != directory.name
+                fd, directory = open_own(new_device, host.pid)
+                readers.append(fd)
+                viewer.sample(final, 13, 99, connected=False)
+                viewer.barrier()
+                assert directory.exists() and held(fd, 0x130), 'prior connection detached a new device'
                 viewer.sock.close()
                 removed(directory, fd)
                 assert host.poll() is None and app.poll() is None
-                print('PASS: authenticated compositor -> own evdev buttons/axes/hat; opt-in and '
-                      'exact focus lease; malformed/stale rejection; focus/read-only/disconnect '
-                      'revoke held-input nodes, zero-rumble terminal, neutral reacquire')
+                print('PASS: authenticated compositor -> own evdev buttons/axes/hat; opt-in, '
+                      'focus-neutral stable slots, stale rejection, zero rumble, blur unplug '
+                      'and cleanup on disable/read-only/disconnect with fresh reconnect identity')
             finally:
                 if viewer:
                     viewer.sock.close()

@@ -24,7 +24,7 @@ private:
   struct Slot {
     SDL_JoystickID instance = 0;
     SDL_Gamepad *controller = nullptr;
-    bool sent = false, rumbleCapable = false, motorOwned = false;
+    bool sent = false, needSnapshot = false, rumbleCapable = false, motorOwned = false;
     uint64_t incarnation = 0, sequence = 0;
     ULONGLONG retryAfter = 0, motorDeadline = 0;
     XINPUT_GAMEPAD last{};
@@ -37,7 +37,7 @@ private:
   bool serverSupported = false, leaseEnabled = false, haveState = false;
   int deadzone = 15;
   uint32_t focusId = 0, leaseId = 0;
-  uint64_t generation = 0;
+  uint64_t generation = 0, generationAtFocusChange = 0;
   ULONGLONG nextPoll = 0, nextInventory = 0;
   int localCount = -1;
   std::string serverError, localError;
@@ -65,27 +65,37 @@ private:
     device.motorOwned = false;
     device.motorDeadline = 0;
   }
-  void closeSlot(size_t slot, bool notify) {
-    auto &device = slots[slot];
-    if (notify && device.sent && generation && leaseId) packet(slot, false, {});
+  static void closeController(Slot &device) {
     stopMotor(device);
     if (device.controller) SDL_CloseGamepad(device.controller);
     device.controller = nullptr;
-    device.sent = device.rumbleCapable = false;
-    device.retryAfter = device.sequence = 0;
+    device.retryAfter = 0;
   }
-  void releaseInput(bool notify) {
+  void closeSlot(size_t slot, bool notify) {
+    auto &device = slots[slot];
+    if (notify && device.sent && generation) packet(slot, false, {});
+    closeController(device);
+    device.sent = device.needSnapshot = device.rumbleCapable = false;
+    device.sequence = 0;
+  }
+  void pauseInput() {
     bluetooth.close();
-    for (size_t i = 0; i < slots.size(); ++i) closeSlot(i, notify);
+    for (auto &device : slots) {
+      closeController(device);
+      device.needSnapshot = true;
+    }
     nextPoll = 0;
   }
   void stopDiscovery(bool notify) {
-    releaseInput(notify);
-    for (auto &device : slots) device.instance = 0;
+    bluetooth.close();
+    for (size_t i = 0; i < slots.size(); ++i) {
+      closeSlot(i, notify);
+      slots[i].instance = 0;
+    }
     bluetoothPath.clear();
     if (initialized) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     initialized = false;
-    nextInventory = 0;
+    nextPoll = nextInventory = 0;
     localCount = -1;
     localError.clear();
   }
@@ -176,12 +186,13 @@ private:
     const auto state = filtered(raw, deadzone);
     if (!device.sent) {
       if (!++device.incarnation) ++device.incarnation;
-    } else if (same(state, device.last)) {
+    } else if (!device.needSnapshot && same(state, device.last)) {
       return;
     }
     packet(slot, true, state);
     device.last = state;
     device.sent = true;
+    device.needSnapshot = false;
   }
 
 public:
@@ -213,7 +224,9 @@ public:
   }
   void focus(uint32_t id) {
     if (focusId == id) return;
-    releaseInput(true);
+    pauseInput();
+    leaseEnabled = false;
+    generationAtFocusChange = generation;
     focusId = id;
     if (negotiated) send({{"type", "gamepad_focus"}, {"id", id}});
   }
@@ -227,10 +240,11 @@ public:
     if (!next || next < generation || id > UINT32_MAX) return;
     bool enabled = message["enabled"].get<bool>();
     bool supportedByServer = message["supported"].get<bool>();
-    if (next != generation || leaseId != id || !enabled || !supportedByServer) releaseInput(false);
+    if (next != generation || leaseId != id || (leaseEnabled && (!enabled || !supportedByServer)))
+      pauseInput();
     generation = next;
     leaseId = uint32_t(id);
-    leaseEnabled = enabled;
+    leaseEnabled = enabled && next > generationAtFocusChange;
     serverSupported = supportedByServer;
     haveState = true;
     if (message.contains("error") && message["error"].is_string())
@@ -252,7 +266,7 @@ public:
         !integer("strong", 65535, strong) || !integer("weak", 65535, weak) ||
         !integer("duration_ms", 1000, duration) || !duration) return;
     auto &device = slots[slot];
-    if (!device.sent || !device.rumbleCapable || device.incarnation != incarnation) return;
+    if (!device.sent || !device.controller || !device.rumbleCapable || device.incarnation != incarnation) return;
     if (SDL_RumbleGamepad(device.controller, Uint16(strong), Uint16(weak), Uint32(duration))) {
       device.motorOwned = strong || weak;
       device.motorDeadline = device.motorOwned ? GetTickCount64() + duration : 0;
@@ -335,7 +349,7 @@ public:
   void disconnect() {
     stopDiscovery(true);
     negotiated = requested = serverSupported = leaseEnabled = haveState = false;
-    generation = 0;
+    generation = generationAtFocusChange = 0;
     focusId = leaseId = 0;
     serverDevices = Json::array();
     serverError.clear();

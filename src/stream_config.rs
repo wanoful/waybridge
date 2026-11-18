@@ -53,6 +53,7 @@ impl App {
         let hdr_changed = self.hdr_requested != hdr;
         self.hdr_requested = hdr;
         let read_only = value["read_only"].as_bool().unwrap_or(false);
+        let read_only_changed = self.read_only != read_only;
         if read_only && !self.read_only {
             self.cancel_data_drop();
             self.cancel_window_drag();
@@ -61,6 +62,9 @@ impl App {
         self.read_only = read_only;
         if let Some(peer) = &self.peer {
             peer.set_desktop_input(!read_only);
+        }
+        if read_only_changed {
+            self.sync_gamepads();
         }
         if self.stream_fps != fps as u32
             || self.stream_bitrate != bitrate as u32

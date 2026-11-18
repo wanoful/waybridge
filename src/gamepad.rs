@@ -1,5 +1,5 @@
-//! Opt-in, focus-leased uinput gamepads. These devices never inject keyboard or
-//! pointer events, and are destroyed when their authenticated session loses input.
+//! Opt-in uinput gamepads. The authenticated connection owns the devices and a
+//! foreground lease gates their input and feedback.
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -249,7 +249,16 @@ impl Device {
         self.sample = sample;
         Ok(())
     }
-    fn feedback(&mut self, now: Instant) -> io::Result<Option<(u16, u16)>> {
+    fn pause(&mut self) -> io::Result<()> {
+        self.playing.clear();
+        self.last_rumble = (0, 0);
+        if self.sample != Sample::default() {
+            self.write(Sample::default())?;
+        }
+        let _ = self.feedback(Instant::now(), false)?;
+        Ok(())
+    }
+    fn feedback(&mut self, now: Instant, playback: bool) -> io::Result<Option<(u16, u16)>> {
         // Kernel FF upload/erase requests must always be acknowledged, including
         // unsupported effects, otherwise the game's EVIOCSFF ioctl blocks.
         for _ in 0..64 {
@@ -313,7 +322,7 @@ impl Device {
                 let id = input.code as i16;
                 if input.value <= 0 {
                     self.playing.remove(&id);
-                } else if let Some(effect) = self.effects.get(&id) {
+                } else if let Some(effect) = self.effects.get(&id).filter(|_| playback) {
                     let start = now + Duration::from_millis(u64::from(effect.delay));
                     let duration =
                         u64::from(effect.length).saturating_mul(input.value.min(32767) as u64);
@@ -378,6 +387,7 @@ pub struct Gamepads {
     allowed: bool,
     target: Option<u32>,
     generation: u64,
+    connection_generation: u64,
     session: u64,
     incarnations: [u64; 4],
     devices: [Option<Device>; 4],
@@ -402,6 +412,7 @@ impl Gamepads {
             allowed: false,
             target: None,
             generation: 0,
+            connection_generation: 0,
             session: 0,
             incarnations: [0; 4],
             devices: std::array::from_fn(|_| None),
@@ -417,6 +428,7 @@ impl Gamepads {
         self.requested = available && enabled;
         self.session = self.session.wrapping_add(1).max(1);
         self.generation = self.generation.wrapping_add(1).max(1);
+        self.connection_generation = self.generation;
         self.probe();
         self.sync();
         self.publish();
@@ -470,21 +482,37 @@ impl Gamepads {
         self.allowed = allowed;
         self.sync();
     }
+    pub fn release_focus(&mut self) {
+        self.server_focus = None;
+        self.sync();
+    }
     fn sync(&mut self) {
-        let target = (self.available
-            && self.requested
-            && self.supported
-            && self.allowed
+        let keep_devices = self.available && self.requested && self.supported && self.allowed;
+        let mut target = (keep_devices
             && self.client_focus != 0
             && self.server_focus == Some(self.client_focus))
         .then_some(self.client_focus);
-        if target == self.target {
-            return;
+        let had_devices = self.devices.iter().any(Option::is_some);
+        if !keep_devices {
+            self.clear_devices();
+        } else if target != self.target {
+            // Drain pending rumble on both sides of the transition. A game may
+            // keep its evdev handle and uploaded effects while the lease is paused.
+            if let Err(error) = self.pause_devices() {
+                self.error = backend_error(&error);
+                self.supported = false;
+                target = None;
+                self.clear_devices();
+            }
         }
-        self.clear_devices();
-        self.target = target;
-        self.generation = self.generation.wrapping_add(1).max(1);
-        self.publish();
+        let target_changed = target != self.target;
+        if target_changed {
+            self.target = target;
+            self.generation = self.generation.wrapping_add(1).max(1);
+        }
+        if target_changed || (had_devices && (!keep_devices || !self.supported)) {
+            self.publish();
+        }
     }
     fn publish(&mut self) {
         if !self.available {
@@ -499,24 +527,42 @@ impl Gamepads {
     fn rumble(&mut self, slot: usize, incarnation: u64, strong: u16, weak: u16) {
         self.outgoing.push(json!({"type":"gamepad_rumble","generation":self.generation,"slot":slot,"device_generation":incarnation,"strong":strong,"weak":weak,"duration_ms":750}));
     }
+    fn stop_rumble(&mut self, slot: usize, incarnation: u64) {
+        self.outgoing.retain(|message| {
+            message["type"] != "gamepad_rumble"
+                || message["slot"] != slot
+                || (message["strong"] == 0 && message["weak"] == 0)
+        });
+        self.rumble(slot, incarnation, 0, 0);
+    }
+    fn pause_devices(&mut self) -> io::Result<()> {
+        for slot in 0..self.devices.len() {
+            if let Some(device) = &mut self.devices[slot] {
+                device.pause()?;
+                let incarnation = device.incarnation;
+                if self.target.is_some() {
+                    self.stop_rumble(slot, incarnation);
+                }
+            }
+        }
+        Ok(())
+    }
     fn clear_devices(&mut self) {
-        for slot in 0..4 {
+        for slot in 0..self.devices.len() {
             if let Some(device) = self.devices[slot].take() {
-                self.rumble(slot, device.incarnation, 0, 0);
+                self.stop_rumble(slot, device.incarnation);
                 drop(device);
             }
         }
         self.incarnations = [0; 4];
     }
     pub fn input(&mut self, value: &Value) {
-        let Some(target) = self.target else {
+        let Some(generation) = value["generation"].as_u64() else {
             return;
         };
-        if value["generation"].as_u64() != Some(self.generation)
-            || value["id"].as_u64() != Some(u64::from(target))
-        {
+        let Some(id) = value["id"].as_u64().and_then(|id| u32::try_from(id).ok()) else {
             return;
-        }
+        };
         let Some(slot) = value["slot"]
             .as_u64()
             .filter(|s| *s < 4)
@@ -541,34 +587,37 @@ impl Gamepads {
                 return;
             }
         }
-        let sample = if connected {
-            let Some(s) = Sample::parse(value) else {
-                return;
-            };
-            s
-        } else {
-            Sample::default()
-        };
         if !connected {
-            if self.incarnations[slot] != incarnation {
+            // A physical device may unplug during blur, or before the viewer
+            // receives the latest focus transition. Accept the exact current
+            // device's newer detach within this authenticated connection.
+            if self.connection_generation == 0
+                || !(self.connection_generation..=self.generation).contains(&generation)
+                || self.incarnations[slot] != incarnation
+            {
                 return;
             }
             if let Some(device) = self.devices[slot].take() {
-                self.rumble(slot, incarnation, 0, 0);
+                self.stop_rumble(slot, incarnation);
                 drop(device);
                 self.publish();
             }
-            // Retain the closed incarnation so a delayed connected snapshot
-            // cannot resurrect an unplugged device in this same lease.
+            // A delayed snapshot cannot resurrect an unplugged incarnation.
             self.incarnations[slot] = incarnation.saturating_add(1);
             return;
         }
+        if generation != self.generation || self.target != Some(id) {
+            return;
+        }
+        let Some(sample) = Sample::parse(value) else {
+            return;
+        };
         if self.devices[slot]
             .as_ref()
             .is_none_or(|d| d.incarnation != incarnation)
         {
             if let Some(old) = self.devices[slot].take() {
-                self.rumble(slot, old.incarnation, 0, 0);
+                self.stop_rumble(slot, old.incarnation);
                 drop(old);
             }
             match Device::new(&self.backend, slot, incarnation, self.session) {
@@ -596,10 +645,10 @@ impl Gamepads {
     }
     pub fn poll(&mut self) -> Vec<Value> {
         let now = Instant::now();
-        for slot in 0..4 {
+        for slot in 0..self.devices.len() {
             let feedback = self.devices[slot]
                 .as_mut()
-                .map(|d| (d.incarnation, d.feedback(now)));
+                .map(|d| (d.incarnation, d.feedback(now, self.target.is_some())));
             if let Some((incarnation, result)) = feedback {
                 match result {
                     Ok(Some((strong, weak))) => self.rumble(slot, incarnation, strong, weak),
@@ -625,6 +674,7 @@ impl Gamepads {
         self.initialized = false;
         self.available = false;
         self.requested = false;
+        self.connection_generation = 0;
         self.generation = self.generation.wrapping_add(1).max(1);
         self.outgoing.clear();
     }
@@ -794,6 +844,16 @@ mod tests {
         }
         result
     }
+    fn play_effect(file: &mut File, id: i16) {
+        let play = event(EV_FF, id as u16, 1);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&play as *const libc::input_event).cast::<u8>(),
+                size_of::<libc::input_event>(),
+            )
+        };
+        file.write_all(bytes).unwrap();
+    }
     #[test]
     #[ignore = "creates only a uniquely named disposable uinput gamepad; requires uinput and own-node access"]
     fn uinput_roundtrip_and_real_rumble() {
@@ -856,15 +916,8 @@ mod tests {
                 )
             };
             assert_eq!(result, 0, "{}", io::Error::last_os_error());
-            let play = event(EV_FF, effect.id as u16, 1);
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    (&play as *const libc::input_event).cast::<u8>(),
-                    size_of::<libc::input_event>(),
-                )
-            };
-            reader.write_all(bytes).unwrap();
-            reader
+            play_effect(&mut reader, effect.id);
+            (reader, effect.id)
         });
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut feedback = Vec::new();
@@ -881,7 +934,7 @@ mod tests {
             upload.is_finished(),
             "kernel FF upload acknowledgement timed out"
         );
-        let mut reader = upload.join().unwrap();
+        let (mut reader, effect_id) = upload.join().unwrap();
         let rumble = feedback
             .iter()
             .find(|v| v["type"] == "gamepad_rumble" && v["strong"] == 0x1234)
@@ -910,17 +963,42 @@ mod tests {
         replay["buttons"] = json!(0);
         pads.input(&replay);
         assert_eq!(pads.devices[0].as_ref().unwrap().sample, original);
-        pads.devices[0]
-            .as_mut()
-            .unwrap()
-            .write(Sample::default())
-            .unwrap();
+        play_effect(&mut reader, effect_id);
+        assert!(pads
+            .poll()
+            .iter()
+            .any(|v| v["type"] == "gamepad_rumble" && v["strong"] == 0x1234));
+        pads.focus(0);
+        assert_eq!(pads.devices[0].as_ref().unwrap().sysname, sysname);
+        assert_eq!(pads.devices[0].as_ref().unwrap().sample, Sample::default());
         let neutral = drain(&mut reader);
         assert!(neutral.contains(&(EV_KEY, 0x130, 0)));
         assert!(neutral.contains(&(EV_ABS, 0, 0)));
-        let mut unplug = input(generation, 41, 2);
+        assert!(pads
+            .poll()
+            .iter()
+            .any(|v| v["type"] == "gamepad_rumble" && v["strong"] == 0 && v["weak"] == 0));
+        play_effect(&mut reader, effect_id);
+        assert!(pads.poll().is_empty(), "rumble played while unfocused");
+        // Queue an effect immediately before regrant to exercise the handoff
+        // drain as well as the regular inactive polling path.
+        play_effect(&mut reader, effect_id);
+        pads.focus(7);
+        assert!(pads.poll().iter().all(|v| v["type"] != "gamepad_rumble"));
+        let newer = pads.generation;
+        assert!(newer > generation);
+        pads.input(&input(newer, 41, 2));
+        assert_eq!(pads.devices[0].as_ref().unwrap().sysname, sysname);
+        play_effect(&mut reader, effect_id);
+        assert!(pads.poll().iter().any(|v| v["type"] == "gamepad_rumble"
+            && v["strong"] == 0x1234
+            && v["generation"] == newer));
+        pads.focus(0);
+        let mut unplug = input(newer, 41, 3);
         unplug["connected"] = json!(false);
         pads.input(&unplug);
+        pads.focus(7);
+        let generation = pads.generation;
         pads.input(&input(generation, 41, 999));
         assert!(
             pads.devices[0].is_none(),
@@ -928,12 +1006,13 @@ mod tests {
         );
         pads.input(&input(generation, 42, 1));
         assert_eq!(pads.devices[0].as_ref().unwrap().incarnation, 42);
+        let replacement = pads.devices[0].as_ref().unwrap().sysname.clone();
+        pads.input(&unplug);
+        assert_eq!(pads.devices[0].as_ref().unwrap().sysname, replacement);
         pads.focus(0);
+        assert!(pads.devices[0].is_some());
+        pads.set_enabled(false);
         assert!(pads.devices.iter().all(Option::is_none));
-        assert!(pads
-            .poll()
-            .iter()
-            .any(|v| v["type"] == "gamepad_rumble" && v["strong"] == 0 && v["weak"] == 0));
         assert!(!PathBuf::from("/sys/devices/virtual/input")
             .join(sysname)
             .exists());

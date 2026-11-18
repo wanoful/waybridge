@@ -800,8 +800,11 @@ internal sealed partial class MainWindow : Window
                 else if (localGamepadCount is int count) gamepadText += $"Windows 已识别 {count} 个手柄。";
                 if (connectedGamepads?.Count > 0)
                     gamepadText += "远端设备：" + string.Join("、", connectedGamepads) + "。";
-                else if (gamepadSupported == true && localGamepadCount > 0 && !inputDeviceReadOnly)
-                    gamepadText += gamepadActiveLease == false ? "请先聚焦远端窗口。" : "正在等待 Linux 创建设备。";
+                if (gamepadSupported == true && localGamepadCount > 0 && !inputDeviceReadOnly)
+                {
+                    if (gamepadActiveLease == false) gamepadText += "手柄输入已暂停，请先聚焦远端窗口。";
+                    else if (connectedGamepads?.Count is null or 0) gamepadText += "正在等待 Linux 创建设备。";
+                }
             }
             if (gamepadActive == true && connectedGamepads?.Count > 0 && selected.Settings.GamepadRumble && rumbleSupported == false)
                 gamepadText += "当前连接不支持震动反馈。";

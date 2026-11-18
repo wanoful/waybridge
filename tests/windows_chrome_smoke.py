@@ -22,7 +22,7 @@ def main():
         os.close(write_fd)
         with os.fdopen(read_fd) as pipe:
             display = ":" + pipe.readline().strip()
-        wine_env = {**os.environ, "DISPLAY": display, "WINEPREFIX": str(prefix), "WINEDEBUG": "-all", "WINEDLLOVERRIDES": "winemenubuilder.exe=d;mscoree,mshtml=", "WAYBRIDGE_GDI": "1"}
+        wine_env = {**os.environ, "DISPLAY": display, "WINEPREFIX": str(prefix), "WINEDEBUG": "-all", "WINEDLLOVERRIDES": "winemenubuilder.exe=d;mscoree,mshtml=", "WAYBRIDGE_GDI": "1", "WAYBRIDGE_DND_TRACE": "1"}
         env = {**os.environ, "XDG_RUNTIME_DIR": runtime, "WAYLAND_DEBUG": "1"}
         token = "windows-chrome-" + "a" * 40
         token_path = Path(runtime) / "token"
@@ -43,9 +43,10 @@ def main():
             app = subprocess.Popen([str(ROOT / "target/debug/waybridge"), "--socket", "windows-chrome-0", "--launch", "--", "google-chrome-stable", f"--user-data-dir={runtime}/profile", "--password-store=basic", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "data:text/html,<title>Waybridge tab A</title><h1>Tab A</h1>", "data:text/html,<title>Waybridge tab B</title><h1>Tab B</h1>"], env=env, stdout=app_log, stderr=app_log)
             processes.append(app)
             wait(lambda: probe("ready", False).returncode == 0, seconds=25)
-            for action in ("split", "merge", "cancel"):
+            for action, move in (("split", "released"), ("merge", "interrupted"), ("cancel", "cancelled")):
                 result = probe(action, False)
                 assert result.returncode == 0, (action, result.returncode, result.stdout, result.stderr)
+                assert f"DND window_move.{move}" in Path(log.name).read_text(), (action, move)
                 print(result.stdout.strip(), flush=True)
         finally:
             for process in reversed(processes):

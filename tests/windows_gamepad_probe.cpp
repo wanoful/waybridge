@@ -144,19 +144,36 @@ int main() {
   check(replacementMotors.writes.empty(), "feedback crossed physical replacement");
   pad.feedback(haptic(1, 1, newInc));
   check(replacementMotors.writes.size() == 1, "replacement feedback discarded");
+  before = messages.size();
   pad.focus(0);
   check(replacementMotors.writes.back() == std::make_pair(Uint16(0), Uint16(0)) &&
-        firstMotors.writes.empty() && latest(0)["connected"] == false && latest(1)["connected"] == false,
-        "focus loss did not release remote input and owned SDL motor");
+        firstMotors.writes.empty() && messages.size() == before + 1 &&
+        messages.back()["type"] == "gamepad_focus" && !pad.status()["gamepad_active"].get<bool>(),
+        "focus loss failed to stop the motor without disconnecting remote devices");
+  pad.state(lease(2, 0, false));
   before = messages.size();
   pad.poll(now += 500);
   check(messages.size() == before && pad.status()["gamepad_local_count"] == 4,
         "blur confused local inventory with forwarded devices");
+  d.detach();
+  pad.poll(now += 500);
+  check(latest(3)["connected"] == false && latest(3)["generation"] == 2 && latest(3)["id"] == 0,
+        "physical unplug during blur did not remove the remote slot");
   pad.focus(7);
+  before = messages.size();
   pad.state(lease(2, 7));
   pad.poll(now += 8);
-  check(latest(0)["generation"] == 2 && latest(0)["device_generation"].get<uint64_t>() > aInc &&
-        latest(1)["buttons"] == XINPUT_GAMEPAD_X, "focus recovery lost physical slots or generations");
+  check(messages.size() == before && !pad.status()["gamepad_active"].get<bool>(),
+        "focus recovery permitted input on a stale lease");
+  pad.state(lease(3, 7));
+  pad.poll(now += 8);
+  check(latest(0)["generation"] == 3 && latest(0)["device_generation"] == aInc &&
+        latest(0)["sequence"].get<uint64_t>() > 1 && latest(1)["device_generation"] == newInc &&
+        latest(1)["buttons"] == XINPUT_GAMEPAD_X && latest(3)["connected"] == false,
+        "focus recovery failed to preserve slot identity and send fresh samples");
+  before = replacementMotors.writes.size();
+  pad.feedback(haptic(1, 1, newInc));
+  check(replacementMotors.writes.size() == before, "old feedback was replayed after focus recovery");
   pad.configure(true, true, false, 50);
   a.axis(SDL_GAMEPAD_AXIS_LEFTY, -1000);
   pad.poll(now += 8);
@@ -165,7 +182,7 @@ int main() {
   check(latest(0)["connected"] == false && pad.status()["gamepad_local_count"].is_null(),
         "disable did not clear active input and local inventory");
   pad.disconnect();
-  a.detach(); c.detach(); d.detach(); replacement.detach();
+  a.detach(); c.detach(); replacement.detach();
   SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
   check(SDL_WasInit(SDL_INIT_GAMEPAD) == 0, "SDL gamepad subsystem leaked a reference");
 

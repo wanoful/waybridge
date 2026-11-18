@@ -187,6 +187,24 @@ int main(){
   require(takeover.beginInteraction(capturedStart,window)&&events.back().edge==0,"null-edge captured DND start");
   eventCount=events.size();wireCount=wire.size();takeover.sample(ineligible,WM_POINTERCAPTURECHANGED,108,first);
   require(events.size()==eventCount+1&&events.back().phase=="cancel"&&wire.size()==wireCount&&!takeover.ownsInteraction(),"owning native capture loss failed to cancel exactly once");
+  takeover.sample(target,WM_POINTERDOWN,109,first);
+  auto systemStart=start(6,wire.back()["gesture"]);systemStart["generation"]=13;
+  require(takeover.beginInteraction(systemStart,window),"system move start rejected");
+  require(!takeover.systemMove(5,true)&&takeover.systemMove(6,true),"system move did not bind to its operation");
+  eventCount=events.size();
+  takeover.sample(ineligible,WM_POINTERCAPTURECHANGED,109,first);
+  require(takeover.ownsInteraction()&&events.size()==eventCount,"system move capture handoff canceled the owner");
+  require(takeover.systemMove(6,false),"declined system move rejected fallback");
+  takeover.sample(ineligible,WM_POINTERUPDATE,109,moved);
+  require(events.back().phase=="motion"&&!events.back().systemMove,"declined system move did not restore local motion");
+  require(takeover.systemMove(6,true),"system move could not take ownership");
+  eventCount=events.size();
+  takeover.finishSystemMove(5);
+  require(takeover.ownsInteraction()&&events.size()==eventCount,"stale system move completion ended a new gesture");
+  takeover.finishSystemMove(6);
+  takeover.sample(ineligible,WM_POINTERUP,109,moved);
+  require(!takeover.ownsInteraction()&&!takeover.ownsPointer(109)&&events.size()==eventCount+1&&
+          events.back().systemMove&&events.back().phase=="up","system move did not report one release");
   // Concrete popup coordinates use the root lease, including a first queued
   // tap when the keyboard focus remains on the root window.
   HWND popup=CreateWindowExW(0,L"STATIC",L"Touch popup",WS_POPUP,200,200,220,180,window,nullptr,GetModuleHandleW(nullptr),nullptr);
@@ -204,7 +222,7 @@ int main(){
   require(popupWire[0]["gesture"]==popupWire[1]["gesture"]&&popupWire[0]["gesture"]!=popupWire[2]["gesture"],"queued taps reused gesture identity");
   DestroyWindow(popup);DestroyWindow(elsewhere);
   DestroyWindow(window);
-  std::cout<<"PASS: native touch lease/popup geometry, distinct queued gestures, real null/omitted move/DND edges, malformed resize rejection, takeover ACK ordering, exact owning contact, second-finger isolation, focus-independent motion/up, stale operations, down/up-before-ACK, external capture/UP/completion, policy/server cancel and touch-only mouse suppression\n";
+  std::cout<<"PASS: native touch lease/popup geometry, distinct queued gestures, real null/omitted move/DND edges, malformed resize rejection, takeover ACK ordering, exact owning contact, second-finger isolation, focus-independent motion/up, stale operations, down/up-before-ACK, external capture/UP/completion, system move capture/fallback/release, policy/server cancel and touch-only mouse suppression\n";
   return 0;
  }catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}
 }

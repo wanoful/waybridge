@@ -332,6 +332,10 @@ internal static class GuiFocusProbe
         Receive(window, new { type = "gamepad_state", gamepad_enabled = true, gamepad_active = false, gamepad_devices = Array.Empty<object>() });
         Check(gamepadState.Text.Contains("当前连接手柄转发已开启", StringComparison.Ordinal) &&
             gamepadState.Text.Contains("请先聚焦远端窗口", StringComparison.Ordinal), "background focus lease was confused with the saved gamepad preference");
+        Receive(window, new { type = "gamepad_state", gamepad_enabled = true, gamepad_active = false,
+            gamepad_devices = new[] { new { slot = 0, name = "Private test controller" } } });
+        Check(gamepadState.Text.Contains("远端设备：Private test controller", StringComparison.Ordinal) &&
+            gamepadState.Text.Contains("手柄输入已暂停", StringComparison.Ordinal), "retained gamepad was shown as accepting input without focus");
         Receive(window, new { type = "local_settings_applied", pen_error = "测试笔设备不可用", gamepad_error = "测试手柄不可用" });
         Check(penState.Text.Contains("测试笔设备不可用", StringComparison.Ordinal) && gamepadState.Text.Contains("测试手柄不可用", StringComparison.Ordinal),
             "professional device errors were not retained inline");

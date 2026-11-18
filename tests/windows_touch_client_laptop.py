@@ -17,6 +17,8 @@ from smoke import ROOT
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', required=True)
+    parser.add_argument('--expect-snap', action='store_true',
+                        help='also exercise Windows edge Snap on the fixture, with Windows Snap enabled')
     parser.add_argument('--client', type=Path, default=ROOT/'build/windows/waybridge-client.exe')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', args.host):
@@ -89,13 +91,15 @@ def main():
 $ErrorActionPreference='Stop';$root='@ROOT@';$name='@KEY@'
 $run=@'
 $ErrorActionPreference='Stop';$root=$PSScriptRoot;$worker=$null
-$env:WAYBRIDGE_DPI='96';$env:WAYBRIDGE_NO_AUDIO='1'
+$env:WAYBRIDGE_DPI='96';$env:WAYBRIDGE_NO_AUDIO='1';$env:WAYBRIDGE_STATS='1'
 Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public static class Foreground { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd); }'
 $previous=[Foreground]::GetForegroundWindow()
 try {
  $worker=Start-Process ($root+'\viewer.exe') -NoNewWindow -ArgumentList @('127.0.0.1','@PORT@','@TOKEN@','--touch') -PassThru -RedirectStandardOutput ($root+'\viewer.txt') -RedirectStandardError ($root+'\viewer-err.txt')
  Start-Sleep -Seconds 2
- $driver=Start-Process ($root+'\driver.exe') -NoNewWindow -ArgumentList @([string]$worker.Id,'@KEY@') -PassThru -Wait -RedirectStandardOutput ($root+'\driver.txt') -RedirectStandardError ($root+'\driver-err.txt')
+ $driverArgs=@([string]$worker.Id,'@KEY@')
+ if ('@EXPECT_SNAP@' -eq 'yes') { $driverArgs+= '--expect-snap' }
+ $driver=Start-Process ($root+'\driver.exe') -NoNewWindow -ArgumentList $driverArgs -PassThru -Wait -RedirectStandardOutput ($root+'\driver.txt') -RedirectStandardError ($root+'\driver-err.txt')
  $driver.ExitCode|Set-Content -Encoding ASCII ($root+'\exit.txt')
 } catch { $_|Out-String|Set-Content ($root+'\failure.txt');'99'|Set-Content ($root+'\exit.txt') }
 finally { if($worker){Stop-Process -Id $worker.Id -Force -ErrorAction SilentlyContinue};[Foreground]::SetForegroundWindow($previous)|Out-Null }
@@ -105,7 +109,8 @@ $action=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile
 $principal=New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $name -Action $action -Principal $principal | Out-Null
 Start-ScheduledTask -TaskName $name
-'''.replace('@ROOT@', quoted).replace('@KEY@', key).replace('@PORT@', str(remote_port)).replace('@TOKEN@', token))
+'''.replace('@ROOT@', quoted).replace('@KEY@', key).replace('@PORT@', str(remote_port)).replace('@TOKEN@', token)
+               .replace('@EXPECT_SNAP@', 'yes' if args.expect_snap else 'no'))
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
                 output = remote("$p='" + quoted + "';if(Test-Path ($p+'\\exit.txt')){Get-Content ($p+'\\exit.txt')}")
@@ -118,12 +123,22 @@ Start-ScheduledTask -TaskName $name
                     result = json.loads(inventory)
                     assert result['ok'] is True, result
                     text = (evidence/'app.log').read_text()
-                    assert text.count('CLIENT_TOUCH_DOWN ') == 4, text
-                    assert text.count('CLIENT_REQUEST_MOVE\n') == 1 and text.count('CLIENT_REQUEST_RESIZE\n') == 1, text
-                    assert text.count('CLIENT_TOUCH_UP ') >= 2 and 'CLIENT_TOUCH_MOTION ' in text, text
+                    assert text.count('CLIENT_TOUCH_DOWN 0 ') == (5 if args.expect_snap else 4), text
+                    # The second down can arrive before the first move handoff
+                    # has reached Windows. Its own move request then races the
+                    # active operation. The driver checks that it cannot move
+                    # or release the first finger's HWND.
+                    secondary = text.count('CLIENT_TOUCH_DOWN 1 ')
+                    assert secondary in (0, 1) and text.count('CLIENT_TOUCH_DOWN ') == (
+                        (5 if args.expect_snap else 4) + secondary), text
+                    assert text.count('CLIENT_REQUEST_MOVE\n') == (2 if args.expect_snap else 1) + secondary, text
+                    assert text.count('CLIENT_REQUEST_RESIZE\n') == 1, text
+                    assert text.count('CLIENT_TOUCH_UP 0\n') == 2 and 'CLIENT_TOUCH_MOTION ' in text, text
                     assert app.poll() is None and server.poll() is None
                     print(json.dumps(result, indent=2))
                     print('PASS: real PT_TOUCH through production client -> live wl_touch, owner-preserving xdg move/resize, second-finger isolation and fresh touch recovery')
+                    if args.expect_snap:
+                        print('PASS: app-confirmed single-contact move triggered Windows edge Snap')
                     return
                 time.sleep(.5)
             raise AssertionError('Production touch injection timed out; see ' + str(evidence))

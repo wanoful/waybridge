@@ -86,8 +86,13 @@ could not move. The implementation now accepts a live touch serial for native
 Wayland move/resize, binds the request to its original gesture and owning slot,
 and drives the Windows HWND from that contact's physical coordinates. Resize
 honors window constraints, including opposite-edge anchoring, and moving a
-maximized window restores it. Mouse position and left-button state do not drive
-these native operations. Native Windows frames retain their system handling.
+maximized window restores it. When a self-decorated window confirms a move,
+the viewer may ask Windows to promote the held primary contact and take over
+its caption move. The viewer enters the system move loop on the genuine
+promoted mouse message for that same contact. The loop owns placement and edge
+Snap once entered. Contact-based placement remains available when conversion
+or loop entry is unavailable. Resize retains its contact-based placement, and
+native Windows frames retain their system handling.
 
 Popup HWNDs map to their root and concrete popup surface. Native contact hit
 coordinates reach menus and nested popup surfaces; an outside press dismisses
@@ -157,13 +162,20 @@ external drop and late reads after operation retirement. Controlled production
 PE adapter tests exercise gesture/slot reuse, popup targets, focus changes,
 second-finger isolation, external capture/up and exact completion. Actual HWND
 regressions check contact-based movement, edge limits and maximized restoration.
-These tests do not claim an unlocked physical production-client acceptance run.
+The guarded production-client probe used injected PT_TOUCH on an unlocked x64
+Windows desktop. It verified a normal touch, two-contact isolation during local
+move, anchored resize, fresh touch after release, and a single-contact CSD move
+that snapped to half the work area. Windows reported the window as arranged.
+Physical touchscreen input across mixed-DPI monitors and ARM64 remain separate
+checks.
 
 ```
 python3 tests/touch_interaction_smoke.py
 python3 tests/windows_touch_smoke.py
 # Opt-in unlocked, logged-in Windows test device; exact fixture ownership guards:
 python3 tests/windows_touch_client_laptop.py --host laptop
+# Requires an interactive desktop with Windows Snap enabled:
+python3 tests/windows_touch_client_laptop.py --host laptop --expect-snap
 python3 tests/windows_touch_ole_laptop.py --host laptop
 ```
 

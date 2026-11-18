@@ -30,6 +30,7 @@
 #include "relative_input.h"
 #include "ime.h"
 #include "native_touch.h"
+#include "native_touchpad.h"
 #include "native_pen.h"
 #include "gamepad.h"
 #include "touch_window.h"
@@ -71,6 +72,13 @@ int hostedGamepadDeadzone = 15;
 std::map<std::string, bool> touchApplicationModes;
 TouchWindowManipulation touchWindow, penWindow;
 TouchOle::Bridge touchOle;
+struct {
+  TouchOle::Bridge promotion;
+  uint64_t attempted = 0;
+  ULONGLONG deadline = 0;
+  HWND systemWindow = nullptr;
+  bool entered = false;
+} touchMove;
 uint64_t touchOlePromotedOperation = 0, touchOleWarning = 0;
 bool touchOleMouseReady = false, touchOlePumping = false;
 ULONGLONG touchOleDeadline = 0;
@@ -82,6 +90,8 @@ void sendJson(const Json &value);
 RemoteNotifications remoteNotifications([](Json message) { hostControl.emit(std::move(message)); },
                                       [](Json message) { sendJson(message); });
 NativeTouch nativeTouch([](const Json &message) { sendJson(message); });
+NativeTouchpad nativeTouchpad([](const Json &message) { sendJson(message); });
+bool touchpadNegotiated = false;
 NativePen nativePen([](const Json &message) { sendJson(message); });
 NativeGamepad nativeGamepads([](const Json &message) { sendJson(message); });
 constexpr size_t MaxPacket = 72 * 1024 * 1024;
@@ -115,6 +125,8 @@ AudioPlayback audioPlayback;
 std::string serverHost, serverPort, serverToken;
 std::set<uint8_t> supportedVideoKinds;
 using Clock = std::chrono::steady_clock;
+constexpr UINT_PTR MoveViewportTimer = 2;
+constexpr UINT MoveViewportIntervalMs = 33;
 struct ClientStats {
   struct Stage {
     double total = 0, max = 0;
@@ -212,6 +224,8 @@ struct RemoteWindow {
   Clock::time_point resizeSent;
   UINT lastDpi = 0;
   int lastHdr = -1;
+  HMONITOR lastViewportMonitor = nullptr;
+  bool moveViewportPending = false;
   int lastWorkWidth = 0, lastWorkHeight = 0, lastWorkX = INT_MIN, lastWorkY = INT_MIN;
   int lastMonitorWidth = 0, lastMonitorHeight = 0;
 };
@@ -228,9 +242,15 @@ void reconcileWindows();
 RelativeInput relativeInput;
 struct WindowDrag {
   bool active = false, released = false, cancelled = false, touch = false;
+  bool moveAttempted = false, moveCompleted = false;
   uint32_t source = 0, attached = 0, target = 0;
   int offsetX = 0, offsetY = 0;
 } windowDrag;
+struct WindowDragMove {
+  HWND hwnd = nullptr;
+  bool entered = false, interrupted = false, buttonUp = false, startFileDrag = false;
+} windowDragMove;
+constexpr UINT StartWindowDragMove = WM_APP + 2;
 constexpr UINT_PTR WindowDragTimer = 5, TouchOleTimer = 6, GamepadTimer = 7;
 Json touchInteractionInput(const NativeTouch::InteractionSample &sample);
 
@@ -309,7 +329,7 @@ void setDecoration(RemoteWindow *w, bool clientDecorated) {
                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
-void sendResize(RemoteWindow *w);
+void sendResize(RemoteWindow *w, bool coalesceMove = false);
 
 std::wstring wide(const std::string &s) {
   int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()),
@@ -1613,6 +1633,11 @@ RemoteWindow *windowDragTarget(POINT point) {
     RECT rect{};
     if (!GetWindowRect(hwnd, &rect) || !PtInRect(&rect, s.point))
       return TRUE;
+    // Windows moves and Snap can show an overlay above the dragged HWND.
+    // A transparent layered window passes mouse input through to the target.
+    constexpr auto clickThrough = WS_EX_LAYERED | WS_EX_TRANSPARENT;
+    if ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & clickThrough) == clickThrough)
+      return TRUE;
     for (auto &[id, window] : windows) {
       if (window->hwnd != hwnd) continue;
       POINT local = s.point;
@@ -1631,8 +1656,9 @@ RemoteWindow *windowDragTarget(POINT point) {
 }
 void moveDraggedWindow() {
   auto found = windows.find(windowDrag.attached);
-  if (!windowDrag.active || windowDrag.released || found == windows.end()) return;
+  if (!windowDrag.active || windowDrag.released || windowDrag.moveCompleted || found == windows.end()) return;
   auto *w = found->second.get();
+  if (windowDragMove.hwnd == w->hwnd) return;
   POINT cursor{};
   if (!GetCursorPos(&cursor)) return;
   POINT client{0, 0};
@@ -1643,6 +1669,11 @@ void moveDraggedWindow() {
                cursor.x - MulDiv(windowDrag.offsetX, w->dpi, 96) - (client.x - outer.left),
                cursor.y - MulDiv(windowDrag.offsetY, w->dpi, 96) - (client.y - outer.top),
                0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+void stopWindowDragMove() {
+  if (!windowDragMove.hwnd || windowDragMove.interrupted) return;
+  windowDragMove.interrupted = true;
+  SendMessageW(windowDragMove.hwnd, WM_CANCELMODE, 0, 0);
 }
 void sendWindowDragMotion(bool release = false) {
   if (!windowDrag.active || windowDrag.released) return;
@@ -1657,9 +1688,14 @@ void sendWindowDragMotion(bool release = false) {
     if (release) windowDrag.released = true;
     return;
   }
+  // Let the native modal loop finish (including Snap) before dropping on Wayland.
+  if (release && windowDragMove.hwnd) return;
   if (dataDragNegotiated) {
     FileDrag::maybeClaim();
-    if (FileDrag::ownsInput()) return;
+    if (FileDrag::ownsInput()) {
+      stopWindowDragMove();
+      return;
+    }
   }
   moveDraggedWindow();
   POINT point{};
@@ -1692,6 +1728,7 @@ void cancelWindowDrag() {
   if (!windowDrag.active || windowDrag.cancelled) return;
   windowDrag.cancelled = true;
   windowDrag.released = true;
+  stopWindowDragMove();
   sendJson({{"type", "toplevel_drag_cancel"}});
 }
 void endWindowDrag() {
@@ -1699,11 +1736,58 @@ void endWindowDrag() {
   auto target = windowDrag.attached ? windowDrag.attached : windowDrag.target;
   bool cancelled = windowDrag.cancelled;
   windowDrag = {};
+  stopWindowDragMove();
   KillTimer(controller, WindowDragTimer);
   if (GetCapture() == controller) ReleaseCapture();
   auto found = windows.find(target);
   if (!cancelled && found != windows.end() && IsWindowVisible(found->second->hwnd))
     SetForegroundWindow(found->second->hwnd);
+}
+LRESULT CALLBACK windowDragMoveMouse(int code, WPARAM wp, LPARAM lp) {
+  if (code == HC_ACTION && (wp == WM_LBUTTONUP || wp == WM_NCLBUTTONUP))
+    windowDragMove.buttonUp = true;
+  return CallNextHookEx(nullptr, code, wp, lp);
+}
+void startWindowDragMove() {
+  if (!windowDrag.active || windowDrag.touch || windowDrag.released || windowDrag.moveAttempted ||
+      windowDragMove.hwnd || FileDrag::ownsInput() || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
+    return;
+  auto found = windows.find(windowDrag.attached);
+  if (found == windows.end() || found->second->popup || found->second->state.fullscreen)
+    return;
+  HWND hwnd = found->second->hwnd;
+  if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
+  POINT cursor{};
+  if (!GetCursorPos(&cursor)) return;
+
+  windowDrag.moveAttempted = true;
+  // The modal loop consumes button-up and Escape. Only a mouse release commits a drop.
+  HHOOK mouse = SetWindowsHookExW(WH_MOUSE, windowDragMoveMouse, nullptr, GetCurrentThreadId());
+  if (!mouse) return;
+  windowDragMove.hwnd = hwnd;
+  if (GetCapture() == controller) ReleaseCapture();
+  // The native loop dispatches network and timer messages. The remote grab
+  // continues sending data-device motion while Windows owns the HWND position.
+  DefWindowProcW(hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, MAKELPARAM(cursor.x, cursor.y));
+  UnhookWindowsHookEx(mouse);
+  auto move = windowDragMove;
+  windowDragMove = {};
+  if (move.entered)
+    FileDrag::trace(move.interrupted ? "window_move.interrupted" : move.buttonUp ? "window_move.released" : "window_move.cancelled");
+  if (move.startFileDrag) PostMessageW(controller, FileDrag::StartMessage, 0, 0);
+  if (!windowDrag.active || windowDrag.released || FileDrag::ownsInput()) return;
+
+  bool held = GetAsyncKeyState(VK_LBUTTON) & 0x8000;
+  if (move.entered && !move.interrupted) {
+    if (!move.buttonUp) { cancelWindowDrag(); return; }
+    windowDrag.moveCompleted = true;
+    sendWindowDragMotion(true);
+    return;
+  }
+  if (held) SetCapture(controller);
+  sendWindowDragMotion(!held);
+  if (held && !windowDrag.moveAttempted && windowDrag.attached)
+    PostMessageW(controller, StartWindowDragMove, 0, 0);
 }
 uint32_t linuxKey(LPARAM param, UINT virtualKey = 0) {
   uint32_t code = (param >> 16) & 0xff;
@@ -1791,8 +1875,13 @@ void sendColorMode(RemoteWindow *w) {
               {"color_space", active ? "bt2020_pq" : "bt709_sdr"}});
   }
 }
-void sendResize(RemoteWindow *w) {
-  sendColorMode(w);
+void sendResize(RemoteWindow *w, bool coalesceMove) {
+  if (!coalesceMove && w->moveViewportPending) {
+    KillTimer(w->hwnd, MoveViewportTimer);
+    w->moveViewportPending = false;
+  }
+  if (!coalesceMove)
+    sendColorMode(w);
   if (w->popup || IsIconic(w->hwnd) ||
       (semanticsNegotiated && (!w->state.metadataReady || w->state.applying)))
     return;
@@ -1801,7 +1890,8 @@ void sendResize(RemoteWindow *w) {
   bool maximized = !w->state.fullscreen && IsZoomed(w->hwnd) != FALSE;
   MONITORINFO monitor{};
   monitor.cbSize = sizeof(monitor);
-  GetMonitorInfoW(MonitorFromWindow(w->hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
+  HMONITOR display = MonitorFromWindow(w->hwnd, MONITOR_DEFAULTTONEAREST);
+  GetMonitorInfoW(display, &monitor);
   int workWidth = monitor.rcWork.right - monitor.rcWork.left,
       workHeight = monitor.rcWork.bottom - monitor.rcWork.top;
   int monitorWidth = monitor.rcMonitor.right - monitor.rcMonitor.left,
@@ -1815,11 +1905,29 @@ void sendResize(RemoteWindow *w) {
       w->lastMaximized != maximized || w->lastDpi != w->dpi ||
       (semanticsNegotiated && (w->state.lastFullscreen != w->state.fullscreen ||
                                w->state.lastFullscreenEpoch != w->state.fullscreenEpoch));
+  bool displayChanged = w->lastViewportMonitor != display || w->lastWorkWidth != workWidth ||
+                        w->lastWorkHeight != workHeight || w->lastMonitorWidth != monitorWidth ||
+                        w->lastMonitorHeight != monitorHeight;
   if (rect.right <= 0 || rect.bottom <= 0 ||
-      (!resized && w->lastWorkWidth == workWidth && w->lastWorkHeight == workHeight &&
-       w->lastMonitorWidth == monitorWidth && w->lastMonitorHeight == monitorHeight &&
-       w->lastWorkX == workX && w->lastWorkY == workY))
+      (!resized && !displayChanged && w->lastWorkX == workX && w->lastWorkY == workY))
     return;
+  if (coalesceMove && !resized && !displayChanged) {
+    // Only defer same-monitor work-area offsets. The window and its popups
+    // move immediately, and the trailing timer samples their latest position.
+    if (w->moveViewportPending || SetTimer(w->hwnd, MoveViewportTimer, MoveViewportIntervalMs, nullptr)) {
+      w->moveViewportPending = true;
+      return;
+    }
+  }
+  if (coalesceMove) {
+    if (w->moveViewportPending) {
+      KillTimer(w->hwnd, MoveViewportTimer);
+      w->moveViewportPending = false;
+    }
+    if (resized || displayChanged)
+      sendColorMode(w);
+  }
+  w->lastViewportMonitor = display;
   w->lastWorkX = workX;
   w->lastWorkY = workY;
   w->lastResizeWidth = rect.right;
@@ -2165,6 +2273,57 @@ bool touchOleMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
   }
   return true;
 }
+void tryTouchMove(const NativeTouch::InteractionSample &sample) {
+  if (touchMove.attempted == sample.operation || touchMove.systemWindow ||
+      sample.hwnd != sample.rootWindow || GetForegroundWindow() != sample.hwnd)
+    return;
+  auto active = nativeTouch.activeInteraction();
+  if (!active || active->operation != sample.operation || !nativeTouch.ownsPointer(sample.pointerId))
+    return;
+  touchMove.promotion.reset();
+  touchMove.attempted = sample.operation;
+  touchMove.deadline = GetTickCount64() + 250;
+  // Conversion must happen inside the live pointer message. The system may
+  // reenter here to deliver its first promoted mouse message.
+  auto result = touchMove.promotion.promote(sample.hwnd, sample.pointerId);
+  if (clientStats.enabled)
+    std::cout << "Touch move promotion " << TouchOle::name(result.code) << " error=" << result.error << std::endl;
+  if (!result.promoted())
+    touchMove.deadline = 0;
+}
+bool touchMoveMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
+  if ((message != WM_LBUTTONDOWN && message != WM_MOUSEMOVE) || touchMove.systemWindow ||
+      !touchMove.deadline || GetTickCount64() >= touchMove.deadline ||
+      GetForegroundWindow() != hwnd || !touchMove.promotion.active(hwnd))
+    return false;
+  auto held = nativeTouch.activeInteraction();
+  if (!held || held->kind != "move" || held->operation != touchMove.attempted ||
+      held->pointerId != touchMove.promotion.pointerId() ||
+      !touchMove.promotion.takeMouseReady(hwnd, message, keys, extra))
+    return false;
+  touchMove.deadline = 0;
+  if (!nativeTouch.systemMove(held->operation, true))
+    return true;
+  touchMove.systemWindow = hwnd;
+  touchMove.entered = false;
+  LPARAM screen = GetMessagePos();
+  touchWindow.update({GET_X_LPARAM(screen), GET_Y_LPARAM(screen)});
+  if (auto active = nativeTouch.activeInteraction();
+      active && active->operation == held->operation && GetForegroundWindow() == hwnd) {
+    // This is the handler for the real OS-promoted mouse message. Windows owns
+    // capture and Snap inside its synchronous caption move loop.
+    DefWindowProcW(hwnd, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, screen);
+  }
+  if (clientStats.enabled)
+    std::cout << "Touch move system loop " << (touchMove.entered ? "entered" : "declined") << std::endl;
+  if (touchMove.entered)
+    nativeTouch.finishSystemMove(held->operation);
+  else
+    nativeTouch.systemMove(held->operation, false);
+  touchMove.systemWindow = nullptr;
+  touchMove.promotion.reset();
+  return true;
+}
 void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
   auto found = windows.find(sample.id);
   RemoteWindow *source = found == windows.end() ? nullptr : found->second.get();
@@ -2176,6 +2335,7 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
         auto cancel = sample; cancel.phase = "cancel"; sendJson(touchInteractionInput(cancel));
         nativeTouch.endInteraction(sample.operation); return;
       }
+      if (sample.kind == "move" && !touchMove.systemWindow) touchMove.attempted = 0;
       source->sizing = true;
       if (!touchWindow.begin(source->hwnd,sample.kind,sample.edge,sample.initialWindow,
                              sample.initialScreen,sample.screen)) {
@@ -2197,9 +2357,12 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
         0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
     }
   }
-  if (manipulating && (sample.phase == "motion" || sample.phase == "up"))
+  if (manipulating && !sample.systemMove && (sample.phase == "motion" || sample.phase == "up"))
     touchWindow.update(sample.screen);
-  if (sample.phase != "end" && (!sample.external || sample.phase == "cancel" || sample.phase == "up"))
+  if (sample.kind == "move" && sample.phase == "motion" && !sample.systemMove)
+    tryTouchMove(sample);
+  if ((sample.phase == "motion" && sample.kind == "dnd" && !sample.external) ||
+      sample.phase == "cancel" || sample.phase == "up")
     sendJson(touchInteractionInput(sample));
   if (sample.phase == "up" && sample.external) {
     auto transfer=FileDrag::current();
@@ -2218,9 +2381,26 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
     if (sample.phase != "up" || !sample.external) resetTouchOle(sample.operation);
     if (manipulating) {
       touchWindow.end();
-      if (source) { source->sizing=false; KillTimer(source->hwnd,1); sendResize(source); }
+      if (sample.kind == "move" && touchMove.attempted == sample.operation) {
+        touchMove.deadline = 0;
+        touchMove.promotion.reset();
+        if (sample.phase != "up" && touchMove.systemWindow == sample.rootWindow &&
+            GetCapture() == sample.rootWindow)
+          DefWindowProcW(sample.rootWindow, WM_CANCELMODE, 0, 0);
+      }
+      // Native loop exit already sends the final geometry, including Snap.
+      if (source && !(sample.systemMove && touchMove.entered)) {
+        source->sizing=false; KillTimer(source->hwnd,1); sendResize(source);
+      }
     }
   }
+}
+
+bool allowsTouchpad(const RemoteWindow *w) {
+  return touchpadNegotiated && !hostedReadOnly && !w->popup && w->shown &&
+         GetForegroundWindow() == w->hwnd && !w->sizing && !grabbedRoot &&
+         !windowDrag.active && !relativeInput.active() && !FileDrag::ownsInput() &&
+         !nativeTouch.ownsInteraction(w->hwnd) && !nativePen.ownsWindowInteraction(w->hwnd);
 }
 
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
@@ -2237,6 +2417,21 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   }
   if (!w)
     return DefWindowProcW(hwnd, message, wp, lp);
+  if (message == DM_POINTERHITTEST && allowsTouchpad(w)) {
+    POINT position{};
+    RECT image = imageRect(w);
+    if (GetCursorPos(&position) && ScreenToClient(hwnd, &position) && PtInRect(&image, position) &&
+        nativeTouchpad.hit(hwnd, wp, w->dpi)) {
+      // Establish Wayland pointer focus before sending the first gesture.
+      pointer(w, MAKELPARAM(position.x,position.y));
+      return 0;
+    }
+  }
+  if (message == WM_TIMER && wp == NativeTouchpad::Timer) {
+    nativeTouchpad.tick(hwnd,allowsTouchpad(w));
+    return 0;
+  }
+  if (touchMoveMouse(hwnd, message, wp, ULONG_PTR(GetMessageExtraInfo()))) return 0;
   if (touchOleMouse(hwnd,message,wp,ULONG_PTR(GetMessageExtraInfo()))) return 0;
   if ((message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) &&
       nativePenFor(w) && nativePen.promotedMouse(hwnd,ULONG_PTR(GetMessageExtraInfo()))) return 0;
@@ -2303,6 +2498,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       releasePointer();
     break;
   case WM_CANCELMODE:
+    nativeTouchpad.cancel(hwnd);
     nativePen.cancel(hwnd);
     nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
@@ -2323,6 +2519,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       w->state.clamp(hwnd, w->dpi, w->clientDecorated, reinterpret_cast<WINDOWPOS *>(lp));
     break;
   case WM_SHOWWINDOW:
+    if (!wp) nativeTouchpad.detach(hwnd);
     if (!wp) { nativePen.cancel(hwnd); nativeTouch.cancel(hwnd); }
     sendWindowState(w);
     break;
@@ -2358,10 +2555,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       for (auto &[id, popup] : windows)
         if (popup->popup && popup->root == w->id)
           positionPopup(popup.get());
-      // DefWindowProc dispatches WM_SIZE after this message. Let WM_SIZE
-      // coalesce drag sizes; movement alone still updates popup constraints.
-      if (reinterpret_cast<WINDOWPOS *>(lp)->flags & SWP_NOSIZE)
-        sendResize(w);
+      // DefWindowProc dispatches WM_SIZE for a size change. For pure movement
+      // keep the local window responsive and coalesce remote viewport updates.
+      auto flags = reinterpret_cast<WINDOWPOS *>(lp)->flags;
+      if (flags & SWP_NOSIZE)
+        sendResize(w, w->sizing && !(flags & SWP_NOMOVE));
     }
     break;
   case WM_GETMINMAXINFO: {
@@ -2413,7 +2611,20 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     return semanticsNegotiated && !acceptsInput(w, lp) ? HTTRANSPARENT : HTCLIENT;
   case WM_ENTERSIZEMOVE:
+    if (windowDragMove.hwnd == hwnd) {
+      windowDragMove.entered = true;
+      w->sizing = true;
+      return 0;
+    }
+    nativeTouchpad.cancel(hwnd);
     nativePen.cancel(hwnd);
+    if (touchMove.systemWindow == hwnd) {
+      auto active = nativeTouch.activeInteraction();
+      if (active && active->operation == touchMove.attempted && active->systemMove) {
+        touchMove.entered = true;
+        return 0;
+      }
+    }
     nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
       releasePointer();
@@ -2427,6 +2638,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_DESTROY:
+    nativeTouchpad.detach(hwnd);
     nativePen.cancel(hwnd);
     nativeTouch.cancel(hwnd);
     ApplicationIdentity::clear(hwnd);
@@ -2475,9 +2687,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     if (w->popup)
       return 0;
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", true}});
+    if (touchpadNegotiated) nativeTouchpad.focus(hwnd,w->id);
     updateIme();
     return 0;
   case WM_KILLFOCUS:
+    nativeTouchpad.detach(hwnd);
     nativePen.cancel(); nativeGamepads.focus(0);
     if (auto owner = nativeTouch.activeInteraction(); !owner || owner->kind != "dnd") nativeTouch.cancel();
     if (relativeInput.active(hwnd))
@@ -2490,10 +2704,6 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     DestroyCaret();
     sendJson({{"type", "focus"}, {"id", w->id}, {"focused", false}});
     return 0;
-  case WM_MOVE:
-    if (!w->popup)
-      sendColorMode(w);
-    break;
   case WM_IME_SETCONTEXT:
     return DefWindowProcW(hwnd, message, wp,
                          w->ime.enabled ? lp & ~ISC_SHOWUICOMPOSITIONWINDOW : lp);
@@ -2602,8 +2812,9 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     sendResize(w);
     return 0;
   case WM_DPICHANGED: {
+    nativeTouchpad.cancel(hwnd);
     nativePen.cancel(hwnd);
-    nativeTouch.cancel(hwnd);
+    if (touchMove.systemWindow != hwnd) nativeTouch.cancel(hwnd);
     if (w->popup) {
       positionPopup(w);
       return 0;
@@ -2629,6 +2840,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   }
   case WM_SIZE:
+    nativeTouchpad.resize(hwnd);
     if (!nativePen.ownsWindowInteraction(hwnd)) nativePen.cancel(hwnd);
     if (!nativeTouch.ownsInteraction(hwnd)) nativeTouch.cancel(hwnd);
     sendWindowState(w);
@@ -2647,9 +2859,17 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     updateIme();
     return 0;
   case WM_TIMER:
-    KillTimer(hwnd, 1);
-    sendResize(w);
-    return 0;
+    if (wp == MoveViewportTimer) {
+      if (w->moveViewportPending)
+        sendResize(w);
+      return 0;
+    }
+    if (wp == 1) {
+      KillTimer(hwnd, 1);
+      sendResize(w);
+      return 0;
+    }
+    break;
   case WM_MOUSEMOVE:
     if (windowDrag.active) { sendWindowDragMotion(); return 0; }
     if (relativeInput.active(hwnd))
@@ -2806,6 +3026,7 @@ void destroyRemote(uint32_t id) {
   auto found = windows.find(id);
   if (found == windows.end())
     return;
+  if (windowDragMove.hwnd == found->second->hwnd) stopWindowDragMove();
   found->second->dropLifetime.reset();
   if (grabbedRoot == id)
     setPopupGrab(id, false);
@@ -2873,6 +3094,7 @@ void dispatchNetwork() {
       nativeGamepads.configure(gamepadNegotiated,hostedGamepads,hostedGamepadRumble,hostedGamepadDeadzone);
       pollGamepads();
       touchNegotiated = m.value("touch_v1",false);
+      touchpadNegotiated = nativeTouchpad.available() && m.value("touchpad_v1",false);
       touchSettingsNegotiated = touchNegotiated && m.value("touch_settings_v1",false);
       touchInteractionNegotiated = touchNegotiated && m.value("touch_interaction_v1",false);
       nativeTouch.hello(touchNegotiated);
@@ -2937,7 +3159,12 @@ void dispatchNetwork() {
         SetTimer(controller, WindowDragTimer, 10, nullptr);
       }
       windowDrag.source = m.value("source", 0u);
-      windowDrag.attached = m.value("id", 0u);
+      auto attached = m.value("id", 0u);
+      if (windowDrag.attached != attached) {
+        windowDrag.attached = attached;
+        windowDrag.moveAttempted = false;
+        stopWindowDragMove();
+      }
       windowDrag.offsetX = m.value("offset_x", 0);
       windowDrag.offsetY = m.value("offset_y", 0);
       sendWindowDragMotion(!(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
@@ -2966,6 +3193,7 @@ void dispatchNetwork() {
       w->state.mapped = m.value("mapped", true);
       w->state.stateSent = false;
       if (!w->state.mapped) {
+        if (windowDragMove.hwnd == w->hwnd) stopWindowDragMove();
         nativeActivation.closed(w->id);
         // Unmapping usually precedes destruction. Re-enable and restore the
         // owner before hiding its foreground modal, while we still own focus.
@@ -3339,6 +3567,9 @@ void dispatchNetwork() {
     }
   }
   moveDraggedWindow();
+  if (windowDrag.active && !windowDrag.touch && !windowDrag.released && windowDrag.attached &&
+      !windowDrag.moveAttempted && !windowDragMove.hwnd)
+    PostMessageW(controller, StartWindowDragMove, 0, 0);
   updateIme();
 }
 void sendStreamConfiguration() {
@@ -3543,13 +3774,17 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       }
       return 0;
     }
+    if (message == StartWindowDragMove) {
+      startWindowDragMove();
+      return 0;
+    }
     if (windowDrag.active) {
       if (message == WM_MOUSEMOVE) { sendWindowDragMotion(); return 0; }
       if (message == WM_LBUTTONUP) { sendWindowDragMotion(true); return 0; }
       if (message == WM_CANCELMODE || (message == WM_CAPTURECHANGED && reinterpret_cast<HWND>(lp) != hwnd)) {
         // OLE deliberately releases capture while retaining the original
         // Wayland source. Its QueryContinueDrag/result owns cancellation now.
-        if (!FileDrag::ownsInput()) cancelWindowDrag();
+        if (!windowDragMove.hwnd && !FileDrag::ownsInput()) cancelWindowDrag();
         return 0;
       }
       if (message == WM_TIMER && wp == WindowDragTimer) {
@@ -3570,6 +3805,11 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     if (message == FileDrag::StartMessage) {
       if (auto transfer=FileDrag::current(); transfer && transfer->touchOperation) return 0;
+      if (windowDragMove.hwnd) {
+        windowDragMove.startFileDrag = true;
+        stopWindowDragMove();
+        return 0;
+      }
       if (FileDrag::ownsInput()) {
         releasePointer();
         suspendImeForOle();
@@ -3603,7 +3843,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       return 0;
     }
     if (message == WM_CLOSE) {
-      nativePen.cancel(); nativeGamepads.disconnect();
+      nativeTouch.cancel(); nativePen.cancel(); nativeGamepads.disconnect();
       TextDrag::reset();
       dragVisual.reset();
       remoteTray.clear();
@@ -3716,6 +3956,7 @@ int wmain(int argc, wchar_t **argv) {
   if (Gdiplus::GdiplusStartup(&gdiplus, &startup, nullptr) != Gdiplus::Ok)
     return 1;
   OleInitialize(nullptr);
+  nativeTouchpad.initialize();
   bool audioSupported = AudioPlayback::supported();
   bool mfStarted = MediaFoundation::get().available() &&
                    SUCCEEDED(MediaFoundation::get().Startup(MF_VERSION, MFSTARTUP_FULL));
@@ -3865,6 +4106,7 @@ int wmain(int argc, wchar_t **argv) {
             {"pen_v1", true}, {"pen_enabled",hostedPen},
             {"gamepad_v1", true}, {"gamepad_enabled",hostedGamepads},
             {"touch_v1", true},
+            {"touchpad_v1", nativeTouchpad.available()},
             {"touch_enabled", hostedTouch},
             {"touch_interaction_v1", true},
             {"pointer_lock", true},
@@ -3891,6 +4133,7 @@ int wmain(int argc, wchar_t **argv) {
   windowDrag.cancelled = true;
   endWindowDrag();
   releasePointer(false);
+  nativeTouchpad.shutdown();
   nativePen.cancel(nullptr,false); nativeGamepads.disconnect();
   nativeTouch.cancel(nullptr,false);
   running = false;

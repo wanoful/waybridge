@@ -179,6 +179,32 @@ int main(int argc, char **argv) {
                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
       return 0;
     }
+    if (mode == "move-burst") {
+      const auto move = [&](int x, int y) {
+        require(SetWindowPos(hwnd, nullptr, x, y, 0, 0,
+                             SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER) != FALSE,
+                "move-burst placement");
+      };
+      const auto origin = [&]() {
+        POINT p{};
+        require(ClientToScreen(hwnd, &p) != FALSE, "move-burst client origin");
+        return Json::array({p.x, p.y});
+      };
+      // Drive the production window's position-change messages without system
+      // pointer input. The caller runs this only in a private Wine desktop.
+      SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+      for (int i = 0; i < 48; ++i) {
+        move(450 + 5 * i, 320 + 3 * i);
+        Sleep(2);
+      }
+      auto paused = origin();
+      Sleep(100); // Pending viewport must arrive even while the drag remains held.
+      move(800, 480);
+      auto released = origin();
+      SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+      std::cout << Json::array({paused, released}).dump() << '\n';
+      return 0;
+    }
     if (mode == "pixel") {
       require(argc > 4, "pixel id x y");
       SetForegroundWindow(hwnd);

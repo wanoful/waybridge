@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check actual viewer monitor metadata across fullscreen on private Wine/Xvfb."""
+"""Check viewer monitor metadata and interactive placement on private Wine/Xvfb."""
 import json
 import os
 from pathlib import Path
@@ -12,6 +12,11 @@ from smoke import ROOT
 
 
 def main():
+    probe = ROOT/'build/tests/windows-viewport-probe.exe'
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['x86_64-w64-mingw32-g++', '-std=c++17', '-static', '-O2', '-DUNICODE', '-D_UNICODE',
+                    '-DWINVER=0x0A00', '-D_WIN32_WINNT=0x0A00', '-Iclient',
+                    'tests/windows_semantics_probe.cpp', '-o', str(probe), '-lgdi32'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='waybridge-monitor-') as directory, (ROOT/'build/tests/windows-monitor.log').open('w') as log:
         env = {**os.environ, 'WINEPREFIX': str(Path(directory)/'wine'), 'WINEDEBUG': '-all',
                'WINEDLLOVERRIDES': 'winemenubuilder.exe=d;mscoree,mshtml=',
@@ -58,9 +63,30 @@ def main():
                     hello = receive()
                     assert hello['type'] == 'hello' and (hello['monitor_width'],hello['monitor_height']) == (2560,1600)
                     send(type='hello', version=3, codec='mixed', window_semantics_v1=True)
-                    send(type='window', id=1, title='Waybridge monitor fixture', width=500, height=300,
+                    send(type='window', id=1, title='Waybridge semantics 1', width=500, height=300,
                          decoration='client', fullscreen=False, fullscreen_epoch=0)
                     normal = resize(False,0)
+                    paused, released = json.loads(subprocess.check_output(
+                        ['wine', str(probe), 'move-burst', '1'], env=env, text=True, timeout=10))
+                    dpi = normal['dpi']
+                    def work_offset(client_origin):
+                        # Xvfb's work area starts at (0, 0). MulDiv rounds to nearest.
+                        return tuple(-((coordinate * 96 + dpi // 2) // dpi) for coordinate in client_origin)
+                    final = work_offset(released)
+                    moves = []
+                    deadline = time.monotonic()+5
+                    while time.monotonic() < deadline:
+                        message = receive()
+                        if message['type'] != 'viewport':
+                            continue
+                        xy = message['work_x'], message['work_y']
+                        moves.append(xy)
+                        if xy == final:
+                            break
+                    assert moves and moves[-1] == final, moves
+                    assert work_offset(paused) in moves, moves
+                    assert len(moves) < 24, f'49 drag positions emitted {len(moves)} viewport updates'
+                    print(f'PASS: 49 placements coalesced into {len(moves)} viewport updates, including pause and release')
                     send(type='window_action', id=1, action='fullscreen', fullscreen_epoch=1)
                     full = resize(True,1)
                     assert (full['width'],full['height']) == (1463,914), full
