@@ -78,8 +78,8 @@ Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能
 | 键鼠与输入法 | 键盘、鼠标、滚轮、本地光标、微软拼音桥接 Wayland text-input-v3 | Qt 基础微软拼音场景有 WoA 实机记录；更多输入法、切换组合和 X11/XIM 未覆盖 |
 | 原生触控（实验） | Windows WM_POINTER → Wayland wl_touch，十点、分数缩放、代次及取消恢复；两端显式协商 | 按连接保存、实时开关与自动订阅检测，可选应用级鼠标兼容；窗口操作、弹窗与 Wayland 触控 DND 已接入，Windows 实机/OLE 待解锁验证；X11 原生触控未接入，见 INPUT_DEVICES.md |
 | 压感笔（实验） | Windows PT_PEN → tablet-v2；悬停、笔尖、有效压感/倾斜/旋转、侧键、橡皮擦和持笔窗口移动/缩放；设置实时应用 | 默认关闭，未订阅/X11 保持鼠标兼容；原生笔 DND 和实体硬件验收待完成，见 [PEN.md](PEN.md) |
-| 游戏手柄（实验） | 最多四个 XInput 手柄 → Linux uinput；按钮、摇杆、扳机、方向键、热插拔、死区和双电机震动；失焦释放 | 默认关闭，需可访问 uinput；焦点变化重建设备可能改变玩家索引，实体 Windows/SDL/Steam 待验，见 [GAMEPADS.md](GAMEPADS.md) |
-| 游戏鼠标 | Raw Input 相对位移、指针锁定、隐藏与裁剪、失焦释放、紧急解锁 | 尚无 confined-pointer；手柄当前仅覆盖 XInput 标准布局；实际游戏兼容性须按游戏验收 |
+| 游戏手柄（实验） | 最多四个 SDL3 识别的手柄 → Linux uinput；按钮、摇杆、扳机、方向键、热插拔、死区和双电机震动；失焦释放 | 默认关闭，需可访问 uinput；焦点变化重建设备可能改变玩家索引，实体 Windows/SDL/Steam 待验，见 [GAMEPADS.md](GAMEPADS.md) |
+| 游戏鼠标 | Raw Input 相对位移、指针锁定、隐藏与裁剪、失焦释放、紧急解锁 | 尚无 confined-pointer；手柄当前转发标准游戏手柄布局；实际游戏兼容性须按游戏验收 |
 | 剪贴板 | 双向文本、PNG、文件和目录；方向与图片、文件共享开关 | HTML/RTF 等富文本未实现；应用私有剪贴板格式不跨平台转换 |
 | 文件传输与拖放 | 双向文件和目录、Windows 虚拟文件导入、Linux 按需虚拟文件拖出、完成活动与接收目录入口；外部只读 URI 可交付至 Xwayland 目标 | 跨设备只 COPY，原 Linux 会话内保留 COPY/MOVE；只读输入与可写独立副本已实现；GUI 无逐文件进度、暂停、续传和统一取消；Wayland/X11 混合后端已接入，真实应用矩阵仍待扩展 |
 | 文字拖放及反馈 | Windows Unicode 与 Wayland/X11 UTF-8 双向 COPY、原会话跨 HWND 拖放与 OLE 返回、源提供的透明动画虚影 | HTML/RTF/图像拖放、X11 专用虚影和文件 hover 尚未覆盖；具体方向与限制见 DESKTOP_INTERACTIONS.md |

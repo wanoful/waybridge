@@ -16,5 +16,7 @@ try {
     Copy-Item 'docs/*.md' "$Output/docs/"
     Copy-Item 'scripts/Diagnose-Startup.ps1', 'scripts/Diagnose-Startup.cmd' $Output
     Copy-Item LICENSE "$Output/LICENSE-Waybridge.txt"
+    New-Item -ItemType Directory -Force "$Output/licenses" | Out-Null
+    Copy-Item "$Native/SDL3-LICENSE.txt" "$Output/licenses/"
     Write-Host "Built $Output/Waybridge.Control.exe"
 } finally { Pop-Location }

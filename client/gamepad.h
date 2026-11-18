@@ -1,100 +1,152 @@
 #pragma once
 #include <windows.h>
 #include <xinput.h>
+#include <SDL3/SDL_gamepad.h>
+#include <SDL3/SDL_init.h>
 #include "third_party/json.hpp"
 #include "xbox_bluetooth.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
+#include <utility>
 
-// Controller-thread XInput adapter. It never calls XInputEnable (which changes
-// process-wide reporting), and does not poll an unfocused/background session.
-// The optional API pair is for the deterministic device-free probe only.
+// SDL owns physical device discovery, mapping and feedback. Waybridge owns the
+// foreground lease, protocol slots and the lifetime of remote input.
 class NativeGamepad {
 public:
   using Json = nlohmann::json;
-  using GetState = DWORD(WINAPI *)(DWORD, XINPUT_STATE *);
-  using SetState = DWORD(WINAPI *)(DWORD, XINPUT_VIBRATION *);
-  using GetCapabilities = DWORD(WINAPI *)(DWORD, DWORD, XINPUT_CAPABILITIES *);
 
 private:
   struct Slot {
-    bool connected = false, sent = false, motorOwned = false;
+    SDL_JoystickID instance = 0;
+    SDL_Gamepad *controller = nullptr;
+    bool sent = false, rumbleCapable = false, motorOwned = false;
     uint64_t incarnation = 0, sequence = 0;
-    ULONGLONG nextProbe = 0, motorDeadline = 0;
+    ULONGLONG retryAfter = 0, motorDeadline = 0;
     XINPUT_GAMEPAD last{};
   };
-  HMODULE library = nullptr;
-  GetState get = nullptr;
-  SetState set = nullptr;
-  GetCapabilities capabilities = nullptr;
-  XboxBluetoothGamepad bluetooth;
-  std::wstring bluetoothPath;
-  bool mocked = false, bluetoothReadFailed = false;
   std::function<void(const Json &)> emit;
   std::array<Slot, 4> slots{};
-  bool negotiated = false, requested = false, rumble = true;
+  XboxBluetoothGamepad bluetooth;
+  std::wstring bluetoothPath;
+  bool initialized = false, negotiated = false, requested = false, rumble = true;
   bool serverSupported = false, leaseEnabled = false, haveState = false;
   int deadzone = 15;
   uint32_t focusId = 0, leaseId = 0;
   uint64_t generation = 0;
-  ULONGLONG nextPoll = 0;
-  ULONGLONG nextInventory = 0;
+  ULONGLONG nextPoll = 0, nextInventory = 0;
   int localCount = -1;
-  std::string backend, error;
+  std::string serverError, localError;
   Json serverDevices = Json::array();
+
   void send(const Json &message) {
-    if (emit)
-      emit(message);
+    if (emit) emit(message);
   }
+  bool supported() const { return !requested || initialized || !bluetoothPath.empty(); }
   bool active() const {
     return negotiated && requested && supported() && serverSupported && leaseEnabled && focusId &&
            leaseId == focusId && generation;
   }
-  void stopMotor(DWORD slot) {
+  void packet(size_t slot, bool connected, const XINPUT_GAMEPAD &sample) {
     auto &device = slots[slot];
-    if (device.motorOwned && set) {
-      XINPUT_VIBRATION zero{};
-      set(slot, &zero);
-    }
+    send({{"type", "gamepad"}, {"generation", generation}, {"id", leaseId}, {"slot", slot},
+          {"device_generation", device.incarnation}, {"sequence", ++device.sequence},
+          {"connected", connected}, {"buttons", sample.wButtons}, {"lx", sample.sThumbLX},
+          {"ly", sample.sThumbLY}, {"rx", sample.sThumbRX}, {"ry", sample.sThumbRY},
+          {"lt", sample.bLeftTrigger}, {"rt", sample.bRightTrigger}});
+  }
+  static void stopMotor(Slot &device) {
+    if (device.motorOwned && device.controller)
+      SDL_RumbleGamepad(device.controller, 0, 0, 0);
     device.motorOwned = false;
     device.motorDeadline = 0;
   }
-  void packet(DWORD slot, bool connected, const XINPUT_GAMEPAD &sample) {
+  void closeSlot(size_t slot, bool notify) {
     auto &device = slots[slot];
-    send({{"type", "gamepad"},
-          {"generation", generation},
-          {"id", leaseId},
-          {"slot", slot},
-          {"device_generation", device.incarnation},
-          {"sequence", ++device.sequence},
-          {"connected", connected},
-          {"buttons", sample.wButtons},
-          {"lx", sample.sThumbLX},
-          {"ly", sample.sThumbLY},
-          {"rx", sample.sThumbRX},
-          {"ry", sample.sThumbRY},
-          {"lt", sample.bLeftTrigger},
-          {"rt", sample.bRightTrigger}});
+    if (notify && device.sent && generation && leaseId) packet(slot, false, {});
+    stopMotor(device);
+    if (device.controller) SDL_CloseGamepad(device.controller);
+    device.controller = nullptr;
+    device.sent = device.rumbleCapable = false;
+    device.retryAfter = device.sequence = 0;
   }
-  void reset(bool notify) {
+  void releaseInput(bool notify) {
     bluetooth.close();
-    bluetoothReadFailed = false;
-    for (DWORD i = 0; i < slots.size(); ++i) {
-      auto &device = slots[i];
-      if (notify && device.connected && device.sent && generation && leaseId)
-        packet(i, false, {});
-      stopMotor(i);
-      device.connected = device.sent = false;
-      device.last = {};
-      device.nextProbe = 0;
-      device.sequence = 0;
-    }
+    for (size_t i = 0; i < slots.size(); ++i) closeSlot(i, notify);
     nextPoll = 0;
+  }
+  void stopDiscovery(bool notify) {
+    releaseInput(notify);
+    for (auto &device : slots) device.instance = 0;
+    bluetoothPath.clear();
+    if (initialized) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+    initialized = false;
+    nextInventory = 0;
+    localCount = -1;
+    localError.clear();
+  }
+  void refreshDevices() {
+    int count = 0;
+    std::unique_ptr<SDL_JoystickID, decltype(&SDL_free)> instances(
+        initialized ? SDL_GetGamepads(&count) : nullptr, SDL_free);
+    if (initialized && !instances) {
+      localError = "无法枚举 SDL 手柄：" + std::string(SDL_GetError());
+      return;
+    }
+    if (initialized) localError.clear();
+    const auto *first = instances.get();
+    for (size_t i = 0; i < slots.size(); ++i) {
+      auto &device = slots[i];
+      if (device.instance && (!count || std::find(first, first + count, device.instance) == first + count)) {
+        closeSlot(i, true);
+        device.instance = 0;
+      }
+    }
+    // Keep the existing single-device fallback until SDL can be checked with
+    // the affected physical controller. Never enumerate it alongside SDL pads.
+    auto path = count == 0 ? XboxBluetoothGamepad::find() : std::wstring{};
+    if (path != bluetoothPath) {
+      bluetooth.close();
+      closeSlot(0, true);
+      bluetoothPath = std::move(path);
+    }
+    localCount = count > 0 ? std::min(count, int(slots.size())) : (!bluetoothPath.empty() ? 1 : 0);
+    for (int n = 0; n < count; ++n) {
+      const auto id = first[n];
+      if (std::any_of(slots.begin(), slots.end(), [&](const Slot &s) { return s.instance == id; })) continue;
+      auto vacant = std::find_if(slots.begin(), slots.end(), [](const Slot &s) { return !s.instance; });
+      if (vacant == slots.end()) break;
+      vacant->instance = id;
+    }
+  }
+  static XINPUT_GAMEPAD sample(SDL_Gamepad *controller) {
+    // The v1 wire uses Xbox button masks and positive-up stick coordinates.
+    static constexpr std::pair<SDL_GamepadButton, WORD> buttons[] = {
+      {SDL_GAMEPAD_BUTTON_SOUTH, XINPUT_GAMEPAD_A}, {SDL_GAMEPAD_BUTTON_EAST, XINPUT_GAMEPAD_B},
+      {SDL_GAMEPAD_BUTTON_WEST, XINPUT_GAMEPAD_X}, {SDL_GAMEPAD_BUTTON_NORTH, XINPUT_GAMEPAD_Y},
+      {SDL_GAMEPAD_BUTTON_BACK, XINPUT_GAMEPAD_BACK}, {SDL_GAMEPAD_BUTTON_START, XINPUT_GAMEPAD_START},
+      {SDL_GAMEPAD_BUTTON_LEFT_STICK, XINPUT_GAMEPAD_LEFT_THUMB},
+      {SDL_GAMEPAD_BUTTON_RIGHT_STICK, XINPUT_GAMEPAD_RIGHT_THUMB},
+      {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER},
+      {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER},
+      {SDL_GAMEPAD_BUTTON_DPAD_UP, XINPUT_GAMEPAD_DPAD_UP},
+      {SDL_GAMEPAD_BUTTON_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_DOWN},
+      {SDL_GAMEPAD_BUTTON_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_LEFT},
+      {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_RIGHT},
+    };
+    WORD mask = 0;
+    for (auto [button, flag] : buttons)
+      if (SDL_GetGamepadButton(controller, button)) mask |= flag;
+    auto axis = [controller](SDL_GamepadAxis a) { return SDL_GetGamepadAxis(controller, a); };
+    auto up = [](Sint16 value) { return SHORT(std::min(32767, -int(value))); };
+    auto trigger = [](Sint16 value) { return BYTE((std::max(0, int(value)) * 255 + 16383) / 32767); };
+    return {mask, trigger(axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER)), trigger(axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)),
+            axis(SDL_GAMEPAD_AXIS_LEFTX), up(axis(SDL_GAMEPAD_AXIS_LEFTY)),
+            axis(SDL_GAMEPAD_AXIS_RIGHTX), up(axis(SDL_GAMEPAD_AXIS_RIGHTY))};
   }
   static bool same(const XINPUT_GAMEPAD &a, const XINPUT_GAMEPAD &b) {
     return a.wButtons == b.wButtons && a.bLeftTrigger == b.bLeftTrigger &&
@@ -109,7 +161,7 @@ private:
       x = y = 0;
       return;
     }
-    double scaled = ((std::min)(1.0, magnitude) - threshold) / (1.0 - threshold);
+    double scaled = (std::min(1.0, magnitude) - threshold) / (1.0 - threshold);
     nx = nx / magnitude * scaled;
     ny = ny / magnitude * scaled;
     x = SHORT(std::clamp(std::lround(nx * (nx < 0 ? 32768.0 : 32767.0)), -32768l, 32767l));
@@ -119,199 +171,148 @@ private:
     int threshold = 255 * percent / 100;
     return value <= threshold ? 0 : BYTE((int(value) - threshold) * 255 / (255 - threshold));
   }
-  template <class T> static T address(HMODULE module, const char *name) {
-    auto raw = GetProcAddress(module, name);
-    T result = nullptr;
-    static_assert(sizeof(raw) == sizeof(result));
-    std::memcpy(&result, &raw, sizeof(result));
-    return result;
-  }
-
-  void inventory(ULONGLONG now) {
-    if (!negotiated || !requested || now < nextInventory)
+  void forward(size_t slot, XINPUT_GAMEPAD raw) {
+    auto &device = slots[slot];
+    const auto state = filtered(raw, deadzone);
+    if (!device.sent) {
+      if (!++device.incarnation) ++device.incarnation;
+    } else if (same(state, device.last)) {
       return;
-    nextInventory = now + 500;
-    int count = get ? -1 : 0;
-    if (capabilities) {
-      count = 0;
-      for (DWORD i = 0; i < slots.size(); ++i) {
-        XINPUT_CAPABILITIES device{};
-        DWORD result = capabilities(i, XINPUT_FLAG_GAMEPAD, &device);
-        if (result == ERROR_SUCCESS)
-          ++count;
-        else if (result != ERROR_DEVICE_NOT_CONNECTED) {
-          count = -1;
-          break;
-        }
-      }
     }
-    // Use one backend at a time so a controller exposed through both paths
-    // cannot appear twice. Keep the normal XInput slots whenever present.
-    auto path = count == 0 && !mocked ? XboxBluetoothGamepad::find() : std::wstring{};
-    if (path != bluetoothPath) {
-      reset(true);
-      bluetoothPath = std::move(path);
-    }
-    localCount = bluetoothPath.empty() ? count : 1;
+    packet(slot, true, state);
+    device.last = state;
+    device.sent = true;
   }
 
 public:
-  explicit NativeGamepad(std::function<void(const Json &)> sender = {}, GetState mockGet = nullptr,
-                         SetState mockSet = nullptr, GetCapabilities mockCapabilities = nullptr)
-      : emit(std::move(sender)) {
-    if (mockGet || mockSet) {
-      mocked = true;
-      get = mockGet;
-      set = mockSet;
-      capabilities = mockCapabilities;
-      backend = "test-api";
-      return;
-    }
-    for (const wchar_t *name : {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"}) {
-      HMODULE module = LoadLibraryExW(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-      if (!module)
-        continue;
-      auto read = address<GetState>(module, "XInputGetState");
-      auto write = address<SetState>(module, "XInputSetState");
-      if (read && write) {
-        library = module;
-        get = read;
-        set = write;
-        capabilities = address<GetCapabilities>(module, "XInputGetCapabilities");
-        while (*name)
-          backend.push_back(char(*name++));
-        break;
-      }
-      FreeLibrary(module);
-    }
-  }
-  ~NativeGamepad() {
-    reset(false);
-    if (library)
-      FreeLibrary(library);
-  }
+  explicit NativeGamepad(std::function<void(const Json &)> sender = {}) : emit(std::move(sender)) {}
+  ~NativeGamepad() { stopDiscovery(false); }
   NativeGamepad(const NativeGamepad &) = delete;
   NativeGamepad &operator=(const NativeGamepad &) = delete;
-  bool supported() const { return (get && set) || !bluetoothPath.empty(); }
+
   void configure(bool capability, bool enabled, bool motors, int percent) {
-    bool changed = negotiated != capability || requested != enabled;
-    if (changed) {
-      reset(true);
-      bluetoothPath.clear();
-      nextInventory = 0;
-      localCount = -1;
-    }
-    if (rumble && !motors)
-      for (DWORD i = 0; i < slots.size(); ++i)
-        stopMotor(i);
-    int nextDeadzone = std::clamp(percent, 0, 50);
-    if (deadzone != nextDeadzone)
-      for (auto &device : slots)
-        device.sent = false;
-    bool newlyNegotiated = !negotiated && capability;
+    const bool newlyNegotiated = !negotiated && capability;
+    const bool changed = negotiated != capability || requested != enabled;
+    if (changed) stopDiscovery(true);
     negotiated = capability;
     requested = enabled;
+    if (changed && negotiated && requested) {
+      initialized = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+      if (initialized) {
+        SDL_SetGamepadEventsEnabled(false);
+        SDL_SetJoystickEventsEnabled(false);
+      } else {
+        localError = "无法初始化 SDL 手柄：" + std::string(SDL_GetError());
+      }
+    }
+    if (rumble && !motors)
+      for (auto &device : slots) stopMotor(device);
     rumble = motors;
-    deadzone = nextDeadzone;
-    if (newlyNegotiated && focusId)
-      send({{"type", "gamepad_focus"}, {"id", focusId}});
+    deadzone = std::clamp(percent, 0, 50);
+    if (newlyNegotiated && focusId) send({{"type", "gamepad_focus"}, {"id", focusId}});
   }
   void focus(uint32_t id) {
-    if (focusId == id)
-      return;
-    reset(true);
+    if (focusId == id) return;
+    releaseInput(true);
     focusId = id;
-    if (negotiated)
-      send({{"type", "gamepad_focus"}, {"id", id}});
+    if (negotiated) send({{"type", "gamepad_focus"}, {"id", id}});
   }
   void state(const Json &message) {
     if (!message.is_object() || !message.contains("generation") || !message.contains("id") ||
         !message.contains("enabled") || !message.contains("supported") ||
         !message["generation"].is_number_unsigned() || !message["id"].is_number_unsigned() ||
-        !message["enabled"].is_boolean() || !message["supported"].is_boolean())
-      return;
+        !message["enabled"].is_boolean() || !message["supported"].is_boolean()) return;
     uint64_t next = message["generation"].get<uint64_t>();
     uint64_t id = message["id"].get<uint64_t>();
-    if (!next || next < generation || id > UINT32_MAX)
-      return;
+    if (!next || next < generation || id > UINT32_MAX) return;
     bool enabled = message["enabled"].get<bool>();
-    if (next != generation || leaseId != id || !enabled)
-      reset(false);
+    bool supportedByServer = message["supported"].get<bool>();
+    if (next != generation || leaseId != id || !enabled || !supportedByServer) releaseInput(false);
     generation = next;
     leaseId = uint32_t(id);
     leaseEnabled = enabled;
-    serverSupported = message["supported"].get<bool>();
+    serverSupported = supportedByServer;
     haveState = true;
     if (message.contains("error") && message["error"].is_string())
-      error = message["error"].get<std::string>();
+      serverError = message["error"].get<std::string>();
     if (message.contains("devices") && message["devices"].is_array())
       serverDevices = message["devices"];
   }
   void feedback(const Json &message) {
-    if (!active() || !rumble || !bluetoothPath.empty())
-      return;
+    if (!active() || !rumble) return;
     auto integer = [&](const char *field, uint64_t maximum, uint64_t &out) {
-      if (!message.contains(field) || !message[field].is_number_unsigned())
-        return false;
+      if (!message.contains(field) || !message[field].is_number_unsigned()) return false;
       out = message[field].get<uint64_t>();
       return out <= maximum;
     };
     uint64_t lease, slot, incarnation, strong, weak, duration;
     if (!integer("generation", UINT64_MAX, lease) || lease != generation ||
-        !integer("slot", 3, slot) || !integer("device_generation", UINT64_MAX, incarnation) ||
+        !integer("slot", slots.size() - 1, slot) ||
+        !integer("device_generation", UINT64_MAX, incarnation) ||
         !integer("strong", 65535, strong) || !integer("weak", 65535, weak) ||
-        !integer("duration_ms", 1000, duration) || !duration)
-      return;
+        !integer("duration_ms", 1000, duration) || !duration) return;
     auto &device = slots[slot];
-    if (!device.connected || device.incarnation != incarnation)
-      return;
-    XINPUT_VIBRATION motors{WORD(strong), WORD(weak)};
-    if (set(DWORD(slot), &motors) == ERROR_SUCCESS) {
+    if (!device.sent || !device.rumbleCapable || device.incarnation != incarnation) return;
+    if (SDL_RumbleGamepad(device.controller, Uint16(strong), Uint16(weak), Uint32(duration))) {
       device.motorOwned = strong || weak;
       device.motorDeadline = device.motorOwned ? GetTickCount64() + duration : 0;
     }
   }
   void poll(ULONGLONG now = GetTickCount64()) {
-    inventory(now);
-    for (DWORD i = 0; i < slots.size(); ++i)
-      if (slots[i].motorOwned && now >= slots[i].motorDeadline)
-        stopMotor(i);
-    if (!active() || now < nextPoll)
+    if (!negotiated || !requested) return;
+    for (auto &device : slots)
+      if (device.motorOwned && now >= device.motorDeadline) stopMotor(device);
+    const bool inventoryDue = now >= nextInventory;
+    const bool sampleDue = active() && now >= nextPoll;
+    if (!sampleDue && !inventoryDue) return;
+    if (initialized) SDL_UpdateGamepads();
+    if (inventoryDue) {
+      nextInventory = now + 500;
+      refreshDevices();
+    }
+    if (!active() || now < nextPoll) return;
+    nextPoll = now + 8;
+    if (!bluetoothPath.empty()) {
+      auto &device = slots[0];
+      if (now < device.retryAfter) return;
+      XINPUT_GAMEPAD state{};
+      if (bluetooth.read(bluetoothPath, state)) {
+        localError.clear();
+        forward(0, state);
+      } else {
+        closeSlot(0, true);
+        device.retryAfter = now + 500;
+        localError = "无法读取 Xbox 蓝牙手柄输入";
+      }
       return;
-    nextPoll = now + 8; // At most 125 Hz; empty XInput slots are checked at 2 Hz.
-    bool usingBluetooth = !bluetoothPath.empty();
-    for (DWORD i = 0; i < (usingBluetooth ? 1 : slots.size()); ++i) {
+    }
+    bool opened = false;
+    for (size_t i = 0; i < slots.size(); ++i) {
       auto &device = slots[i];
-      if (!device.connected && now < device.nextProbe)
+      if (!device.instance || now < device.retryAfter) continue;
+      if (device.controller && !SDL_GamepadConnected(device.controller)) {
+        closeSlot(i, true);
+        device.instance = 0;
         continue;
-      XINPUT_STATE state{};
-      bool connected = usingBluetooth ? bluetooth.read(bluetoothPath, state.Gamepad)
-                                      : get(i, &state) == ERROR_SUCCESS;
-      if (usingBluetooth) bluetoothReadFailed = !connected;
-      if (!connected) {
-        if (device.connected) {
-          packet(i, false, {});
-          stopMotor(i);
+      }
+      if (!device.controller) {
+        device.controller = SDL_OpenGamepad(device.instance);
+        if (!device.controller) {
+          device.retryAfter = now + 500;
+          localError = "无法打开 SDL 手柄：" + std::string(SDL_GetError());
+          continue;
         }
-        device.connected = device.sent = false;
-        device.nextProbe = now + 500;
-        continue;
-      }
-      if (!device.connected) {
-        device.connected = true;
-        device.sent = false;
-        device.sequence = 0;
-        ++device.incarnation;
-        if (!device.incarnation)
-          ++device.incarnation;
-      }
-      XINPUT_GAMEPAD sample = filtered(state.Gamepad, deadzone);
-      if (!device.sent || !same(sample, device.last)) {
-        packet(i, true, sample);
-        device.last = sample;
-        device.sent = true;
+        device.rumbleCapable = SDL_GetBooleanProperty(SDL_GetGamepadProperties(device.controller),
+                                                    SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+        opened = true;
       }
     }
+    // Opening a mapped gamepad initializes the trigger zero point. Refresh it
+    // before forwarding the first snapshot, including triggers already held.
+    if (opened) SDL_UpdateGamepads();
+    for (size_t i = 0; i < slots.size(); ++i)
+      if (auto *controller = slots[i].controller; controller && SDL_GamepadConnected(controller))
+        forward(i, sample(controller));
   }
   static XINPUT_GAMEPAD filtered(XINPUT_GAMEPAD sample, int percent) {
     percent = std::clamp(percent, 0, 50);
@@ -323,24 +324,20 @@ public:
     return sample;
   }
   Json status() const {
+    bool motors = std::any_of(slots.begin(), slots.end(), [](const Slot &s) { return s.rumbleCapable; });
     return {{"gamepad_supported", negotiated && supported() && (!haveState || serverSupported)},
-            {"gamepad_enabled", negotiated && requested},
-            {"gamepad_active", active()},
+            {"gamepad_enabled", negotiated && requested}, {"gamepad_active", active()},
             {"gamepad_local_count", localCount < 0 ? Json(nullptr) : Json(localCount)},
-            {"gamepad_devices", serverDevices},
-            {"rumble_supported", negotiated && get && set && bluetoothPath.empty() && serverSupported},
-            {"gamepad_error", bluetoothReadFailed ? "无法读取 Xbox 蓝牙手柄输入" :
-                supported() ? error : "没有可用的 XInput 或受支持的 Xbox 蓝牙手柄"},
-            {"gamepad_backend", bluetoothPath.empty() ? backend : "Xbox Bluetooth HID"}};
+            {"gamepad_devices", serverDevices}, {"rumble_supported", negotiated && serverSupported && motors},
+            {"gamepad_error", serverError.empty() ? localError : serverError},
+            {"gamepad_backend", bluetoothPath.empty() ? "SDL3" : "Xbox Bluetooth HID"}};
   }
   void disconnect() {
-    reset(true);
+    stopDiscovery(true);
     negotiated = requested = serverSupported = leaseEnabled = haveState = false;
     generation = 0;
     focusId = leaseId = 0;
     serverDevices = Json::array();
-    bluetoothPath.clear();
-    nextInventory = 0;
-    localCount = -1;
+    serverError.clear();
   }
 };

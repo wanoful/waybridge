@@ -34,6 +34,7 @@ for arch in "${architectures[@]}"; do
   cp scripts/Diagnose-Startup.ps1 scripts/Diagnose-Startup.cmd "$output/"
   cp LICENSE "$output/LICENSE-Waybridge.txt"
   mkdir -p "$output/licenses"
+  cp "$native/SDL3-LICENSE.txt" "$output/licenses/"
   cp client/third_party/json.LICENSE.MIT "$output/licenses/nlohmann-json-LICENSE.txt"
   dotnet_version=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["runtimeOptions"]["includedFrameworks"][0]["version"])' "$output/Waybridge.Control.runtimeconfig.json")
   packages="${NUGET_PACKAGES:-$HOME/.nuget/packages}"

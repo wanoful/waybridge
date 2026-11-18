@@ -7,15 +7,13 @@ from smoke import ROOT
 
 
 def main():
-    output = ROOT / 'build/tests/windows-drop-lifetime.exe'
-    output.parent.mkdir(parents=True, exist_ok=True)
-    libraries = ('secur32 bcrypt ws2_32 gdiplus gdi32 ole32 crypt32 shell32 uuid d3d11 dxgi dcomp '
-                 'd3dcompiler mfuuid wmcodecdspuuid strmiids oleaut32 windowscodecs imm32')
-    subprocess.run(['x86_64-w64-mingw32-g++', '-std=c++17', '-Wall', '-Wextra', '-Wpedantic',
-                    '-DUNICODE', '-D_UNICODE', '-DWIN32_LEAN_AND_MEAN', '-DNOMINMAX',
-                    '-DWINVER=0x0A00', '-D_WIN32_WINNT=0x0A00', '-municode', '-static', '-O1',
-                    'tests/windows_drop_lifetime_probe.cpp', '-o', str(output),
-                    *['-l' + library for library in libraries.split()]], cwd=ROOT, check=True)
+    build = ROOT / 'build/windows'
+    if not (build / 'CMakeCache.txt').exists():
+        subprocess.run(['cmake', '-S', 'client', '-B', str(build), '-G', 'Ninja',
+                        '-DCMAKE_TOOLCHAIN_FILE=mingw.cmake', '-DCMAKE_BUILD_TYPE=Release'], cwd=ROOT, check=True)
+    subprocess.run(['cmake', '--build', str(build), '--target', 'waybridge-drop-lifetime-probe'], cwd=ROOT, check=True)
+    output = build / 'waybridge-drop-lifetime-probe.exe'
+    (ROOT / 'build/tests').mkdir(parents=True, exist_ok=True)
     prefix = ROOT / 'build/wine-drop-lifetime'
     prefix.mkdir(mode=0o700, parents=True, exist_ok=True)
     env = {**os.environ, 'WINEPREFIX': str(prefix), 'WINEDEBUG': '-all',

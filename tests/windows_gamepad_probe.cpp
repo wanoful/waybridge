@@ -1,150 +1,183 @@
-// Deterministic XInput adapter checks. All reads/motor writes use the fake API;
-// this executable never opens a real controller or manipulates the desktop.
+// Exercise the production adapter with SDL virtual controllers and motor callbacks.
 #include "gamepad.h"
 #include <cstdlib>
 #include <iostream>
 #include <vector>
+
 using Json = nlohmann::json;
-static std::array<bool, 4> connected{};
-static std::array<XINPUT_GAMEPAD, 4> physical{};
-static std::array<unsigned, 4> reads{};
-static unsigned inventories = 0;
-struct Motor {
-  DWORD slot;
-  WORD strong, weak;
-};
-static std::vector<Motor> motors;
-static DWORD WINAPI readState(DWORD slot, XINPUT_STATE *out) {
-  ++reads.at(slot);
-  if (!connected.at(slot))
-    return ERROR_DEVICE_NOT_CONNECTED;
-  out->Gamepad = physical.at(slot);
-  return ERROR_SUCCESS;
-}
-static DWORD WINAPI readCapabilities(DWORD slot, DWORD, XINPUT_CAPABILITIES *) {
-  ++inventories;
-  return connected.at(slot) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
-}
-static DWORD WINAPI setState(DWORD slot, XINPUT_VIBRATION *value) {
-  motors.push_back({slot, value->wLeftMotorSpeed, value->wRightMotorSpeed});
-  return connected.at(slot) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
-}
-static void check(bool condition, const char *reason) {
+
+static void check(bool condition, const char *failure) {
   if (!condition) {
-    std::cerr << reason << '\n';
+    std::cerr << failure << " (SDL: " << SDL_GetError() << ")\n";
     std::exit(1);
   }
 }
+struct Motors {
+  std::vector<std::pair<Uint16, Uint16>> writes;
+};
+struct FixturePad {
+  SDL_JoystickID id = 0;
+  SDL_Joystick *joystick = nullptr;
+  Motors *motors = nullptr;
+  // An SDL virtual joystick emits only dirty axes by default. Repeat the
+  // trigger values so they model a device delivering a fresh state report.
+  Sint16 leftTrigger = -32768, rightTrigger = -32768;
+
+  static void SDLCALL update(void *userdata) {
+    auto &pad = *static_cast<FixturePad *>(userdata);
+    if (!pad.joystick) return;
+    SDL_SetJoystickVirtualAxis(pad.joystick, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, pad.leftTrigger);
+    SDL_SetJoystickVirtualAxis(pad.joystick, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, pad.rightTrigger);
+  }
+  static bool SDLCALL rumble(void *userdata, Uint16 low, Uint16 high) {
+    static_cast<FixturePad *>(userdata)->motors->writes.emplace_back(low, high);
+    return true;
+  }
+
+  void attach(const char *name, Motors *feedback = nullptr) {
+    motors = feedback;
+    SDL_VirtualJoystickDesc desc;
+    SDL_INIT_INTERFACE(&desc);
+    desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    desc.name = name;
+    desc.userdata = this;
+    desc.Update = update;
+    if (motors) desc.Rumble = rumble;
+    id = SDL_AttachVirtualJoystick(&desc);
+    check(id && SDL_IsGamepad(id), "fixture did not enumerate as a mapped gamepad");
+    joystick = SDL_OpenJoystick(id);
+    check(joystick != nullptr, "fixture joystick open failed");
+  }
+  void detach() {
+    if (!id) return;
+    check(SDL_DetachVirtualJoystick(id), "fixture detach failed");
+    SDL_CloseJoystick(joystick);
+    joystick = nullptr;
+    id = 0;
+  }
+  void button(SDL_GamepadButton button, bool down) {
+    check(SDL_SetJoystickVirtualButton(joystick, button, down), "fixture button update failed");
+  }
+  void axis(SDL_GamepadAxis axis, Sint16 value) {
+    check(SDL_SetJoystickVirtualAxis(joystick, axis, value), "fixture axis update failed");
+  }
+};
 static Json lease(uint64_t generation, uint32_t id, bool enabled = true) {
   return {{"type", "gamepad_state"}, {"generation", generation}, {"id", id},
-          {"enabled", enabled},      {"supported", true},        {"error", ""},
-          {"devices", Json::array()}};
+          {"enabled", enabled}, {"supported", true}, {"error", ""}, {"devices", Json::array()}};
 }
-static Json feedback(uint64_t generation, uint32_t slot, uint64_t incarnation) {
-  return {{"generation", generation}, {"slot", slot},           {"device_generation", incarnation},
+static Json haptic(uint64_t generation, uint32_t slot, uint64_t incarnation) {
+  return {{"generation", generation}, {"slot", slot}, {"device_generation", incarnation},
           {"strong", uint32_t(1234)}, {"weak", uint32_t(5678)}, {"duration_ms", uint32_t(750)}};
 }
+
 int main() {
-  std::vector<Json> packets;
-  NativeGamepad pad([&](const Json &v) { packets.push_back(v); }, readState, setState, readCapabilities);
-  ULONGLONG now = GetTickCount64() + 10;
-  check(motors.empty(), "constructor touched unrelated motors");
-  pad.configure(true, false, true, 15);
+  std::vector<Json> messages;
+  auto latest = [&](size_t slot) -> Json {
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it)
+      if ((*it)["type"] == "gamepad" && (*it)["slot"] == slot) return *it;
+    return Json::object();
+  };
+  NativeGamepad pad([&](const Json &message) { messages.push_back(message); });
+  ULONGLONG now = GetTickCount64();
+  pad.configure(true, false, true, 0);
   pad.focus(7);
   pad.state(lease(1, 7));
   pad.poll(now);
-  check(reads[0] == 0 && inventories == 0 && motors.empty(), "default OFF accessed gamepads");
-  check(pad.status()["gamepad_enabled"] == false, "OFF preference status");
-  connected[0] = connected[3] = true;
-  physical[0].wButtons = XINPUT_GAMEPAD_A;
-  physical[0].sThumbLY = 32767;
-  pad.configure(true, true, true, 15);
-  pad.poll(now);
-  check(reads[0] == 1 && reads[3] == 1, "four-slot discovery");
-  check(packets.back()["slot"] == 3 && packets.back()["device_generation"] == 1,
-        "slot/incarnation identity");
-  auto packetCount = packets.size();
+  check(SDL_WasInit(SDL_INIT_GAMEPAD) == 0 && latest(0).empty(), "opt-out started SDL or forwarded input");
+
+  // Attach only private devices in this process. SDL handles discovery,
+  // normalization and feedback just as in production.
+  check(SDL_InitSubSystem(SDL_INIT_GAMEPAD), "could not initialize SDL in the fixture");
+  Motors firstMotors, secondMotors, replacementMotors;
+  FixturePad a, b, c, d, overflow, replacement;
+  a.attach("Waybridge SDL test A", &firstMotors);
+  b.attach("Waybridge SDL test B", &secondMotors);
+  c.attach("Waybridge SDL test C");
+  d.attach("Waybridge SDL test D");
+  overflow.attach("Waybridge SDL test overflow");
+  a.button(SDL_GAMEPAD_BUTTON_SOUTH, true);
+  a.button(SDL_GAMEPAD_BUTTON_DPAD_UP, true);
+  a.axis(SDL_GAMEPAD_AXIS_LEFTY, -32768);
+  a.leftTrigger = 32767;
+  b.button(SDL_GAMEPAD_BUTTON_EAST, true);
+  pad.configure(true, true, true, 0);
+  pad.poll(now += 100);
+  check(pad.status()["gamepad_local_count"] == 4 && pad.status()["gamepad_backend"] == "SDL3" &&
+        latest(4).empty() && !latest(3).empty(), "SDL slots or four-device limit wrong");
+  check(latest(0)["buttons"] == (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_DPAD_UP) &&
+        latest(0)["ly"] == 32767 && latest(0)["lt"] == 255 && latest(0)["rt"] == 0 &&
+        latest(1)["buttons"] == XINPUT_GAMEPAD_B, "SDL button, stick or trigger mapping wrong");
+  auto aInc = latest(0)["device_generation"].get<uint64_t>();
+  auto bInc = latest(1)["device_generation"].get<uint64_t>();
+  auto cInc = latest(2)["device_generation"].get<uint64_t>();
+  size_t before = messages.size();
+  b.button(SDL_GAMEPAD_BUTTON_NORTH, true);
   pad.poll(now + 1);
-  check(packets.size() == packetCount && reads[0] == 1, "125Hz upper bound");
-  physical[0].wButtons |= XINPUT_GAMEPAD_B;
-  pad.poll(now + 8);
-  check(reads[0] == 2 && reads[1] == 1 && packets.back()["sequence"] == 2,
-        "changed sample / bounded empty-slot probes");
-  pad.state(Json::object());
-  pad.feedback(Json::object());
-  pad.feedback(feedback(0, 3, 1));
-  pad.feedback(feedback(1, 4, 1));
-  pad.feedback(feedback(1, 3, 99));
-  check(motors.empty(), "stale/malformed feedback drove motors");
-  pad.feedback(feedback(1, 3, 1));
-  check(motors.size() == 1 && motors.back().slot == 3 && motors.back().strong == 1234,
-        "rumble went to wrong physical slot");
+  check(messages.size() == before, "poll exceeded 125 Hz");
+  pad.poll(now += 8);
+  check(latest(1)["sequence"] == 2 && latest(0)["sequence"] == 1, "SDL changes lost or rebroadcast in other slots");
+  check(pad.status()["rumble_supported"] == true, "SDL rumble capability missing");
+  pad.feedback(haptic(1, 2, cInc));
+  pad.feedback(haptic(9, 0, aInc));
+  pad.feedback(haptic(1, 0, aInc + 1));
+  check(firstMotors.writes.empty() && secondMotors.writes.empty(), "stale or unsupported feedback escaped");
+  pad.feedback(haptic(1, 1, bInc));
+  check(firstMotors.writes.empty() && secondMotors.writes == decltype(secondMotors.writes){{1234, 5678}},
+        "SDL rumble went to the wrong physical instance");
+  pad.poll(GetTickCount64() + 1000);
+  check(secondMotors.writes.back() == std::make_pair(Uint16(0), Uint16(0)), "rumble watchdog did not stop SDL motor");
+
+  overflow.detach();
+  b.detach();
+  pad.poll(now += 1500);
+  check(latest(1)["connected"] == false && latest(2)["device_generation"] == cInc &&
+        latest(0)["device_generation"] == aInc, "unplug renumbered remaining devices or left held input");
+  replacement.attach("Waybridge SDL test replacement", &replacementMotors);
+  replacement.button(SDL_GAMEPAD_BUTTON_WEST, true);
+  pad.poll(now += 500);
+  auto newInc = latest(1)["device_generation"].get<uint64_t>();
+  check(newInc > bInc && latest(1)["buttons"] == XINPUT_GAMEPAD_X, "replacement did not reuse vacant slot with fresh identity");
+  pad.feedback(haptic(1, 1, bInc));
+  check(replacementMotors.writes.empty(), "feedback crossed physical replacement");
+  pad.feedback(haptic(1, 1, newInc));
+  check(replacementMotors.writes.size() == 1, "replacement feedback discarded");
   pad.focus(0);
-  pad.poll(now + 16);
-  check(motors.size() == 2 && motors.back().slot == 3 && motors.back().strong == 0,
-        "focus loss did not stop only our owned motors");
-  check(reads[0] == 2 && !pad.status()["gamepad_active"].get<bool>() &&
-            pad.status()["gamepad_enabled"] == true,
-        "blur changed preference or polled background");
-  check(pad.status()["gamepad_local_count"] == 2 && pad.status()["gamepad_devices"].empty(),
-        "local presence was confused with forwarded devices");
-  pad.feedback(feedback(1, 3, 1));
-  check(motors.size() == 2, "background rumble accepted");
+  check(replacementMotors.writes.back() == std::make_pair(Uint16(0), Uint16(0)) &&
+        firstMotors.writes.empty() && latest(0)["connected"] == false && latest(1)["connected"] == false,
+        "focus loss did not release remote input and owned SDL motor");
+  before = messages.size();
+  pad.poll(now += 500);
+  check(messages.size() == before && pad.status()["gamepad_local_count"] == 4,
+        "blur confused local inventory with forwarded devices");
   pad.focus(7);
-  pad.state(lease(3, 7));
-  pad.poll(now + 24);
-  check(packets.back()["device_generation"] == 2, "new lease reused device incarnation");
-  connected[3] = false;
-  pad.poll(now + 32);
-  check(packets.back()["slot"] == 3 && packets.back()["connected"] == false, "hot-unplug not sent");
-  connected[3] = true;
-  pad.poll(now + 544);
-  check(packets.back()["slot"] == 3 && packets.back()["device_generation"] == 3,
-        "replug did not advance incarnation");
-  pad.feedback(feedback(3, 3, 2));
-  check(motors.size() == 2, "old device feedback crossed hotplug");
-  pad.feedback(feedback(3, 3, 3));
-  check(motors.size() == 3, "current device feedback rejected");
-  pad.poll(GetTickCount64() + 1001);
-  check(motors.size() == 4 && motors.back().strong == 0, "rumble watchdog failed");
-  pad.feedback(feedback(3, 3, 3));
-  pad.configure(true, true, false, 15);
-  check(motors.size() == 6 && motors.back().strong == 0, "rumble OFF failed to neutralize");
-  unsigned before = reads[0];
+  pad.state(lease(2, 7));
+  pad.poll(now += 8);
+  check(latest(0)["generation"] == 2 && latest(0)["device_generation"].get<uint64_t>() > aInc &&
+        latest(1)["buttons"] == XINPUT_GAMEPAD_X, "focus recovery lost physical slots or generations");
+  pad.configure(true, true, false, 50);
+  a.axis(SDL_GAMEPAD_AXIS_LEFTY, -1000);
+  pad.poll(now += 8);
+  check(latest(0)["ly"] == 0, "live deadzone not applied");
   pad.configure(true, false, false, 15);
-  pad.poll(now + 2000);
-  check(reads[0] == before && pad.status()["gamepad_local_count"].is_null(),
-        "disabled adapter read or retained physical state");
+  check(latest(0)["connected"] == false && pad.status()["gamepad_local_count"].is_null(),
+        "disable did not clear active input and local inventory");
   pad.disconnect();
-  check(motors.size() == 6, "cleanup zeroed unrelated motors");
-  XINPUT_GAMEPAD raw{};
-  raw.sThumbLX = 1000;
-  raw.sThumbLY = -1000;
-  raw.bLeftTrigger = 10;
-  auto neutral = NativeGamepad::filtered(raw, 15);
-  check(neutral.sThumbLX == 0 && neutral.sThumbLY == 0 && neutral.bLeftTrigger == 0,
-        "deadzone failed");
-  raw = {};
-  raw.sThumbLX = -32768;
-  raw.bRightTrigger = 255;
-  auto extreme = NativeGamepad::filtered(raw, 15);
-  check(extreme.sThumbLX == -32768 && extreme.bRightTrigger == 255, "analog endpoints lost");
-  // Xbox Series BLE report layout checked against the physical controller's
-  // HID descriptor. Non-state and out-of-range trigger packets are ignored.
-  XboxBluetoothGamepad::Report report = {1, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+  a.detach(); c.detach(); d.detach(); replacement.detach();
+  SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+  check(SDL_WasInit(SDL_INIT_GAMEPAD) == 0, "SDL gamepad subsystem leaked a reference");
+
+  XboxBluetoothGamepad::Report legacyReport = {1, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
       0xff, 0x03, 0x00, 0x02, 2, 0x49, 0x2c, 0x00};
-  check(XboxBluetoothGamepad::decode(report, raw), "valid Xbox BLE report rejected");
-  check(raw.sThumbLX == 32767 && raw.sThumbLY == 32767 && raw.sThumbRX == -32768 &&
-        raw.sThumbRY == -32768 && raw.bLeftTrigger == 255 && raw.bRightTrigger == 128,
-        "Xbox BLE axes not mapped to XInput conventions");
-  check(raw.wButtons == (XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_A |
-        XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_BACK |
-        XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_LEFT_THUMB), "Xbox BLE buttons or direction mapped incorrectly");
-  report[0] = 4;
-  check(!XboxBluetoothGamepad::decode(report, raw), "battery report accepted as input");
-  report[0] = 1;
-  report[10] = 4;
-  check(!XboxBluetoothGamepad::decode(report, raw), "invalid Xbox BLE trigger accepted");
-  std::cout
-      << "gamepad: opt-in/focus/125Hz/deadzones/4-slots/hotplug/lease/exact-rumble/watchdog PASS\n";
+  XINPUT_GAMEPAD legacyState{};
+  check(XboxBluetoothGamepad::decode(legacyReport, legacyState) && legacyState.sThumbLX == 32767 &&
+        legacyState.sThumbLY == 32767 && legacyState.bLeftTrigger == 255 && legacyState.bRightTrigger == 128 &&
+        legacyState.wButtons == (XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_A |
+            XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_BACK |
+            XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_LEFT_THUMB), "temporary Xbox fallback report regressed");
+  legacyReport[0] = 4;
+  check(!XboxBluetoothGamepad::decode(legacyReport, legacyState), "temporary fallback accepted a battery report");
+  std::cout << "PASS: SDL virtual pads, four slots and hotplug, buttons/axes/triggers, lease and deadzone, exact rumble/stop and stale feedback\n";
 }

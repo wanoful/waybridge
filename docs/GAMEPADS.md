@@ -1,6 +1,6 @@
 # 游戏手柄（实验）
 
-更新日期：2026-11-18。Windows 的 XInput 手柄通过认证连接转发为 Linux 会话拥有的 uinput 虚拟手柄。默认关闭，不采集后台手柄输入。
+更新日期：2026-11-18。Windows 通过 SDL3 Gamepad 识别实体手柄，再通过认证连接转发为 Linux 会话拥有的 uinput 虚拟手柄。默认关闭。开启后可在后台显示本地设备数量，只有前台窗口取得输入租约才打开设备并转发输入。
 
 ## GUI 与配置
 
@@ -14,11 +14,13 @@
 
 摇杆使用径向死区并重新缩放剩余行程，扳机独立应用阈值并重新缩放。初始 hello 协商 `gamepad_v1`、`gamepad_enabled`；支持 `gamepad_settings_v1` 的服务端可通过 `gamepad_enabled` 实时切换。旧端缺少能力时显示状态，不把保存偏好误报为已生效。
 
-`gamepad_enabled` 表示协商后的启用偏好；`gamepad_active` 表示当前前台窗口取得了输入租约。另报告 `gamepad_supported`、`gamepad_devices`、`rumble_supported`、`gamepad_error` 和动态加载的 `gamepad_backend`。
+`gamepad_enabled` 表示协商后的启用偏好，`gamepad_active` 表示当前前台窗口取得了输入租约。`gamepad_local_count` 是 Windows 可转发的设备数（最多四个），`gamepad_devices` 是已创建的 Linux 虚拟设备。另报告 `rumble_supported`、`gamepad_error` 和 `gamepad_backend`。
 
 ## 输入、焦点与震动
 
-Windows 从 System32 动态加载 `xinput1_4.dll`，失败后依次尝试 `xinput1_3.dll`、`xinput9_1_0.dll`。XInput 最多四个槽位。XInput 无设备时，可改用一个 Xbox Series 蓝牙 HID 手柄（`045e:0b13`），转发标准按键、双摇杆、双扳机和方向键。此蓝牙路径暂不支持震动。普通 HID/DirectInput 设备仍不在范围内。活跃设备轮询上限为 125 Hz，空槽位每 500 ms 探测一次。实际频率受 UI 定时器和调度影响。
+SDL3 负责设备发现、标准按键映射和支持设备上的双电机震动。最多四个槽位按 SDL 实例 ID 分配，插拔一只手柄不重排其他已连接手柄。SDL 无设备时，暂时保留 `045e:0b13` Xbox Series 的单设备蓝牙 HID 回退，等待这只实体手柄的 SDL 验收。这条回退不支持震动。活跃输入采样上限为 125 Hz，设备清单每 500 ms 更新一次。实际频率受 UI 定时器和调度影响。
+
+Windows 构建下载并校验固定版本的 [SDL3 源码](https://github.com/libsdl-org/SDL/releases/tag/release-3.4.20)，将游戏手柄库静态链接到 worker。便携包包含 SDL 许可证。
 
 只有本地前台远端窗口、服务端焦点和非只读输入策略同时匹配才取得租约。输入快照绑定窗口 ID、服务端 generation、槽位、设备 incarnation 和递增序号；过期、重复及越界状态不产生输入。失焦、只读、关闭功能、拔出或断开会清空按钮与轴，撤销对应虚拟设备，并停止 Waybridge 自己启动的震动。默认关闭时不会轮询手柄或清零其他应用的电机。
 
@@ -39,7 +41,7 @@ python3 tests/windows_gamepad_smoke.py
 python3 tests/session_fixture.py python3 tests/gamepad_smoke.py
 ```
 
-真实 Linux 测试只操作由唯一名称、phys 和 sysname 确认的临时虚拟设备，验证 evdev 按钮/轴/方向键、真实 `EVIOCSFF` 上传和震动回传、效果到期归零、热插拔隔离及设备删除。负例覆盖缺失/无权限后端、非 uinput 节点、非法数值、旧租约和重放。Windows 测试在私有 Wine/Xvfb 中运行生产适配器与模拟 XInput，覆盖默认关闭、轮询边界、死区、焦点、重连和精确槽位震动。
+真实 Linux 测试只操作由唯一名称、phys 和 sysname 确认的临时虚拟设备，验证 evdev 按钮/轴/方向键、真实 `EVIOCSFF` 上传和震动回传、效果到期归零、热插拔隔离及设备删除。负例覆盖缺失/无权限后端、非 uinput 节点、非法数值、旧租约和重放。Windows 测试在私有 Wine/Xvfb 中运行生产适配器和 SDL 虚拟手柄，覆盖四槽、热插拔、方向键、轴和扳机、焦点、死区及震动路由和停止。
 
 真实合成器协议到 evdev 的端到端测试也已通过默认关闭、双端焦点匹配、按钮/轴/HAT、非法/过期/重复输入拒绝、失焦/只读/断线中和销毁和恢复后归零。只读取由本次合成器 PID、name、phys 和 sysname 确认的临时节点，权限不足明确跳过，不修改权限。
 

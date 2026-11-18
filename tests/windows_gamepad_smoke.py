@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production XInput adapter with fake devices/motors in a private Wine prefix."""
+"""Production SDL adapter with SDL virtual devices in a private Wine prefix."""
 import os
 from pathlib import Path
 import subprocess
@@ -8,11 +8,12 @@ from smoke import ROOT
 
 
 def main():
-    executable = ROOT / 'build/tests/windows-gamepad-probe.exe'
-    executable.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(['x86_64-w64-mingw32-g++', '-std=c++17', '-Wall', '-Wextra',
-                    '-Werror', '-static', '-O2', '-Iclient', 'tests/windows_gamepad_probe.cpp',
-                    '-o', str(executable)], cwd=ROOT, check=True)
+    build = ROOT / 'build/windows'
+    if not (build / 'CMakeCache.txt').exists():
+        subprocess.run(['cmake', '-S', 'client', '-B', str(build), '-G', 'Ninja',
+                        '-DCMAKE_TOOLCHAIN_FILE=mingw.cmake', '-DCMAKE_BUILD_TYPE=Release'], cwd=ROOT, check=True)
+    subprocess.run(['cmake', '--build', str(build), '--target', 'waybridge-gamepad-probe'], cwd=ROOT, check=True)
+    executable = build / 'waybridge-gamepad-probe.exe'
     with tempfile.TemporaryDirectory(prefix='waybridge-native-gamepad-') as directory:
         env = {**os.environ, 'WINEPREFIX': str(Path(directory) / 'wine'), 'WINEDEBUG': '-all',
                'WINEDLLOVERRIDES': 'winemenubuilder.exe=d;mscoree,mshtml='}

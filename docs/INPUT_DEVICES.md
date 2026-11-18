@@ -1,7 +1,7 @@
 # Professional input and game devices
 
 Implemented experimental slices include native multitouch for `wl_touch`
-applications, [native pen/tablet-v2](PEN.md), and [XInput gamepads with rumble](GAMEPADS.md).
+applications, [native pen/tablet-v2](PEN.md), and [SDL gamepads with rumble](GAMEPADS.md).
 Each is enabled and saved in the control center's input settings. Physical-device
 and application coverage, application-specific gesture mapping and X11 native
 touch remain follow-up work. This does not mark M3 complete.

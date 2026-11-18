@@ -779,7 +779,7 @@ internal sealed class MainWindow : Window
                 else if (gamepadSupported == true && localGamepadCount > 0 && !inputDeviceReadOnly)
                     gamepadText += gamepadActiveLease == false ? "请先聚焦远端窗口。" : "正在等待 Linux 创建设备。";
             }
-            if (gamepadActive == true && selected.Settings.GamepadRumble && rumbleSupported == false)
+            if (gamepadActive == true && connectedGamepads?.Count > 0 && selected.Settings.GamepadRumble && rumbleSupported == false)
                 gamepadText += "当前连接不支持震动反馈。";
             if (penError.Length > 0) penText += "手写笔暂不可用：" + penError;
             if (gamepadError.Length > 0) gamepadText += "手柄暂不可用：" + gamepadError;
