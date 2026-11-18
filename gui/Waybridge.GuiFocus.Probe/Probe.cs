@@ -265,7 +265,7 @@ internal static class GuiFocusProbe
             gamepad_local_count = 0,
             rumble_supported = false, pen_error = "", gamepad_error = "" });
         Check(penState.Text.Contains("未检测到可用的手写笔", StringComparison.Ordinal) &&
-            gamepadState.Text.Contains("Windows 未检测到已连接的 XInput 手柄", StringComparison.Ordinal) &&
+            gamepadState.Text.Contains("Windows 未检测到可转发的手柄", StringComparison.Ordinal) &&
             penState.Text.Contains("只读模式已暂停", StringComparison.Ordinal) && gamepadState.Text.Contains("只读模式已暂停", StringComparison.Ordinal),
             "missing hardware/readonly professional state was hidden");
         Receive(window, new { type = "local_settings_applied", settings = new { read_only = false },

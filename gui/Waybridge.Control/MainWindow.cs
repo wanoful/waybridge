@@ -772,7 +772,7 @@ internal sealed class MainWindow : Window
             }
             if (gamepadActive == true)
             {
-                if (localGamepadCount == 0) gamepadText += "Windows 未检测到已连接的 XInput 手柄。请检查蓝牙或 USB 连接。";
+                if (localGamepadCount == 0) gamepadText += "Windows 未检测到可转发的手柄。请检查蓝牙或 USB 连接。";
                 else if (localGamepadCount is int count) gamepadText += $"Windows 已识别 {count} 个手柄。";
                 if (connectedGamepads?.Count > 0)
                     gamepadText += "远端设备：" + string.Join("、", connectedGamepads) + "。";

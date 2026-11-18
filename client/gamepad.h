@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <xinput.h>
 #include "third_party/json.hpp"
+#include "xbox_bluetooth.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -31,6 +32,9 @@ private:
   GetState get = nullptr;
   SetState set = nullptr;
   GetCapabilities capabilities = nullptr;
+  XboxBluetoothGamepad bluetooth;
+  std::wstring bluetoothPath;
+  bool mocked = false, bluetoothReadFailed = false;
   std::function<void(const Json &)> emit;
   std::array<Slot, 4> slots{};
   bool negotiated = false, requested = false, rumble = true;
@@ -48,7 +52,7 @@ private:
       emit(message);
   }
   bool active() const {
-    return negotiated && requested && get && set && serverSupported && leaseEnabled && focusId &&
+    return negotiated && requested && supported() && serverSupported && leaseEnabled && focusId &&
            leaseId == focusId && generation;
   }
   void stopMotor(DWORD slot) {
@@ -78,6 +82,8 @@ private:
           {"rt", sample.bRightTrigger}});
   }
   void reset(bool notify) {
+    bluetooth.close();
+    bluetoothReadFailed = false;
     for (DWORD i = 0; i < slots.size(); ++i) {
       auto &device = slots[i];
       if (notify && device.connected && device.sent && generation && leaseId)
@@ -122,21 +128,31 @@ private:
   }
 
   void inventory(ULONGLONG now) {
-    if (!negotiated || !requested || !capabilities || now < nextInventory)
+    if (!negotiated || !requested || now < nextInventory)
       return;
     nextInventory = now + 500;
-    int count = 0;
-    for (DWORD i = 0; i < slots.size(); ++i) {
-      XINPUT_CAPABILITIES device{};
-      DWORD result = capabilities(i, XINPUT_FLAG_GAMEPAD, &device);
-      if (result == ERROR_SUCCESS)
-        ++count;
-      else if (result != ERROR_DEVICE_NOT_CONNECTED) {
-        localCount = -1;
-        return;
+    int count = get ? -1 : 0;
+    if (capabilities) {
+      count = 0;
+      for (DWORD i = 0; i < slots.size(); ++i) {
+        XINPUT_CAPABILITIES device{};
+        DWORD result = capabilities(i, XINPUT_FLAG_GAMEPAD, &device);
+        if (result == ERROR_SUCCESS)
+          ++count;
+        else if (result != ERROR_DEVICE_NOT_CONNECTED) {
+          count = -1;
+          break;
+        }
       }
     }
-    localCount = count;
+    // Use one backend at a time so a controller exposed through both paths
+    // cannot appear twice. Keep the normal XInput slots whenever present.
+    auto path = count == 0 && !mocked ? XboxBluetoothGamepad::find() : std::wstring{};
+    if (path != bluetoothPath) {
+      reset(true);
+      bluetoothPath = std::move(path);
+    }
+    localCount = bluetoothPath.empty() ? count : 1;
   }
 
 public:
@@ -144,6 +160,7 @@ public:
                          SetState mockSet = nullptr, GetCapabilities mockCapabilities = nullptr)
       : emit(std::move(sender)) {
     if (mockGet || mockSet) {
+      mocked = true;
       get = mockGet;
       set = mockSet;
       capabilities = mockCapabilities;
@@ -167,8 +184,6 @@ public:
       }
       FreeLibrary(module);
     }
-    if (!get || !set)
-      error = "系统没有可用的 XInput；手柄转发不可用";
   }
   ~NativeGamepad() {
     reset(false);
@@ -177,11 +192,12 @@ public:
   }
   NativeGamepad(const NativeGamepad &) = delete;
   NativeGamepad &operator=(const NativeGamepad &) = delete;
-  bool supported() const { return get && set; }
+  bool supported() const { return (get && set) || !bluetoothPath.empty(); }
   void configure(bool capability, bool enabled, bool motors, int percent) {
     bool changed = negotiated != capability || requested != enabled;
     if (changed) {
       reset(true);
+      bluetoothPath.clear();
       nextInventory = 0;
       localCount = -1;
     }
@@ -232,7 +248,7 @@ public:
       serverDevices = message["devices"];
   }
   void feedback(const Json &message) {
-    if (!active() || !rumble)
+    if (!active() || !rumble || !bluetoothPath.empty())
       return;
     auto integer = [&](const char *field, uint64_t maximum, uint64_t &out) {
       if (!message.contains(field) || !message[field].is_number_unsigned())
@@ -263,13 +279,16 @@ public:
     if (!active() || now < nextPoll)
       return;
     nextPoll = now + 8; // At most 125 Hz; empty XInput slots are checked at 2 Hz.
-    for (DWORD i = 0; i < slots.size(); ++i) {
+    bool usingBluetooth = !bluetoothPath.empty();
+    for (DWORD i = 0; i < (usingBluetooth ? 1 : slots.size()); ++i) {
       auto &device = slots[i];
       if (!device.connected && now < device.nextProbe)
         continue;
       XINPUT_STATE state{};
-      DWORD result = get(i, &state);
-      if (result != ERROR_SUCCESS) {
+      bool connected = usingBluetooth ? bluetooth.read(bluetoothPath, state.Gamepad)
+                                      : get(i, &state) == ERROR_SUCCESS;
+      if (usingBluetooth) bluetoothReadFailed = !connected;
+      if (!connected) {
         if (device.connected) {
           packet(i, false, {});
           stopMotor(i);
@@ -309,9 +328,10 @@ public:
             {"gamepad_active", active()},
             {"gamepad_local_count", localCount < 0 ? Json(nullptr) : Json(localCount)},
             {"gamepad_devices", serverDevices},
-            {"rumble_supported", negotiated && supported() && serverSupported},
-            {"gamepad_error", supported() ? error : "系统没有可用的 XInput；手柄转发不可用"},
-            {"gamepad_backend", backend}};
+            {"rumble_supported", negotiated && get && set && bluetoothPath.empty() && serverSupported},
+            {"gamepad_error", bluetoothReadFailed ? "无法读取 Xbox 蓝牙手柄输入" :
+                supported() ? error : "没有可用的 XInput 或受支持的 Xbox 蓝牙手柄"},
+            {"gamepad_backend", bluetoothPath.empty() ? backend : "Xbox Bluetooth HID"}};
   }
   void disconnect() {
     reset(true);
@@ -319,6 +339,7 @@ public:
     generation = 0;
     focusId = leaseId = 0;
     serverDevices = Json::array();
+    bluetoothPath.clear();
     nextInventory = 0;
     localCount = -1;
   }

@@ -129,6 +129,22 @@ int main() {
   raw.bRightTrigger = 255;
   auto extreme = NativeGamepad::filtered(raw, 15);
   check(extreme.sThumbLX == -32768 && extreme.bRightTrigger == 255, "analog endpoints lost");
+  // Xbox Series BLE report layout checked against the physical controller's
+  // HID descriptor. Non-state and out-of-range trigger packets are ignored.
+  XboxBluetoothGamepad::Report report = {1, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+      0xff, 0x03, 0x00, 0x02, 2, 0x49, 0x2c, 0x00};
+  check(XboxBluetoothGamepad::decode(report, raw), "valid Xbox BLE report rejected");
+  check(raw.sThumbLX == 32767 && raw.sThumbLY == 32767 && raw.sThumbRX == -32768 &&
+        raw.sThumbRY == -32768 && raw.bLeftTrigger == 255 && raw.bRightTrigger == 128,
+        "Xbox BLE axes not mapped to XInput conventions");
+  check(raw.wButtons == (XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_A |
+        XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_BACK |
+        XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_LEFT_THUMB), "Xbox BLE buttons or direction mapped incorrectly");
+  report[0] = 4;
+  check(!XboxBluetoothGamepad::decode(report, raw), "battery report accepted as input");
+  report[0] = 1;
+  report[10] = 4;
+  check(!XboxBluetoothGamepad::decode(report, raw), "invalid Xbox BLE trigger accepted");
   std::cout
       << "gamepad: opt-in/focus/125Hz/deadzones/4-slots/hotplug/lease/exact-rumble/watchdog PASS\n";
 }
