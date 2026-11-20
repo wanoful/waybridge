@@ -25,11 +25,16 @@ struct Transfer {
   uint64_t id = 0, nextRequest = 0;
   uint64_t touchOperation = 0, touchGesture = 0, touchGeneration = 0;
   uint32_t touchSlot = 0;
+  uint64_t penTool = 0;
+  bool penEraser = false;
   Json ownerMessage(Json message) const {
     if (touchOperation) {
       message["touch_operation"]=touchOperation; message["touch_gesture"]=touchGesture;
       message["touch_generation"]=touchGeneration;
       message["touch_slot"]=touchSlot;
+      if (penTool) {
+        message["input"]="pen"; message["pen_tool"]=penTool; message["pen_eraser"]=penEraser;
+      }
     }
     return message;
   }
@@ -56,6 +61,7 @@ struct Transfer {
       cancelled = !success;
     }
     wake.notify_all();
+    TransferActivity::finish("drag", id, success ? "done" : "cancelled");
     sendJson(ownerMessage({{"type", "drag_result"},
               {"drag", id},
               {"success", success},
@@ -79,6 +85,11 @@ struct Transfer {
         return STG_E_INSUFFICIENTMEMORY;
       request = ++nextRequest;
       requests.emplace(request, response);
+      if (request == 1 && !files.empty()) {
+        uint64_t total = 0;
+        for (const auto &entry : files) total += entry.size;
+        TransferActivity::begin("drag", id, utf8(files.front().name), total);
+      }
     }
     sendJson({{"type", "drag_read"},
               {"drag", id},
@@ -97,6 +108,7 @@ struct Transfer {
       return STG_E_READFAULT;
     }
     bytes = std::move(response->bytes);
+    TransferActivity::advance("drag", id, bytes.size());
     return S_OK;
   }
 };
@@ -163,6 +175,7 @@ inline bool receive(const Json &message) {
       transfer->cancelled = !message.value("success", false);
     }
     transfer->wake.notify_all();
+    TransferActivity::finish("drag", transfer->id, message.value("success", false) ? "done" : "cancelled");
     return false;
   }
   uint64_t request = message.at("request").get<uint64_t>();
@@ -667,11 +680,16 @@ inline bool control(const Json &message, HWND controllerWindow, HWND sourceWindo
     auto state = std::make_shared<Transfer>();
     state->id = message.at("drag");
     state->source = sourceWindow;
-    if (message.value("input", "") == "touch") {
+    const auto input=message.value("input", "");
+    if (input == "touch" || input == "pen") {
       state->touchOperation=message.value("touch_operation",uint64_t(0));
       state->touchGesture=message.value("touch_gesture",uint64_t(0));
       state->touchGeneration=message.value("touch_generation",uint64_t(0));
       state->touchSlot=message.value("touch_slot",uint32_t(0));
+      if (input == "pen") {
+        state->penTool=message.value("pen_tool",uint64_t(0));
+        state->penEraser=message.value("pen_eraser",false);
+      }
     }
     if (auto old = current()) {
       std::lock_guard<std::mutex> lock(old->mutex);

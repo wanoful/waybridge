@@ -37,9 +37,11 @@
 #include "touch_ole.h"
 #include "third_party/json.hpp"
 #include "native_transport.h"
+#include "microphone.h"
 #include "host_control.h"
 #include "remote_notifications.h"
 #include "ordered_sender.h"
+#include "rich_clipboard.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -62,9 +64,11 @@ DragVisual dragVisual;
 Json hostedSettings = Json::object();
 bool hostedReadOnly = false, hostedIme = true, hostedFiles = true, hostedImages = true, hostedDragText = true;
 std::string hostedClipboard = "both";
+uint64_t hostedFileRate = 0;
 bool streamConfigNegotiated = false;
+bool appStreamModesNegotiated = false;
 bool hostedTouch = false, touchNegotiated = false, touchSettingsNegotiated = false, touchInteractionNegotiated = false;
-bool hostedPen = false, penNegotiated = false, penSettingsNegotiated = false;
+bool hostedPen = false, penNegotiated = false, penSettingsNegotiated = false, penDragNegotiated = false;
 bool hostedGamepads = false, gamepadNegotiated = false, gamepadSettingsNegotiated = false;
 double hostedPenGamma = 1.0;
 bool hostedGamepadRumble = true;
@@ -127,6 +131,10 @@ std::thread mediaReceiver;
 std::thread audioReceiver;
 std::atomic<SOCKET> audioConnection{INVALID_SOCKET};
 AudioPlayback audioPlayback;
+MicrophoneForwarder microphoneForwarder;
+bool hostedMicrophone = false, microphoneRequested = false, microphoneDenied = false;
+uint64_t microphoneRequest = 0;
+std::string microphoneKey;
 std::string serverHost, serverPort, serverToken;
 std::set<uint8_t> supportedVideoKinds;
 using Clock = std::chrono::steady_clock;
@@ -183,7 +191,7 @@ struct DecodedFrame {
 };
 std::map<uint32_t, std::shared_ptr<DecodedFrame>> decodedFrames;
 DWORD ownClipboardSequence = 0;
-UINT pngFormat;
+UINT pngFormat, htmlFormat, rtfFormat;
 std::vector<std::thread> fileWorkers;
 std::atomic<uint64_t> nextUpload{GetTickCount64() * 1000000};
 
@@ -266,6 +274,7 @@ constexpr UINT StartWindowDragMove = WM_APP + 2;
 constexpr UINT CheckRemoteFocus = WM_APP + 3;
 constexpr UINT_PTR WindowDragTimer = 5, TouchOleTimer = 6, GamepadTimer = 7;
 Json touchInteractionInput(const NativeTouch::InteractionSample &sample);
+std::optional<NativeTouch::InteractionSample> activeContactDrag();
 
 bool nativeTouchFor(const RemoteWindow *window) {
   if (!hostedTouch || !window) return false;
@@ -442,6 +451,39 @@ uint32_t u32(const uint8_t *p) {
   uint32_t n;
   memcpy(&n, p, 4);
   return ntohl(n);
+}
+
+#include "file_channel.h"
+FileChannel fileChannel;
+
+void startFileChannel(const std::string &key) {
+  fileChannel.start(serverHost, serverPort, serverToken, key, [](Json message, size_t bytes) {
+    if (FileDrag::receive(message)) return;
+    message["_file_io_bytes"] = bytes;
+    if (!FileTree::receive(message, true))
+      throw std::runtime_error("Unexpected packet on file data channel");
+  }, [] {
+    TransferActivity::failAll("文件数据通道已断开");
+    FileTree::cancelUploads();
+    FileTree::cancelIncoming();
+    FileDrag::disconnect();
+    hostControl.emit({{"type", "transfer"}, {"event", "file_channel_lost"}});
+  });
+}
+
+void cancelTransfer(const Json &request) {
+  const auto kind = request.value("kind", "");
+  const auto id = request.value("id", uint64_t(0));
+  if (!id) return;
+  if (kind == "upload" && FileTree::cancelUpload(id)) {
+    TransferActivity::finish("upload", id, "cancelled");
+    sendJson({{"type", "tree_upload_cancel"}, {"batch", id}});
+  } else if (kind == "download" && FileTree::cancelDownload(id)) {
+    sendJson({{"type", "file_download_cancel"}, {"batch", id}});
+  } else if (kind == "drag") {
+    if (auto transfer = FileDrag::current(); transfer && transfer->id == id)
+      transfer->finish(false);
+  }
 }
 
 void queueMedia(uint8_t kind, std::vector<uint8_t> bytes) {
@@ -750,6 +792,40 @@ void startAudio(const std::string &key) {
     NativeTransport::detach(socket);
     closesocket(socket);
   });
+}
+
+void updateMicrophonePermission() {
+  if (microphoneKey.empty()) return;
+  bool requested = hostedMicrophone && !hostedReadOnly;
+  if (microphoneRequested == requested) return;
+  if (!requested) microphoneForwarder.configure(std::nullopt);
+  microphoneRequested = requested;
+  microphoneDenied = false;
+  sendJson({{"type","microphone_enabled"},{"enabled",requested},{"request_id",++microphoneRequest}});
+}
+
+void microphoneReply(const Json &value) {
+  if (!microphoneRequested || !hostedMicrophone || hostedReadOnly ||
+      value.value("request_id", uint64_t(0)) != microphoneRequest)
+    return;
+  MicrophoneForwarder::Lease lease;
+  microphoneDenied = !value.value("allowed", false) ||
+      getpeername(connection, reinterpret_cast<sockaddr *>(&lease.address), &lease.addressSize) != 0;
+  if (microphoneDenied) return;
+  lease.host = serverHost;
+  lease.token = serverToken;
+  lease.key = microphoneKey;
+  lease.request = microphoneRequest;
+  microphoneForwarder.configure(std::move(lease));
+}
+
+void addMicrophoneStatus(Json &value) {
+  auto state = microphoneForwarder.status();
+  value["microphone_supported"] = !microphoneKey.empty();
+  value["microphone_enabled"] = hostedMicrophone;
+  value["microphone_paused"] = hostedMicrophone && hostedReadOnly;
+  value["microphone_active"] = state.active;
+  value["microphone_error"] = microphoneDenied ? "Linux 会话未启用麦克风输入" : state.error;
 }
 
 std::unique_ptr<Gdiplus::Bitmap> decodeImage(const uint8_t *data, size_t size) {
@@ -1519,11 +1595,54 @@ void receiveFiles(const Json &message) {
     }
   }, bytes), "File I/O queue full");
 }
+void putRichClipboard(UINT format, const std::string &value) {
+  if (!format || value.empty()) return;
+  if (auto memory = globalBytes(value.c_str(), value.size() + 1)) {
+    if (!SetClipboardData(format, memory)) GlobalFree(memory);
+  }
+}
+
+void setRichClipboard(const Json &items) {
+  if (const auto it = items.find("text/html"); it != items.end() && it->is_string()) {
+    auto raw = unbase64(it->get_ref<const std::string &>());
+    if (!raw.empty())
+      putRichClipboard(htmlFormat, RichClipboard::encodeHtml(
+          std::string_view(reinterpret_cast<const char *>(raw.data()), raw.size())));
+  }
+  for (const auto *mime : {"text/rtf", "application/rtf"}) {
+    const auto it = items.find(mime);
+    if (it == items.end() || !it->is_string()) continue;
+    auto raw = unbase64(it->get_ref<const std::string &>());
+    std::string rtf(raw.begin(), raw.end());
+    if (RichClipboard::validRtf(rtf)) {
+      putRichClipboard(rtfFormat, rtf);
+      break;
+    }
+  }
+}
+
+void appendRichClipboard(Json &items, UINT format, const char *mime, bool html) {
+  if (!format) return;
+  HGLOBAL memory = GetClipboardData(format);
+  const size_t size = memory ? GlobalSize(memory) : 0;
+  if (!size || size > RichClipboard::MaxBytes + RichClipboard::MaxHtmlHeader) return;
+  auto data = static_cast<const char *>(GlobalLock(memory));
+  if (!data) return;
+  std::string_view raw(data, size);
+  while (!raw.empty() && raw.back() == '\0') raw.remove_suffix(1);
+  auto content = html ? RichClipboard::decodeHtml(raw)
+                      : RichClipboard::validRtf(raw) ? raw : std::string_view{};
+  if (!content.empty())
+    items[mime] = base64(reinterpret_cast<const uint8_t *>(content.data()), content.size());
+  GlobalUnlock(memory);
+}
+
 void setClipboard(const Json &items) {
   if (hostedClipboard == "off" || hostedClipboard == "send") return;
   if (!items.is_object() || !OpenClipboard(controller))
     return;
   EmptyClipboard();
+  setRichClipboard(items);
   for (const auto *mime : {"text/plain;charset=utf-8", "text/plain"}) {
     if (!items.contains(mime) || !items[mime].is_string())
       continue;
@@ -1607,6 +1726,10 @@ void publishClipboard() {
       items["text/plain;charset=utf-8"] =
           base64(reinterpret_cast<const uint8_t *>(text.data()), text.size());
     }
+  }
+  if (files.empty()) {
+    appendRichClipboard(items, htmlFormat, "text/html", true);
+    appendRichClipboard(items, rtfFormat, "text/rtf", false);
   }
   if (auto mem = GetClipboardData(pngFormat); hostedImages && mem) {
     auto p = static_cast<const uint8_t *>(GlobalLock(mem));
@@ -1771,7 +1894,7 @@ bool promotedToplevelMove() {
 }
 void syncDraggedWindowPosition() {
   if (windowDrag.touch && !promotedToplevelMove()) {
-    auto owner = nativeTouch.activeInteraction();
+    auto owner = activeContactDrag();
     if (!owner || owner->operation != windowDrag.touchOperation) return;
     if (!owner->external) {
       moveDraggedWindow(owner->screen);
@@ -1789,7 +1912,7 @@ void stopWindowDragMove() {
 void sendWindowDragMotion(bool release = false) {
   if (!windowDrag.active || windowDrag.released) return;
   if (windowDrag.touch) {
-    auto owner = nativeTouch.activeInteraction();
+    auto owner = activeContactDrag();
     if (!owner || owner->kind != "dnd" || owner->operation != windowDrag.touchOperation) return;
     if (promotedToplevelMove()) {
       if (release && windowDragMove.hwnd) return;
@@ -2403,7 +2526,36 @@ void suspendImeForOle() {
   imeOleSuspending = false;
 }
 
+NativeTouch::InteractionSample penContact(const NativePen::WindowInteractionSample &pen) {
+  NativeTouch::InteractionSample out;
+  out.operation=pen.operation;out.gesture=pen.gesture;out.generation=pen.generation;
+  out.id=pen.id;out.pointerId=pen.pointerId;out.penTool=pen.tool;out.penEraser=pen.eraser;
+  out.kind=pen.kind;out.phase=pen.phase;out.hwnd=pen.hwnd;out.rootWindow=pen.rootWindow;
+  out.screen=pen.screen;out.external=pen.external;
+  return out;
+}
+std::optional<NativeTouch::InteractionSample> activeContactDrag() {
+  if (auto pen=nativePen.activeDrag()) return penContact(*pen);
+  auto touch=nativeTouch.activeInteraction();
+  return touch && touch->kind=="dnd" ? touch : std::nullopt;
+}
+bool holdsContact(const NativeTouch::InteractionSample &contact) {
+  return contact.penTool ? nativePen.ownsDragPointer(contact.pointerId) : nativeTouch.ownsPointer(contact.pointerId);
+}
+bool setContactExternal(const NativeTouch::InteractionSample &contact,bool external) {
+  return contact.penTool ? nativePen.externalDrag(contact.operation,external) :
+                           nativeTouch.externalInteraction(contact.operation,external);
+}
+void cancelContact(const NativeTouch::InteractionSample &contact) {
+  if (contact.penTool) nativePen.cancel();
+  else nativeTouch.cancel();
+}
+void touchInteractionSample(const NativeTouch::InteractionSample &sample);
 void penWindowInteractionSample(const NativePen::WindowInteractionSample &sample) {
+  if (sample.kind == "dnd") {
+    touchInteractionSample(penContact(sample));
+    return;
+  }
   auto found=windows.find(sample.id);
   RemoteWindow *source=found == windows.end() ? nullptr : found->second.get();
   if (sample.phase == "begin") {
@@ -2428,6 +2580,11 @@ Json touchInteractionInput(const NativeTouch::InteractionSample &sample) {
   Json input = {{"type","touch_interaction_input"},{"operation",sample.operation},
                 {"gesture",sample.gesture},{"generation",sample.generation},{"slot",sample.slot},
                 {"phase",sample.phase},{"id",0},{"x",0.0},{"y",0.0}};
+  if (sample.penTool) {
+    input["input"]="pen";
+    input["pen_tool"]=sample.penTool;
+    input["pen_eraser"]=sample.penEraser;
+  }
   if (sample.kind != "dnd") return input;
   if (auto *target = windowDragTarget(sample.screen)) {
     POINT point = sample.screen; ScreenToClient(target->hwnd, &point);
@@ -2446,45 +2603,51 @@ void resetTouchOle(uint64_t expected = 0) {
   touchOle.reset(); touchOlePromotedOperation=0; touchOleMouseReady=false; touchOleDeadline=0;
   if (controller) KillTimer(controller,TouchOleTimer);
 }
+bool contactOwnsTransfer(const NativeTouch::InteractionSample &sample,const FileDrag::Transfer &transfer) {
+  return transfer.touchOperation==sample.operation && transfer.touchGesture==sample.gesture &&
+         transfer.touchGeneration==sample.generation && transfer.touchSlot==sample.slot &&
+         transfer.penTool==sample.penTool && transfer.penEraser==sample.penEraser;
+}
 bool tryTouchOle(const NativeTouch::InteractionSample &sample) {
   if (sample.kind != "dnd" || sample.phase != "motion" || sample.external || windowDragTarget(sample.screen)) return false;
   auto transfer = FileDrag::current();
-  if (!transfer || transfer->touchOperation != sample.operation) return false;
+  if (!transfer || !contactOwnsTransfer(sample,*transfer)) return false;
   // The OS call must run while this real contact's pointer message is current.
-  if (!nativeTouch.externalInteraction(sample.operation,true)) return false;
+  if (!setContactExternal(sample,true)) return false;
   touchOlePromotedOperation=sample.operation; touchOleMouseReady=false;
   touchOleDeadline=GetTickCount64()+1000;
   sendJson(touchInteractionInput(sample));
-  auto result=touchOle.promote(sample.hwnd,sample.pointerId);
+  auto result=touchOle.promote(sample.hwnd,sample.pointerId,sample.penTool?PT_PEN:PT_TOUCH);
   if (result.promoted()) {
-    auto owner=nativeTouch.activeInteraction();
+    auto owner=activeContactDrag();
     // Promotion can synchronously dispatch the entire mouse/OLE attempt.
     // Do not rearm an expired operation or overwrite a newer target position.
     if (owner && owner->operation == sample.operation && owner->external &&
         touchOlePromotedOperation == sample.operation && !touchOleMouseReady &&
-        nativeTouch.ownsPointer(owner->pointerId)) SetTimer(controller,TouchOleTimer,50,nullptr);
+        holdsContact(*owner)) SetTimer(controller,TouchOleTimer,50,nullptr);
     return true;
   }
-  nativeTouch.externalInteraction(sample.operation,false); resetTouchOle(sample.operation);
+  setContactExternal(sample,false); resetTouchOle(sample.operation);
   if (touchOleWarning != sample.operation) {
     touchOleWarning=sample.operation;
     hostControl.emit({{"type","settings_warning"},
-      {"message","当前系统未能接管原生触控跨端拖放；可在输入设置中为此应用选择鼠标兼容后重试"},
+      {"message",sample.penTool ? "当前系统未能接管笔的跨端拖放；仍可在串流窗口之间拖放" :
+        "当前系统未能接管原生触控跨端拖放；可在输入设置中为此应用选择鼠标兼容后重试"},
       {"reason",TouchOle::name(result.code)}});
   }
   return false;
 }
 bool touchOleMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
   if (touchOlePumping || (message != WM_MOUSEMOVE && message != WM_LBUTTONDOWN)) return false;
-  auto owner=nativeTouch.activeInteraction();
+  auto owner=activeContactDrag();
   if (!owner || !owner->external || owner->operation != touchOlePromotedOperation ||
-      !(keys & MK_LBUTTON) || (extra & 0xffffff00) != 0xff515700 || !(extra & 0x80)) return false;
+      !(keys & MK_LBUTTON) || !TouchOle::Bridge::matchesMouse(owner->penTool?PT_PEN:PT_TOUCH,extra)) return false;
   if (!touchOleMouseReady) {
     if (!touchOle.takeMouseReady(hwnd,message,keys,extra)) return false;
     touchOleMouseReady=true; touchOleDeadline=0; KillTimer(controller,TouchOleTimer);
   }
   auto transfer=FileDrag::current();
-  if (!transfer || transfer->touchOperation != owner->operation) return true;
+  if (!transfer || !contactOwnsTransfer(*owner,*transfer)) return true;
   touchOlePumping=true;
   struct Reset { ~Reset() { touchOlePumping=false; } } reset;
   FileDrag::maybeClaim();
@@ -2495,8 +2658,8 @@ bool touchOleMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
     if (!transfer->claimed) return false;
   }
   auto current=[&] {
-    auto active=nativeTouch.activeInteraction();
-    if (!active || active->operation != owner->operation || !nativeTouch.ownsPointer(active->pointerId) ||
+    auto active=activeContactDrag();
+    if (!active || active->operation != owner->operation || !holdsContact(*active) ||
         hostedReadOnly || FileDrag::current() != transfer) return false;
     std::lock_guard<std::mutex> lock(transfer->mutex);
     return !transfer->cancelled && !transfer->done;
@@ -2520,9 +2683,9 @@ bool touchOleMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
   } else if (current()) {
     // A stationary contact cannot provide a later mouse-handler entry. End the
     // timed-out attempt rather than leaving an externally owned gesture idle.
-    nativeTouch.cancel(); transfer->finish(false); resetTouchOle();
+    cancelContact(*owner); transfer->finish(false); resetTouchOle();
     hostControl.emit({{"type","settings_warning"},
-      {"message","触控拖放协商超时，本次拖动已取消，请重试"},{"reason","touch_drag_ready_timeout"}});
+      {"message","拖放协商超时，本次拖动已取消，请重试"},{"reason","touch_drag_ready_timeout"}});
   }
   return true;
 }
@@ -2642,7 +2805,7 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
     if (tryTouchOle(sample)) return;
     if (windowDrag.touch && windowDrag.touchOperation == sample.operation) moveDraggedWindow(sample.screen);
     sendJson(touchInteractionInput(sample));
-    tryTouchToplevelMove(sample);
+    if (!sample.penTool) tryTouchToplevelMove(sample);
     return;
   }
   if (manipulating && !sample.systemMove && (sample.phase == "motion" || sample.phase == "up")) {
@@ -2661,7 +2824,7 @@ void touchInteractionSample(const NativeTouch::InteractionSample &sample) {
     if (pending) {
       // UP can win while claim/readiness is in flight. There is no remaining
       // physical mouse-handler entry in which to start this OLE attempt.
-      nativeTouch.cancel(); transfer->finish(false); resetTouchOle(sample.operation);
+      cancelContact(sample); transfer->finish(false); resetTouchOle(sample.operation);
     }
   }
   if (sample.phase == "up" || sample.phase == "cancel" || sample.phase == "end") {
@@ -2800,7 +2963,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     break;
   case WM_CANCELMODE:
     nativeTouchpad.cancel(hwnd);
-    nativePen.cancel(hwnd);
+    if (!nativePen.ownsExternalDrag(hwnd)) nativePen.cancel(hwnd);
     if (windowDragMove.hwnd != hwnd || !windowDragMove.interrupted || !promotedToplevelMove())
       nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
@@ -3005,7 +3168,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   case WM_KILLFOCUS:
     nativeTouchpad.detach(hwnd);
-    nativePen.cancel(); nativeGamepads.focus(0);
+    if (!nativePen.activeDrag()) nativePen.cancel();
+    nativeGamepads.focus(0);
     if (auto owner = nativeTouch.activeInteraction(); !owner || owner->kind != "dnd") nativeTouch.cancel(hwnd);
     if (relativeInput.active(hwnd))
       releasePointer();
@@ -3420,8 +3584,10 @@ void dispatchNetwork() {
     if (type == "hello") {
       penNegotiated=m.value("pen_v1",false);
       penSettingsNegotiated=penNegotiated && m.value("pen_settings_v1",false);
+      penDragNegotiated=penNegotiated && m.value("pen_drag_v1",false);
       gamepadNegotiated=m.value("gamepad_v1",false);
       gamepadSettingsNegotiated=gamepadNegotiated && m.value("gamepad_settings_v1",false);
+      nativeGamepads.allowReconnect(gamepadNegotiated && m.value("gamepad_reconnect_v1",false));
       nativePen.hello(penNegotiated); nativePen.configure(hostedPen,hostedPenGamma);
       nativeGamepads.configure(gamepadNegotiated,hostedGamepads,hostedGamepadRumble,hostedGamepadDeadzone);
       pollGamepads();
@@ -3443,6 +3609,8 @@ void dispatchNetwork() {
       }
       if (m.value("audio_pcm", false))
         startAudio(m.at("media_key").get<std::string>());
+      if (m.value("microphone_v1", false))
+        microphoneKey = m.value("media_key", "");
       if (m.contains("udp_fec_v1"))
         udpMedia.start(m["udp_fec_v1"], queueMedia, sendJson);
       semanticsNegotiated = m.value("window_semantics_v1", false);
@@ -3457,15 +3625,21 @@ void dispatchNetwork() {
       {
         FileTree::supported = std::find(m["features"].begin(), m["features"].end(), "file_tree") != m["features"].end();
         streamConfigNegotiated = std::find(m["features"].begin(),m["features"].end(),"stream_config_v1") != m["features"].end();
+        appStreamModesNegotiated = std::find(m["features"].begin(), m["features"].end(), "app_stream_modes_v1") != m["features"].end();
       }
       if (m.value("split_media", false))
         startMedia(m.at("media_key").get<std::string>());
+      if (m.value("file_channel_v1", false))
+        startFileChannel(m.at("media_key").get<std::string>());
       publishClipboard();
       hostControl.emit({{"type","connected"},{"version",3},{"features",m.value("features",Json::array())},
                         {"activation_v1",nativeActivation.enabled()},
                         {"hardware_codecs",supportedVideoKinds},{"stream_config",streamConfigNegotiated}});
       remoteNotifications.hello(m);
       if (hostControl.active()) sendStreamConfiguration();
+      updateMicrophonePermission();
+    } else if (type == "microphone_state") {
+      microphoneReply(m);
     } else if (type == "activation_prepared") {
       hostControl.emit(m);
     } else if (type == "window_activate") {
@@ -3477,7 +3651,7 @@ void dispatchNetwork() {
       hostControl.emit(m);
     } else if (type == "toplevel_drag") {
       if (!m.value("active", false)) { endWindowDrag(); continue; }
-      if (m.value("input","") == "touch") {
+      if (m.value("input","") == "touch" || m.value("input","") == "pen") {
         windowDrag.active = true; windowDrag.touch = true;
         windowDrag.touchOperation = m.value("touch_operation", uint64_t(0));
       } else if (!windowDrag.active) {
@@ -3541,13 +3715,22 @@ void dispatchNetwork() {
       sendWindowState(w);
     } else if (type == "touch_interaction") {
       auto operation = m.value("operation",uint64_t(0));
+      bool pen = m.value("input","") == "pen";
       if (m.value("kind","") == "end") {
         if (windowDrag.touch && windowDrag.touchOperation == operation)
           windowDrag.cancelled |= m.value("cancelled", false);
-        nativeTouch.endInteraction(operation);
+        if (pen) nativePen.endDrag(operation);
+        else nativeTouch.endInteraction(operation);
       } else {
         auto source = windows.find(m.value("id",uint32_t(0)));
-        if (!touchInteractionNegotiated || source == windows.end() || hostedReadOnly ||
+        if (pen) {
+          bool accepted = penDragNegotiated && source != windows.end() && !hostedReadOnly &&
+            m.value("kind","") == "dnd" && !nativeTouch.ownsInteraction() &&
+            nativePen.beginDrag(m,source->second->hwnd);
+          sendJson({{"type","touch_interaction_ack"},{"operation",operation},{"accepted",accepted},
+            {"input","pen"},{"generation",m.value("generation",uint64_t(0))},{"gesture",m.value("gesture",uint64_t(0))},
+            {"slot",m.value("slot",uint32_t(0))},{"pen_tool",m.value("pen_tool",uint64_t(0))},{"pen_eraser",m.value("pen_eraser",false)}});
+        } else if (!touchInteractionNegotiated || source == windows.end() || hostedReadOnly ||
             (source->second->state.fullscreen && m.value("kind","") != "dnd")) {
           sendJson({{"type","touch_interaction_ack"},{"operation",operation},{"accepted",false}});
         } else nativeTouch.beginInteraction(m,source->second->hwnd);
@@ -3871,13 +4054,26 @@ void sendStreamConfiguration() {
     hostControl.emit({{"type","settings_warning"},{"message","服务端不支持实时画面设置，请更新 Linux 服务端；本地设置仍可使用"}});
     return;
   }
-  sendJson({{"type","stream_config"},{"request_id",++streamRequest},
-            {"fps",hostedSettings.value("fps",60)},{"bitrate",hostedSettings.value("bitrate",30000)},
-            {"codec",hostedSettings.value("codec","auto")},{"hdr",hostedSettings.value("hdr",false)},
-            {"read_only",hostedReadOnly}});
+  Json request = {{"type","stream_config"},{"request_id",++streamRequest},
+                  {"fps",hostedSettings.value("fps",60)},{"bitrate",hostedSettings.value("bitrate",30000)},
+                  {"codec",hostedSettings.value("codec","auto")},{"hdr",hostedSettings.value("hdr",false)},
+                  {"read_only",hostedReadOnly}};
+  const auto modes = hostedSettings.value("app_stream_modes", Json::object());
+  if (appStreamModesNegotiated) request["app_modes"] = modes;
+  else if (!modes.empty())
+    hostControl.emit({{"type","settings_warning"},{"message","此 Linux 服务端暂不支持按应用设置画面预设"}});
+  sendJson(request);
 }
 void applyHostedSettings(const Json &settings, bool live) {
   if (!settings.is_object()) throw std::runtime_error("Settings must be an object");
+  if (settings.contains("microphone") && !settings["microphone"].is_boolean())
+    throw std::runtime_error("Microphone setting must be boolean");
+  if (const auto modes = settings.find("app_stream_modes"); modes != settings.end()) {
+    if (!modes->is_object() || modes->size() > 256) throw std::runtime_error("Invalid application stream modes");
+    for (auto mode = modes->begin(); mode != modes->end(); ++mode)
+      if (mode.key().empty() || mode.key().size() > 1024 || (*mode != "clear" && *mode != "low_latency"))
+        throw std::runtime_error("Invalid application stream mode");
+  }
   if (settings.contains("touch") && !settings["touch"].is_boolean())
     throw std::runtime_error("Touch setting must be boolean");
   bool requestedTouch = settings.value("touch",false);
@@ -3965,9 +4161,15 @@ void applyHostedSettings(const Json &settings, bool live) {
   remoteTray.configure(trayNegotiated,settings.value("tray",true),settings.value("read_only",false));
   remoteTray.repaint();
   hostedReadOnly=settings.value("read_only",false); hostedIme=settings.value("ime",true);
+  hostedMicrophone = settings.value("microphone", false);
+  if (!hostedMicrophone || hostedReadOnly) microphoneForwarder.configure(std::nullopt);
   remoteNotifications.inputReadOnly(hostedReadOnly);
   hostedDragText=settings.value("drag_text",true);
   hostedFiles=settings.value("files",true); hostedImages=settings.value("clipboard_images",true);
+  hostedFileRate=settings.value("file_rate_kib",uint64_t(0));
+  if (hostedFileRate && (hostedFileRate < 32 || hostedFileRate > 1048576))
+    throw std::runtime_error("File rate must be unlimited or 32–1048576 KiB/s");
+  fileChannel.setRate(hostedFileRate);
   if (hostedReadOnly || !hostedDragText) TextDrag::reset();
   hostedClipboard=clipboard;
   FileTree::setDownloadsEnabled(hostedFiles && hostedClipboard != "off" && hostedClipboard != "send");
@@ -3984,6 +4186,8 @@ void applyHostedSettings(const Json &settings, bool live) {
     if (!hostedFiles) { FileDrag::disconnect(); FileTree::cancelUploads(); FileTree::cancelIncoming(); VirtualFiles::cancel(); }
     if (hostedClipboard=="off" || hostedClipboard=="send") { FileTree::cancelIncoming(); VirtualFiles::cancel(); }
     sendJson({{"type","file_drop_out_enabled"},{"enabled",hostedFiles}});
+    if (fileChannel.negotiated())
+      sendJson({{"type","file_transfer_rate"},{"kib_per_second",hostedFileRate}});
     sendJson({{"type","text_drag_enabled"},{"enabled",hostedDragText}});
     if (touchSettingsNegotiated)
       sendJson({{"type","touch_enabled"},{"enabled",hostedTouch}});
@@ -3991,9 +4195,11 @@ void applyHostedSettings(const Json &settings, bool live) {
     if (gamepadSettingsNegotiated) sendJson({{"type","gamepad_enabled"},{"enabled",hostedGamepads}});
     pollGamepads();
     sendStreamConfiguration();
+    updateMicrophonePermission();
     for (auto &[id,window] : windows) if (!window->popup) { window->dpi=effectiveDpi(window->hwnd); sendResize(window.get()); }
     updateIme();
     Json applied=professionalInputStatus(); applied["type"]="local_settings_applied"; applied["settings"]=settings;
+    addMicrophoneStatus(applied);
     applied["touch_enabled"]=hostedTouch && touchNegotiated;
     applied["touch_live_supported"]=touchSettingsNegotiated; hostControl.emit(applied);
   }
@@ -4008,6 +4214,7 @@ void publishHostedStatus() {
       {"hardware_decode",bool(w->frame && VideoDecoder::videoKind(w->frame->codec))},{"presentation",w->presentation?"D3D11 / DirectComposition":"GDI"}});
   }
   Json status=professionalInputStatus();
+  addMicrophoneStatus(status);
   const auto budget = mediaBudget.snapshot();
   status["media_budget"] = {{"cpu_reserved_bytes", budget.used.cpu},
                             {"gpu_estimated_bytes", budget.used.gpu},
@@ -4028,8 +4235,8 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_TIMER && wp == DragVisual::Timer) { dragVisual.tick(); return 0; }
     if (message == WM_TIMER && wp == TouchOleTimer) {
       if (touchOleDeadline && GetTickCount64() >= touchOleDeadline) {
-        auto owner=nativeTouch.activeInteraction();
-        if (owner && owner->operation == touchOlePromotedOperation) nativeTouch.cancel();
+        auto owner=activeContactDrag();
+        if (owner && owner->operation == touchOlePromotedOperation) cancelContact(*owner);
         resetTouchOle();
       }
       return 0;
@@ -4055,6 +4262,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
             if (!(request.value("epoch",uint64_t(0)) && request.value("generation",uint64_t(0)) && remoteTray.request(request.value("id",std::string()),request.value("action",std::string()),request.value("epoch",uint64_t(0)),request.value("generation",uint64_t(0)))))
               throw std::runtime_error("Tray action is unavailable or input is read-only");
           }
+          else if (type=="cancel_transfer") cancelTransfer(request);
           else if (type=="send_files") {
             if (!hostedFiles) throw std::runtime_error("File transfers disabled");
             std::vector<std::wstring> paths;
@@ -4251,10 +4459,11 @@ int wmain(int argc, wchar_t **argv) {
     if (flag==L"--touch") hostedTouch=true;
     else if (flag==L"--pen") hostedPen=true;
     else if (flag==L"--gamepads") hostedGamepads=true;
+    else if (flag==L"--microphone") hostedMicrophone=true;
     else validInputFlags=false;
   }
   if (argc < 4 || !validInputFlags) {
-    std::cerr << "Usage: waybridge-client.exe HOST PORT TOKEN [--touch] [--pen] [--gamepads]\nUse an SSH "
+    std::cerr << "Usage: waybridge-client.exe HOST PORT TOKEN [--touch] [--pen] [--gamepads] [--microphone]\nUse an SSH "
                  "tunnel to the Linux loopback listener.\n";
     return 1;
   }
@@ -4306,6 +4515,8 @@ int wmain(int argc, wchar_t **argv) {
   std::cout << "H.264 hardware decoder capability: "
             << (hardwareDecoder ? "available" : "unavailable; using PNG") << '\n';
   pngFormat = RegisterClipboardFormatW(L"PNG");
+  htmlFormat = RegisterClipboardFormatW(L"HTML Format");
+  rtfFormat = RegisterClipboardFormatW(L"Rich Text Format");
   HINSTANCE instance = GetModuleHandleW(nullptr);
   WNDCLASSW wc{};
   wc.hInstance = instance;
@@ -4321,10 +4532,23 @@ int wmain(int argc, wchar_t **argv) {
   RegisterClassW(&wc);
   controller = CreateWindowExW(0, wc.lpszClassName, L"Waybridge", 0, 0, 0, 0, 0, HWND_MESSAGE,
                                nullptr, instance, nullptr);
-  hostControl.start(controller);
+  hostControl.start(controller, [](const Json &request) {
+    // A shell IStream read may be blocking the native STA. Wake it before
+    // dispatching the cancellation that finishes the drag on that same STA.
+    if (request.value("type", "") == "cancel_transfer" && request.value("kind", "") == "drag")
+      if (auto transfer = FileDrag::current(); transfer && transfer->id == request.value("id", uint64_t(0)))
+        transfer->cancel();
+  });
   dragVisual.attach(controller);
   TextDrag::attach(controller);
   FileTree::activity = [](const Json &event) { hostControl.emit(event); };
+  TransferActivity::report = [](const Json &event) { hostControl.emit(event); };
+  FileTree::separateData = [] { return fileChannel.negotiated(); };
+  FileTree::sendData = [](const Json &message, const std::function<bool()> &valid) {
+    if (fileChannel.negotiated()) return fileChannel.send(message, valid);
+    sendJson(message);
+    return running.load();
+  };
   FileDrag::remoteHitTest = [](POINT point) { return windowDragTarget(point)!=nullptr; };
   remoteNotifications.decorate = [](Json &message) {
     NativeIcon icon;
@@ -4408,6 +4632,7 @@ int wmain(int argc, wchar_t **argv) {
             {"version", 3},
             {"split_media", true},
             {"audio_pcm", audioSupported},
+            {"microphone_v1", true},
             {"udp_fec_v1", UdpMedia::requested()},
             {"frame_ack", true},
             {"hdr", supportedVideoKinds.count(7) > 0 || supportedVideoKinds.count(8) > 0},
@@ -4420,8 +4645,8 @@ int wmain(int argc, wchar_t **argv) {
             {"data_drag_v1", true},
             {"notifications_v1", hostControl.active()},
             {"notifications_enabled", false},
-            {"pen_v1", true}, {"pen_enabled",hostedPen},
-            {"gamepad_v1", true}, {"gamepad_enabled",hostedGamepads},
+            {"pen_v1", true}, {"pen_drag_v1", true}, {"pen_enabled",hostedPen},
+            {"gamepad_v1", true}, {"gamepad_reconnect_v1",true}, {"gamepad_enabled",hostedGamepads},
             {"touch_v1", true},
             {"touchpad_v1", nativeTouchpad.available()},
             {"touch_enabled", hostedTouch},
@@ -4432,6 +4657,8 @@ int wmain(int argc, wchar_t **argv) {
             {"file_drop_out", hostedFiles},
             {"drag_text", hostedDragText},
             {"file_tree", true},
+            {"file_channel_v1", true},
+            {"file_rate_kib", hostedFileRate},
             {"codecs", codecs},
             {"token", utf8(argv[3])},
             {"dpi", effectiveDpi()},
@@ -4462,6 +4689,7 @@ int wmain(int argc, wchar_t **argv) {
   frameWake.notify_all();
   shutdown(connection, SD_BOTH);
   controlSender.stop();
+  fileChannel.stop();
   udpMedia.stop();
   SOCKET media = mediaConnection.load();
   if (media != INVALID_SOCKET)
@@ -4473,6 +4701,7 @@ int wmain(int argc, wchar_t **argv) {
   if (audioReceiver.joinable())
     audioReceiver.join();
   audioPlayback.stop();
+  microphoneForwarder.stop();
   if (mediaReceiver.joinable())
     mediaReceiver.join();
   decoder.join();

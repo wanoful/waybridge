@@ -14,6 +14,7 @@ python3 tests/windows_app_icon_smoke.py
 python3 tests/windows_touch_smoke.py
 python3 tests/windows_pen_smoke.py
 python3 tests/windows_gamepad_smoke.py
+python3 tests/windows_smoke.py --rich-clipboard
 python3 tests/touch_settings_smoke.py
 python3 tests/professional_input_settings_smoke.py
 python3 tests/windows_tray_smoke.py

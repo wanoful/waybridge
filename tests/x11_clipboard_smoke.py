@@ -27,7 +27,7 @@ def main():
             viewer=Viewer(port,token)
             # Native Wayland must have keyboard focus for regular wl-paste; data-control can read without focus.
             png=io.BytesIO();Image.new('RGBA',(5,3),(23,71,129,128)).save(png,format='PNG')
-            for mime,data in [('text/plain;charset=utf-8',('中文🙂 INCR\n'*18000).encode()),('image/png',png.getvalue())]:
+            for mime,data in [('text/plain;charset=utf-8',('中文🙂 INCR\n'*18000).encode()),('image/png',png.getvalue()),('text/html','<em>中文🙂</em>'.encode()),('text/rtf',br'{\rtf1\ansi \b Bold\b0}')]:
                 print('X11 clipboard MIME',mime,flush=True)
                 source=Path(runtime)/'source';source.write_bytes(data)
                 output=Path(runtime)/'output'
@@ -40,7 +40,7 @@ def main():
                     return p.returncode==0 and p.stdout==data
                 wait(paste_wayland)
                 # Viewer/Windows → X11, preserving exact bytes and superseding the original source.
-                changed=data+('来自 Windows🙂'.encode() if mime.startswith('text') else b'')
+                changed=data+('来自 Windows🙂'.encode() if mime in ('text/plain;charset=utf-8','text/html') else b'')
                 viewer.send(type='clipboard',items={mime:base64.b64encode(changed).decode()});time.sleep(.1)
                 subprocess.run([str(ROOT/'build/tests/x11-clipboard'),'paste',mime,str(output)],env=xenv,stdout=log,stderr=log,timeout=10,check=True)
                 assert output.read_bytes()==changed,(mime,len(output.read_bytes()),len(changed),output.read_bytes()[-24:])
@@ -50,7 +50,7 @@ def main():
                 subprocess.run([str(ROOT/'build/tests/x11-clipboard'),'paste',mime,str(output)],env=xenv,stdout=log,stderr=log,timeout=10,check=True)
                 assert output.read_bytes()==data
                 ready.close()
-            print('PASS: real X11/Wayland/viewer bidirectional Unicode/emoji and PNG bytes, >200KiB INCR clipboard, source replacement/generations')
+            print('PASS: real X11/Wayland/viewer bidirectional Unicode/emoji, PNG, HTML and RTF bytes, >200KiB INCR clipboard, source replacement/generations')
         finally:
             if viewer:viewer.sock.close()
             for process in reversed(processes):

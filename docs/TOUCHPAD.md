@@ -47,9 +47,11 @@ finger-source scrolling with an axis stop, a two-contact pinch with changing
 scale and a normal pinch end. It received no duplicate wheel events. The probe's
 `--production-viewer PID TITLE` mode requires a visible foreground window owned
 by that process and a title beginning with `Waybridge-touchpad-e2e-`. The Wayland
-fixture takes that title from `WAYBRIDGE_TOUCHPAD_FIXTURE_TITLE`. Physical
-touchpad testing remains separate.
+fixture takes that title from `WAYBRIDGE_TOUCHPAD_FIXTURE_TITLE`.
 
 The shipped x64 viewer also passed a synthetic Precision Touchpad pinch into
 native Wayland Chrome. Chrome's visual viewport scale increased from 1 to 2.69
 while its layout width and device pixel ratio stayed fixed.
+
+The user confirmed that physical touchpad pinching in streamed Chrome worked
+after reconnecting to the upgraded Linux session.

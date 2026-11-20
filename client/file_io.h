@@ -57,6 +57,7 @@ inline void start(std::function<void()> notify, std::function<void()> failure = 
         queuedBytes -= task.bytes;
         execute = (!stopping && !failed) || task.cleanup;
       }
+      wake.notify_all();
       if (execute) {
         try {
           task.run();
@@ -69,7 +70,7 @@ inline void start(std::function<void()> notify, std::function<void()> failure = 
     onWorker = false;
   });
 }
-inline bool submit(std::function<void()> task, size_t bytes = 0) {
+inline bool submit(std::function<void()> task, size_t bytes = 0, bool mayWait = false) {
   if (active && failed)
     return false;
   if (!active || onWorker) {
@@ -77,14 +78,18 @@ inline bool submit(std::function<void()> task, size_t bytes = 0) {
     return true;
   }
   {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(mutex);
     constexpr size_t Budget = 32 * 1024 * 1024;
-    if (stopping || failed || tasks.size() >= 512 || bytes > Budget || queuedBytes > Budget - bytes)
+    if (bytes > Budget) return false;
+    auto room = [&] { return tasks.size() < 512 && bytes <= Budget - queuedBytes; };
+    while (mayWait && !stopping && !failed && running && !room())
+      wake.wait_for(lock, std::chrono::milliseconds(100));
+    if (stopping || failed || !running || !room())
       return false;
     queuedBytes += bytes;
     tasks.push_back({std::move(task), bytes, false, nullptr});
   }
-  wake.notify_one();
+  wake.notify_all();
   return true;
 }
 inline void cleanup(std::function<void()> task, const void *key = nullptr) {

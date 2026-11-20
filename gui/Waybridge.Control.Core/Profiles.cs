@@ -14,6 +14,7 @@ public sealed record ClientSettings
     public int Dpi { get; set; }
     public bool Audio { get; set; } = true;
     public string AudioDevice { get; set; } = "";
+    public bool Microphone { get; set; }
     public bool Hdr { get; set; }
     public bool Udp { get; set; }
     public string UdpHost { get; set; } = "";
@@ -26,9 +27,11 @@ public sealed record ClientSettings
     public bool GamepadRumble { get; set; } = true;
     public int GamepadDeadzone { get; set; } = 15;
     public Dictionary<string, string> TouchModes { get; set; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> AppStreamModes { get; set; } = new(StringComparer.Ordinal);
     public string Clipboard { get; set; } = "both";
     public bool ClipboardImages { get; set; } = true;
     public bool Files { get; set; } = true;
+    public int FileRateKib { get; set; }
     public bool DragText { get; set; } = true;
     public string BadgePng { get; set; } = "";
     public bool Notifications { get; set; } = true;
@@ -37,12 +40,18 @@ public sealed record ClientSettings
     public string GpuInput { get; set; } = "cpu";
     public void Validate()
     {
+        if (FileRateKib != 0 && FileRateKib is < 32 or > 1048576)
+            throw new ArgumentException("文件传输限速为 0 或 32–1048576 KiB/s");
         if (!double.IsFinite(PenPressureGamma) || PenPressureGamma is < .25 or > 4)
             throw new ArgumentException("笔压力度曲线范围为 0.25–4");
         if (GamepadDeadzone is < 0 or > 50) throw new ArgumentException("手柄摇杆死区范围为 0%–50%");
         if (TouchModes is null || TouchModes.Count > 100 || TouchModes.Any(p =>
             string.IsNullOrWhiteSpace(p.Key) || p.Key.Length > 256 || p.Key.Any(char.IsControl) || p.Value is not ("native" or "mouse")))
             throw new ArgumentException("应用触控模式无效，最多配置 100 个应用");
+        if (AppStreamModes is null || AppStreamModes.Count > 256 || AppStreamModes.Any(p =>
+            string.IsNullOrEmpty(p.Key) || System.Text.Encoding.UTF8.GetByteCount(p.Key) > 1024
+            || p.Key.Any(char.IsControl) || p.Value is not ("clear" or "low_latency")))
+            throw new ArgumentException("应用画面预设无效");
         if (BadgePng is null || BadgePng.Length > 32768) throw new ArgumentException("自定义角标过大");
         if (BadgePng.Length > 0)
         {

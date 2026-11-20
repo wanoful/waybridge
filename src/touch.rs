@@ -3,7 +3,7 @@
 use super::*;
 use smithay::{
     backend::input::TouchSlot,
-    input::touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
+    input::touch::{DownEvent, GrabStartData, MotionEvent as TouchMotionEvent, UpEvent},
 };
 use std::collections::BTreeMap;
 
@@ -28,6 +28,7 @@ struct Interaction {
     gesture: u64,
     slot: u32,
     source: Option<u64>,
+    pen: Option<PenContact>,
     acknowledged: bool,
     owner_up: bool,
     returning: bool,
@@ -36,6 +37,38 @@ struct Interaction {
     started: Instant,
     ended: Option<bool>,
     deferred_focus: Option<Option<u32>>,
+}
+struct PenContact {
+    epoch: u64,
+    tool: u64,
+    eraser: bool,
+    position: Point<f64, Logical>,
+}
+impl Interaction {
+    fn tag_input(&self, message: &mut Value) {
+        if let Some(pen) = &self.pen {
+            message["input"] = json!("pen");
+            message["pen_tool"] = json!(pen.tool);
+            message["pen_eraser"] = json!(pen.eraser);
+        }
+    }
+    fn input_matches(&self, message: &Value) -> bool {
+        self.pen.as_ref().map_or_else(
+            || message["input"] != "pen",
+            |pen| {
+                message["input"] == "pen"
+                    && message["pen_tool"].as_u64() == Some(pen.tool)
+                    && message["pen_eraser"].as_bool() == Some(pen.eraser)
+            },
+        )
+    }
+    fn matches_pen_message(&self, message: &Value) -> bool {
+        self.input_matches(message)
+            && (self.pen.is_none()
+                || (message["generation"].as_u64() == Some(self.generation)
+                    && message["gesture"].as_u64() == Some(self.gesture)
+                    && message["slot"].as_u64() == Some(u64::from(self.slot))))
+    }
 }
 #[derive(Default)]
 pub struct Touch {
@@ -97,7 +130,9 @@ impl App {
         }
         self.touch.enabled = enabled;
         if !enabled {
-            self.cancel_touch();
+            if self.pen_drag_operation().is_none() {
+                self.cancel_touch();
+            }
         } else {
             let before = self.touch.generation;
             self.sync_touch();
@@ -162,27 +197,33 @@ impl App {
             .map(|w| (id, w.state.mapping_epoch))
     }
     pub fn sync_touch(&mut self) {
-        if !self.touch.available {
-            return;
-        }
         if let Some(focus) = self.touch.resume_focus.take() {
             self.focus(focus);
         }
         if let Some(operation) = &self.touch.operation {
-            let valid = self.touch.enabled
-                && !self.read_only
+            let valid = !self.read_only
                 && self.peer.as_ref().is_some_and(|p| p.desktop_input())
-                && self.windows.iter().any(|w| {
-                    w.id == operation.root
-                        && w.mapped
-                        && w.window.alive()
-                        && self.window_touch_bound(&w.window)
-                })
-                && self
-                    .touch
-                    .contacts
-                    .get(&operation.slot)
-                    .is_some_and(|c| c.gesture == operation.gesture)
+                && operation.pen.as_ref().map_or_else(
+                    || {
+                        self.touch.enabled
+                            && self.windows.iter().any(|w| {
+                                w.id == operation.root
+                                    && w.mapped
+                                    && w.window.alive()
+                                    && self.window_touch_bound(&w.window)
+                            })
+                            && self
+                                .touch
+                                .contacts
+                                .get(&operation.slot)
+                                .is_some_and(|c| c.gesture == operation.gesture)
+                    },
+                    |pen| {
+                        self.pen_drag_allowed(operation.root, pen.epoch)
+                            && self.focused_window == Some(operation.root)
+                            && operation.started.elapsed() < Duration::from_secs(120)
+                    },
+                )
                 && (operation.acknowledged || operation.started.elapsed() < Duration::from_secs(2));
             if !valid {
                 self.finish_touch_interaction(true);
@@ -191,6 +232,9 @@ impl App {
             } else {
                 return;
             }
+        }
+        if !self.touch.available {
+            return;
         }
         let desired = self.focused_window.and_then(|id| self.touch_candidate(id));
         let dead = self.touch.contacts.values().any(|c| !c.surface.is_alive());
@@ -527,6 +571,7 @@ impl App {
             gesture: contact.gesture,
             slot,
             source,
+            pen: None,
             acknowledged: false,
             owner_up: false,
             returning: false,
@@ -541,6 +586,59 @@ impl App {
             "id":root,"generation":self.touch.generation,"gesture":contact.gesture,"slot":slot,"edge":edge}));
         true
     }
+    pub(crate) fn pen_drag_operation(&self) -> Option<u64> {
+        let operation = self.touch.operation.as_ref()?;
+        operation.pen.as_ref().map(|_| operation.operation)
+    }
+    pub(crate) fn start_pen_drag(
+        &mut self,
+        pen: pen::PenDragStart,
+        source: u64,
+    ) -> Option<GrabStartData<Self>> {
+        if self.touch.operation.is_some() || self.seat.get_touch().is_none() {
+            return None;
+        }
+        self.cancel_touch();
+        self.touch.operation_sequence = self.touch.operation_sequence.wrapping_add(1).max(1);
+        let operation = self.touch.operation_sequence;
+        self.touch.operation = Some(Interaction {
+            operation,
+            kind: "dnd",
+            root: pen.root,
+            generation: pen.generation,
+            gesture: pen.gesture,
+            slot: 0,
+            source: Some(source),
+            pen: Some(PenContact {
+                epoch: pen.epoch,
+                tool: pen.tool,
+                eraser: pen.eraser,
+                position: pen.position,
+            }),
+            acknowledged: false,
+            owner_up: false,
+            returning: false,
+            return_focus: None,
+            return_settled: false,
+            started: Instant::now(),
+            ended: None,
+            deferred_focus: None,
+        });
+        self.data_drop.point = Some((pen.target, pen.local.0, pen.local.1));
+        self.control(
+            json!({"type":"touch_interaction","operation":operation,"kind":"dnd","input":"pen",
+            "id":pen.root,"generation":pen.generation,"gesture":pen.gesture,"slot":0,
+            "pen_tool":pen.tool,"pen_eraser":pen.eraser}),
+        );
+        self.retire_pen_for_drag();
+        // Drive Smithay's contact drag with a private slot. No wl_touch down,
+        // wl_pointer button or synthetic client input is sent for the pen.
+        Some(GrabStartData {
+            focus: Some((pen.surface.into(), pen.origin)),
+            slot: TouchSlot::from(Some(0)),
+            location: pen.position,
+        })
+    }
     pub(crate) fn defer_touch_focus(&mut self, id: Option<u32>) -> bool {
         if let Some(operation) = &mut self.touch.operation {
             operation.deferred_focus = Some(id);
@@ -553,11 +651,11 @@ impl App {
         let Some(operation) = self.touch.operation.take() else {
             return;
         };
-        self.control(
-            json!({"type":"touch_interaction","kind":"end","operation":operation.operation,
+        let mut end = json!({"type":"touch_interaction","kind":"end","operation":operation.operation,
             "id":operation.root,"generation":operation.generation,"gesture":operation.gesture,
-            "slot":operation.slot,"cancelled":cancelled}),
-        );
+            "slot":operation.slot,"cancelled":cancelled});
+        operation.tag_input(&mut end);
+        self.control(end);
         self.touch.resume_focus = operation.deferred_focus;
         self.touch.contacts.clear();
         if let Some(touch) = self.seat.get_touch() {
@@ -571,15 +669,18 @@ impl App {
         let Some(operation) = &self.touch.operation else {
             return;
         };
-        if value["operation"].as_u64() != Some(operation.operation) {
+        if value["operation"].as_u64() != Some(operation.operation)
+            || !operation.matches_pen_message(value)
+        {
             return;
         }
         let held = !operation.owner_up
-            && self
-                .touch
-                .contacts
-                .get(&operation.slot)
-                .is_some_and(|c| c.gesture == operation.gesture);
+            && (operation.pen.is_some()
+                || self
+                    .touch
+                    .contacts
+                    .get(&operation.slot)
+                    .is_some_and(|c| c.gesture == operation.gesture));
         if value["accepted"] != true || !held {
             self.finish_touch_interaction(true);
             return;
@@ -599,6 +700,7 @@ impl App {
         if value["operation"].as_u64() != Some(operation.operation)
             || value["gesture"].as_u64() != Some(operation.gesture)
             || value["slot"].as_u64() != Some(u64::from(operation.slot))
+            || !operation.matches_pen_message(value)
         {
             return;
         }
@@ -717,11 +819,11 @@ impl App {
             return;
         }
         let slot = operation.slot;
-        let location = self
-            .touch
-            .contacts
-            .get(&slot)
-            .map(|c| c.position)
+        let location = operation
+            .pen
+            .as_ref()
+            .map(|pen| pen.position)
+            .or_else(|| self.touch.contacts.get(&slot).map(|c| c.position))
             .unwrap_or((0., 0.).into());
         if let Some(touch) = self.seat.get_touch() {
             touch.motion(
@@ -788,18 +890,22 @@ impl App {
             .as_ref()
             .filter(|op| op.source == Some(source))
             .is_none_or(|op| {
-                [
-                    ("touch_operation", op.operation),
-                    ("touch_generation", op.generation),
-                    ("touch_gesture", op.gesture),
-                    ("touch_slot", u64::from(op.slot)),
-                ]
-                .into_iter()
-                .all(|(field, expected)| {
-                    message
-                        .get(field)
-                        .is_none_or(|value| value.as_u64() == Some(expected))
-                })
+                if message["type"] == "drag_read" {
+                    return true;
+                }
+                op.input_matches(message)
+                    && [
+                        ("touch_operation", op.operation),
+                        ("touch_generation", op.generation),
+                        ("touch_gesture", op.gesture),
+                        ("touch_slot", u64::from(op.slot)),
+                    ]
+                    .into_iter()
+                    .all(|(field, expected)| {
+                        message
+                            .get(field)
+                            .map_or(op.pen.is_none(), |value| value.as_u64() == Some(expected))
+                    })
             })
     }
     pub(crate) fn touch_source_held(&self, source: u64) -> bool {
@@ -808,11 +914,12 @@ impl App {
                 && op.source == Some(source)
                 && !op.owner_up
                 && op.ended.is_none()
-                && self
-                    .touch
-                    .contacts
-                    .get(&op.slot)
-                    .is_some_and(|c| c.gesture == op.gesture)
+                && (op.pen.is_some()
+                    || self
+                        .touch
+                        .contacts
+                        .get(&op.slot)
+                        .is_some_and(|c| c.gesture == op.gesture))
         })
     }
     pub(crate) fn touch_source_active(&self, source: u64) -> bool {
@@ -833,6 +940,7 @@ impl App {
             message["touch_generation"] = json!(op.generation);
             message["touch_gesture"] = json!(op.gesture);
             message["touch_slot"] = json!(op.slot);
+            op.tag_input(message);
         }
     }
     pub(crate) fn touch_source_finished(&mut self, source: u64, success: bool) {

@@ -13,6 +13,14 @@ static struct wl_surface *pen_focus;
 static char pen_action[32];
 static uint32_t last_tip_serial;
 static unsigned pen_window(struct wl_surface*s){for(unsigned i=0;i<2;i++)if(windows[i].surface==s)return i+1;return 0;}
+static void pen_drag(struct wl_surface *surface, uint32_t serial) {
+ if(drag_source||!data_device)return;
+ drag_source=wl_data_device_manager_create_data_source(data_manager);
+ wl_data_source_add_listener(drag_source,&source_listener,NULL);
+ wl_data_source_offer(drag_source,"text/uri-list");
+ wl_data_source_set_actions(drag_source,WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+ wl_data_device_start_drag(data_device,drag_source,surface,NULL,serial);
+}
 static void tname(void*d,struct zwp_tablet_v2*t,const char*n){(void)d;(void)t;printf("TABLET_NAME %s\n",n);fflush(stdout);}
 static void tid(void*d,struct zwp_tablet_v2*t,uint32_t v,uint32_t p){(void)d;(void)t;(void)v;(void)p;}
 static void tpath(void*d,struct zwp_tablet_v2*t,const char*p){(void)d;(void)t;(void)p;}
@@ -33,6 +41,7 @@ static void pdown(void*d,struct zwp_tablet_tool_v2*t,uint32_t serial){
  if(!strcmp(pen_action,"move"))xdg_toplevel_move(windows[0].top,seat,serial);
  else if(!strcmp(pen_action,"resize"))xdg_toplevel_resize(windows[0].top,seat,serial,XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT);
  else if(!strcmp(pen_action,"invalid_move"))xdg_toplevel_move(windows[1].top,seat,serial);
+ else if(!strcmp(pen_action,"drag"))pen_drag(pen_focus,serial);
 }
 static void pup(void*d,struct zwp_tablet_tool_v2*t){(void)d;(void)t;puts("PEN_UP");fflush(stdout);}
 static void pmotion(void*d,struct zwp_tablet_tool_v2*t,wl_fixed_t x,wl_fixed_t y){(void)d;(void)t;printf("PEN_MOTION %.3f %.3f\n",wl_fixed_to_double(x),wl_fixed_to_double(y));fflush(stdout);}
@@ -59,6 +68,10 @@ int main(void){
  display=wl_display_connect(NULL);if(!display)return 1;
  wl_registry_add_listener(wl_display_get_registry(display),&pen_registry_listener,NULL);
  wl_display_roundtrip(display);wl_display_roundtrip(display);if(!tablet_manager||!seat||!shm||!shell)return 2;
+ if(getenv("WAYBRIDGE_TEST_DRAG_URIS")&&data_manager){
+  data_device=wl_data_device_manager_get_data_device(data_manager,seat);
+  wl_data_device_add_listener(data_device,&device_listener,NULL);
+ }
  for(int i=0;i<2;i++){
   struct window*w=&windows[i];w->id=i+1;w->width=400;w->height=300;w->surface=wl_compositor_create_surface(compositor);
   w->xdg=xdg_wm_base_get_xdg_surface(shell,w->surface);xdg_surface_add_listener(w->xdg,&surface_listener,w);

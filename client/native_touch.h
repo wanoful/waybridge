@@ -32,6 +32,8 @@ public:
     POINT screen{}, initialScreen{};
     RECT initialWindow{};
     bool external = false, systemMove = false;
+    uint64_t penTool = 0;
+    bool penEraser = false;
   };
 private:
   struct Contact {

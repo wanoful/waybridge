@@ -155,6 +155,23 @@ where
                         return;
                     }
                 }
+                if handler.tablet_drag_origin(&seat, &origin, serial) {
+                    if let Some(ref icon) = icon {
+                        if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
+                            resource.post_error(
+                                wl_data_device::Error::Role,
+                                "Given surface already has an other role",
+                            );
+                            return;
+                        }
+                    }
+                    if let Some(source) = source {
+                        handler.dnd_requested(source, icon, seat, serial, GrabType::Tablet);
+                    } else {
+                        handler.dnd_requested(origin, icon, seat, serial, GrabType::Tablet);
+                    }
+                    return;
+                }
                 debug!(serial = ?serial, client = ?client, "denying drag from client without implicit grab");
             }
             wl_data_device::Request::SetSelection { source, .. } => {

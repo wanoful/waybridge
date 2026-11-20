@@ -1,6 +1,7 @@
 #include <windows.h>
 #include "native_pen.h"
 #include "touch_window.h"
+#include "touch_ole.h"
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -105,5 +106,32 @@ int main(){try{
  info.pointerInfo.pointerFlags|=POINTER_FLAG_INCONTACT;manipulation.sample(target,WM_POINTERDOWN,info);
  require(manipulation.beginWindowInteraction(request(1,"move",0),window),"hello retained old window operation counter");
  manipulation.cancel(window);require(operations.back().phase=="cancel"&&!manipulation.ownsWindowInteraction(),"focus/capture policy cancel");
- DestroyWindow(window);std::cout<<"PASS: production pen mask/range/pressure gamma, DPI transform, hover/tip/barrel/eraser identity, leases/focus handoff/revocation, capture recovery, automatic fallback, pressure-less/late axes, held-tip CSD move/resize actual HWNDs, stale/secondary-pointer/policy rejection and 16-device bound\n";return 0;
+ std::vector<NativePen::Json> dragWire;
+ std::vector<NativePen::WindowInteractionSample> dragEvents;
+ NativePen drag([&](const auto&p){dragWire.push_back(p);});
+ drag.onWindowInteraction([&](const auto&s){dragEvents.push_back(s);});
+ drag.hello(true);drag.configure(true);drag.state({{"generation",1},{"enabled",true},{"id",7}});
+ info.pointerInfo.pointerFlags=POINTER_FLAG_INRANGE|POINTER_FLAG_INCONTACT;info.pointerInfo.ptPixelLocation=first;
+ require(drag.sample(target,WM_POINTERDOWN,info),"fresh pen drag tip");
+ const auto &tip=dragWire.back();
+ auto offer=NativePen::Json{{"operation",1},{"id",7},{"generation",tip["generation"]},
+   {"gesture",tip["gesture"]},{"pen_tool",tip["tool"]},{"pen_eraser",tip["eraser"]},{"slot",0}};
+ auto foreign=offer;foreign["gesture"]=99;
+ require(!drag.beginDrag(foreign,window)&&drag.beginDrag(offer,window),"pen drag did not check held tool and gesture");
+ drag.state({{"generation",2},{"enabled",false},{"drag_operation",1}});
+ require(drag.activeDrag()&&drag.externalDrag(1,true),"marked pen lease retirement lost OLE owner");
+ require(TouchOle::Bridge::matchesMouse(PT_PEN,0xff515700) &&
+         !TouchOle::Bridge::matchesMouse(PT_PEN,0xff515780) &&
+         !TouchOle::Bridge::matchesMouse(PT_PEN,0),"OLE promoted input signature mismatch");
+ drag.sample(target,WM_POINTERCAPTURECHANGED,info);
+ require(drag.activeDrag()&&drag.ownsDragPointer(info.pointerInfo.pointerId),"OLE capture lost the current pen");
+ auto wrongUp=info;wrongUp.pointerInfo.pointerId++;
+ require(!drag.sample(target,WM_POINTERUP,wrongUp)&&drag.activeDrag(),"second pointer released pen drag");
+ info.pointerInfo.pointerFlags=POINTER_FLAG_INRANGE;
+ drag.sample(target,WM_POINTERUP,info);
+ require(drag.activeDrag()&&!drag.ownsDragPointer(info.pointerInfo.pointerId)&&dragEvents.back().phase=="up",
+         "OLE must keep the release token without a held tip");
+ drag.endDrag(0);require(drag.activeDrag().has_value(),"stale end lost the drag");
+ drag.endDrag(1);require(!drag.activeDrag()&&dragEvents.back().phase=="end","valid OLE result lost pen drag");
+ DestroyWindow(window);std::cout<<"PASS: production pen mask/range/pressure gamma, DPI transform, hover/tip/barrel/eraser identity, leases/focus handoff/revocation, capture recovery, automatic fallback, pressure-less/late axes, held-tip CSD move/resize actual HWNDs, native drag/OLE release ownership, stale/secondary-pointer/policy rejection and 16-device bound\n";return 0;
  }catch(const std::exception&error){std::cerr<<"FAIL: "<<error.what()<<"\n";return 1;}}

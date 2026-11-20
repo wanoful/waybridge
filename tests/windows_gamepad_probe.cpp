@@ -80,7 +80,9 @@ int main() {
       if ((*it)["type"] == "gamepad" && (*it)["slot"] == slot) return *it;
     return Json::object();
   };
-  NativeGamepad pad([&](const Json &message) { messages.push_back(message); });
+  SDL_JoystickID reconnectId=0;
+  NativeGamepad pad([&](const Json &message) { messages.push_back(message); },
+                    [&](SDL_JoystickID id) { return id == reconnectId ? "fixture-a" : ""; });
   ULONGLONG now = GetTickCount64();
   pad.configure(true, false, true, 0);
   pad.focus(7);
@@ -94,6 +96,7 @@ int main() {
   Motors firstMotors, secondMotors, replacementMotors;
   FixturePad a, b, c, d, overflow, replacement;
   a.attach("Waybridge SDL test A", &firstMotors);
+  reconnectId=a.id;
   b.attach("Waybridge SDL test B", &secondMotors);
   c.attach("Waybridge SDL test C");
   d.attach("Waybridge SDL test D");
@@ -178,11 +181,36 @@ int main() {
   a.axis(SDL_GAMEPAD_AXIS_LEFTY, -1000);
   pad.poll(now += 8);
   check(latest(0)["ly"] == 0, "live deadzone not applied");
+  pad.allowReconnect(true);
+  a.detach();
+  pad.poll(now += 500);
+  check(latest(0)["connected"] == false && latest(0)["suspended"] == true && latest(0)["device_generation"] == aInc &&
+        latest(1)["device_generation"] == newInc && latest(2)["device_generation"] == cInc,
+        "SDL reconnect did not reserve only the missing slot");
+  a.attach("Waybridge SDL test A reconnected", &firstMotors);
+  reconnectId=a.id;
+  a.button(SDL_GAMEPAD_BUTTON_SOUTH,true);
+  pad.configure(true,true,true,50);
+  pad.poll(now += 500);
+  auto resumed=latest(0)["device_generation"].get<uint64_t>();
+  check(latest(0)["connected"] == true && latest(0)["reconnect_from"] == aInc &&
+        resumed > aInc && latest(0)["buttons"] == XINPUT_GAMEPAD_A && latest(1)["device_generation"] == newInc,
+        "SDL reconnect lost the original slot or did not refresh its physical identity");
+  pad.feedback(haptic(3,0,aInc));
+  check(firstMotors.writes.empty(),"stale motor command reached the reconnected device");
+  pad.feedback(haptic(3,0,resumed));
+  check(firstMotors.writes.size()==1,"new motor command did not reach the reconnected device");
+  a.detach();
+  pad.poll(now += 500);
+  check(latest(0)["suspended"] == true,"second detach did not suspend the reconnected slot");
+  pad.poll(now += 5001);
+  check(latest(0)["connected"] == false && !latest(0).contains("suspended"),
+        "empty reserved slot did not expire");
   pad.configure(true, false, false, 15);
   check(latest(0)["connected"] == false && pad.status()["gamepad_local_count"].is_null(),
         "disable did not clear active input and local inventory");
   pad.disconnect();
-  a.detach(); c.detach(); replacement.detach();
+  c.detach(); replacement.detach();
   SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
   check(SDL_WasInit(SDL_INIT_GAMEPAD) == 0, "SDL gamepad subsystem leaked a reference");
 
@@ -196,5 +224,5 @@ int main() {
             XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_LEFT_THUMB), "temporary Xbox fallback report regressed");
   legacyReport[0] = 4;
   check(!XboxBluetoothGamepad::decode(legacyReport, legacyState), "temporary fallback accepted a battery report");
-  std::cout << "PASS: SDL virtual pads, four slots and hotplug, buttons/axes/triggers, lease and deadzone, exact rumble/stop and stale feedback\n";
+  std::cout << "PASS: SDL virtual pads, four slots and hotplug, buttons/axes/triggers, lease and deadzone, exact rumble/stop and stale feedback, bounded same-slot reconnect\n";
 }

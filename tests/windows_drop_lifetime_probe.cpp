@@ -254,10 +254,15 @@ int wmain() {
       {"generation",13},{"gesture",gesture},{"slot",0}},touchTarget->hwnd),"production touch DND rejected");
     require(nativeTouch.externalInteraction(33,true),"external owner not retained");
     auto returned=std::make_shared<FileDrag::Transfer>(); returned->id=51; returned->touchOperation=33;
+    returned->touchGesture=gesture; returned->touchGeneration=12; returned->touchSlot=0;
     { std::lock_guard<std::mutex> lock(FileDrag::activeMutex); FileDrag::active=returned; }
     touchOlePromotedOperation=33; touchOleMouseReady=true;
     FileDrag::remoteHitTest=[](POINT point){return windowDragTarget(point) != nullptr;};
     SetCursorPos(move.x,move.y);
+    require(touchOleMouse(touchTarget->hwnd,WM_MOUSEMOVE,MK_LBUTTON,0xff515780) &&
+      !returned->claimed && nativeTouch.ownsInteraction(),
+      "stale generation entered OLE or leaked a promoted mouse event");
+    returned->touchGeneration=13;
     auto started=GetTickCount64();
     require(!touchOleMouse(touchTarget->hwnd,WM_MOUSEMOVE,MK_LBUTTON,0xff515780) &&
       GetTickCount64()-started < 500 && nativeTouch.ownsInteraction(),

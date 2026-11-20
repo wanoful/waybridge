@@ -274,7 +274,7 @@ pub fn export(peer: Arc<Peer>, generation: u64, uris: Vec<u8>) {
                 return Ok(());
             }
             let source = crate::file_tree::Source::open(paths, peer.file_tree())?;
-            tree = source.is_tree();
+            tree = source.is_tree() || peer.has_file_lane();
             let begin = if tree {
                 json!({"type":"tree_begin","batch":generation,"epoch":epoch,"entries":source.entries})
             } else {

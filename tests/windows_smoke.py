@@ -27,6 +27,7 @@ def main():
     terminal="--terminal" in sys.argv
     x11="--x11" in sys.argv
     ime="--ime" in sys.argv
+    rich_clipboard="--rich-clipboard" in sys.argv
     qt="--qt" in sys.argv or ime
     udp="--udp" in sys.argv
     proxy=None
@@ -174,6 +175,20 @@ def main():
             wait_for(lambda:pasted("text/plain;charset=utf-8")=="Windows 你好 ✓".encode())
             copy("Linux 你好 ✓".encode(),"text/plain;charset=utf-8")
             wait_for(lambda:(lambda r:r.returncode==0 and "Linux 你好 ✓" in r.stdout)(probe("clipboard",check=False)))
+            if rich_clipboard:
+                probe("rich-clipboard","set")
+                wait_for(lambda:b"<b>"+ "你好🙂".encode() + b"</b>" in pasted("text/html"))
+                wait_for(lambda:pasted("application/rtf")==br"{\rtf1\ansi Windows \b bold\b0}")
+                wait_for(lambda:pasted("text/plain;charset=utf-8")==b"Windows plain fallback")
+                markup = "<p><em>Linux 你好🙂</em></p>"
+                copy(markup.encode(),"text/html")
+                wait_for(lambda:markup in probe("rich-clipboard","html",check=False).stdout)
+                rtf = r"{\rtf1\ansi Linux \i italic\i0}"
+                copy(rtf.encode(),"application/rtf")
+                wait_for(lambda:probe("rich-clipboard","rtf",check=False).stdout==rtf)
+                print("PASS: native CF_HTML and CF_RTF round-trip with Wayland MIME, UTF-8 byte offsets and plain fallback")
+                app_log.close()
+                return
             data=os.urandom(180_000);source=Path(runtime)/"native-file.bin";source.write_bytes(data)
             win_source="Z:"+str(source).replace("/","\\")
             probe("copyfile",win_source)

@@ -455,6 +455,7 @@ internal sealed partial class MainWindow : Window
         foreach (var scope in profileScopes) scope.Text = hasProfile ? $"此连接 · {selected.Name}" : "添加工作站后可保存连接设置。";
         pairedStatus.Text = paired ? "此 Windows 设备已通过 TLS 配对。" : "此设备需要配对。";
         UpdateLauncherActions();
+        UpdateMicrophoneStatus();
     }
     private void Load(ConnectionProfile profile)
     {
@@ -486,12 +487,14 @@ internal sealed partial class MainWindow : Window
         scale.SelectedIndex = Array.IndexOf(new[] { 0, 96, 120, 144, 168, 192, 240, 288, 384 }, settings.Dpi);
         if (scale.SelectedIndex < 0) scale.SelectedIndex = 0;
         audio.IsOn = settings.Audio; volume.Value = settings.Volume;
+        microphone.IsOn = settings.Microphone;
         output.SelectedIndex = Math.Max(0, audioDevices.FindIndex(d => d.Id == settings.AudioDevice));
         udp.IsOn = settings.Udp; udpHost.Text = settings.UdpHost; hdr.IsOn = settings.Hdr;
         gpu.SelectedIndex = settings.GpuInput == "cuda" ? 1 : 0;
         clipboard.SelectedIndex = Array.IndexOf(new[] { "both", "send", "receive", "off" }, settings.Clipboard);
         remoteTray.IsOn = settings.Tray;
         images.IsOn = settings.ClipboardImages; files.IsOn = settings.Files; dragText.IsOn = settings.DragText; readOnly.IsOn = settings.ReadOnly; ime.IsOn = settings.Ime; touch.IsOn = settings.Touch;
+        fileRate.Value = settings.FileRateKib;
         pen.IsOn = settings.Pen; penPressureGamma.Value = settings.PenPressureGamma;
         gamepads.IsOn = settings.Gamepads; gamepadRumble.IsOn = settings.GamepadRumble; gamepadDeadzone.Value = settings.GamepadDeadzone;
         notifications.IsOn = settings.Notifications;
@@ -508,9 +511,11 @@ internal sealed partial class MainWindow : Window
             Fps = checked((int)fps.Value), Bitrate = checked((int)(bitrate.Value * 1000)),
             Dpi = new[] { 0, 96, 120, 144, 168, 192, 240, 288, 384 }[Math.Max(0, scale.SelectedIndex)],
             Audio = audio.IsOn, Volume = (int)volume.Value, AudioDevice = audioDevices[Math.Clamp(output.SelectedIndex, 0, audioDevices.Count - 1)].Id,
+            Microphone = microphone.IsOn,
             Hdr = hdr.IsOn, Udp = udp.IsOn, UdpHost = udpHost.Text.Trim(), GpuInput = gpu.SelectedIndex == 1 ? "cuda" : "cpu",
             Clipboard = new[] { "both", "send", "receive", "off" }[Math.Max(0, clipboard.SelectedIndex)],
             BadgePng = badgePng, ClipboardImages = images.IsOn, Files = files.IsOn, DragText = dragText.IsOn, ReadOnly = readOnly.IsOn, Ime = ime.IsOn, Touch = touch.IsOn,
+            FileRateKib = checked((int)fileRate.Value),
             Pen = pen.IsOn, PenPressureGamma = penPressureGamma.Value,
             Gamepads = gamepads.IsOn, GamepadRumble = gamepadRumble.IsOn, GamepadDeadzone = checked((int)gamepadDeadzone.Value),
             Notifications = notifications.IsOn, Tray = remoteTray.IsOn, TouchModes = new(touchModes, StringComparer.Ordinal)
@@ -565,7 +570,7 @@ internal sealed partial class MainWindow : Window
     {
         string credential = secrets.Read(profile.Id) ?? throw new InvalidOperationException("此设备需要重新配对");
         notice.IsOpen = false;
-        liveSettings = SettingsWithLauncherTouch(profile.Settings);
+        liveSettings = SettingsWithLauncherPolicies(profile.Settings);
         desktopNotifications.SharingChanged(profile.Settings.Notifications);
         var connection = controller.ConnectAsync(profile with { Settings = liveSettings }, credential);
         UpdateMode();
@@ -583,7 +588,7 @@ internal sealed partial class MainWindow : Window
     private Task ApplyAsync() => RunOperationAsync(async () =>
     {
         var profile = ReadEditor();
-        var requested = SettingsWithLauncherTouch(profile.Settings);
+        var requested = SettingsWithLauncherPolicies(profile.Settings);
         await controller.ApplyAsync(requested, expectedProfileId: profile.Id);
         liveSettings = requested;
         desktopNotifications.SharingChanged(profile.Settings.Notifications);
@@ -597,7 +602,7 @@ internal sealed partial class MainWindow : Window
         finally
         {
             busy = false; connecting = false; UpdateMode();
-            if (launcherTouchPending) _ = GuardAsync(ApplyLauncherTouchAsync);
+            if (launcherPoliciesPending) _ = GuardAsync(ApplyLauncherPoliciesAsync);
         }
     }
     private void UpdateBackground(JsonElement items)
@@ -762,7 +767,7 @@ internal sealed partial class MainWindow : Window
                         ? parsedSlot : device.TryGetProperty("userindex", out var userIndex) && userIndex.TryGetInt32(out var parsedIndex) ? parsedIndex : connectedGamepads.Count;
                     label = $"手柄 {slot + 1}";
                 }
-                connectedGamepads.Add(label);
+                connectedGamepads.Add(TouchFlag(device, "reconnecting") == true ? $"{label}（等待重连）" : label);
             }
         }
         if (message.TryGetProperty("settings", out var settings) && settings.ValueKind == JsonValueKind.Object)
@@ -823,6 +828,7 @@ internal sealed partial class MainWindow : Window
         if (desktopNotifications.Receive(message)) return;
         string? type = message.GetProperty("type").GetString();
         if (type is "status" or "local_settings_applied") ReceiveTouchStatus(message);
+        if (type is "status" or "local_settings_applied") ReceiveMicrophoneStatus(message);
         if (type is "status" or "local_settings_applied" or "gamepad_state") ReceiveInputDeviceStatus(message);
         if (type == "notification_status") { Inform(message.GetProperty("message").GetString() ?? "通知服务状态已更新"); return; }
         if (type == "connected" && message.TryGetProperty("hardware_codecs", out var supported))
@@ -890,7 +896,7 @@ internal sealed partial class MainWindow : Window
             {
                 remoteWindows = windows.ToArray();
                 RenderWindows();
-                _ = GuardAsync(ApplyLauncherTouchAsync);
+                _ = GuardAsync(ApplyLauncherPoliciesAsync);
             }
             actual.Text = diagnosticMediaPath.Text = windows.Count > 0
                 ? string.Join('\n', windows.Select(window => $"{window.Title} · {window.Path}"))
@@ -901,23 +907,25 @@ internal sealed partial class MainWindow : Window
             if (message.TryGetProperty("directory", out var directory)) receiveDirectory = directory.GetString() ?? receiveDirectory;
             string text = message.TryGetProperty("name", out var n) ? n.GetString() + " · " : "";
             string? activity = message.GetProperty("event").GetString();
+            if (activity == "progress") { UpdateTransferProgress(message); return; }
+            if (activity is "upload_started" or "tree_upload_ready" or "tree_upload_error" or "tree_begin" or "tree_done")
+                return; // Displayed in place by the byte-counted transfer row.
+            if ((activity is "download_complete" or "download_error") &&
+                message.TryGetProperty("batch", out var batch) && batch.TryGetUInt64(out ulong fileBatch) &&
+                activeTransfers.ContainsKey(("download", fileBatch))) return;
             text += activity switch
             {
-                "upload_started" => "正在发送…",
-                "tree_upload_ready" when message.TryGetProperty("stage", out var stage) && stage.GetString() == "commit" => "发送完成，已放入远端剪贴板",
-                "tree_upload_ready" => "服务端已接收目录信息",
                 "upload_ready" => "文件发送完成",
-                "files_begin" or "tree_begin" => "正在接收…",
-                "files_done" or "tree_done" => "数据接收完成",
+                "files_begin" => "正在接收…",
+                "files_done" => "数据接收完成",
                 "download_complete" => "只读输入已就绪，可复制到自己选择的文件夹",
                 "files_error" or "tree_error" or "tree_upload_error" or "upload_rejected" or "download_error" => "传输失败",
+                "file_channel_lost" => "文件通道已断开。重新连接可恢复文件功能。",
                 _ => "文件传输状态已更新"
             };
             if (message.TryGetProperty("message", out var detail) && detail.GetString() is { Length: > 0 } reason) text += " · " + reason;
             if (message.TryGetProperty("bytes", out var b)) text += $" · {b} bytes";
-            transfers.Items.Insert(0, Text(text));
-            while (transfers.Items.Count > 100) transfers.Items.RemoveAt(transfers.Items.Count - 1);
-            MarkTransferActivity();
+            AddTransferItem(Text(text));
         }
     }
     private async Task<bool> ConfirmAsync(string title, string description, string primary)

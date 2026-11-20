@@ -23,7 +23,7 @@ public:
   };
   struct WindowInteractionSample {
     uint64_t operation=0,generation=0,gesture=0,tool=0;
-    bool eraser=false;
+    bool eraser=false, external=false;
     uint32_t id=0,edge=0;
     UINT pointerId=0;
     std::string kind,phase;
@@ -35,7 +35,7 @@ private:
   std::function<void(const Json&)> emit;
   std::function<void(const WindowInteractionSample&)> windowCallback;
   std::optional<WindowInteractionSample> windowInteraction;
-  uint64_t lastWindowOperation=0;
+  uint64_t lastWindowOperation=0, lastDragOperation=0;
   POINT lastScreen{},downScreen{};
   RECT downWindow{};
   bool negotiated=false,requested=false,sent=false,inRange=false,tip=false;
@@ -74,17 +74,34 @@ private:
     {"origin_x",owner.originX},{"origin_y",owner.originY}};}
   bool windowSample(UINT message,const POINTER_PEN_INFO&info){
     if(!windowInteraction||windowInteraction->pointerId!=info.pointerInfo.pointerId)return false;
-    if(message==WM_POINTERDOWN)return true;
+    bool canceled=(info.pointerInfo.pointerFlags&POINTER_FLAG_CANCELED)!=0;
+    if(message==WM_POINTERDOWN||windowInteraction->phase=="up"||
+       (message==WM_POINTERCAPTURECHANGED&&windowInteraction->external&&!canceled))return true;
     auto sample=*windowInteraction;sample.screen=info.pointerInfo.ptPixelLocation;
-    sample.phase=message==WM_POINTERCAPTURECHANGED||(info.pointerInfo.pointerFlags&POINTER_FLAG_CANCELED)?"cancel":
+    sample.phase=message==WM_POINTERCAPTURECHANGED||canceled?"cancel":
       message==WM_POINTERUP?"up":message==WM_POINTERLEAVE&&!(info.pointerInfo.pointerFlags&POINTER_FLAG_INCONTACT)?"cancel":"motion";
     if(sample.phase=="up"||sample.phase=="cancel"){
-      windowInteraction.reset();clear();
+      if(sample.phase=="up"&&sample.external)windowInteraction=sample;
+      else windowInteraction.reset();
+      clear();
       blockedPointer=sample.phase=="cancel"?sample.pointerId:0;
     }else *windowInteraction=sample;
     suppressUntil=GetTickCount64()+500;suppressedWindow=sample.rootWindow;
     if(windowCallback)windowCallback(sample);
     return true;
+  }
+  bool heldTip(HWND sourceRoot) const {
+    return negotiated && requested && !windowInteraction && inRange && tip && sent && pending.empty() &&
+      generation && IsWindow(owner.hwnd) && IsWindow(root(owner)) && sourceRoot == root(owner);
+  }
+  void beginInteraction(uint64_t operation, std::string kind, uint32_t edge=0) {
+    WindowInteractionSample sample;
+    sample.operation=operation;sample.generation=generation;sample.gesture=gesture;sample.tool=tool;sample.eraser=eraser;
+    sample.id=owner.id;sample.edge=edge;sample.pointerId=pointer;sample.kind=std::move(kind);sample.phase="begin";
+    sample.hwnd=owner.hwnd;sample.rootWindow=root(owner);sample.screen=lastScreen;sample.initialScreen=downScreen;sample.initialWindow=downWindow;
+    windowInteraction=sample;
+    // Park the live physical owner while the server retires its tablet tip.
+    owner={};pointer=0;sent=false;inRange=false;tip=false;gesture=sequence=tool=0;pending.clear();pendingStarted=0;
   }
 public:
   explicit NativePen(std::function<void(const Json&)>sender={}):emit(std::move(sender)){}
@@ -94,26 +111,52 @@ public:
     requested=enabled;gamma=next;
     if(!requested){suppressedWindow=nullptr;suppressUntil=0;}
   }
-  void hello(bool available){cancel(nullptr,false);negotiated=available;leaseId=0;generation=lastGeneration=0;tools.clear();lastTool=lastGesture=lastWindowOperation=0;}
+  void hello(bool available){cancel(nullptr,false);negotiated=available;leaseId=0;generation=lastGeneration=0;tools.clear();lastTool=lastGesture=lastWindowOperation=lastDragOperation=0;}
   bool active()const{return negotiated&&requested&&((inRange&&sent)||windowInteraction.has_value());}
   void onWindowInteraction(std::function<void(const WindowInteractionSample&)>callback){windowCallback=std::move(callback);}
   bool ownsWindowInteraction(HWND window=nullptr)const{return windowInteraction&&(!window||windowInteraction->hwnd==window||windowInteraction->rootWindow==window);}
+  std::optional<WindowInteractionSample> activeDrag() const {
+    return windowInteraction && windowInteraction->kind=="dnd" ? windowInteraction : std::nullopt;
+  }
+  bool ownsDragPointer(UINT id) const {
+    return windowInteraction && windowInteraction->kind=="dnd" &&
+           windowInteraction->pointerId==id && windowInteraction->phase!="up";
+  }
+  bool externalDrag(uint64_t operation,bool external) {
+    if(!windowInteraction || windowInteraction->kind!="dnd" || windowInteraction->operation!=operation ||
+       windowInteraction->phase=="up")return false;
+    windowInteraction->external=external;
+    return true;
+  }
+  bool ownsExternalDrag(HWND window=nullptr) const {
+    return ownsWindowInteraction(window) && windowInteraction->kind=="dnd" && windowInteraction->external;
+  }
+  bool beginDrag(const Json &value, HWND sourceRoot) {
+    uint64_t operation=value.value("operation",uint64_t(0));
+    if(!operation || operation<=lastDragOperation || !heldTip(sourceRoot) ||
+       value.value("id",uint32_t(0))!=owner.id || value.value("generation",uint64_t(0))!=generation ||
+       value.value("gesture",uint64_t(0))!=gesture || value.value("pen_tool",uint64_t(0))!=tool ||
+       !value.contains("pen_eraser") || value["pen_eraser"]!=eraser || value.value("slot",uint32_t(1))!=0)
+      return false;
+    lastDragOperation=operation;
+    beginInteraction(operation,"dnd");
+    return true;
+  }
+  void endDrag(uint64_t operation) {
+    if(windowInteraction && windowInteraction->kind=="dnd" && windowInteraction->operation==operation)
+      cancel(nullptr,false);
+  }
   bool beginWindowInteraction(const Json&value,HWND sourceRoot){
     uint64_t operation=value.value("pen_operation",uint64_t(0));
     std::string kind=value.value("action",std::string());
     uint32_t edge=value.contains("edge")&&value["edge"].is_number_integer()?value["edge"].get<uint32_t>():0;
-    if(!negotiated||!requested||windowInteraction||!operation||operation<=lastWindowOperation||
+    if(!heldTip(sourceRoot)||!operation||operation<=lastWindowOperation||
       (kind!="move"&&kind!="resize")||(kind=="resize"&&(!edge||(edge&~15u)||(edge&3u)==3u||(edge&12u)==12u))||
-      !inRange||!tip||!sent||!pending.empty()||!generation||!IsWindow(owner.hwnd)||!IsWindow(root(owner))||sourceRoot!=root(owner)||
       value.value("id",uint32_t(0))!=owner.id||value.value("pen_generation",uint64_t(0))!=generation||
       value.value("pen_gesture",uint64_t(0))!=gesture||value.value("pen_tool",uint64_t(0))!=tool||value.value("pen_eraser",false)!=eraser)return false;
-    WindowInteractionSample sample;sample.operation=operation;sample.generation=generation;sample.gesture=gesture;sample.tool=tool;sample.eraser=eraser;
-    sample.id=owner.id;sample.edge=edge;sample.pointerId=pointer;sample.kind=kind;sample.phase="begin";
-    sample.hwnd=owner.hwnd;sample.rootWindow=root(owner);sample.screen=lastScreen;sample.initialScreen=downScreen;sample.initialWindow=downWindow;
-    windowInteraction=sample;lastWindowOperation=operation;
-    // Server retires ordinary tablet ownership after this exact held tip takes
-    // over. State-marker revocation distinguishes takeover from policy cancel.
-    owner={};pointer=0;sent=false;inRange=false;tip=false;gesture=sequence=tool=0;pending.clear();pendingStarted=0;
+    lastWindowOperation=operation;
+    beginInteraction(operation,std::move(kind),edge);
+    auto sample=*windowInteraction;
     if(windowCallback)windowCallback(sample);
     return true;
   }
@@ -125,14 +168,19 @@ public:
     if(send)value["generation"]=generation;
     clear();leaseId=0;generation=0;
     if(send&&emit)emit(value);
-    if(operation){blockedPointer=operation->pointerId;operation->phase=notify?"cancel":"end";if(windowCallback)windowCallback(*operation);}
+    if(operation){
+      blockedPointer=operation->phase=="up"?0:operation->pointerId;
+      suppressedWindow=operation->hwnd;suppressUntil=GetTickCount64()+500;
+      operation->phase=notify?"cancel":"end";if(windowCallback)windowCallback(*operation);
+    }
   }
   void state(const Json&value){
     uint64_t next=value.value("generation",uint64_t(0));
     if(!negotiated||!next||next<=lastGeneration)return;
     if(!requested){cancel(nullptr,false);lastGeneration=next;return;}
     if(windowInteraction){
-      if(value.value("window_operation",uint64_t(0))==windowInteraction->operation){lastGeneration=generation=next;leaseId=0;return;}
+      auto field=windowInteraction->kind=="dnd"?"drag_operation":"window_operation";
+      if(value.value(field,uint64_t(0))==windowInteraction->operation){lastGeneration=generation=next;leaseId=0;return;}
       cancel(nullptr,false);
     }
     bool enabled=value.value("enabled",false);uint32_t id=enabled?value.value("id",uint32_t(0)):0;
@@ -210,9 +258,14 @@ public:
     UINT id=GET_POINTERID_WPARAM(wp);
     if(windowInteraction){
       if(windowInteraction->pointerId!=id)return false;
+      if(message==WM_POINTERCAPTURECHANGED&&windowInteraction->external){
+        POINTER_INFO data{};
+        if(GetPointerInfo(id,&data)&&(data.pointerFlags&POINTER_FLAG_CANCELED))cancel();
+        return true;
+      }
       if(message==WM_POINTERCAPTURECHANGED){cancel();return true;}
       POINTER_PEN_INFO info{};
-      if(!GetPointerPenInfo(id,&info)){cancel();return true;}
+      if(!GetPointerPenInfo(id,&info)){if(windowInteraction->phase!="up")cancel();return true;}
       return windowSample(message,info);
     }
     if(message==WM_POINTERCAPTURECHANGED&&pointer==id&&owner.hwnd){cancel();return true;}
@@ -224,6 +277,7 @@ public:
   }
   bool promotedMouse(HWND window,ULONG_PTR extra)const{
     return negotiated&&requested&&(extra&0xffffff80u)==0xff515700u&&
-      (window==suppressedWindow||window==owner.hwnd)&&GetTickCount64()<=suppressUntil;
+      (((window==suppressedWindow||window==owner.hwnd)&&GetTickCount64()<=suppressUntil)||
+       ownsWindowInteraction(window));
   }
 };

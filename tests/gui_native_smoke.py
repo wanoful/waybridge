@@ -9,6 +9,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 from gui_session_smoke import Rpc, wait, stop_process
 from smoke import ROOT
 
@@ -76,6 +77,25 @@ def main():
             settings.update(read_only=False, clipboard="both")
             send(type="settings", settings=settings)
             until(lambda e: e["type"] == "stream_config" and not e["read_only"])
+            settings["file_rate_kib"] = 64
+            send(type="settings", settings=settings)
+            until(lambda e: e["type"] == "local_settings_applied" and e["settings"]["file_rate_kib"] == 64)
+            slow = root/"slow.bin"; slow.write_bytes(os.urandom(1024 * 1024))
+            send(type="send_files", paths=["Z:" + str(slow)])
+            progress = until(lambda e: e["type"] == "transfer" and e["event"] == "progress"
+                             and e["kind"] == "upload" and e["bytes"] > 0)
+            assert progress["total"] == slow.stat().st_size and progress["bytes"] < progress["total"]
+            started = time.monotonic()
+            until(lambda e: e["type"] == "transfer" and e["event"] == "progress"
+                  and e["id"] == progress["id"] and e["bytes"] > progress["bytes"])
+            assert time.monotonic() - started >= 0.8, "upload rate limit was not applied"
+            send(type="cancel_transfer", kind="upload", id=progress["id"])
+            until(lambda e: e["type"] == "transfer" and e["event"] == "progress"
+                  and e["id"] == progress["id"] and e["state"] == "cancelled")
+            wait(lambda: not list((root/"waybridge-inbox").glob(f'tree-{progress["id"]}*')))
+            settings["file_rate_kib"] = 0
+            send(type="settings", settings=settings)
+            until(lambda e: e["type"] == "local_settings_applied" and e["settings"]["file_rate_kib"] == 0)
             file = root/"你好.txt"; file.write_text("native named pipe file payload")
             send(type="send_files", paths=["Z:" + str(file)])
             until(lambda e: e["type"] == "transfer" and e["event"] == "upload_started")
@@ -87,7 +107,7 @@ def main():
             assert rpc.ok(op="ensure", session="gui-native-0", mode="attach")["pid"] == server_pid
             assert session["token"] not in native_log.read_text()
             rpc.ok(op="end", session="gui-native-0"); stop_process(server_pid); server_pid = None
-            print("PASS: real Windows worker custom-badge startup/reset, named-pipe startup, sanitized capabilities/status, live FPS/bitrate/read-only/DPI, actual Unicode file upload, graceful disconnect and retained remote session")
+            print("PASS: real Windows worker custom-badge startup/reset, named-pipe startup, sanitized capabilities/status, live FPS/bitrate/read-only/DPI, file-lane upload/progress/cancel, actual Unicode file upload, graceful disconnect and retained remote session")
         finally:
             rpc.close()
             for child in reversed(processes):

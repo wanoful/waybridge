@@ -30,7 +30,7 @@ A viewer advertises `png_rgba` unconditionally. It adds `h264_alpha`, `hevc_alph
 
 ## Media connection
 
-A viewer requesting `split_media:true` opens a second TCP connection to the same address and port. Authenticate it with `{"type":"hello","version":3,"token":"...","channel":"media","media_key":"..."}`. Only the current viewer's random key is accepted, and only one media socket attaches. The server replies `media_ready`, then sends frame kinds 1/2/4/5/7/8 over this socket. Input, window control, clipboard and file messages stay on the control socket. Socket failure closes the session; reconnect restores live windows. The TLS entry and existing SSH forwarding carry both connections. Test/simple viewers may omit `split_media` to multiplex on one socket.
+A viewer requesting `split_media:true` opens a second TCP connection to the same address and port. Authenticate it with `{"type":"hello","version":3,"token":"...","channel":"media","media_key":"..."}`. Only the current viewer's random key is accepted, and only one media socket attaches. The server replies `media_ready`, then sends frame kinds 1/2/4/5/7/8 over this socket. Input, window control and clipboard metadata stay on the control socket. Negotiated peers can additionally open the [file data channel](FILE_TRANSFERS.md#文件数据通道) and [microphone channel](MICROPHONE.md#传输). Media socket failure closes the viewer connection. Reconnect restores live windows. The TLS entry carries these channels on the same listener. Test and simple viewers may omit `split_media` to multiplex its frames on the control socket.
 
 ## Optional UDP/FEC v1
 
@@ -294,7 +294,7 @@ Oneshot constraints require a newly created object after deactivation.
 
 ## Clipboard
 
-Both directions send `{"type":"clipboard","items":{"<MIME>":"<base64>"}}`. Supported formats are `text/plain;charset=utf-8`, `text/plain`, and `image/png`. Maximum decoded size is 12 MiB per format. Linux clipboard reads are asynchronous and tagged with an ownership generation to discard stale responses. Windows tracks the clipboard sequence number to avoid echo loops.
+Both directions send `{"type":"clipboard","items":{"<MIME>":"<base64>"}}`. Supported formats are UTF-8 plain text, `image/png`, `text/html`, and `text/rtf`. Linux also accepts `application/rtf` and `application/x-rtf`, and can offer those aliases to local applications. HTML maps to Windows `HTML Format` using UTF-8 byte offsets. RTF maps to `Rich Text Format`. Plain text remains available alongside rich formats when the source provides it. Maximum decoded size is 12 MiB per format. Linux clipboard reads are asynchronous and tagged with an ownership generation to discard stale responses. Windows tracks the clipboard sequence number to avoid echo loops.
 
 ## Files
 
@@ -512,6 +512,13 @@ Changing FPS/bitrate/codec clears cached encoder sessions on the encoder worker;
 new video starts with a fresh epoch and independent keyframe. Already in-flight
 frames remain valid and must still be acknowledged. Entering read-only releases
 held input and rejects pointer, relative motion, buttons, scroll, keys and IME.
+`app_stream_modes_v1` additionally accepts an optional `app_modes` object
+mapping exact application IDs to `clear` or `low_latency`, up to 256 rules.
+An empty object clears the rules for this viewer. Desktop IDs can match the
+same Wayland app ID without its `.desktop` suffix. The clear preset prefers
+lossless PNG and caps that window at 30 FPS. Low latency prefers H.264 and
+prioritizes capture among background windows. Server codec policy and viewer
+capabilities still apply. Changing a preset refreshes only affected windows.
 `file_drop_out_enabled {enabled}` changes outbound drag availability and cancels
 an active outbound operation when disabled.
 
@@ -903,6 +910,15 @@ axes and exact owner before publishing tablet-v2 events. `window_action` with
 authorized lease retirement. `pen_window_end` must match those identities.
 An unmarked policy revoke cancels manipulation. See [PEN.md](PEN.md).
 
+When both sides negotiate `pen_drag_v1`, a validated tablet tip serial can
+start a data-device drag. The contact drag messages `touch_interaction`,
+`touch_interaction_ack` and `touch_interaction_input` then carry
+`input:"pen"`, the operation, generation, gesture, pen tool and eraser flag,
+and slot 0. `pen_state.drag_operation` marks tablet lease retirement.
+Outbound drag offers and interactive claim/return/drop/result messages use the
+same `input`, `pen_tool` and `pen_eraser` plus the contact ownership fields
+`touch_operation`, `touch_generation`, `touch_gesture` and `touch_slot`.
+
 `gamepad_focus` supplies the actual local foreground root `id`; it must match
 server focus. `gamepad_state` grants `id` and `generation`, plus `supported`,
 `requested`, `enabled`, `devices`, `rumble_supported` and `error`. `gamepad`
@@ -917,6 +933,13 @@ It must match the current device in that slot and advance its sequence.
 `strong`/`weak` and a bounded `duration_ms` heartbeat. Rumble playback is
 gated by the active focus lease. Read-only, disable and disconnect destroy
 owned devices. See [GAMEPADS.md](GAMEPADS.md).
+
+With `gamepad_reconnect_v1`, a matching detach can carry `suspended:true` to
+neutralize its virtual device while retaining it for up to five seconds.
+`gamepad_state.devices[].reconnecting` reports the suspended interval.
+A current-focus snapshot with a new device incarnation and
+`reconnect_from` naming the paused incarnation can reuse that device before
+the deadline. Device incarnations still isolate stale input and rumble.
 
 ## Optional Precision Touchpad gestures
 

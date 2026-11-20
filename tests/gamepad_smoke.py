@@ -54,9 +54,9 @@ class GamepadViewer(Viewer):
         self.sock = socket.create_connection(('127.0.0.1', port), timeout=8)
         self.geometry, self.state, self.controls = {}, {}, []
         self.send(type='hello', version=3, token=token, gamepad_v1=True,
-                  gamepad_enabled=enabled, window_semantics_v1=True)
+                  gamepad_enabled=enabled, gamepad_reconnect_v1=True, window_semantics_v1=True)
         hello = self.receive()[1]
-        assert hello['type'] == 'hello' and hello['gamepad_v1'], hello
+        assert hello['type'] == 'hello' and hello['gamepad_v1'] and hello['gamepad_reconnect_v1'], hello
 
     def receive(self):
         kind, value = super().receive()
@@ -313,12 +313,28 @@ def run():
                 viewer.sample(final, 13, 99, connected=False)
                 viewer.barrier()
                 assert directory.exists() and held(fd, 0x130), 'prior connection detached a new device'
+                viewer.sample(reconnected, 31, 1, slot=1)
+                other_device = viewer.device(31, 1)
+                other_fd, other_directory = open_own(other_device, host.pid)
+                readers.append(other_fd)
+                viewer.sample(reconnected, 13, 2, connected=False, suspended=True)
+                assert viewer.device(13)['reconnecting']
+                assert directory.exists() and not any(buttons(fd))
+                assert other_directory.exists() and held(other_fd, 0x130)
+                viewer.sample(reconnected, 13, 3)
+                viewer.barrier()
+                assert not any(buttons(fd)), 'suspended generation still admitted input'
+                viewer.sample(reconnected, 14, 1, reconnect_from=13)
+                resumed = viewer.device(14)
+                assert not resumed['reconnecting'] and resumed['sysname'] == directory.name
+                assert held(fd, 0x130) and viewer.device(31, 1) == other_device
                 viewer.sock.close()
                 removed(directory, fd)
+                removed(other_directory, other_fd)
                 assert host.poll() is None and app.poll() is None
                 print('PASS: authenticated compositor -> own evdev buttons/axes/hat; opt-in, '
                       'focus-neutral stable slots, stale rejection, zero rumble, blur unplug '
-                      'and cleanup on disable/read-only/disconnect with fresh reconnect identity')
+                      'short reconnect retaining dual handles, and cleanup on disable/read-only/disconnect')
             finally:
                 if viewer:
                     viewer.sock.close()

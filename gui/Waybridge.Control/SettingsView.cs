@@ -50,6 +50,8 @@ internal sealed partial class MainWindow
         Row("播放远端声音", "关闭可即时静音。首次打开音频可能需要重连。", audio),
         Row("远端音量", "实时应用，仅影响本连接。", volume),
         Row("Windows 输出设备", "重连后生效。", output),
+        Row("转发麦克风", "应用到当前连接后生效。Linux 应用可选择 Waybridge Microphone。", microphone),
+        microphoneStatus,
         SettingsActions(includeApply: true, includeReconnect: true));
 
     private UIElement SharingPage() => SettingsPage("共享与权限",
@@ -58,6 +60,7 @@ internal sealed partial class MainWindow
         Row("同步剪贴板图片", "实时应用。文字同步按上面的方向设置。", images),
         Row("跨端文字拖放", "实时应用。独立于剪贴板同步。", dragText),
         Row("共享文件和目录", "实时应用。接收的文件以只读方式交付。", files),
+        Row("文件传输限速（KiB/s）", "0 为不限速，有效限速为 32–1048576，分别应用于上传和下载。", fileRate),
         SettingsActions(includeApply: true));
 
     private UIElement NetworkPage() => SettingsPage("网络",
@@ -206,6 +209,7 @@ internal sealed partial class MainWindow
         launcherPreferences.Recent.Remove(profile.Id);
         launcherPreferences.Pinned.Remove(profile.Id);
         launcherPreferences.AppTouchModes.Remove(profile.Id);
+        launcherPreferences.AppStreamModes.Remove(profile.Id);
         launcherPreferences.Commands.Remove(profile.Id);
         var remaining = profiles.FirstOrDefault();
         launcherPreferences.SelectedProfile = remaining?.Id;

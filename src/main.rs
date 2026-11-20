@@ -3,7 +3,9 @@
 mod activation;
 mod app_icon;
 mod audio;
+mod microphone;
 mod capture;
+mod clipboard_formats;
 mod color;
 mod color_management;
 mod cursor;
@@ -15,6 +17,7 @@ mod dnd_lifecycle;
 mod drag;
 mod drag_visual;
 mod file_tree;
+mod file_transport;
 mod gamepad;
 mod ime;
 mod input_focus;
@@ -280,6 +283,8 @@ struct RemoteWindow {
     last_info: Value,
     frame_sequence: u64,
     capture_after: Instant,
+    last_capture: Option<Instant>,
+    stream_mode: stream_config::AppStreamMode,
     gpu_source: Option<waybridge_codec::GpuSource>,
     target: Option<capture::Target>,
     target_size: (i32, i32),
@@ -330,6 +335,7 @@ struct App {
     stream_fps: u32,
     stream_bitrate: u32,
     stream_limits: waybridge_config::Limits,
+    app_streams: stream_config::AppStreams,
     read_only: bool,
     audio: Option<audio::Session>,
     cursor: cursor::Cursor,
@@ -989,10 +995,10 @@ impl App {
             std::thread::spawn(move || {
                 let mut bytes = Vec::new();
                 if (&mut read)
-                    .take(12 * 1024 * 1024 + 1)
+                    .take(clipboard_formats::MAX_BYTES as u64 + 1)
                     .read_to_end(&mut bytes)
                     .is_ok()
-                    && bytes.len() <= 12 * 1024 * 1024
+                    && bytes.len() <= clipboard_formats::MAX_BYTES
                 {
                     let _ = tx.send(Event::Clipboard {
                         generation,
@@ -1101,6 +1107,13 @@ impl App {
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0);
         match value["type"].as_str().unwrap_or("") {
+            "microphone_enabled" => {
+                if let (Some(peer), Some(request), Some(enabled)) = (
+                    &self.peer, value["request_id"].as_u64(), value["enabled"].as_bool(),
+                ) {
+                    peer.configure_microphone(request, enabled);
+                }
+            }
             "tray_action" if !self.read_only => {
                 if let Some(peer) = self
                     .peer
@@ -1206,11 +1219,16 @@ impl App {
                     },
                     value["touch_interaction_v1"] == true,
                 );
-                self.pen_negotiate(value["pen_v1"] == true, value["pen_enabled"] == true);
+                self.pen_negotiate(
+                    value["pen_v1"] == true,
+                    value["pen_enabled"] == true,
+                    value["pen_drag_v1"] == true,
+                );
                 self.touchpad.negotiate(value["touchpad_v1"] == true);
                 self.gamepads.negotiate(
                     value["gamepad_v1"] == true,
                     value["gamepad_enabled"] == true,
+                    value["gamepad_reconnect_v1"] == true,
                 );
                 self.sync_gamepads();
                 self.activation.negotiated = value["activation_v1"] == true;
@@ -1513,24 +1531,8 @@ impl App {
                 }
             }
             "clipboard" => {
-                let mut contents = BTreeMap::new();
-                if let Some(items) = value["items"].as_object() {
-                    for (mime, data) in items {
-                        if !matches!(
-                            mime.as_str(),
-                            "text/plain;charset=utf-8" | "text/plain" | "image/png"
-                        ) {
-                            continue;
-                        }
-                        if let Some(text) = data.as_str() {
-                            if text.len() <= 16 * 1024 * 1024 {
-                                if let Ok(bytes) = B64.decode(text) {
-                                    contents.insert(mime.clone(), bytes);
-                                }
-                            }
-                        }
-                    }
-                }
+                let contents = clipboard_formats::decode(&value["items"]);
+                let types = clipboard_formats::local_types(&contents);
                 self.clipboard_generation += 1; // discard reads from a superseded Linux selection
                 if let Some(peer) = &self.peer {
                     peer.begin_file_export(self.clipboard_generation);
@@ -1540,14 +1542,14 @@ impl App {
                 if let Some(wm) = self.x11.wm.as_mut() {
                     let _ = wm.new_selection(
                         SelectionTarget::Clipboard,
-                        Some(contents.keys().cloned().collect()),
+                        Some(types.clone()),
                     );
                 }
                 let seat = self.seat.clone();
                 set_data_device_selection(
                     &self.dh,
                     &seat,
-                    contents.keys().cloned().collect(),
+                    types,
                     Arc::new(contents),
                 );
             }
@@ -1566,12 +1568,34 @@ impl App {
                     }
                 }
             }
+            "file_transfer_rate" => {
+                if let (Some(peer), Some(kib)) = (&self.peer, value["kib_per_second"].as_u64()) {
+                    peer.set_file_rate(kib);
+                }
+            }
+            "file_download_cancel" => {
+                if let (Some(peer), Some(batch)) = (&self.peer, value["batch"].as_u64()) {
+                    peer.cancel_file_download(batch);
+                }
+            }
             "tree_upload_begin" | "tree_upload_chunk" | "tree_upload_end"
             | "tree_upload_commit" | "tree_upload_cancel" | "upload_begin" | "upload_chunk"
             | "upload_end" | "upload_commit" => {
                 let Some(peer) = self.peer.clone() else {
                     return;
                 };
+                if peer.has_file_lane() {
+                    match value["type"].as_str() {
+                        Some("tree_upload_chunk" | "tree_upload_end"
+                            | "upload_begin" | "upload_chunk" | "upload_end" | "upload_commit") => return,
+                        Some("tree_upload_cancel") => {
+                            if let Some(batch) = value["batch"].as_u64() {
+                                peer.cancel_file_upload(batch);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 if matches!(
                     value["type"].as_str(),
                     Some("tree_upload_commit" | "upload_commit")
@@ -1718,7 +1742,13 @@ impl App {
             .collect();
         let focused = self.focused_window;
         let mut render_order: Vec<_> = (0..self.windows.len()).collect();
-        render_order.sort_by_key(|i| Some(self.windows[*i].id) != focused);
+        render_order.sort_by_key(|i| {
+            let window = &self.windows[*i];
+            (
+                Some(window.id) != focused,
+                window.stream_mode != stream_config::AppStreamMode::LowLatency,
+            )
+        });
         for index in render_order {
             let remote = &mut self.windows[index];
             let Some(surface) = remote.window.wl_surface().map(|s| s.into_owned()) else {
@@ -1818,6 +1848,15 @@ impl App {
             remote
                 .icon
                 .observe(info["app_id"].as_str().unwrap_or_default());
+            let mode = self
+                .app_streams
+                .mode(info["app_id"].as_str().unwrap_or_default());
+            if remote.stream_mode != mode {
+                remote.stream_mode = mode;
+                remote.last_capture = None;
+                self.encoder.forget(remote.id);
+                remote.dirty = true;
+            }
             info["icon_revision"] = json!(remote.icon.revision);
             info["touch_input"] = json!(
                 !remote.window.is_x11()
@@ -1892,12 +1931,23 @@ impl App {
                 }
                 remote.dirty |= peer.take_capture_refresh(remote.id);
                 if remote.dirty && (!semantics || remote.state.visible) {
-                    if (Some(remote.id) != focused && Instant::now() < remote.capture_after)
+                    let interval = mode.capture_interval(self.stream_fps);
+                    if interval
+                        .zip(remote.last_capture)
+                        .is_some_and(|(interval, last)| last.elapsed() < interval)
+                        || (Some(remote.id) != focused && Instant::now() < remote.capture_after)
                         || !capture::ready(&self.encoder, peer, remote.id, bbox, remote.scale)
                     {
                         deferred = true;
                     } else {
                         remote.frame_sequence += 1;
+                        let video_codec = mode.codec(
+                            self.video_codec,
+                            self.video_allowed,
+                            &self.stream_limits,
+                            peer,
+                            remote.id,
+                        );
                         let frame = capture::surface(
                             &mut self.renderer,
                             &surface,
@@ -1909,7 +1959,7 @@ impl App {
                             &mut remote.target_size,
                             peer.clone(),
                             self.gpu_device.as_ref().filter(|_| {
-                                self.video_codec.is_some_and(|codec| {
+                                video_codec.is_some_and(|codec| {
                                     peer.supports(codec, remote.id)
                                         || (self.hdr_requested
                                             && peer.hdr_allowed(remote.id)
@@ -1920,16 +1970,21 @@ impl App {
                             }),
                             &mut remote.gpu_source,
                             self.color_programs.as_ref(),
-                            self.video_codec
+                            video_codec
                                 .filter(|_| self.hdr_requested)
                                 .and_then(|c| c.hdr_variant()),
                             self.encoder.budget(),
-                            self.video_codec,
+                            video_codec,
                         )?;
                         deferred = if let Some(mut frame) = frame {
                             frame.video_eligible =
                                 remote.last_info["type"] == "window" && frame.budget_video;
-                            !self.encoder.submit(frame)
+                            if self.encoder.submit(frame) {
+                                remote.last_capture = Some(Instant::now());
+                                false
+                            } else {
+                                true
+                            }
                         } else {
                             true
                         };
@@ -2277,6 +2332,8 @@ impl XdgShellHandler for App {
             last_info: Value::Null,
             frame_sequence: 0,
             capture_after: Instant::now(),
+            last_capture: None,
+            stream_mode: stream_config::AppStreamMode::Default,
             gpu_source: None,
             target: None,
             target_size: (0, 0),
@@ -2550,16 +2607,8 @@ impl SelectionHandler for App {
         if let Some(wm) = self.x11.wm.as_mut() {
             let _ = wm.new_selection(SelectionTarget::Clipboard, Some(types.clone()));
         }
-        for mime in [
-            "text/plain;charset=utf-8",
-            "text/plain",
-            "image/png",
-            "text/uri-list",
-        ] {
-            if !types.iter().any(|s| s == mime) {
-                continue;
-            }
-            self.clipboard_reads.push((generation, mime.to_string()));
+        for mime in clipboard_formats::read_types(&types) {
+            self.clipboard_reads.push((generation, mime));
         }
     }
     fn send_selection(
@@ -2570,7 +2619,7 @@ impl SelectionHandler for App {
         _: Seat<Self>,
         data: &Clipboard,
     ) {
-        if let Some(bytes) = data.get(&mime).cloned() {
+        if let Some(bytes) = clipboard_formats::lookup(data, &mime).cloned() {
             std::thread::spawn(move || {
                 let _ = fs::File::from(fd).write_all(&bytes);
             });
@@ -2770,6 +2819,7 @@ fn main() -> Result<()> {
         .as_deref()
         .map(|address| udp::Hub::new(address, args.udp_mbps))
         .transpose()?;
+    let file_ingress = transfer_worker::Ingress::default();
     let (events, tx) = network::listen(
         &args.listen,
         auth,
@@ -2778,7 +2828,9 @@ fn main() -> Result<()> {
                 && gpu_device.is_some()
                 && video_codec.is_some_and(|c| c.hdr_variant().is_some()),
             audio: audio.is_some(),
+            microphone: audio.as_ref().map_or_else(std::sync::Weak::new, audio::Session::microphone),
             udp,
+            file_ingress: file_ingress.clone(),
         },
     )?;
     // Publishing the Wayland socket is also the readiness signal used by local
@@ -2844,8 +2896,8 @@ fn main() -> Result<()> {
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
-    let transfers =
-        transfer_worker::Worker::new(PathBuf::from(&runtime).join("waybridge-inbox"), tx.clone())?;
+    let transfers = transfer_worker::Worker::new(
+        PathBuf::from(&runtime).join("waybridge-inbox"), tx.clone(), file_ingress)?;
     let fractional_scale = FractionalScaleManagerState::new::<App>(&dh);
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
@@ -2861,6 +2913,7 @@ fn main() -> Result<()> {
         stream_fps: args.fps,
         stream_bitrate: args.bitrate,
         stream_limits: configuration.config.limits.clone(),
+        app_streams: stream_config::AppStreams::default(),
         read_only: false,
         audio,
         cursor: cursor::Cursor::default(),
@@ -2929,7 +2982,6 @@ fn main() -> Result<()> {
         focused_window: None,
         last_interaction: None,
         encoder: video::Encoder::new(
-            video_codec,
             args.fps,
             args.bitrate,
             media_budget::Budget::new(&configuration.config.media_budget),
@@ -3048,6 +3100,7 @@ fn main() -> Result<()> {
                         app.x11.grab = None;
                         app.release_input();
                         app.touchpad = touchpad::Touchpad::default();
+                        app.app_streams = stream_config::AppStreams::default();
                         app.peer = Some(peer);
                         app.cursor.dirty = true;
                         app.configure_capabilities();
@@ -3077,11 +3130,7 @@ fn main() -> Result<()> {
                             w.icon.sent = false;
                             w.dirty = true;
                         }
-                        let items: BTreeMap<_, _> = app
-                            .clipboard
-                            .iter()
-                            .map(|(mime, data)| (mime.clone(), B64.encode(data)))
-                            .collect();
+                        let items = clipboard_formats::encode(&app.clipboard);
                         if !items.is_empty() {
                             app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                         }
@@ -3130,6 +3179,9 @@ fn main() -> Result<()> {
                         }
                         let value = &completed.message;
                         let tree = value["type"] == "tree_upload_commit";
+                        if tree && !completed.peer.file_upload_current(value["batch"].as_u64().unwrap_or(0)) {
+                            continue;
+                        }
                         let dropped = value["drop"].as_bool() == Some(true);
                         let valid = if dropped {
                             value["id"].as_u64().is_some_and(|id| {
@@ -3250,15 +3302,11 @@ fn main() -> Result<()> {
                             set_data_device_selection(
                                 &app.dh,
                                 &app.seat,
-                                app.clipboard.keys().cloned().collect(),
+                                clipboard_formats::local_types(&app.clipboard),
                                 Arc::new(app.clipboard.clone()),
                             );
                         }
-                        let items: BTreeMap<_, _> = app
-                            .clipboard
-                            .iter()
-                            .map(|(mime, data)| (mime.clone(), B64.encode(data)))
-                            .collect();
+                        let items = clipboard_formats::encode(&app.clipboard);
                         app.control(json!({"type":"clipboard", "items":items, "generation":app.clipboard_generation}));
                     }
                     Event::Clipboard { .. } => {}

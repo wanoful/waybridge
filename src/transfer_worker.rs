@@ -8,9 +8,9 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
-    sync::{mpsc::SyncSender, Arc, Condvar, Mutex},
+    sync::{mpsc::SyncSender, Arc, Condvar, Mutex, Weak},
     thread::{self, JoinHandle},
 };
 
@@ -28,7 +28,7 @@ pub struct Completed {
 struct Job {
     peer: Arc<Peer>,
     message: Value,
-    clipboard_generation: u64,
+    clipboard_generation: Option<u64>,
     epoch: u64,
     bytes: usize,
 }
@@ -48,8 +48,82 @@ struct Shared {
 }
 
 pub struct Worker {
-    shared: Arc<Shared>,
+    ingress: Ingress,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Default)]
+pub struct Ingress(Arc<Shared>);
+
+impl Ingress {
+    /// Only the independent file receiver may wait for disk queue capacity.
+    pub fn submit_data(&self, peer: Arc<Peer>, message: Value) -> bool {
+        self.submit(peer, message, None)
+    }
+
+    pub fn abort_data(&self, peer: Arc<Peer>) {
+        let mut queue = self.0.queue.lock().unwrap();
+        if queue.closed || peer.is_closed() {
+            return;
+        }
+        queue.jobs.retain(|job| {
+            !Arc::ptr_eq(&job.peer, &peer)
+                || !job.message["type"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("tree_upload_"))
+        });
+        queue.bytes = queue.jobs.iter().map(|job| job.bytes).sum();
+        let epoch = queue.epoch;
+        queue.jobs.push_front(Job {
+            peer,
+            message: json!({"type":"file_lane_cleanup"}),
+            clipboard_generation: None,
+            epoch,
+            bytes: 0,
+        });
+        self.0.wake.notify_all();
+    }
+
+    fn submit(&self, peer: Arc<Peer>, message: Value, generation: Option<u64>) -> bool {
+        let bytes = footprint(&message);
+        if bytes > MAX_BYTES {
+            return false;
+        }
+        let (max_jobs, max_bytes) = if generation.is_some() {
+            (MAX_JOBS, MAX_BYTES)
+        } else {
+            (MAX_JOBS - 8, MAX_BYTES - 2 * 1024 * 1024)
+        };
+        if bytes > max_bytes {
+            return false;
+        }
+        let mut queue = self.0.queue.lock().unwrap();
+        let epoch = queue.epoch;
+        while !queue.closed && queue.epoch == epoch && !peer.is_closed() {
+            if queue.jobs.len() < max_jobs && bytes <= max_bytes.saturating_sub(queue.bytes) {
+                queue.bytes += bytes;
+                queue.jobs.push_back(Job {
+                    peer,
+                    message,
+                    clipboard_generation: generation,
+                    epoch,
+                    bytes,
+                });
+                self.0.wake.notify_all();
+                return true;
+            }
+            if generation.is_some() {
+                return false;
+            }
+            queue = self
+                .0
+                .wake
+                .wait_timeout(queue, std::time::Duration::from_millis(100))
+                .unwrap()
+                .0;
+        }
+        false
+    }
 }
 
 fn footprint(value: &Value) -> usize {
@@ -66,14 +140,14 @@ fn footprint(value: &Value) -> usize {
 }
 
 impl Worker {
-    pub fn new(root: PathBuf, events: SyncSender<Event>) -> Result<Self> {
+    pub fn new(root: PathBuf, events: SyncSender<Event>, ingress: Ingress) -> Result<Self> {
         // Initial filesystem setup happens during startup, not event dispatch.
         let mut transfers = Transfers::new(root)?;
-        let shared = Arc::new(Shared::default());
-        let state = shared.clone();
+        let state = ingress.0.clone();
         let worker = thread::Builder::new().name("file-receive".into()).spawn(move || {
             let mut epoch = 0;
             let mut legacy_failed = false;
+            let mut generations: BTreeMap<u64, (u64, Weak<Peer>)> = BTreeMap::new();
             loop {
                 let job = {
                     let mut queue = state.queue.lock().unwrap();
@@ -90,15 +164,34 @@ impl Worker {
                         drop(queue);
                         transfers.cancel();
                         legacy_failed = false;
+                        generations.clear();
                         continue;
                     }
                     let job = queue.jobs.pop_front().unwrap();
                     queue.bytes -= job.bytes;
+                    state.wake.notify_all();
                     job
                 };
                 if job.peer.is_closed() { continue; }
                 let tree = job.message["type"].as_str().unwrap_or("").starts_with("tree_");
                 let kind = job.message["type"].as_str().unwrap_or("");
+                if kind == "file_lane_cleanup" {
+                    generations.retain(|batch, (_, source)| {
+                        if Weak::ptr_eq(source, &Arc::downgrade(&job.peer)) {
+                            transfers.cancel_tree(*batch);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    continue;
+                }
+                let batch = job.message["batch"].as_u64().unwrap_or(0);
+                if tree && !job.peer.file_upload_current(batch) {
+                    transfers.cancel_tree(batch);
+                    generations.remove(&batch);
+                    continue;
+                }
                 if !tree && kind == "upload_begin" { legacy_failed = false; }
                 if !tree && legacy_failed { continue; }
                 match receive(&mut transfers, &job) {
@@ -108,9 +201,11 @@ impl Worker {
                             !queue.closed && queue.epoch == job.epoch
                         };
                         if valid && !job.peer.is_closed() {
+                            let clipboard_generation = generations.remove(&batch).map(|(generation, _)| generation)
+                                .or(job.clipboard_generation).unwrap_or_default();
                             let mut event = Event::UploadedFiles(Completed {
                                 peer: job.peer, message: job.message, uris,
-                                clipboard_generation: job.clipboard_generation, epoch: job.epoch,
+                                clipboard_generation, epoch: job.epoch,
                             });
                             loop {
                                 match events.try_send(event) {
@@ -124,11 +219,17 @@ impl Worker {
                             }
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if kind == "tree_upload_begin" && job.peer.has_file_lane() {
+                            generations.insert(batch, (job.clipboard_generation.unwrap_or_default(), Arc::downgrade(&job.peer)));
+                        } else if kind == "tree_upload_cancel" {
+                            generations.remove(&batch);
+                        }
+                    }
                     Err(error) => {
                         if tree {
-                            let batch = job.message["batch"].as_u64().unwrap_or(0);
                             transfers.cancel_tree(batch);
+                            generations.remove(&batch);
                             job.peer.control(json!({"type":"tree_upload_error","batch":batch,"message":error.to_string()}));
                         } else {
                             transfers.cancel();
@@ -140,56 +241,39 @@ impl Worker {
             }
         })?;
         Ok(Self {
-            shared,
+            ingress,
             worker: Some(worker),
         })
     }
 
     /// Never waits for disk or queue space on the compositor thread.
     pub fn submit(&self, peer: Arc<Peer>, message: Value, clipboard_generation: u64) -> bool {
-        let bytes = footprint(&message);
-        let mut queue = self.shared.queue.lock().unwrap();
-        if queue.closed
-            || queue.jobs.len() >= MAX_JOBS
-            || bytes > MAX_BYTES.saturating_sub(queue.bytes)
-        {
-            return false;
-        }
-        let epoch = queue.epoch;
-        queue.bytes += bytes;
-        queue.jobs.push_back(Job {
-            peer,
-            message,
-            clipboard_generation,
-            epoch,
-            bytes,
-        });
-        self.shared.wake.notify_one();
-        true
+        self.ingress
+            .submit(peer, message, Some(clipboard_generation))
     }
 
     pub fn current(&self, epoch: u64) -> bool {
-        let queue = self.shared.queue.lock().unwrap();
+        let queue = self.ingress.0.queue.lock().unwrap();
         !queue.closed && queue.epoch == epoch
     }
 
     pub fn cancel(&self) {
-        let mut queue = self.shared.queue.lock().unwrap();
+        let mut queue = self.ingress.0.queue.lock().unwrap();
         queue.epoch = queue.epoch.wrapping_add(1);
         queue.jobs.clear();
         queue.bytes = 0;
-        self.shared.wake.notify_one();
+        self.ingress.0.wake.notify_all();
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
         {
-            let mut queue = self.shared.queue.lock().unwrap();
+            let mut queue = self.ingress.0.queue.lock().unwrap();
             queue.closed = true;
             queue.jobs.clear();
             queue.bytes = 0;
-            self.shared.wake.notify_all();
+            self.ingress.0.wake.notify_all();
         }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -244,6 +328,9 @@ fn receive(transfers: &mut Transfers, job: &Job) -> Result<Option<Vec<u8>>> {
             batch,
             usize::try_from(value["file"].as_u64().context("missing file")?)?,
         )?,
+        "tree_upload_barrier" => job
+            .peer
+            .control(json!({"type":"tree_upload_ready","batch":batch,"stage":"data"})),
         "tree_upload_commit" => {
             return transfers
                 .finish_tree(

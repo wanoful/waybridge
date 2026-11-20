@@ -429,6 +429,8 @@ impl App {
             last_info: Value::Null,
             frame_sequence: 0,
             capture_after: Instant::now(),
+            last_capture: None,
+            stream_mode: stream_config::AppStreamMode::Default,
             gpu_source: None,
             target: None,
             target_size: (0, 0),
@@ -741,7 +743,7 @@ impl XwmHandler for App {
         if flags < 0 {
             return;
         }
-        if let Some(bytes) = self.clipboard.get(&mime).cloned() {
+        if let Some(bytes) = clipboard_formats::lookup(&self.clipboard, &mime).cloned() {
             if WRITERS
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     (n < 16).then_some(n + 1)
@@ -804,15 +806,7 @@ impl XwmHandler for App {
         self.x11.clipboard_generation = Some(generation);
         self.clipboard.clear();
         self.control(json!({"type":"clipboard","items":{}}));
-        for mime in [
-            "text/plain;charset=utf-8",
-            "text/plain",
-            "image/png",
-            "text/uri-list",
-        ] {
-            if !types.iter().any(|m| m == mime) {
-                continue;
-            }
+        for mime in clipboard_formats::read_types(&types) {
             let Ok((mut read, write)) = UnixStream::pair() else {
                 continue;
             };
@@ -822,20 +816,19 @@ impl XwmHandler for App {
                 .wm
                 .as_mut()
                 .unwrap()
-                .send_selection(SelectionTarget::Clipboard, mime.into(), write.into())
+                .send_selection(SelectionTarget::Clipboard, mime.clone(), write.into())
                 .is_err()
             {
                 continue;
             }
             let events = self.events.clone();
-            let mime = mime.to_string();
             std::thread::spawn(move || {
                 let mut bytes = Vec::new();
                 if (&mut read)
-                    .take(12 * 1024 * 1024 + 1)
+                    .take(clipboard_formats::MAX_BYTES as u64 + 1)
                     .read_to_end(&mut bytes)
                     .is_ok()
-                    && bytes.len() <= 12 * 1024 * 1024
+                    && bytes.len() <= clipboard_formats::MAX_BYTES
                 {
                     let _ = events.send(Event::Clipboard {
                         generation,

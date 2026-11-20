@@ -58,13 +58,28 @@ strokes cannot resume after regrant. Initial focus buffering is bounded to 64
 samples and 500 ms. Tool caches are bounded to 16 native identities / 32 server
 pen-and-eraser tools.
 
-## Validation and remaining work
+## Pen drag and drop
 
-`tests/pen_smoke.py` exercises actual tablet-v2 resources, axes, pressure-less
-tools, capability upgrades, CSD requests and cancellation. `tests/windows_pen_smoke.py`
-uses the production native adapter with controlled samples and real HWND
-move/resize on a private Wine desktop; x64 and ARM64 probes compile.
+On a `pen_drag_v1` connection, a Wayland application can start
+`wl_data_device.start_drag` with the current tablet tip serial on its origin
+surface. The compositor verifies the seat, origin, mapped window, lease and
+held tip. The viewer independently checks the same pen or eraser, its gesture
+and the original HWND before accepting. A remote target receives a normal
+Wayland data-device drag without pointer buttons or touchscreen contacts.
 
-**Windows physical pen hardware end-to-end acceptance remains pending.** Native
-pen-initiated data-device DND and Windows OLE handoff are not connected yet; the
-implemented native touch DND path does not imply pen DND support.
+For a supported outbound text or file drag, Windows can promote the same
+primary pen contact on a build that provides
+[`ConvertPrimaryPointerToMouseDrag`](https://learn.microsoft.com/en-us/windows/win32/winmsg/winuser/nf-winuser-convertprimarypointertomousedrag).
+The OLE loop starts from its matching system mouse message after the external
+destination is ready. If Windows declines promotion, dragging between
+streamed windows remains available. Return from OLE resumes the original
+Wayland source, and a superseded operation cannot accept another tip's release.
+
+## Validation
+
+`tests/pen_smoke.py` exercises real tablet-v2 resources, axes, CSD operations,
+remote-window drag, external file-sink handoff, and stale generation and tool
+rejection. `tests/windows_pen_smoke.py` uses the production native adapter with
+controlled samples on a private Wine desktop. It checks ownership, cancellation,
+real HWND movement and preservation of the OLE completion token after pen-up.
+Physical Windows pen promotion and drops into Windows apps remain to be checked.

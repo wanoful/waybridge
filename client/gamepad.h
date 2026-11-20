@@ -21,19 +21,24 @@ public:
   using Json = nlohmann::json;
 
 private:
+  static constexpr ULONGLONG ReconnectGraceMs = 5000;
   struct Slot {
     SDL_JoystickID instance = 0;
     SDL_Gamepad *controller = nullptr;
     bool sent = false, needSnapshot = false, rumbleCapable = false, motorOwned = false;
     uint64_t incarnation = 0, sequence = 0;
     ULONGLONG retryAfter = 0, motorDeadline = 0;
+    ULONGLONG reconnectUntil = 0;
+    std::string identity;
     XINPUT_GAMEPAD last{};
   };
   std::function<void(const Json &)> emit;
+  std::function<std::string(SDL_JoystickID)> deviceIdentity;
   std::array<Slot, 4> slots{};
   XboxBluetoothGamepad bluetooth;
   std::wstring bluetoothPath;
   bool initialized = false, negotiated = false, requested = false, rumble = true;
+  bool reconnect = false;
   bool serverSupported = false, leaseEnabled = false, haveState = false;
   int deadzone = 15;
   uint32_t focusId = 0, leaseId = 0;
@@ -51,13 +56,17 @@ private:
     return negotiated && requested && supported() && serverSupported && leaseEnabled && focusId &&
            leaseId == focusId && generation;
   }
-  void packet(size_t slot, bool connected, const XINPUT_GAMEPAD &sample) {
+  void packet(size_t slot, bool connected, const XINPUT_GAMEPAD &sample, bool suspended = false,
+              uint64_t reconnectFrom = 0) {
     auto &device = slots[slot];
-    send({{"type", "gamepad"}, {"generation", generation}, {"id", leaseId}, {"slot", slot},
+    Json value = {{"type", "gamepad"}, {"generation", generation}, {"id", leaseId}, {"slot", slot},
           {"device_generation", device.incarnation}, {"sequence", ++device.sequence},
           {"connected", connected}, {"buttons", sample.wButtons}, {"lx", sample.sThumbLX},
           {"ly", sample.sThumbLY}, {"rx", sample.sThumbRX}, {"ry", sample.sThumbRY},
-          {"lt", sample.bLeftTrigger}, {"rt", sample.bRightTrigger}});
+          {"lt", sample.bLeftTrigger}, {"rt", sample.bRightTrigger}};
+    if (suspended) value["suspended"] = true;
+    if (reconnectFrom) value["reconnect_from"] = reconnectFrom;
+    send(value);
   }
   static void stopMotor(Slot &device) {
     if (device.motorOwned && device.controller)
@@ -77,6 +86,32 @@ private:
     closeController(device);
     device.sent = device.needSnapshot = device.rumbleCapable = false;
     device.sequence = 0;
+    device.reconnectUntil = 0;
+  }
+  void detachPhysical(size_t slot, ULONGLONG now, bool keepDevice = true) {
+    auto &device = slots[slot];
+    if (keepDevice && reconnect && device.sent && generation && !device.identity.empty()) {
+      closeController(device);
+      device.rumbleCapable = false;
+      if (!device.reconnectUntil) {
+        packet(slot, false, {}, true);
+        device.reconnectUntil = now + ReconnectGraceMs;
+      }
+    } else {
+      closeSlot(slot, true);
+      device.identity.clear();
+    }
+    device.instance = 0;
+  }
+  static std::string sdlIdentity(SDL_JoystickID id) {
+    const auto *path = SDL_GetGamepadPathForID(id);
+    if (!path || !*path || SDL_IsJoystickVirtual(id)) return {};
+    char guid[33]{};
+    SDL_GUIDToString(SDL_GetGamepadGUIDForID(id), guid, sizeof(guid));
+    return std::string(guid) + ":" + path;
+  }
+  static std::string hidIdentity(const std::wstring &path) {
+    return "HID:" + std::string(reinterpret_cast<const char *>(path.data()), path.size() * sizeof(wchar_t));
   }
   void pauseInput() {
     bluetooth.close();
@@ -91,6 +126,7 @@ private:
     for (size_t i = 0; i < slots.size(); ++i) {
       closeSlot(i, notify);
       slots[i].instance = 0;
+      slots[i].identity.clear();
     }
     bluetoothPath.clear();
     if (initialized) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
@@ -99,7 +135,7 @@ private:
     localCount = -1;
     localError.clear();
   }
-  void refreshDevices() {
+  void refreshDevices(ULONGLONG now) {
     int count = 0;
     std::unique_ptr<SDL_JoystickID, decltype(&SDL_free)> instances(
         initialized ? SDL_GetGamepads(&count) : nullptr, SDL_free);
@@ -112,8 +148,7 @@ private:
     for (size_t i = 0; i < slots.size(); ++i) {
       auto &device = slots[i];
       if (device.instance && (!count || std::find(first, first + count, device.instance) == first + count)) {
-        closeSlot(i, true);
-        device.instance = 0;
+        detachPhysical(i, now);
       }
     }
     // Keep the existing single-device fallback until SDL can be checked with
@@ -121,16 +156,29 @@ private:
     auto path = count == 0 ? XboxBluetoothGamepad::find() : std::wstring{};
     if (path != bluetoothPath) {
       bluetooth.close();
-      closeSlot(0, true);
+      if (!bluetoothPath.empty()) detachPhysical(0, now, count == 0);
+      if (!path.empty()) {
+        auto key = hidIdentity(path);
+        if (slots[0].identity != key) closeSlot(0, true);
+        slots[0].identity = std::move(key);
+      }
       bluetoothPath = std::move(path);
     }
     localCount = count > 0 ? std::min(count, int(slots.size())) : (!bluetoothPath.empty() ? 1 : 0);
     for (int n = 0; n < count; ++n) {
       const auto id = first[n];
       if (std::any_of(slots.begin(), slots.end(), [&](const Slot &s) { return s.instance == id; })) continue;
-      auto vacant = std::find_if(slots.begin(), slots.end(), [](const Slot &s) { return !s.instance; });
-      if (vacant == slots.end()) break;
+      std::string key = deviceIdentity ? deviceIdentity(id) : sdlIdentity(id);
+      auto vacant = slots.end();
+      if (!key.empty())
+        vacant = std::find_if(slots.begin(), slots.end(), [&](const Slot &s) {
+          return !s.instance && s.reconnectUntil && s.identity == key;
+        });
+      if (vacant == slots.end())
+        vacant = std::find_if(slots.begin(), slots.end(), [](const Slot &s) { return !s.instance && !s.reconnectUntil; });
+      if (vacant == slots.end()) continue;
       vacant->instance = id;
+      vacant->identity = std::move(key);
     }
   }
   static XINPUT_GAMEPAD sample(SDL_Gamepad *controller) {
@@ -184,22 +232,31 @@ private:
   void forward(size_t slot, XINPUT_GAMEPAD raw) {
     auto &device = slots[slot];
     const auto state = filtered(raw, deadzone);
-    if (!device.sent) {
+    uint64_t reconnectFrom = 0;
+    if (device.reconnectUntil) {
+      reconnectFrom = device.incarnation;
+      device.reconnectUntil = 0;
+      device.sequence = 0;
+      if (!++device.incarnation) ++device.incarnation;
+    } else if (!device.sent) {
       if (!++device.incarnation) ++device.incarnation;
     } else if (!device.needSnapshot && same(state, device.last)) {
       return;
     }
-    packet(slot, true, state);
+    packet(slot, true, state, false, reconnectFrom);
     device.last = state;
     device.sent = true;
     device.needSnapshot = false;
   }
 
 public:
-  explicit NativeGamepad(std::function<void(const Json &)> sender = {}) : emit(std::move(sender)) {}
+  explicit NativeGamepad(std::function<void(const Json &)> sender = {},
+                         std::function<std::string(SDL_JoystickID)> identity = {})
+      : emit(std::move(sender)), deviceIdentity(std::move(identity)) {}
   ~NativeGamepad() { stopDiscovery(false); }
   NativeGamepad(const NativeGamepad &) = delete;
   NativeGamepad &operator=(const NativeGamepad &) = delete;
+  void allowReconnect(bool allowed) { reconnect = allowed; }
 
   void configure(bool capability, bool enabled, bool motors, int percent) {
     const bool newlyNegotiated = !negotiated && capability;
@@ -266,7 +323,8 @@ public:
         !integer("strong", 65535, strong) || !integer("weak", 65535, weak) ||
         !integer("duration_ms", 1000, duration) || !duration) return;
     auto &device = slots[slot];
-    if (!device.sent || !device.controller || !device.rumbleCapable || device.incarnation != incarnation) return;
+    if (!device.sent || device.reconnectUntil || !device.controller || !device.rumbleCapable ||
+        device.incarnation != incarnation) return;
     if (SDL_RumbleGamepad(device.controller, Uint16(strong), Uint16(weak), Uint32(duration))) {
       device.motorOwned = strong || weak;
       device.motorDeadline = device.motorOwned ? GetTickCount64() + duration : 0;
@@ -274,15 +332,21 @@ public:
   }
   void poll(ULONGLONG now = GetTickCount64()) {
     if (!negotiated || !requested) return;
-    for (auto &device : slots)
+    for (size_t slot=0;slot<slots.size();++slot) {
+      auto &device=slots[slot];
       if (device.motorOwned && now >= device.motorDeadline) stopMotor(device);
+      if (device.reconnectUntil && now >= device.reconnectUntil) {
+        closeSlot(slot, true);
+        if (!device.instance && (slot != 0 || bluetoothPath.empty())) device.identity.clear();
+      }
+    }
     const bool inventoryDue = now >= nextInventory;
     const bool sampleDue = active() && now >= nextPoll;
     if (!sampleDue && !inventoryDue) return;
     if (initialized) SDL_UpdateGamepads();
     if (inventoryDue) {
       nextInventory = now + 500;
-      refreshDevices();
+      refreshDevices(now);
     }
     if (!active() || now < nextPoll) return;
     nextPoll = now + 8;
@@ -294,7 +358,7 @@ public:
         localError.clear();
         forward(0, state);
       } else {
-        closeSlot(0, true);
+        detachPhysical(0, now);
         device.retryAfter = now + 500;
         localError = "无法读取 Xbox 蓝牙手柄输入";
       }
@@ -305,8 +369,7 @@ public:
       auto &device = slots[i];
       if (!device.instance || now < device.retryAfter) continue;
       if (device.controller && !SDL_GamepadConnected(device.controller)) {
-        closeSlot(i, true);
-        device.instance = 0;
+        detachPhysical(i, now);
         continue;
       }
       if (!device.controller) {
@@ -349,6 +412,7 @@ public:
   void disconnect() {
     stopDiscovery(true);
     negotiated = requested = serverSupported = leaseEnabled = haveState = false;
+    reconnect = false;
     generation = generationAtFocusChange = 0;
     focusId = leaseId = 0;
     serverDevices = Json::array();

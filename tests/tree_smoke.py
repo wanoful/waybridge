@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Real tree inbox/export/Wayland drop and lazy native-drag protocol, no desktop."""
 import base64
+import argparse
+import json
 import os
 from pathlib import Path
+import select
 import socket
 import shutil
 import errno
 import subprocess
+import struct
 import tempfile
 import time
 from urllib.parse import unquote, urlparse
@@ -38,7 +42,77 @@ def entries(root):
     return out
 
 
+class FileViewer(Viewer):
+    """Use separate sockets while keeping file admission and commit ordered on control."""
+    def __init__(self, port, token, **_):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        self.geometry = {}
+        super().send(type="hello", version=3, token=token, file_tree=True,
+                     file_drop_out=True, file_channel_v1=True)
+        hello = self.receive()[1]
+        assert hello["type"] == "hello" and hello["file_channel_v1"]
+
+        def attach(key):
+            data = socket.create_connection(("127.0.0.1", port), timeout=10)
+            self.write(data, dict(type="hello", version=3, token=token, channel="files", media_key=key))
+            return data
+        with attach("bad-key") as invalid:
+            assert invalid.recv(1) == b"", "unbound file socket was accepted"
+        self.files = attach(hello["media_key"])
+        assert self.receive_files()[1]["type"] == "files_ready"
+        with attach(hello["media_key"]) as duplicate:
+            assert duplicate.recv(1) == b"", "second file socket was accepted"
+
+    @staticmethod
+    def write(sock, message):
+        body = b"\0" + json.dumps(message).encode()
+        sock.sendall(struct.pack(">I", len(body)) + body)
+
+    def send(self, **message):
+        kind = message["type"]
+        if kind in ("tree_upload_chunk", "tree_upload_end"):
+            self.write(self.files, message)
+        elif kind == "tree_upload_commit":
+            self.write(self.files, dict(type="tree_upload_barrier", batch=message["batch"]))
+            self.until(lambda k, m: k == "control" and m["type"] == "tree_upload_ready"
+                       and m["batch"] == message["batch"] and m["stage"] == "data")
+            super().send(**message)
+        else:
+            super().send(**message)
+
+    def receive_files(self):
+        def exact(n):
+            data = bytearray()
+            while len(data) < n:
+                piece = self.files.recv(n - len(data))
+                if not piece:
+                    raise EOFError("file channel disconnected")
+                data.extend(piece)
+            return data
+        size, = struct.unpack(">I", exact(4))
+        assert 1 < size <= 2 * 1024 * 1024
+        value = exact(size)
+        assert value[0] == 0
+        return "control", json.loads(value[1:])
+
+    def until_files(self, predicate):
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            kind, message = self.receive_files()
+            if predicate(kind, message):
+                return message
+        raise AssertionError("expected file event did not arrive")
+
+    def close(self):
+        self.files.close()
+        self.sock.close()
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file-channel", action="store_true")
+    args = parser.parse_args()
+    viewer_class = FileViewer if args.file_channel else Viewer
     subprocess.run(["bash", "tests/build-fixture.sh"], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="waybridge-tree-") as directory:
         runtime = Path(directory)
@@ -66,7 +140,7 @@ def main():
                 old.until(lambda k, m: k == "control" and m["type"] == "tree_upload_error")
                 old.sock.close()
                 time.sleep(0.1)
-                viewer = Viewer(port, token.read_text(), file_tree=True, file_drop_out=True)
+                viewer = viewer_class(port, token.read_text(), file_tree=True, file_drop_out=True)
                 app = subprocess.Popen([str(ROOT / "build/tests/test-app")], env=env, stdout=app_log, stderr=app_log)
                 processes.append(app)
                 window = viewer.until(lambda k, m: k == "control" and m["type"] == "window")["id"]
@@ -115,12 +189,23 @@ def main():
                     p.stdin.write((source.as_uri() + "\r\n").encode())
                     p.stdin.close()
                     return p
+                if args.file_channel:
+                    viewer.send(type="file_transfer_rate", kib_per_second=128)
+                    viewer.send(type="ping", nonce=72)
+                    viewer.until(lambda k, m: k == "control" and m.get("nonce") == 72)
+                until_files = viewer.until_files if args.file_channel else viewer.until
+                receive_files = viewer.receive_files if args.file_channel else viewer.receive
                 copy_tree()
-                begin = viewer.until(lambda k, m: k == "control" and m["type"] == "tree_begin")
+                begin = until_files(lambda k, m: k == "control" and m["type"] == "tree_begin")
+                first_chunk = time.monotonic()
+                if args.file_channel:
+                    viewer.send(type="ping", nonce=73)
+                    viewer.until(lambda k, m: k == "control" and m.get("nonce") == 73)
+                    assert time.monotonic() - first_chunk < 1, "control waited behind throttled file data"
                 assert begin["entries"] == manifest
                 received = {e["id"]: bytearray() for e in manifest if e["kind"] == "file"}
                 while True:
-                    kind, message = viewer.receive()
+                    kind, message = receive_files()
                     if kind != "control" or message.get("batch") != begin["batch"]:
                         continue
                     if message["type"] == "tree_chunk":
@@ -130,6 +215,17 @@ def main():
                 for entry in manifest:
                     if entry["kind"] == "file":
                         assert received[entry["id"]] == (source.parent / entry["name"]).read_bytes()
+                if args.file_channel:
+                    assert time.monotonic() - first_chunk >= 0.9, "download rate limit was not applied"
+                    copy_tree()
+                    begin = until_files(lambda k, m: k == "control" and m["type"] == "tree_begin")
+                    viewer.send(type="file_download_cancel", batch=begin["batch"])
+                    viewer.send(type="ping", nonce=74)
+                    viewer.until(lambda k, m: k == "control" and m.get("nonce") == 74)
+                    while select.select([viewer.files], [], [], 0.3)[0]:
+                        _, pending = receive_files()
+                        assert pending.get("batch") != begin["batch"] or pending["type"] != "tree_done"
+                    viewer.send(type="file_transfer_rate", kib_per_second=0)
 
                 (runtime / "enable-drag").touch()
                 viewer.send(type="pointer", id=window, x=50, y=70)
@@ -141,7 +237,7 @@ def main():
                 for entry in manifest:
                     if entry["kind"] == "file" and entry["size"]:
                         viewer.send(type="drag_read", drag=offer["drag"], request=entry["id"], file=entry["id"], offset=0, length=min(entry["size"], 65536))
-                        data = viewer.until(lambda k, m: k == "control" and m["type"] == "drag_data")
+                        data = until_files(lambda k, m: k == "control" and m["type"] == "drag_data")
                         assert base64.b64decode(data["data"]) == (source.parent / entry["name"]).read_bytes()[:65536]
                 viewer.send(type="drag_drop", drag=offer["drag"])
                 viewer.send(type="drag_result", drag=offer["drag"], success=True)
@@ -184,17 +280,25 @@ def main():
                 assert not (runtime / "waybridge-inbox/tree-706").exists()
                 viewer.send(type="tree_upload_begin", batch=703, entries=manifest)
                 viewer.until(lambda k, m: k == "control" and m["type"] == "tree_upload_ready" and m["batch"] == 703)
+                if args.file_channel:
+                    # Dropping only the file socket must clean incomplete staging
+                    # without disconnecting the viewer's control connection.
+                    viewer.files.close()
+                    viewer.until(lambda k, m: k == "control" and m["type"] == "file_channel_lost")
+                    viewer.send(type="ping", nonce=75)
+                    viewer.until(lambda k, m: k == "control" and m.get("nonce") == 75)
                 viewer.sock.close()
                 wait_for(lambda: not (runtime / "waybridge-inbox/tree-703").exists())
                 assert (saved / "a/same.bin").read_bytes() == b"saved edit" and (saved / "empty/new").is_dir()
                 assert snapshot(source) == expected and snapshot(destination) == expected and snapshot(dropped) == expected
-                viewer = Viewer(port, token.read_text(), file_tree=True, file_drop_out=True)
+                viewer = viewer_class(port, token.read_text(), file_tree=True, file_drop_out=True)
                 viewer.until(lambda k, m: k == "frame")
                 upload(501)
                 retry_uri = subprocess.check_output(["wl-paste", "--no-newline", "--type", "text/uri-list"], env=env).decode().strip()
                 retry = Path(unquote(urlparse(retry_uri).path))
                 assert retry != destination and snapshot(retry) == expected and snapshot(destination) == expected
-                viewer.sock.close()
+                if args.file_channel: viewer.close()
+                else: viewer.sock.close()
                 assert host.poll() is None and app.poll() is None
                 print("PASS: negotiated real directory tree clipboard/drop/export/lazy drag; empty/Unicode/zero/same-basename entries; traversal/ADS/devices/case collision rejection; incomplete/cancel/disconnect cleanup; completed trees and source retained")
             except BaseException:

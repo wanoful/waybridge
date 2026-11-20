@@ -122,6 +122,11 @@ pub trait DataDeviceHandler: Sized + SelectionHandler + WaylandDndGrabHandler {
 /// Handler for wayland client initiated drag'n'drop
 #[allow(unused_variables)]
 pub trait WaylandDndGrabHandler: SeatHandler + Sized {
+    /// Validate a tablet tip serial against the live implicit tablet grab.
+    fn tablet_drag_origin(&self, _seat: &Seat<Self>, _origin: &WlSurface, _serial: Serial) -> bool {
+        false
+    }
+
     /// A client requested a drag'n'drop as response to a user pointer action
     ///
     /// * `source` - The data source provided by the client.
@@ -129,7 +134,7 @@ pub trait WaylandDndGrabHandler: SeatHandler + Sized {
     ///   during the drag'n'drop.
     /// * `seat` - The seat on which the DnD operation was started
     /// * `serial` - Serial passed and validated for the grab
-    /// * `type_` - If the grab was validated for pointer or touch input
+    /// * `type_` - Which input type supplied the implicit grab
     fn dnd_requested<S: Source>(
         &mut self,
         source: S,

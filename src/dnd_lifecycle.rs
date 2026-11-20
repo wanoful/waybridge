@@ -233,9 +233,21 @@ impl App {
         let attached = resource
             .as_ref()
             .is_some_and(|s| self.window_drag.is_toplevel_source(s));
-        let touch_drag = matches!(kind, GrabType::Touch);
+        let contact_drag = matches!(kind, GrabType::Touch | GrabType::Tablet);
         let id = self.next_source();
-        if touch_drag && !self.start_touch_interaction(serial, "dnd", None, Some(id)) {
+        let tablet_start = if kind == GrabType::Tablet {
+            let Some(start) = self
+                .pen_drag_start(serial)
+                .and_then(|pen| self.start_pen_drag(pen, id))
+            else {
+                source.cancel();
+                return;
+            };
+            Some(start)
+        } else {
+            None
+        };
+        if kind == GrabType::Touch && !self.start_touch_interaction(serial, "dnd", None, Some(id)) {
             source.cancel();
             return;
         }
@@ -245,7 +257,7 @@ impl App {
         self.data_drop.native = Some(NativeDrag {
             source: source.clone(),
             toplevel: attached,
-            window: if touch_drag {
+            window: if contact_drag {
                 self.focused_window
             } else {
                 self.pointer_window.or(self.focused_window)
@@ -255,7 +267,7 @@ impl App {
                 .metadata()
                 .is_some_and(|m| !m.mime_types.is_empty() && !m.dnd_actions.is_empty()),
             exported: false,
-            touch: touch_drag,
+            touch: contact_drag,
         });
         let dh = self.dh.clone();
         match kind {
@@ -278,6 +290,15 @@ impl App {
                         self,
                         DnDGrab::new_touch(&dh, start, SharedSource(source), seat),
                         serial,
+                    )
+                }
+            }
+            GrabType::Tablet => {
+                if let (Some(p), Some(start)) = (seat.get_touch(), tablet_start) {
+                    p.set_grab(
+                        self,
+                        DnDGrab::new_touch(&dh, start, SharedSource(source), seat),
+                        SERIAL_COUNTER.next_serial(),
                     )
                 }
             }
@@ -452,6 +473,15 @@ impl App {
     }
 }
 impl WaylandDndGrabHandler for App {
+    fn tablet_drag_origin(&self, seat: &Seat<Self>, origin: &WlSurface, serial: Serial) -> bool {
+        seat == &self.seat
+            && self.data_drop.native.is_none()
+            && self.pressed_buttons.is_empty()
+            && self
+                .pen_drag_start(serial)
+                .is_some_and(|start| start.surface == *origin)
+    }
+
     fn dnd_requested<S: Source>(
         &mut self,
         source: S,

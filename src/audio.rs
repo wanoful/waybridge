@@ -1,4 +1,5 @@
 //! Opt-in private PulseAudio/PipeWire-Pulse sink. Never captures a host/default monitor.
+use crate::microphone;
 use crate::network::Peer;
 use anyhow::{bail, Context, Result};
 use std::{
@@ -13,26 +14,24 @@ struct Sink {
     name: String,
     module: u32,
 }
+pub(crate) fn pulse_list(kind: &str) -> Option<Vec<Vec<String>>> {
+    let output = Command::new("pactl")
+        .args(["list", "short", kind])
+        .output()
+        .ok()?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.split('\t').map(str::to_string).collect())
+            .collect()
+    })
+}
+
 impl Drop for Sink {
     fn drop(&mut self) {
-        let query = |kind: &str| -> Option<Vec<Vec<String>>> {
-            let output = Command::new("pactl")
-                .args(["list", "short", kind])
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            Some(
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .map(|line| line.split('\t').map(str::to_string).collect())
-                    .collect(),
-            )
-        };
         // A PulseAudio restart may recycle module IDs. Never unload somebody else's module.
         // The stable short listing includes indices even on pactl versions whose JSON omits them.
-        let Some(modules) = query("modules") else {
+        let Some(modules) = pulse_list("modules") else {
             return;
         };
         let owned = modules.iter().any(|m| {
@@ -47,7 +46,7 @@ impl Drop for Sink {
             return;
         }
         // Mute this sink's streams before unload so stream-rescue cannot expose audio on the host.
-        if let (Some(sinks), Some(inputs)) = (query("sinks"), query("sink-inputs")) {
+        if let (Some(sinks), Some(inputs)) = (pulse_list("sinks"), pulse_list("sink-inputs")) {
             let index = sinks
                 .iter()
                 .find(|s| s.get(1) == Some(&self.name))
@@ -75,6 +74,7 @@ impl Drop for Sink {
 }
 pub struct Session {
     sink: Sink,
+    microphone: Option<Arc<microphone::Source>>,
     peer: Arc<Mutex<Weak<Peer>>>,
     capture: Child,
     worker: Option<JoinHandle<()>>,
@@ -148,8 +148,16 @@ impl Session {
             }
         });
         tracing::info!(sink=%sink.name, "private 48 kHz stereo PCM audio capture active");
+        let microphone = match microphone::Source::new() {
+            Ok(source) => Some(source),
+            Err(error) => {
+                tracing::warn!(%error, "session microphone unavailable");
+                None
+            }
+        };
         Ok(Self {
             sink,
+            microphone,
             peer,
             capture,
             worker: Some(worker),
@@ -157,6 +165,11 @@ impl Session {
     }
     pub fn sink(&self) -> &str {
         &self.sink.name
+    }
+    pub fn microphone(&self) -> Weak<microphone::Source> {
+        self.microphone
+            .as_ref()
+            .map_or_else(Weak::new, Arc::downgrade)
     }
     pub fn configure_command(&self, command: &mut Command) {
         let inherited = std::env::var("PIPEWIRE_PROPS").unwrap_or_default();
@@ -168,6 +181,9 @@ impl Session {
         command.env("PULSE_SINK", self.sink())
             .env("PIPEWIRE_NODE", self.sink())
             .env("PIPEWIRE_PROPS", format!("{{ {body} target.object=\"{}\" node.dont-fallback=true node.dont-reconnect=true }}", self.sink()));
+        if let Some(source) = &self.microphone {
+            command.env("PULSE_SOURCE", source.name());
+        }
     }
     pub fn set_peer(&self, peer: Option<&Arc<Peer>>) {
         *self.peer.lock().unwrap() = peer.map_or_else(Weak::new, Arc::downgrade);

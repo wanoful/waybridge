@@ -13,15 +13,17 @@ class PenViewer(Viewer):
     def __init__(self,port,token,capability=True,preference=True):
         self.sock=socket.create_connection(('127.0.0.1',port),timeout=8)
         self.geometry={};self.state={};self.controls=[]
-        self.send(type='hello',version=3,token=token,dpi=168,window_semantics_v1=True,pen_v1=capability,pen_enabled=preference)
-        hello=self.receive()[1];assert hello.get('pen_v1',False)==capability,hello
+        self.send(type='hello',version=3,token=token,dpi=168,window_semantics_v1=True,
+                  pen_v1=capability,pen_enabled=preference,pen_drag_v1=capability,file_drop_out=True)
+        hello=self.receive()[1]
+        assert hello.get('pen_v1',False)==capability and hello.get('pen_drag_v1',False)==capability,hello
     def receive(self):
         kind,value=super().receive()
         if kind=='control':
             self.controls.append(value)
             if value.get('type')=='pen_state':self.state=value
         return kind,value
-    def control(self,kind,**matches):return self.until(lambda k,v:k=='control' and v.get('type')==kind and all(v.get(n)==x for n,x in matches.items()))
+    def control(self,message_type,**matches):return self.until(lambda k,v:k=='control' and v.get('type')==message_type and all(v.get(n)==x for n,x in matches.items()))
     def barrier(self):
         nonce=time.monotonic_ns();self.send(type='ping',nonce=nonce);self.control('pong',nonce=nonce);time.sleep(.08)
     def lease(self,window):
@@ -37,6 +39,11 @@ def main():
     subprocess.run(['bash','tests/build-pen-fixture.sh'],cwd=ROOT,check=True)
     with tempfile.TemporaryDirectory(prefix='waybridge-pen-') as directory:
         root=Path(directory);env={**os.environ,'XDG_RUNTIME_DIR':directory,'WAYLAND_DISPLAY':'pen-0'}
+        payload=root/'pen-drag-source.txt';payload.write_text('pen drag payload')
+        uri_list=root/'uris';uri_list.write_text(payload.as_uri()+'\r\n')
+        dropped=root/'drop'
+        env.update(WAYBRIDGE_TEST_DRAG_URIS=str(uri_list), WAYBRIDGE_TEST_DROP=str(dropped),
+                   WAYBRIDGE_TEST_DND_FEEDBACK='1')
         token='native-pen-'+'a'*40;secret=root/'token';secret.write_text(token);secret.chmod(0o600)
         with socket.socket() as free:free.bind(('127.0.0.1',0));port=free.getsockname()[1]
         with open(ROOT/'build/tests/pen-host.log','w') as host_log,open(ROOT/'build/tests/pen-app.log','w') as app_log:
@@ -141,7 +148,49 @@ def main():
                 request=viewer.control('window_action',input='pen',action='move');viewer.barrier()
                 viewer.send(type='stream_config',request_id=93,codec='png',fps=60,bitrate=30000,read_only=True);viewer.barrier()
                 assert not viewer.state.get('window_operation') and not viewer.state['enabled'],'policy preserved pen window ownership'
-                viewer.send(type='stream_config',request_id=94,codec='png',fps=60,bitrate=30000,read_only=False);lease=viewer.lease(first);command('none')
+                viewer.send(type='stream_config',request_id=94,codec='png',fps=60,bitrate=30000,read_only=False);lease=viewer.lease(first)
+                command('drag')
+                def begin_drag(lease,gesture):
+                    viewer.pen(lease,gesture,1,'in',tip=True)
+                    request=viewer.control('touch_interaction',kind='dnd',input='pen')
+                    return {key:request[key] for key in ('operation','input','generation','gesture','slot','pen_tool','pen_eraser')}
+                owner=begin_drag(lease,8)
+                assert owner['generation']==lease['generation'] and owner['gesture']==8 and owner['pen_tool']==7,owner
+                viewer.send(type='touch_interaction_ack',accepted=True,**{**owner,'pen_tool':777})
+                viewer.send(type='touch_interaction_input',phase='up',id=other,x=15.,y=50.,**owner)
+                viewer.control('touch_interaction',kind='end',input='pen',cancelled=True)
+                wait(lambda:'SOURCE_CANCELLED' in log())
+                assert not dropped.exists(),'wrong-tool ACK released a native source'
+
+                owner=begin_drag(viewer.lease(first),9)
+                viewer.send(type='touch_interaction_ack',accepted=True,**owner)
+                viewer.send(type='touch_interaction_input',phase='motion',id=other,x=15.,y=50.,**owner)
+                viewer.barrier()
+                assert 'TARGET_ACCEPT text/uri-list' in log(),log()
+                viewer.send(type='touch_interaction_input',phase='up',id=other,x=15.,y=50.,
+                            **{**owner,'generation':owner['generation']+1})
+                viewer.barrier();assert not dropped.exists(),'stale pen generation dropped'
+                viewer.send(type='touch_interaction_input',phase='up',id=other,x=15.,y=50.,**owner)
+                viewer.control('touch_interaction',kind='end',input='pen',cancelled=False)
+                wait(lambda:dropped.exists() and dropped.read_bytes()==uri_list.read_bytes() and 'SOURCE_FINISHED' in log())
+                assert 'BUTTON 272 1' not in log(),'tablet drag synthetic pointer button'
+
+                owner=begin_drag(viewer.lease(first),10)
+                viewer.send(type='touch_interaction_ack',accepted=True,**owner)
+                offer=viewer.control('drag_offer',input='pen')
+                keys={key:offer[key] for key in ('input','touch_operation','touch_generation','touch_gesture','touch_slot','pen_tool','pen_eraser')}
+                assert keys['touch_operation']==owner['operation'] and len(offer['files'])==1,offer
+                viewer.send(type='drag_claim',drag=offer['drag'],**{**keys,'pen_eraser':True})
+                before=len(viewer.controls);viewer.barrier()
+                assert not any(value.get('type')=='drag_ready' for value in viewer.controls[before:])
+                viewer.send(type='drag_claim',drag=offer['drag'],**keys)
+                viewer.control('drag_ready',drag=offer['drag'])
+                viewer.send(type='drag_drop',drag=offer['drag'],**keys)
+                viewer.control('touch_interaction',kind='end',input='pen',cancelled=False)
+                viewer.send(type='drag_result',drag=offer['drag'],success=True,**keys)
+                viewer.control('drag_end',drag=offer['drag'],success=True)
+                wait(lambda:log().count('SOURCE_FINISHED')==2)
+                lease=viewer.lease(first);command('none')
                 # A trusted connection still has a hard tool-resource bound.
                 for identity in range(8,38):
                     gesture=identity+10
@@ -151,7 +200,7 @@ def main():
                 viewer.pen(lease,50,1,'in',tool=39);viewer.barrier()
                 assert log().count('PEN_IN')==before_in,'server tool resource cache exceeded 32'
                 assert host.poll() is None and app.poll() is None
-                print('PASS: actual tablet-v2 early device/resource bind, automatic lease bind/release, hover/motion/valid optional axes, pressure/tilt/rotation, tip/barrel/eraser, malformed/stale rejection, focus/live settings/read-only/unmap/captureloss/disconnect releases, reconnect recovery, held-tip CSD move/resize and policy/stale rejection, pressure-less tools and between-proximity capability upgrades, bounded tool resources')
+                print('PASS: actual tablet-v2 axes and leases, held-tip CSD move/resize, native pen drag across remote windows and through the external file sink, stale owner rejection, pressure-less tools and bounded tool resources')
             finally:
                 if viewer:viewer.sock.close()
                 if app and app.poll() is None:app.terminate();app.wait(timeout=5)

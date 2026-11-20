@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -27,6 +28,7 @@ private:
   std::deque<std::string> outgoing;
   bool writing = false;
   std::vector<nlohmann::json> incoming;
+  std::function<void(const nlohmann::json &)> beforeDispatch;
   std::array<char, 4096> readBuffer{};
   size_t readPosition = 0, readLength = 0;
   static constexpr ULONGLONG NoDeadline = ~ULONGLONG(0);
@@ -81,6 +83,7 @@ private:
       while (self->readLine(line)) {
         auto value = nlohmann::json::parse(line);
         if (!value.is_object()) break;
+        if (self->beforeDispatch) self->beforeDispatch(value);
         {
           std::lock_guard<std::mutex> guard(self->mutex);
           if (self->incoming.size() >= 64) break;
@@ -153,9 +156,10 @@ public:
       stop(); throw;
     }
   }
-  void start(HWND hwnd) {
+  void start(HWND hwnd, std::function<void(const nlohmann::json &)> prepare = {}) {
     if (!active()) return;
     target = hwnd;
+    beforeDispatch = std::move(prepare);
     reader = CreateThread(nullptr, 0, readThread, this, 0, nullptr);
     writer = CreateThread(nullptr, 0, writeThread, this, 0, nullptr);
     if (!reader || !writer) {

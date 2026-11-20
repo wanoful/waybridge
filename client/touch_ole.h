@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cstring>
 
-// A system-only bridge for one current primary touch contact. No SendInput,
+// A system-only bridge for one current primary touch or pen contact. No SendInput,
 // posted fake mouse buttons, ordinal calls or clipboard publication occur here.
 // Promote inside the pointer-owning UI thread while its WM_POINTER data is live,
 // then enter DoDragDrop only when takeMouseReady() accepts a synthesized mouse
@@ -64,6 +64,7 @@ class Bridge {
   Convert convert = nullptr;
   HWND owner = nullptr;
   UINT pointer = 0;
+  POINTER_INPUT_TYPE type = PT_TOUCH;
   bool awaitingMouse = false;
 
 public:
@@ -91,7 +92,11 @@ public:
     pointer = 0;
     awaitingMouse = false;
   }
-  Result promote(HWND window, UINT pointerId) {
+  static bool matchesMouse(POINTER_INPUT_TYPE source, ULONG_PTR extra) {
+    if ((extra & 0xffffff00) != 0xff515700) return false;
+    return source == PT_TOUCH ? (extra & 0x80) != 0 : source == PT_PEN && (extra & 0x80) == 0;
+  }
+  Result promote(HWND window, UINT pointerId, POINTER_INPUT_TYPE source = PT_TOUCH) {
     if (!convert)
       return {Code::Unsupported, ERROR_NOT_SUPPORTED};
     if (owner)
@@ -104,7 +109,7 @@ public:
     SetLastError(ERROR_SUCCESS);
     if (!GetPointerInfo(pointerId, &info))
       return {Code::PointerUnavailable, GetLastError()};
-    if (info.pointerType != PT_TOUCH || info.hwndTarget != window ||
+    if ((source != PT_TOUCH && source != PT_PEN) || info.pointerType != source || info.hwndTarget != window ||
         !(info.pointerFlags & POINTER_FLAG_INCONTACT) ||
         (info.pointerFlags & (POINTER_FLAG_UP | POINTER_FLAG_CANCELED)))
       return {Code::InvalidContact, ERROR_INVALID_PARAMETER};
@@ -129,6 +134,7 @@ public:
     // message reentrantly. Failed conversion rolls the local state back.
     owner = window;
     pointer = pointerId;
+    type = source;
     awaitingMouse = true;
     SetLastError(ERROR_SUCCESS);
     if (!convert()) {
@@ -143,7 +149,7 @@ public:
       return false;
     if (message != WM_LBUTTONDOWN && message != WM_MOUSEMOVE)
       return false;
-    if (!(keys & MK_LBUTTON) || (extra & 0xffffff00) != 0xff515700 || !(extra & 0x80))
+    if (!(keys & MK_LBUTTON) || !matchesMouse(type,extra))
       return false;
     awaitingMouse = false;
     return true;

@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "../client/rich_clipboard.h"
 struct DropSource : IDropSource {
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
     if (id == IID_IUnknown || id == IID_IDropSource) {
@@ -31,6 +32,42 @@ struct DropSource : IDropSource {
 int wmain(int argc, wchar_t **argv) {
   if (argc < 2)
     return 1;
+  if (std::wstring_view(argv[1]) == L"rich-clipboard" && argc == 3) {
+    const std::wstring_view command = argv[2];
+    const UINT html = RegisterClipboardFormatW(L"HTML Format");
+    const UINT rtf = RegisterClipboardFormatW(L"Rich Text Format");
+    if (!OpenClipboard(nullptr)) return 2;
+    if (command == L"set") {
+      EmptyClipboard();
+      auto put = [](UINT format, const void *data, size_t bytes) {
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (!memory) return false;
+        memcpy(GlobalLock(memory), data, bytes);
+        GlobalUnlock(memory);
+        if (SetClipboardData(format, memory)) return true;
+        GlobalFree(memory);
+        return false;
+      };
+      const auto markup = RichClipboard::encodeHtml("<b>你好🙂</b>");
+      constexpr char styled[] = "{\\rtf1\\ansi Windows \\b bold\\b0}";
+      constexpr wchar_t plain[] = L"Windows plain fallback";
+      bool ok = put(html, markup.c_str(), markup.size() + 1) &&
+                put(rtf, styled, sizeof(styled)) && put(CF_UNICODETEXT, plain, sizeof(plain));
+      CloseClipboard();
+      return ok ? 0 : 3;
+    }
+    HGLOBAL memory = GetClipboardData(command == L"html" ? html : rtf);
+    if (!memory) { CloseClipboard(); return 4; }
+    auto data = static_cast<const char *>(GlobalLock(memory));
+    auto bytes = data ? std::string_view(data, GlobalSize(memory)) : std::string_view{};
+    while (!bytes.empty() && bytes.back() == '\0') bytes.remove_suffix(1);
+    if (command == L"html") bytes = RichClipboard::decodeHtml(bytes);
+    else if (!RichClipboard::validRtf(bytes)) bytes = {};
+    if (!bytes.empty()) std::cout.write(bytes.data(), bytes.size());
+    if (data) GlobalUnlock(memory);
+    CloseClipboard();
+    return bytes.empty() ? 5 : 0;
+  }
   if ((std::wstring(argv[1]) == L"copyfile" || std::wstring(argv[1]) == L"drop") && argc > 2) {
     std::wstring paths = argv[2];
     paths.push_back(L'\0');

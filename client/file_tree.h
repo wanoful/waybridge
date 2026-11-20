@@ -1,4 +1,5 @@
 #pragma once
+#include "transfer_activity.h"
 // Shared portable tree manifest, staged clipboard download and directory upload.
 // Included after Json/UTF-8/send helpers; callers own the UI thread inbox.
 #include <functional>
@@ -219,7 +220,8 @@ struct FileInput final : Input {
 struct Upload {
   std::mutex mutex;
   std::condition_variable wake;
-  bool failed = false, clipboard = false;
+  bool failed = false, clipboard = false, committing = false;
+  std::atomic<bool> cancelled{false};
   unsigned stage = 0;
   DWORD comThread = 0;
   uint64_t external = 0;
@@ -240,6 +242,8 @@ inline std::condition_variable requestsWake;
 inline std::deque<UploadRequest> requests;
 inline std::atomic<bool> uploadStopping{false};
 inline bool uploadWorkerStarted = false;
+inline std::function<bool()> separateData;
+inline std::function<bool(const Json &, const std::function<bool()> &)> sendData;
 inline bool uploadResponse(const Json &message) {
   auto type = message.value("type", "");
   if (type != "tree_upload_ready" && type != "tree_upload_error")
@@ -259,8 +263,10 @@ inline bool uploadResponse(const Json &message) {
     std::lock_guard<std::mutex> lock(job->mutex);
     if (type == "tree_upload_error")
       job->failed = true;
-    if (!job->failed)
-      job->stage = message.value("stage", "") == "commit" ? 2 : 1;
+    if (!job->failed) {
+      auto stage = message.value("stage", "");
+      job->stage = stage == "commit" ? 3 : stage == "data" ? 2 : 1;
+    }
     job->wake.notify_all();
   }
   if (type == "tree_upload_error")
@@ -274,6 +280,26 @@ inline void cancelComCall(DWORD thread) {
   static bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
   if (!wine)
     CoCancelCall(thread, 0);
+}
+inline bool cancelUpload(uint64_t batch) {
+  std::shared_ptr<Upload> job;
+  {
+    std::lock_guard<std::mutex> lock(uploadsMutex);
+    auto found = uploads.find(batch);
+    if (found == uploads.end()) return false;
+    job = found->second;
+  }
+  DWORD thread;
+  {
+    std::lock_guard<std::mutex> lock(job->mutex);
+    if (job->committing) return false;
+    job->cancelled = true;
+    job->failed = true;
+    thread = job->comThread;
+  }
+  job->wake.notify_all();
+  if (thread) cancelComCall(thread);
+  return true;
 }
 inline void cancelClipboardUploads() {
   std::vector<DWORD> calls;
@@ -368,10 +394,15 @@ inline void performUpload(UploadRequest request) {
   job->clipboard = !request.drop.value("drop", false);
   job->external = request.external;
   auto valid = [&] {
-    return running && !uploadStopping && (!request.current || request.current()) &&
+    return running && !uploadStopping && !job->cancelled && (!request.current || request.current()) &&
            (!job->clipboard || request.selectionEpoch == epoch.load());
   };
+  auto data = [&](const Json &message) {
+    if (sendData) require(sendData(message, valid), "File data channel unavailable or transfer cancelled");
+    else sendJson(message);
+  };
   bool began = false, success = false;
+  std::string failure;
   auto wait = [&](unsigned stage) {
     std::unique_lock<std::mutex> lock(job->mutex);
     require(job->wake.wait_for(lock, std::chrono::seconds(10),
@@ -386,9 +417,13 @@ inline void performUpload(UploadRequest request) {
       std::lock_guard<std::mutex> lock(uploadsMutex);
       uploads.emplace(batch, job);
     }
+    TransferActivity::begin("upload", batch, "文件", 0);
     auto source = request.open ? request.open() : std::make_unique<FileInput>(request.paths);
     parse(metadata(source->entries));
     require(valid(), "Tree upload superseded");
+    uint64_t totalBytes = 0;
+    for (const auto &entry : source->entries) totalBytes += entry.size;
+    TransferActivity::describe("upload", batch, utf8(source->entries.front().name), totalBytes);
     sendJson({{"type", "tree_upload_begin"},
               {"batch", batch},
               {"drop", !job->clipboard},
@@ -413,27 +448,42 @@ inline void performUpload(UploadRequest request) {
           break;
         total += n;
         require(total <= entry.size, "Source size changed");
-        sendJson({{"type", "tree_upload_chunk"},
+        data({{"type", "tree_upload_chunk"},
                   {"batch", batch},
                   {"file", entry.id},
                   {"data", base64(bytes.data(), n)}});
+        TransferActivity::advance("upload", batch, n);
       }
       require(total == entry.size, "Source size changed");
       source->end();
-      sendJson({{"type", "tree_upload_end"}, {"batch", batch}, {"file", entry.id}});
+      data({{"type", "tree_upload_end"}, {"batch", batch}, {"file", entry.id}});
     }
     require(valid(), "Tree upload superseded");
+    if (separateData && separateData()) {
+      // Receive-side disk work must finish before the ordered control commit.
+      // Clipboard epoch and drop-target changes stay ordered with that commit.
+      data({{"type", "tree_upload_barrier"}, {"batch", batch}});
+      wait(2);
+    }
     Json commit = request.drop;
     commit["type"] = "tree_upload_commit";
     commit["batch"] = batch;
+    {
+      std::lock_guard<std::mutex> lock(job->mutex);
+      require(!job->failed && valid(), "Tree upload cancelled");
+      job->committing = true;
+    }
+    TransferActivity::committing("upload", batch);
     sendJson(commit);
-    wait(2);
+    wait(3);
     success = true;
   } catch (const std::exception &e) {
+    failure = e.what();
     std::cerr << "Tree upload: " << e.what() << '\n';
     if (began && running && !uploadStopping)
       sendJson({{"type", "tree_upload_cancel"}, {"batch", batch}});
   }
+  TransferActivity::finish("upload", batch, success ? "done" : valid() ? "failed" : "cancelled", failure);
   {
     std::lock_guard<std::mutex> lock(uploadsMutex);
     uploads.erase(batch);
@@ -518,7 +568,18 @@ struct Incoming {
   }
 };
 inline std::unique_ptr<Incoming> incoming;
-inline void cancelIncoming() { FileIo::cleanup([] { incoming.reset(); }, &incoming); }
+inline void discardIncoming() {
+  if (incoming) TransferActivity::finish("download", incoming->batch, "cancelled");
+  incoming.reset();
+}
+inline void cancelIncoming() { FileIo::cleanup(discardIncoming, &incoming); }
+inline bool cancelDownload(uint64_t batch) {
+  if (!TransferActivity::finish("download", batch, "cancelled")) return false;
+  FileIo::cleanup([batch] {
+    if (incoming && incoming->batch == batch) discardIncoming();
+  });
+  return true;
+}
 inline void setDownloadsEnabled(bool enabled) {
   if (downloadsEnabled.exchange(enabled) == enabled) return;
   if (!enabled) { ++epoch; cancelIncoming(); cancelIncomingFiles(); }
@@ -543,7 +604,7 @@ inline bool serverClipboard(uint64_t generation) {
     serverGeneration = generation;
     publishedGeneration = 0;
     FileIo::cleanup([] {
-      if (incoming && incoming->batch < serverGeneration) incoming.reset();
+      if (incoming && incoming->batch < serverGeneration) discardIncoming();
     }, &serverGeneration);
     cancelIncomingFilesExcept(generation);
   }
@@ -567,13 +628,16 @@ inline bool receiveNow(const Json &message) {
       return true;
     latestIncoming = batch;
     cancelIncomingFiles();
-    incoming.reset();
+    discardIncoming();
     auto state = std::make_unique<Incoming>();
     state->batch = batch;
     state->selectionEpoch = epoch;
     state->clipboard = GetClipboardSequenceNumber();
     try {
       state->entries = parse(message.at("entries"));
+      uint64_t totalBytes = 0;
+      for (const auto &entry : state->entries) totalBytes += entry.size;
+      TransferActivity::begin("download", batch, utf8(state->entries.front().name), totalBytes);
       wchar_t temp[MAX_PATH]{};
       DWORD length = GetTempPathW(MAX_PATH, temp);
       require(length && length < MAX_PATH, "Unsupported temporary directory path");
@@ -597,6 +661,7 @@ inline bool receiveNow(const Json &message) {
       incoming = std::move(state);
     } catch (const std::exception &error) {
       std::cerr << "Tree download: " << error.what() << '\n';
+      TransferActivity::finish("download", batch, "failed", error.what());
     }
   } else if (incoming && incoming->batch == batch) {
     try {
@@ -612,6 +677,7 @@ inline bool receiveNow(const Json &message) {
                     written == bytes.size(),
                 "Invalid tree chunk");
         file.remaining -= written;
+        TransferActivity::advance("download", batch, written);
       } else if (type == "tree_done") {
         for (const auto &[id, file] : incoming->files)
           require(!file.remaining, "Incomplete tree");
@@ -623,9 +689,13 @@ inline bool receiveNow(const Json &message) {
         FileIo::postUi([state] {
         try {
         const auto batch = state->batch;
+        if (!TransferActivity::active("download", batch)) return;
         if (!downloadsEnabled || state->selectionEpoch != epoch || batch < serverGeneration ||
             batch <= blockedGeneration || batch < latestIncoming ||
-            publicationSequence(batch, state->clipboard) != GetClipboardSequenceNumber()) return;
+            publicationSequence(batch, state->clipboard) != GetClipboardSequenceNumber()) {
+          TransferActivity::finish("download", batch, "cancelled");
+          return;
+        }
         std::vector<wchar_t> paths;
         for (const auto &entry : state->entries)
           if (entry.name.find(L'/') == std::wstring::npos) {
@@ -656,32 +726,36 @@ inline bool receiveNow(const Json &message) {
         ownClipboardSequence = GetClipboardSequenceNumber();
         state->published = true;
         publishedGeneration = batch;
+        TransferActivity::finish("download", batch, "done", utf8(state->directory));
         if (activity) activity({{"type", "transfer"}, {"event", "download_complete"},
                                {"batch", batch}, {"directory", utf8(state->directory)}});
         } catch (const std::exception &error) {
           std::cerr << "Tree publication: " << error.what() << '\n';
+          TransferActivity::finish("download", state->batch, "failed", error.what());
         }
         });
       } else {
         std::cerr << "Tree download: " << message.value("message", "failed") << '\n';
+        TransferActivity::finish("download", batch, "failed", message.value("message", "failed"));
         incoming.reset();
       }
     } catch (const std::exception &error) {
       std::cerr << "Tree download: " << error.what() << '\n';
       if (activity) activity({{"type", "transfer"}, {"event", "download_error"},
                               {"batch", batch}, {"message", error.what()}});
+      TransferActivity::finish("download", batch, "failed", error.what());
       incoming.reset();
     }
   }
   return true;
 }
-inline bool receive(const Json &message) {
+inline bool receive(const Json &message, bool mayWait = false) {
   auto type = message.value("type", "");
   if (type != "tree_begin" && type != "tree_chunk" && type != "tree_done" && type != "tree_error")
     return false;
   if (!downloadsEnabled) return true;
   size_t bytes = message.value("_file_io_bytes", size_t(65536));
-  require(FileIo::submit([message] { receiveNow(message); }, bytes), "File I/O queue full");
+  require(FileIo::submit([message] { if (downloadsEnabled) receiveNow(message); }, bytes, mayWait), "File I/O queue full");
   return true;
 }
 } // namespace FileTree

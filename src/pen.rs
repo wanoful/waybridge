@@ -14,11 +14,26 @@ struct Active {
     surface: WlSurface,
     origin: Point<f64, Logical>,
     position: Point<f64, Logical>,
+    target: u32,
+    local: (f64, f64),
     tip: bool,
     tip_serial: Option<Serial>,
     capabilities: u8,
     barrel: bool,
     tilt: (Option<f64>, Option<f64>),
+}
+pub(crate) struct PenDragStart {
+    pub root: u32,
+    pub epoch: u64,
+    pub generation: u64,
+    pub gesture: u64,
+    pub tool: u64,
+    pub eraser: bool,
+    pub surface: WlSurface,
+    pub origin: Point<f64, Logical>,
+    pub position: Point<f64, Logical>,
+    pub target: u32,
+    pub local: (f64, f64),
 }
 struct Tool {
     handle: TabletToolHandle,
@@ -39,6 +54,7 @@ pub struct Pen {
     available: bool,
     initialized: bool,
     enabled: bool,
+    drag_available: bool,
     generation: u64,
     target: Option<(u32, u64)>,
     handoff: Option<u32>,
@@ -102,15 +118,19 @@ impl App {
         if let Some(operation) = &self.pen.window_operation {
             value["window_operation"] = json!(operation.operation);
         }
+        if let Some(operation) = self.pen_drag_operation() {
+            value["drag_operation"] = json!(operation);
+        }
         self.control(value);
     }
-    pub fn pen_negotiate(&mut self, available: bool, enabled: bool) {
+    pub fn pen_negotiate(&mut self, available: bool, enabled: bool, drag_available: bool) {
         if self.pen.initialized {
             return;
         }
         self.pen.initialized = true;
         self.pen.available = available;
         self.pen.enabled = available && enabled;
+        self.pen.drag_available = available && drag_available;
         self.pen.generation = self.pen.generation.wrapping_add(1).max(1);
         // Advertise before the first physical event, so applications can bind
         // tablet-seat resources without a proximity-driven detection cycle.
@@ -130,9 +150,10 @@ impl App {
         self.pen.available = false;
         self.pen.initialized = false;
         self.pen.enabled = false;
+        self.pen.drag_available = false;
         self.pen.last_gesture = 0;
         if available {
-            self.pen_negotiate(true, true);
+            self.pen_negotiate(true, true, false);
         }
     }
     pub fn pen_enabled(&mut self, enabled: bool) {
@@ -165,6 +186,7 @@ impl App {
             || self.read_only
             || self.peer.as_ref().is_none_or(|p| !p.desktop_input())
             || self.external_drag_input()
+            || self.pen_drag_operation().is_some()
             || self.window_drag.active()
             || self.pointer_locked()
             || self.x11.grab.is_some()
@@ -197,6 +219,9 @@ impl App {
         }
     }
     pub fn cancel_pen(&mut self) {
+        if self.pen_drag_operation().is_some() {
+            self.finish_touch_interaction(true);
+        }
         let pending = self.pen.handoff.take();
         self.end_pen_proximity();
         self.pen.window_operation = None;
@@ -410,6 +435,8 @@ impl App {
                 surface: surface.clone(),
                 origin,
                 position,
+                target,
+                local: (x, y),
                 tip: false,
                 tip_serial: None,
                 capabilities,
@@ -436,6 +463,8 @@ impl App {
         active.surface = surface.clone();
         active.origin = origin;
         active.position = position;
+        active.target = target;
+        active.local = (x, y);
         active.sequence = sequence;
         if active.capabilities & 1 != 0 {
             if let Some(p) = pressure {
@@ -502,6 +531,54 @@ impl App {
 }
 
 impl App {
+    pub(crate) fn pen_drag_start(&self, serial: Serial) -> Option<PenDragStart> {
+        let (root, epoch) = self.pen.target?;
+        let active = self.pen.active.as_ref()?;
+        if !self.pen.drag_available
+            || self.pen.window_operation.is_some()
+            || !active.tip
+            || active.tip_serial != Some(serial)
+            || !active.surface.is_alive()
+            || self.focused_window != Some(root)
+            || self.pen_candidate(root) != Some((root, epoch))
+        {
+            return None;
+        }
+        Some(PenDragStart {
+            root,
+            epoch,
+            generation: self.pen.generation,
+            gesture: active.gesture,
+            tool: active.key.0,
+            eraser: active.key.1,
+            surface: active.surface.clone(),
+            origin: active.origin,
+            position: active.position,
+            target: active.target,
+            local: active.local,
+        })
+    }
+    pub(crate) fn pen_drag_allowed(&self, root: u32, epoch: u64) -> bool {
+        self.pen.enabled
+            && self.pen.drag_available
+            && !self.pointer_locked()
+            && self.input_allowed(root)
+            && self.windows.iter().any(|w| {
+                w.id == root
+                    && w.mapped
+                    && w.window.alive()
+                    && w.state.mapping_epoch == epoch
+                    && self.window_pen_bound(&w.window)
+            })
+    }
+    pub(crate) fn retire_pen_for_drag(&mut self) {
+        self.end_pen_proximity();
+        self.pen.handoff = None;
+        self.pen.target = None;
+        self.pen.generation = self.pen.generation.wrapping_add(1).max(1);
+        self.publish_pen(None);
+    }
+
     pub fn pen_window_request(
         &mut self,
         surface: &ToplevelSurface,

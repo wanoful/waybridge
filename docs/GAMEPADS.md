@@ -26,7 +26,7 @@ Windows 构建下载并校验固定版本的 [SDL3 源码](https://github.com/li
 
 Linux 使用标准 Xbox 360 的 BTN/ABS/HAT 布局，按 evdev 约定反转摇杆 Y 轴。游戏的 `FF_RUMBLE` 上传、播放、停止和有限时长结束，经当前租约回传到原 Windows 槽位；旧设备反馈不能作用于重连后的设备。持续震动每 250 ms 续发，反馈租期为 750 ms，客户端在轮询中检查超时并归零；它不是独立于 UI 调度的实时硬截止。
 
-拔出手柄会删除对应虚拟设备，包含失焦期间的拔出。只读、关闭转发或断开连接会删除全部对应设备。虚拟设备由本会话创建并随生命周期删除，内核设备节点仍对系统可见。
+协商 `gamepad_reconnect_v1` 后，能够识别设备路径的手柄短时掉线会立即归零，并保留虚拟槽位最多 5 秒。SDL 设备使用 SDL 路径和 GUID 识别回来的设备，现有蓝牙 HID 回退使用自己的设备路径。相同设备及时返回时，游戏可继续使用原 evdev 句柄，输入和震动切换到新的设备代次。未经识别的拔出和宽限期过期会删除对应虚拟设备。只读、关闭转发或断开连接会删除全部对应设备。虚拟设备由本会话创建并随生命周期删除，内核设备节点仍对系统可见。
 
 ## 后端与验收
 
@@ -37,11 +37,12 @@ Linux 检查 `/dev/uinput` 的读写访问及版本（需要支持设备设置�
 ```sh
 cargo test --locked gamepad::tests
 cargo test --locked gamepad::tests::uinput_roundtrip_and_real_rumble -- --ignored
+cargo test --locked gamepad::tests::uinput_short_reconnect_preserves_player_handles -- --ignored
 python3 tests/windows_gamepad_smoke.py
 python3 tests/session_fixture.py python3 tests/gamepad_smoke.py
 ```
 
-真实 Linux 测试只操作由唯一名称、phys 和 sysname 确认的临时虚拟设备，验证 evdev 按钮/轴/方向键、真实 `EVIOCSFF` 上传和震动回传、效果到期归零、热插拔隔离及设备删除。负例覆盖缺失/无权限后端、非 uinput 节点、非法数值、旧租约和重放。Windows 测试在私有 Wine/Xvfb 中运行生产适配器和 SDL 虚拟手柄，覆盖四槽、热插拔、方向键、轴和扳机、焦点、死区及震动路由和停止。
+真实 Linux 测试只操作由唯一名称、phys 和 sysname 确认的临时虚拟设备，验证 evdev 按钮/轴/方向键、真实 `EVIOCSFF` 上传和震动回传、效果到期归零、热插拔隔离、双手柄重连后保持设备句柄及超时删除。负例覆盖缺失/无权限后端、非 uinput 节点、非法数值、旧租约和重放。Windows 测试在私有 Wine/Xvfb 中运行生产适配器和 SDL 虚拟手柄，覆盖四槽、热插拔、方向键、轴和扳机、焦点、死区、同槽重连及震动路由。
 
 真实合成器协议到 evdev 的端到端测试覆盖默认关闭、双端焦点匹配、按钮/轴/HAT、非法/过期/重复输入拒绝、切焦点时同一 evdev 设备归零并恢复、失焦期间拔出、只读/关闭/断线清理。只读取由本次合成器 PID、name、phys 和 sysname 确认的临时节点。
 

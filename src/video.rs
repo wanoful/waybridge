@@ -27,6 +27,7 @@ pub struct Frame {
     pub gpu: Option<nvenc::GpuFrame>,
     pub straight: bool,
     pub peer: Arc<Peer>,
+    pub codec: Option<nvenc::Codec>,
     pub video_eligible: bool,
     pub budget_video: bool,
     pub enqueued: Instant,
@@ -60,7 +61,7 @@ struct Queue {
     forget: Vec<u32>,
     reset: bool,
     closed: bool,
-    config: Option<(Option<nvenc::Codec>, u32, u32)>,
+    config: Option<(u32, u32)>,
     reclaim: Option<(u32, bool, bool)>,
     last_reclaim: Option<Instant>,
 }
@@ -161,12 +162,12 @@ fn trim_idle(idle: &mut VecDeque<(u32, Session)>) {
 }
 
 impl Encoder {
-    pub fn new(codec: Option<nvenc::Codec>, fps: u32, bitrate: u32, budget: Budget) -> Self {
+    pub fn new(fps: u32, bitrate: u32, budget: Budget) -> Self {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let worker = queue.clone();
         let worker_budget = budget.clone();
         let worker = thread::spawn(move || {
-            let (mut codec, mut fps, mut bitrate) = (codec, fps, bitrate);
+            let (mut fps, mut bitrate) = (fps, bitrate);
             let mut sessions: BTreeMap<u32, Session> = BTreeMap::new();
             let mut idle = VecDeque::<(u32, Session)>::new();
             let mut epoch = 0u32;
@@ -209,7 +210,7 @@ impl Encoder {
                     (frame, reset, forget, config, reclaim)
                 };
                 if let Some(config) = config {
-                    (codec, fps, bitrate) = config;
+                    (fps, bitrate) = config;
                     sessions.clear();
                     idle.clear();
                 }
@@ -243,6 +244,7 @@ impl Encoder {
                 if frame.peer.is_closed() || frame.peer.window_closed(frame.id) {
                     continue;
                 }
+                let codec = frame.codec;
                 let selected_codec = if frame.gpu.as_ref().is_some_and(|f| f.hdr()) {
                     codec
                         .and_then(|c| c.hdr_variant())
@@ -618,13 +620,13 @@ impl Encoder {
             wake.notify_one();
         }
     }
-    pub fn reconfigure(&self, codec: Option<nvenc::Codec>, fps: u32, bitrate: u32) {
+    pub fn reconfigure(&self, fps: u32, bitrate: u32) {
         let (lock, wake) = &*self.queue;
         let mut queue = lock.lock().unwrap();
         queue.frames.clear();
         queue.bytes = 0;
         queue.observe();
-        queue.config = Some((codec, fps, bitrate));
+        queue.config = Some((fps, bitrate));
         wake.notify_one();
     }
     pub fn shutdown(&mut self) {

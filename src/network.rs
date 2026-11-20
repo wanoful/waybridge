@@ -1,5 +1,5 @@
 //! One authenticated viewer; bounded input, priority control, latest-frame-only video.
-use crate::{protocol, udp};
+use crate::{file_transport::FileLane, protocol, transfer_worker::Ingress, udp};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -110,12 +110,15 @@ impl Queue {
 pub struct Peer {
     audio_enabled: bool,
     audio_attached: AtomicBool,
+    microphone: Option<crate::microphone::Input>,
     udp: Option<Arc<udp::Transport>>,
     queue: Mutex<Queue>,
     wake: Condvar,
     file_tree: bool,
+    files: Option<FileLane>,
     file_epoch: AtomicU64,
     file_export_generation: AtomicU64,
+    file_upload_cancelled: AtomicU64,
     split_media: bool,
     codecs: BTreeSet<waybridge_codec::Codec>,
     acknowledgements: bool,
@@ -225,9 +228,21 @@ impl Peer {
 
     pub fn set_desktop_input(&self, enabled: bool) {
         self.desktop_input.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            if let Some(microphone) = &self.microphone {
+                microphone.revoke();
+            }
+        }
     }
     pub fn desktop_input(&self) -> bool {
         self.desktop_input.load(Ordering::SeqCst) && !self.is_closed()
+    }
+    pub fn configure_microphone(&self, request: u64, enabled: bool) {
+        if let Some(microphone) = &self.microphone {
+            if let Some(allowed) = microphone.configure(request, || enabled && self.desktop_input()) {
+                self.control(json!({"type":"microphone_state","request_id":request,"allowed":allowed}));
+            }
+        }
     }
     pub fn tray_enabled(&self) -> bool {
         self.tray_v1
@@ -259,6 +274,31 @@ impl Peer {
     pub fn file_tree(&self) -> bool {
         self.file_tree
     }
+    pub fn has_file_lane(&self) -> bool {
+        self.files.is_some()
+    }
+    pub fn set_file_rate(&self, kib: u64) {
+        if let Some(files) = &self.files {
+            files.set_rate(kib);
+        }
+    }
+    pub fn cancel_file_download(&self, batch: u64) {
+        if batch == self.file_export_generation.load(Ordering::Relaxed) {
+            if let Some(files) = &self.files {
+                files.cancel_clipboard(batch);
+            }
+        }
+    }
+    pub fn cancel_file_upload(&self, batch: u64) {
+        if self.has_file_lane() {
+            self.file_upload_cancelled.fetch_max(batch, Ordering::Relaxed);
+        }
+    }
+    pub fn file_upload_current(&self, batch: u64) -> bool {
+        self.files.as_ref().is_none_or(|files| {
+            !files.is_closed() && batch > self.file_upload_cancelled.load(Ordering::Relaxed)
+        })
+    }
     pub fn file_epoch(&self) -> u64 {
         self.file_epoch.load(Ordering::Relaxed)
     }
@@ -271,6 +311,7 @@ impl Peer {
     }
     pub fn file_export_current(&self, generation: u64) -> bool {
         !self.is_closed() && self.file_export_generation.load(Ordering::Relaxed) == generation
+            && self.files.as_ref().is_none_or(|files| files.clipboard_current(generation))
     }
 
     pub fn begin_resize(&self, id: u32, width: u32, height: u32, started: Instant) {
@@ -443,6 +484,9 @@ impl Peer {
     }
     /// File workers may wait for network capacity; the compositor never does.
     pub fn bulk(&self, message: Value) -> bool {
+        if let Some(files) = &self.files {
+            return files.push(message);
+        }
         let mut q = self.queue.lock().unwrap();
         while !q.closed && q.bulk.len() >= 16 {
             q = self.wake.wait(q).unwrap();
@@ -459,7 +503,13 @@ impl Peer {
             udp.cancel();
         }
         self.queue.lock().unwrap().closed = true;
+        if let Some(microphone) = &self.microphone {
+            microphone.revoke();
+        }
         self.wake.notify_all();
+        if let Some(files) = &self.files {
+            files.close();
+        }
     }
     fn write_loop(&self, mut socket: TcpStream, media: bool) -> io::Result<()> {
         let mut udp_started = false;
@@ -554,7 +604,9 @@ type MediaSession = Arc<Mutex<Option<(String, Weak<Peer>)>>>;
 pub struct Options {
     pub hdr_enabled: bool,
     pub audio: bool,
+    pub microphone: Weak<crate::microphone::Source>,
     pub udp: Option<Arc<udp::Hub>>,
+    pub file_ingress: Ingress,
 }
 pub fn listen(
     address: &str,
@@ -564,7 +616,9 @@ pub fn listen(
     let Options {
         hdr_enabled,
         audio,
+        microphone,
         udp,
+        file_ingress,
     } = options;
     let listener = TcpListener::bind(address)?;
     tracing::info!(address = %listener.local_addr()?, "viewer listener ready");
@@ -575,13 +629,15 @@ pub fn listen(
     thread::spawn(move || {
         for socket in listener.incoming() {
             let Ok(mut socket) = socket else { continue };
-            let (token, tx, occupied, session, udp) = (
+            let (token, tx, occupied, session, microphone, udp) = (
                 token.clone(),
                 tx.clone(),
                 occupied.clone(),
                 session.clone(),
+                microphone.clone(),
                 udp.clone(),
             );
+            let file_ingress = file_ingress.clone();
             // Authentication is handled outside the compositor loop and cannot stall Wayland.
             thread::spawn(move || {
                 let _ = socket.set_nodelay(true);
@@ -597,6 +653,17 @@ pub fn listen(
                     || hello["version"] != protocol::VERSION
                     || hello["token"].as_str() != Some(&token)
                 {
+                    return;
+                }
+                if hello["channel"] == "microphone" {
+                    let peer = session.lock().unwrap().as_ref().and_then(|(key, peer)| {
+                        (hello["media_key"].as_str() == Some(key)).then(|| peer.upgrade()).flatten()
+                    });
+                    if let (Some(peer), Some(request)) = (peer, hello["request_id"].as_u64()) {
+                        if let Some(microphone) = &peer.microphone {
+                            let _ = microphone.serve(socket, request);
+                        }
+                    }
                     return;
                 }
                 if hello["channel"] == "audio" {
@@ -667,6 +734,17 @@ pub fn listen(
                     peer.audio_attached.store(false, Ordering::SeqCst);
                     return;
                 }
+                if hello["channel"] == "files" {
+                    let peer = session.lock().unwrap().as_ref().and_then(|(key, peer)| {
+                        (hello["media_key"].as_str() == Some(key)).then(|| peer.upgrade()).flatten()
+                    });
+                    if let Some(peer) = peer.filter(|peer| !peer.is_closed()) {
+                        if let Some(files) = &peer.files {
+                            files.run(socket, peer.clone(), file_ingress);
+                        }
+                    }
+                    return;
+                }
                 if hello["channel"] == "media" {
                     let peer = session.lock().unwrap().as_ref().and_then(|(key, peer)| {
                         (hello["media_key"].as_str() == Some(key))
@@ -700,12 +778,16 @@ pub fn listen(
                 let peer = Arc::new(Peer {
                     audio_enabled: audio && hello["audio_pcm"].as_bool().unwrap_or(false),
                     audio_attached: AtomicBool::new(false),
+                    microphone: (hello["microphone_v1"] == true && microphone.strong_count() > 0)
+                        .then(|| crate::microphone::Input::new(microphone)),
                     udp,
                     queue: Mutex::new(Queue::default()),
                     wake: Condvar::new(),
                     file_tree: hello["file_tree"].as_bool().unwrap_or(false),
+                    files: (hello["file_tree"] == true && hello["file_channel_v1"] == true).then(FileLane::new),
                     file_epoch: AtomicU64::new(0),
                     file_export_generation: AtomicU64::new(0),
+                    file_upload_cancelled: AtomicU64::new(0),
                     split_media: hello["split_media"].as_bool().unwrap_or(false),
                     codecs: waybridge_codec::Codec::ALL
                         .into_iter()
@@ -734,6 +816,7 @@ pub fn listen(
                     desktop_input: AtomicBool::new(true),
                 });
                 let mut key = [0; 32];
+                peer.set_file_rate(hello["file_rate_kib"].as_u64().unwrap_or(0));
                 if std::fs::File::open("/dev/urandom")
                     .and_then(|mut f| {
                         use std::io::Read;
@@ -758,7 +841,45 @@ pub fn listen(
                         let _ = s.shutdown(std::net::Shutdown::Both);
                     }
                 });
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media, "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1,"notifications_v1":peer.notifications_v1,"tray_v1":peer.tray_v1,"pen_v1":hello["pen_v1"] == true,"pen_settings_v1":hello["pen_v1"] == true,"gamepad_v1":hello["gamepad_v1"] == true,"gamepad_settings_v1":hello["gamepad_v1"] == true,"touch_v1":hello["touch_v1"] == true, "touch_settings_v1":hello["touch_v1"] == true,"touch_interaction_v1":hello["touch_v1"] == true && hello["touch_interaction_v1"] == true,"touchpad_v1":hello["touchpad_v1"] == true,"data_drag_v1":peer.data_drag_v1,"data_drag_result_v1":peer.data_drag_v1,"activation_v1":peer.activation_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":["windows","input","resize","clipboard_text","clipboard_png","clipboard_files","file_drop_in","file_drop_out","file_tree","window_decorations","dpi","alpha","cursor_v1","window_icon_v1","window_semantics_v1","relative_pointer_locked","locked_pointer","ime_v3","pen_v1","pen_settings_v1","gamepad_v1","gamepad_settings_v1","touch_v1","touch_settings_v1","touch_interaction_v1","touchpad_v1","toplevel_drag_v1","stream_config_v1","notifications_v1","tray_v1","data_drag_v1","data_drag_result_v1","activation_v1"]}));
+                let features: &[&str] = &[
+                    "windows",
+                    "input",
+                    "resize",
+                    "clipboard_text",
+                    "clipboard_png",
+                    "clipboard_files",
+                    "file_drop_in",
+                    "file_drop_out",
+                    "file_tree",
+                    "window_decorations",
+                    "dpi",
+                    "alpha",
+                    "cursor_v1",
+                    "window_icon_v1",
+                    "window_semantics_v1",
+                    "relative_pointer_locked",
+                    "locked_pointer",
+                    "ime_v3",
+                    "pen_v1",
+                    "pen_settings_v1",
+                    "pen_drag_v1",
+                    "gamepad_v1",
+                    "gamepad_settings_v1",
+                    "gamepad_reconnect_v1",
+                    "touch_v1",
+                    "touch_settings_v1",
+                    "touch_interaction_v1",
+                    "touchpad_v1",
+                    "toplevel_drag_v1",
+                    "stream_config_v1",
+                    "app_stream_modes_v1",
+                    "notifications_v1",
+                    "tray_v1",
+                    "data_drag_v1",
+                    "data_drag_result_v1",
+                    "activation_v1",
+                ];
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media,"file_channel_v1":peer.has_file_lane(), "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1,"notifications_v1":peer.notifications_v1,"tray_v1":peer.tray_v1,"pen_v1":hello["pen_v1"] == true,"pen_settings_v1":hello["pen_v1"] == true,"pen_drag_v1":hello["pen_v1"] == true && hello["pen_drag_v1"] == true,"gamepad_v1":hello["gamepad_v1"] == true,"gamepad_settings_v1":hello["gamepad_v1"] == true,"gamepad_reconnect_v1":hello["gamepad_v1"] == true && hello["gamepad_reconnect_v1"] == true,"touch_v1":hello["touch_v1"] == true, "touch_settings_v1":hello["touch_v1"] == true,"touch_interaction_v1":hello["touch_v1"] == true && hello["touch_interaction_v1"] == true,"touchpad_v1":hello["touchpad_v1"] == true,"data_drag_v1":peer.data_drag_v1,"data_drag_result_v1":peer.data_drag_v1,"activation_v1":peer.activation_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "microphone_v1":peer.microphone.is_some(), "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":features}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

@@ -20,6 +20,7 @@ const FF_RUMBLE: u16 = 0x50;
 const FF_GAIN: u16 = 0x60;
 const BUTTON_MASK: u16 = 0xf3ff;
 const MAX_EFFECTS: usize = 16;
+const RECONNECT_GRACE: Duration = Duration::from_secs(5);
 const BUTTONS: [(u16, u16); 10] = [
     (0x1000, 0x130), // A / south
     (0x2000, 0x131), // B / east
@@ -143,6 +144,7 @@ struct Device {
     gain: u16,
     last_rumble: (u16, u16),
     rumble_sent: Instant,
+    reconnect_until: Option<Instant>,
 }
 impl Device {
     fn new(path: &Path, slot: usize, incarnation: u64, session: u64) -> io::Result<Self> {
@@ -228,6 +230,7 @@ impl Device {
             gain: u16::MAX,
             last_rumble: (0, 0),
             rumble_sent: Instant::now(),
+            reconnect_until: None,
         })
     }
     fn write(&mut self, sample: Sample) -> io::Result<()> {
@@ -391,6 +394,7 @@ pub struct Gamepads {
     session: u64,
     incarnations: [u64; 4],
     devices: [Option<Device>; 4],
+    reconnect: bool,
     outgoing: Vec<Value>,
 }
 impl Default for Gamepads {
@@ -416,16 +420,18 @@ impl Gamepads {
             session: 0,
             incarnations: [0; 4],
             devices: std::array::from_fn(|_| None),
+            reconnect: false,
             outgoing: Vec::new(),
         }
     }
-    pub fn negotiate(&mut self, available: bool, enabled: bool) {
+    pub fn negotiate(&mut self, available: bool, enabled: bool, reconnect: bool) {
         if self.initialized {
             return;
         }
         self.initialized = true;
         self.available = available;
         self.requested = available && enabled;
+        self.reconnect = available && reconnect;
         self.session = self.session.wrapping_add(1).max(1);
         self.generation = self.generation.wrapping_add(1).max(1);
         self.connection_generation = self.generation;
@@ -518,7 +524,7 @@ impl Gamepads {
         if !self.available {
             return;
         }
-        let devices: Vec<_> = self.devices.iter().enumerate().filter_map(|(slot, d)| d.as_ref().map(|d| json!({"slot":slot,"name":d.name,"device_generation":d.incarnation,"sysname":d.sysname}))).collect();
+        let devices: Vec<_> = self.devices.iter().enumerate().filter_map(|(slot, d)| d.as_ref().map(|d| json!({"slot":slot,"name":d.name,"device_generation":d.incarnation,"sysname":d.sysname,"reconnecting":d.reconnect_until.is_some()}))).collect();
         let message = json!({"type":"gamepad_state","supported":self.supported,"requested":self.requested,"enabled":self.target.is_some(),"id":self.target.unwrap_or(0),"generation":self.generation,"devices":devices,"rumble_supported":self.supported,"error":self.error});
         // Status is latest-only, but zero-motor terminal events retain ordering.
         self.outgoing.retain(|m| m["type"] != "gamepad_state");
@@ -555,6 +561,13 @@ impl Gamepads {
             }
         }
         self.incarnations = [0; 4];
+    }
+    fn detach(&mut self, slot: usize, incarnation: u64) {
+        if self.devices[slot].take().is_some() {
+            self.stop_rumble(slot, incarnation);
+            self.publish();
+        }
+        self.incarnations[slot] = incarnation.saturating_add(1);
     }
     pub fn input(&mut self, value: &Value) {
         let Some(generation) = value["generation"].as_u64() else {
@@ -597,13 +610,27 @@ impl Gamepads {
             {
                 return;
             }
-            if let Some(device) = self.devices[slot].take() {
+            if self.reconnect && value["suspended"] == true {
+                let Some(device) = self.devices[slot].as_mut() else {
+                    return;
+                };
+                if device.reconnect_until.is_some() {
+                    return;
+                }
+                if let Err(error) = device.pause() {
+                    self.error = backend_error(&error);
+                    self.supported = false;
+                    self.sync();
+                    self.publish();
+                    return;
+                }
+                device.sequence = sequence;
+                device.reconnect_until = Some(Instant::now() + RECONNECT_GRACE);
                 self.stop_rumble(slot, incarnation);
-                drop(device);
                 self.publish();
+            } else {
+                self.detach(slot, incarnation);
             }
-            // A delayed snapshot cannot resurrect an unplugged incarnation.
-            self.incarnations[slot] = incarnation.saturating_add(1);
             return;
         }
         if generation != self.generation || self.target != Some(id) {
@@ -612,6 +639,34 @@ impl Gamepads {
         let Some(sample) = Sample::parse(value) else {
             return;
         };
+        if let Some(device) = self.devices[slot]
+            .as_mut()
+            .filter(|d| d.reconnect_until.is_some())
+        {
+            if incarnation == device.incarnation {
+                // Delayed snapshots cannot resume a physically detached device.
+                return;
+            }
+            if self.reconnect
+                && value["reconnect_from"].as_u64() == Some(device.incarnation)
+                && device
+                    .reconnect_until
+                    .is_some_and(|until| Instant::now() < until)
+            {
+                if let Err(error) = device.pause() {
+                    self.error = backend_error(&error);
+                    self.supported = false;
+                    self.sync();
+                    self.publish();
+                    return;
+                }
+                device.incarnation = incarnation;
+                device.sequence = 0;
+                device.reconnect_until = None;
+                self.incarnations[slot] = incarnation;
+                self.publish();
+            }
+        }
         if self.devices[slot]
             .as_ref()
             .is_none_or(|d| d.incarnation != incarnation)
@@ -646,9 +701,19 @@ impl Gamepads {
     pub fn poll(&mut self) -> Vec<Value> {
         let now = Instant::now();
         for slot in 0..self.devices.len() {
-            let feedback = self.devices[slot]
-                .as_mut()
-                .map(|d| (d.incarnation, d.feedback(now, self.target.is_some())));
+            if let Some(device) = self.devices[slot]
+                .as_ref()
+                .filter(|d| d.reconnect_until.is_some_and(|until| now >= until))
+            {
+                self.detach(slot, device.incarnation);
+                continue;
+            }
+            let feedback = self.devices[slot].as_mut().map(|d| {
+                (
+                    d.incarnation,
+                    d.feedback(now, self.target.is_some() && d.reconnect_until.is_none()),
+                )
+            });
             if let Some((incarnation, result)) = feedback {
                 match result {
                     Ok(Some((strong, weak))) => self.rumble(slot, incarnation, strong, weak),
@@ -674,6 +739,7 @@ impl Gamepads {
         self.initialized = false;
         self.available = false;
         self.requested = false;
+        self.reconnect = false;
         self.connection_generation = 0;
         self.generation = self.generation.wrapping_add(1).max(1);
         self.outgoing.clear();
@@ -715,7 +781,7 @@ mod tests {
         let mut pads = Gamepads::with_backend(PathBuf::from("/waybridge-test-no-such-uinput"));
         pads.policy(Some(7), true);
         pads.focus(7);
-        pads.negotiate(true, false);
+        pads.negotiate(true, false, false);
         let status = pads.poll().pop().unwrap();
         assert_eq!(status["requested"], false);
         assert_eq!(status["supported"], false);
@@ -748,7 +814,7 @@ mod tests {
             .open(&path)
             .unwrap();
         let mut pads = Gamepads::with_backend(path.clone());
-        pads.negotiate(true, true);
+        pads.negotiate(true, true, false);
         pads.focus(7);
         pads.policy(Some(7), true);
         let status = pads.poll().pop().unwrap();
@@ -764,7 +830,7 @@ mod tests {
         // /dev/null opens successfully but is not a uinput backend. Malformed,
         // stale, off and unfocused input must be rejected before the first ioctl.
         let mut pads = Gamepads::with_backend(PathBuf::from("/dev/null"));
-        pads.negotiate(true, false);
+        pads.negotiate(true, false, false);
         assert!(!pads.supported); // Opening a character device is insufficient.
                                   // Controlled healthy-probe fact: guard tests below must never reach
                                   // /dev/null's failing device-creation ioctl until a valid live snapshot.
@@ -855,10 +921,57 @@ mod tests {
         file.write_all(bytes).unwrap();
     }
     #[test]
+    #[ignore = "only operates temporary uniquely named uinput pads"]
+    fn uinput_short_reconnect_preserves_player_handles() {
+        let mut pads = Gamepads::default();
+        pads.negotiate(true, true, true);
+        assert!(pads.supported, "{}", pads.error);
+        pads.focus(7);
+        pads.policy(Some(7), true);
+        let generation = pads.generation;
+        pads.input(&input(generation, 41, 1));
+        let mut second = input(generation, 9, 1);
+        second["slot"] = json!(1);
+        pads.input(&second);
+        let first = pads.devices[0].as_ref().unwrap();
+        let sysname = first.sysname.clone();
+        let mut reader = own_evdev(first).unwrap();
+        let second_sysname = pads.devices[1].as_ref().unwrap().sysname.clone();
+        let mut suspend = input(generation, 41, 2);
+        suspend["connected"] = json!(false);
+        suspend["suspended"] = json!(true);
+        pads.input(&suspend);
+        let paused = pads.devices[0].as_ref().unwrap();
+        assert_eq!(paused.sysname, sysname);
+        assert_eq!(paused.sample, Sample::default());
+        assert!(paused.reconnect_until.is_some());
+        assert!(drain(&mut reader).contains(&(EV_KEY, 0x130, 0)));
+        pads.input(&input(generation, 41, 3));
+        assert_eq!(pads.devices[0].as_ref().unwrap().sample, Sample::default());
+
+        let mut resume = input(generation, 42, 1);
+        resume["reconnect_from"] = json!(41);
+        pads.input(&resume);
+        let first = pads.devices[0].as_ref().unwrap();
+        assert_eq!(first.sysname, sysname);
+        assert_eq!(first.incarnation, 42);
+        assert!(first.reconnect_until.is_none());
+        assert!(drain(&mut reader).contains(&(EV_KEY, 0x130, 1)));
+        assert_eq!(pads.devices[1].as_ref().unwrap().sysname, second_sysname);
+
+        suspend["device_generation"] = json!(42);
+        pads.input(&suspend);
+        pads.devices[0].as_mut().unwrap().reconnect_until = Some(Instant::now());
+        pads.poll();
+        assert!(pads.devices[0].is_none());
+        assert_eq!(pads.devices[1].as_ref().unwrap().sysname, second_sysname);
+    }
+
+    #[test]
     #[ignore = "creates only a uniquely named disposable uinput gamepad; requires uinput and own-node access"]
     fn uinput_roundtrip_and_real_rumble() {
         let mut pads = Gamepads::default();
-        pads.negotiate(true, true);
+        pads.negotiate(true, true, false);
         assert!(pads.supported, "{}", pads.error);
         pads.focus(7);
         pads.policy(Some(7), true);

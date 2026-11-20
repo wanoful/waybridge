@@ -431,6 +431,7 @@ internal sealed partial class MainWindow
 
     private void ResetConnectionView()
     {
+        InterruptTransfers();
         remoteWindows = [];
         RenderWindows();
         backgroundList.Items.Clear();
@@ -516,7 +517,7 @@ internal sealed partial class MainWindow
                 applications = available;
                 FilterApplications();
                 RenderWindows();
-                _ = GuardAsync(ApplyLauncherTouchAsync);
+                _ = GuardAsync(ApplyLauncherPoliciesAsync);
             }
         }
         catch (OperationCanceledException) when (ReferenceEquals(catalogLoad, request)) { SetCatalogStatus("读取目录超时，可以刷新重试。"); }

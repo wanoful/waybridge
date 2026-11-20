@@ -20,7 +20,7 @@ internal sealed partial class MainWindow
     private readonly StackPanel commandHistory = new() { Spacing = 5 };
     private readonly StackPanel commandPane = new() { Visibility = Visibility.Collapsed, Spacing = 12 };
     private LaunchCommand? suggestedCommand;
-    private bool launcherTouchPending;
+    private bool launcherPoliciesPending;
     private bool CommandMode => applicationSearch.Text.TrimStart().StartsWith('>');
 
     private UIElement AppTile(RemoteApplication app, bool compact)
@@ -108,6 +108,15 @@ internal sealed partial class MainWindow
                 touch.Items.Add(item);
             }
             menu.Items.Add(touch);
+            var stream = new MenuFlyoutSubItem { Text = "画面预设" };
+            string preset = launcherPreferences.AppStreamModes.GetValueOrDefault(profileId)?.GetValueOrDefault(app.Id) ?? "";
+            foreach (var (value, label) in new[] { ("", "跟随连接"), ("clear", "文字清晰"), ("low_latency", "交互低延迟") })
+            {
+                var item = new ToggleMenuFlyoutItem { Text = label, IsChecked = preset == value };
+                item.Click += async (_, _) => await GuardAsync(() => selected.Id == profileId ? SetAppStreamModeAsync(app, value) : Task.CompletedTask);
+                stream.Items.Add(item);
+            }
+            menu.Items.Add(stream);
             menu.Items.Add(ActionItem("自定义启动…", () => CustomLaunchAsync(app)));
         };
         return menu;
@@ -133,19 +142,52 @@ internal sealed partial class MainWindow
         return candidates.Length == 1 ? candidates[0] : null;
     }
 
-    private ClientSettings SettingsWithLauncherTouch(ClientSettings settings)
+    private ClientSettings SettingsWithLauncherPolicies(ClientSettings settings)
     {
         var preferred = launcherPreferences.AppTouchModes.GetValueOrDefault(selected.Id);
-        if (preferred is null || preferred.Count == 0) return settings;
         var mapped = new Dictionary<string, string>(settings.TouchModes, StringComparer.Ordinal);
+        if (preferred is { Count: > 0 })
+        {
+            foreach (var window in remoteWindows)
+            {
+                if (mapped.Count >= 100) break;
+                if (MatchWindowApplication(window.AppId) is { } app && preferred.TryGetValue(app.Id, out var mode)
+                    && mode is "native" or "mouse")
+                    mapped.TryAdd(window.AppId, mode);
+            }
+        }
+        return settings with { TouchModes = mapped, AppStreamModes = ApplicationStreamModes() };
+    }
+
+    private Dictionary<string, string> ApplicationStreamModes()
+    {
+        var modes = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (!launcherPreferences.AppStreamModes.TryGetValue(selected.Id, out var saved) || saved is null) return modes;
+        foreach (var (id, mode) in saved.Take(128))
+            if (mode is "clear" or "low_latency") modes[id] = mode;
         foreach (var window in remoteWindows)
         {
-            if (mapped.Count >= 100) break;
-            if (MatchWindowApplication(window.AppId) is { } app && preferred.TryGetValue(app.Id, out var mode)
-                && mode is "native" or "mouse")
-                mapped.TryAdd(window.AppId, mode);
+            if (modes.Count >= 256) break;
+            if (MatchWindowApplication(window.AppId) is { } app && modes.TryGetValue(app.Id, out var mode))
+                modes.TryAdd(window.AppId, mode);
         }
-        return settings with { TouchModes = mapped };
+        return modes;
+    }
+
+    private async Task SetAppStreamModeAsync(RemoteApplication app, string value)
+    {
+        if (!launcherPreferences.AppStreamModes.TryGetValue(selected.Id, out var modes))
+            launcherPreferences.AppStreamModes[selected.Id] = modes = new(StringComparer.Ordinal);
+        if (value.Length == 0) modes.Remove(app.Id);
+        else
+        {
+            if (modes.Count >= 128 && !modes.ContainsKey(app.Id))
+                throw new InvalidOperationException("每个工作站最多可为 128 个应用保存画面预设");
+            modes[app.Id] = value;
+        }
+        if (modes.Count == 0) launcherPreferences.AppStreamModes.Remove(selected.Id);
+        await SaveLauncherPreferencesAsync();
+        await ApplyLauncherPoliciesAsync();
     }
 
     private async Task SetLauncherTouchAsync(RemoteApplication app, string value)
@@ -155,19 +197,21 @@ internal sealed partial class MainWindow
         if (value.Length == 0) modes.Remove(app.Id);
         else modes[app.Id] = value;
         await SaveLauncherPreferencesAsync();
-        await ApplyLauncherTouchAsync();
+        await ApplyLauncherPoliciesAsync();
         if (!remoteWindows.Any(window => MatchWindowApplication(window.AppId)?.Id == app.Id))
             Inform("已保存触控策略，识别到该应用的窗口后应用。");
     }
 
-    private Task ApplyLauncherTouchAsync()
+    private Task ApplyLauncherPoliciesAsync()
     {
-        launcherTouchPending = false;
+        launcherPoliciesPending = false;
         if (!controller.Connected || controller.ActiveProfileId != selected.Id || liveSettings is null) return Task.CompletedTask;
-        if (busy) { launcherTouchPending = true; return Task.CompletedTask; }
-        var requested = SettingsWithLauncherTouch(liveSettings with { TouchModes = selected.Settings.TouchModes });
-        if (requested.TouchModes.Count == liveSettings.TouchModes.Count
-            && requested.TouchModes.All(pair => liveSettings.TouchModes.GetValueOrDefault(pair.Key) == pair.Value))
+        if (busy) { launcherPoliciesPending = true; return Task.CompletedTask; }
+        var requested = SettingsWithLauncherPolicies(liveSettings with { TouchModes = selected.Settings.TouchModes });
+        static bool SameRules(Dictionary<string, string> previous, Dictionary<string, string> current) =>
+            previous.Count == current.Count && current.All(pair => previous.GetValueOrDefault(pair.Key) == pair.Value);
+        if (SameRules(liveSettings.TouchModes, requested.TouchModes) &&
+            SameRules(liveSettings.AppStreamModes, requested.AppStreamModes))
             return Task.CompletedTask;
         var profileId = selected.Id;
         return RunOperationAsync(async () =>

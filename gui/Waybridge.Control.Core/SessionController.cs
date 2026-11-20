@@ -180,7 +180,11 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
     }
 
     private static ClientSettings CopySettings(ClientSettings settings) =>
-        settings with { TouchModes = new(settings.TouchModes, StringComparer.Ordinal) };
+        settings with
+        {
+            TouchModes = new(settings.TouchModes, StringComparer.Ordinal),
+            AppStreamModes = new(settings.AppStreamModes, StringComparer.Ordinal)
+        };
 
     public async Task ApplyAsync(ClientSettings settings, Guid? expectedProfileId = null)
     {

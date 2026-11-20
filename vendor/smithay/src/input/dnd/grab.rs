@@ -35,6 +35,8 @@ pub enum GrabType {
     Pointer,
     /// Touch input was validated for the requested grab
     Touch,
+    /// Tablet tip input was validated by the compositor
+    Tablet,
 }
 
 /// Grab during a client-initiated DnD operation.
