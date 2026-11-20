@@ -28,9 +28,11 @@ for arch in "${architectures[@]}"; do
   rm -rf -- "$output"
   # Programmatic WinUI needs no XAML/PRI compiler. The SDK still generates the
   # full native WinRT component manifest; only its final mt.exe merge is replaced.
+  # The managed assemblies embed a PDB path even when the bundle omits the PDB.
   dotnet publish gui/Waybridge.Control/Waybridge.Control.csproj -c Release \
     -r "win-$arch" -p:Platform="$platform" --self-contained true \
     -p:WindowsAppSDKSelfContained=true -p:MicrosoftWindowsAppSDKPackageDir= \
+    "-p:PathMap=$PWD=/_/waybridge" \
     "-p:ManifestTool=$PWD/scripts/merge-windows-manifest.py" -o "$output"
   cp "$native/waybridge-client.exe" "$output/"
   cp README.md "$output/README.md"
