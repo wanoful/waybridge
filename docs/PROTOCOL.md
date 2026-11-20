@@ -522,12 +522,17 @@ capabilities still apply. Changing a preset refreshes only affected windows.
 `file_drop_out_enabled {enabled}` changes outbound drag availability and cancels
 an active outbound operation when disabled.
 
+With `appearance_v1`, the authenticated viewer can send `color_scheme` in its
+hello and `appearance {color_scheme}` for later updates. Values are `dark`,
+`light`, and `default` (no preference). The compositor exposes the latest
+value through the XDG Settings portal and keeps it after viewer disconnect.
+
 The optional Windows launch form `waybridge-client.exe --control-pipe NAME`
 connects to a randomly named, current-user-only pipe owned by the GUI. It accepts
 UTF-8 newline-delimited JSON, at most 64 KiB per request. The first request is
-`{type:"start",version:1,host,port,token,settings,transport?,source_id?}`. Optional `transport` is `{type:"tls",fingerprint,client_id,client_token,session}`; `host`/`port` then identify the TLS entry and `token` remains the backend v3 credential. Without it the worker uses the legacy socket transport. Authentication stays inside
+`{type:"start",version:1,host,port,token,settings,transport?,source_id?,appearance?,language?}`. `appearance` is the client's effective `light` or `dark` theme. `language` is `en` or `zh-Hans`. Optional `transport` is `{type:"tls",fingerprint,client_id,client_token,session}`; `host`/`port` then identify the TLS entry and `token` remains the backend v3 credential. Without it the worker uses the legacy socket transport. Authentication stays inside
 the pipe; it is absent from the worker command line. Subsequent commands are
-`settings {settings}`, `status`, `send_files {paths}`, `focus_window {id}` and
+`settings {settings}`, `appearance {color_scheme}`, `language {language}`, `status`, `send_files {paths}`, `focus_window {id}` and
 `disconnect`. Pipe EOF stops the local worker without terminating remote apps.
 
 The optional local `source_id` is the GUI's persistent connection-profile ID;

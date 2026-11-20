@@ -107,12 +107,13 @@ By default, this installs:
 - `~/.local/bin/waybridge` and `~/.local/bin/waybridge-service`
 - `~/.config/systemd/user/waybridge.service` (the TLS entry point)
 - `~/.config/systemd/user/waybridge-session*.target` (session lifecycle targets)
+- `waybridge-portals.conf` and the Waybridge Settings backend descriptor under `~/.local/share/xdg-desktop-portal/` (or `$XDG_DATA_HOME/xdg-desktop-portal/`)
 
 > The installer refuses to overwrite modified user-owned unit files so upgrades never silently clobber your customizations.
 
 ### Optional Installer Flags
 
-- **Install the GTK Portal preset** (recommended for native file pickers inside Waybridge):
+- **Install or update the Waybridge Portal preset in the user config directory** (use this if a previous installation placed it there):
   ```bash
   python3 service/install-user-service.py \
     --portal-directory "${XDG_CONFIG_HOME:-$HOME/.config}/xdg-desktop-portal"
@@ -221,9 +222,16 @@ Waybridge uses **TLS on TCP port `49092`** by default for pairing, session manag
 
 ## 6. Optional Desktop & Peripheral Setup
 
-### A. File Pickers via `xdg-desktop-portal`
+### A. XDG Desktop Portal File Pickers and Appearance
 
-After installing `waybridge-portals.conf` (Step 3), bind the portal services to Waybridge's session target so they start with Waybridge and stop cleanly on session exit:
+The Waybridge Portal preset enables GTK file pickers and publishes the connected client's light or dark preference to supported Linux apps. With XDG Desktop Portal 1.22 or later, the user-installed backend descriptor is discovered automatically. On older releases that support `portals.conf`, install it under `/usr/share/xdg-desktop-portal/portals/`:
+
+```bash
+sudo install -Dm644 integration/xdg-desktop-portal/portals/waybridge-appearance.portal \
+  /usr/share/xdg-desktop-portal/portals/waybridge-appearance.portal
+```
+
+Bind the Portal services to Waybridge's session target so they start with the Waybridge desktop environment and stop on session exit:
 
 ```bash
 mkdir -p \

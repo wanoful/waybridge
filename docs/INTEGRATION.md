@@ -17,16 +17,16 @@ systemctl --user enable --now waybridge.service
 
 The installer copies the user binaries, the TLS entry unit, and the three Waybridge session targets without starting services automatically. Modified existing units are not overwritten and require manual merging. `waybridge.service` is the TLS entry point; restarting it does not terminate existing compositor sessions. Session targets are started by the compositor once the display and environment are ready—do not manually `enable` or `start` them.
 
-The default install does not write a Portal configuration. To install the repository's GTK file-chooser Portal preset, pass an explicit target directory:
+The default user install copies `waybridge-portals.conf` to `$XDG_DATA_HOME/xdg-desktop-portal/` (normally `~/.local/share/xdg-desktop-portal/`) and the Waybridge Settings backend descriptor to its `portals/` subdirectory. The preset is selected by the Waybridge desktop identity. To copy it to a higher-priority user configuration directory or upgrade the original shipped preset there, pass an explicit directory:
 
 ```sh
 python3 service/install-user-service.py \
   --portal-directory "${XDG_CONFIG_HOME:-$HOME/.config}/xdg-desktop-portal"
 ```
 
-This installs `waybridge-portals.conf` and likewise refuses to overwrite a differing existing file. Distribution packages may install the default file under `/usr/share/xdg-desktop-portal/`, where user files still take precedence under native Portal lookup rules. Running the compositor never generates temporary Portal configs or modifies `XDG_CONFIG_DIRS`.
+The installer preserves custom presets. If you maintain one, add `org.freedesktop.impl.portal.Settings=waybridge-appearance;gtk;` under `[preferred]`. XDG Desktop Portal 1.22 or later discovers the user-installed backend descriptor. For older releases that support `portals.conf`, install the descriptor under `/usr/share/xdg-desktop-portal/portals/`.
 
-This preset configures `xdg-desktop-portal` with the GTK backend and explicitly sets unimplemented `ScreenCast`, `Screenshot`, `RemoteDesktop`, and `GlobalShortcuts` backends to `none`. It does not imply support for those features or full Flatpak document-portal verification.
+The Waybridge compositor provides `org.freedesktop.appearance.color-scheme` to the XDG Settings portal. GTK remains the fallback for other settings and provides file pickers. Waybridge uses the existing user bus and publishes a session preference there. Log out of any other desktop session for the same Linux user before starting Waybridge so the Portal picks the Waybridge configuration. Apps may have their own appearance overrides. The preset sets `ScreenCast`, `Screenshot`, `RemoteDesktop`, and `GlobalShortcuts` backends to `none`.
 
 ## Connecting a Session Component
 
@@ -123,7 +123,7 @@ systemctl --user enable waybridge-notifications.service
 
 `enable` hooks it into `waybridge-session.target` for future Waybridge sessions. Inside an already running Waybridge session—after confirming no competing provider is active—you can also start it directly with `systemctl --user start waybridge-notifications.service`. No D-Bus activation file edits or global alias overrides are needed. The unit runs `waybridge --notification-provider` and stops with the session via `PartOf`. It requires `WAYBRIDGE_SESSION_ID`'s private runtime directory and the user bus, and cannot run as a standalone daemon outside a Waybridge session.
 
-When another owner already holds the bus name, the provider requests the name with `DoNotQueue` and without `ReplaceExisting`, so it fails cleanly instead of queuing to take over. If the system already provides a native systemd unit for the same `BusName`, inspect its unit and activation configuration so your selection is explicit without creating duplicate bus-name assignments. Diagnostics:
+The unit uses `Type=exec` so another desktop's installed notification unit can reserve the same name in systemd. The provider requests the name directly with `DoNotQueue` and fails cleanly if another daemon currently owns it. Check the unit and journal for the current state.
 
 ```sh
 systemctl --user status waybridge-notifications.service

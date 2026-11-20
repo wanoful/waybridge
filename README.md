@@ -19,6 +19,7 @@ Waybridge runs Linux Wayland and X11 applications inside a private, headless [Sm
 - **Hardware-accelerated display pipeline** — NVENC H.264 / HEVC / AV1 with independent lossless alpha, PNG lossless fallback, optional NVIDIA GL → CUDA → NVENC color input, experimental scRGB Main10 HDR subset, and D3D11 / Media Foundation / DirectComposition presentation on Windows (x64 & native ARM64).
 - **Authenticated TLS connectivity & adaptive UDP** — Linux user-level service (`waybridge-service`) with pinned-certificate TLS pairing, Windows Credential Manager token storage, optional AES-256-GCM UDP/FEC media channel with delivery-feedback pacing and NVENC bitrate coordination, and full `waybridge-service tui` terminal administration.
 - **Native desktop integration** — Windows Control Center (C# / .NET 10 / WinUI 3) with app wall, global search, `waybridge://` app links, Windows Start Menu/Desktop shortcuts, remote SNI/DBusMenu system trays, native Windows notifications, customizable per-connection icon badges, and `AppUserModelID` taskbar grouping.
+- **Language and appearance** — The Control Center supports English and Simplified Chinese. Its appearance setting also updates native streamed window captions and supported Linux apps through the XDG Settings portal.
 - **Rich input & peripherals** — Windows native IME → Wayland `text-input-v3`, Raw Input relative mouse & pointer lock (`Ctrl+Alt+Shift+F12` emergency unlock), native cursors, WASAPI stereo audio playback, optional mono microphone uplink, plus opt-in experimental native multitouch, Precision Touchpad gestures, `tablet-v2` pressure pen, and 4-slot SDL3 → `uinput` gamepads with rumble.
 - **Safe cross-machine data exchange** — Bidirectional text, HTML, RTF, PNG, file, and directory clipboard/drag-and-drop over a dedicated file channel with uniform read-only cross-machine delivery (read-only FUSE view on Linux, NTFS DACLs on Windows) and on-demand virtual-file drag-out.
 
@@ -53,8 +54,11 @@ On Linux (requires Rust, EGL/GLES, `libdrm`, Wayland, `xkbcommon`, FFmpeg dev he
 # Optional: cross-compile native Windows ARM64 engine (requires LLVM-MinGW)
 ./scripts/build-windows-arm64.sh
 
-# Optional: build portable Windows Control Center bundle (requires .NET 10 SDK)
+# Optional: build a portable Windows bundle (requires .NET 10 SDK)
 ./scripts/build-control-center.sh x64   # or arm64 / all
+
+# Build portable bundles and Windows installers (also requires NSIS 3.11+)
+./scripts/build-control-center.sh all --installer
 ```
 
 ### 2. Start the Linux Service and Pair
@@ -72,7 +76,7 @@ cargo build --release --workspace --locked
 ./target/release/waybridge-service tui
 ```
 
-On Windows, extract `build/Waybridge-Control-win-{x64,arm64}.zip`, launch `Waybridge.Control.exe`, add your Linux workstation using its LAN/VPN address, port `49092`, the verified `certificate_sha256` fingerprint, and the one-time pairing code, then connect and launch applications.
+On Windows, run `Waybridge-Setup-win-x64.exe` or `Waybridge-Setup-win-arm64.exe` and open **Waybridge** from Start. For a portable copy, extract the entire matching `Waybridge-Control-win-*.zip` and run `Waybridge.Control.exe`. Add your Linux workstation using its LAN/VPN address, port `49092`, the verified `certificate_sha256` fingerprint, and the one-time pairing code. Then connect and launch applications.
 
 For a full step-by-step Linux host walkthrough (distro packages, `systemd --user`, `loginctl enable-linger`, firewall, Portals, notifications, Chrome/KWallet overrides, and `/dev/uinput` gamepads), see the **[Linux Host Setup Guide](docs/LINUX_SETUP.md)**. For direct low-level CLI + SSH tunnel usage, see [Usage & Build Guide](docs/README.md).
 
