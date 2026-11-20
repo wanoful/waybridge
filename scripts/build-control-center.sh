@@ -3,10 +3,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 architecture="${1:-arm64}"
+installer="${2:-}"
+if [[ -n "$installer" && "$installer" != --installer || "$#" -gt 2 ]]; then
+  echo "Usage: $0 [arm64|x64|all] [--installer]" >&2
+  exit 2
+fi
 case "$architecture" in
   arm64|x64) architectures=("$architecture") ;;
   all) architectures=(arm64 x64) ;;
-  *) echo "Usage: $0 [arm64|x64|all]" >&2; exit 2 ;;
+  *) echo "Usage: $0 [arm64|x64|all] [--installer]" >&2; exit 2 ;;
 esac
 for arch in "${architectures[@]}"; do
   if [[ "$arch" == arm64 ]]; then
@@ -48,4 +53,7 @@ for arch in "${architectures[@]}"; do
   [[ -s "$prerequisite" ]] || curl --fail --location --retry 2 "https://aka.ms/vc14/vc_redist.$arch.exe" -o "$prerequisite"
   cp "$prerequisite" "$output/"
   python3 scripts/package-control-center.py "$arch"
+  if [[ "$installer" == --installer ]]; then
+    python3 scripts/build-client-installer.py "$arch"
+  fi
 done
