@@ -36,7 +36,7 @@ public sealed class EngineChannel : IAsyncDisposable
         if (!activation) return null;
         string request = Guid.NewGuid().ToString("N");
         var pending = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!activations.TryAdd(request, pending)) throw new IOException("激活请求冲突");
+        if (!activations.TryAdd(request, pending)) throw new IOException(Tr("Conflicting activation request"));
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
         timeout.CancelAfter(TimeSpan.FromSeconds(5));
         try
@@ -65,8 +65,8 @@ public sealed class EngineChannel : IAsyncDisposable
             while (await stream.ReadLineAsync(lifetime.Token) is { } line)
             {
                 string sessionSecret = secret, clientSecret = directSecret;
-                if (sessionSecret.Length > 0) line = line.Replace(sessionSecret, "[令牌已隐藏]", StringComparison.Ordinal);
-                if (clientSecret.Length > 0) line = line.Replace(clientSecret, "[客户端凭据已隐藏]", StringComparison.Ordinal);
+                if (sessionSecret.Length > 0) line = line.Replace(sessionSecret, Tr("[session token redacted]"), StringComparison.Ordinal);
+                if (clientSecret.Length > 0) line = line.Replace(clientSecret, Tr("[client credential redacted]"), StringComparison.Ordinal);
                 last = line.Length > 2048 ? line[..2048] : line;
                 Log?.Invoke(last);
             }
@@ -76,9 +76,10 @@ public sealed class EngineChannel : IAsyncDisposable
     }
     public static async Task<EngineChannel> StartAsync(string executable, string host, int port, string token,
         ClientSettings settings, Action<JsonElement> message, Action<string> log,
-        CancellationToken cancellationToken, IReadOnlyList<string>? prefixArguments = null, DirectTransport? transport = null, string sourceId = "")
+        CancellationToken cancellationToken, IReadOnlyList<string>? prefixArguments = null, DirectTransport? transport = null,
+        string sourceId = "", string? language = null)
     {
-        if (token.Length is < 16 or > 4096 || token.Any(char.IsWhiteSpace)) throw new ArgumentException("请输入有效的会话令牌");
+        if (token.Length is < 16 or > 4096 || token.Any(char.IsWhiteSpace)) throw new ArgumentException(Tr("Enter a valid session token"));
         string name = "waybridge-" + Guid.NewGuid().ToString("N");
         var pipe = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
@@ -96,17 +97,17 @@ public sealed class EngineChannel : IAsyncDisposable
             if (await Task.WhenAny(connected, exited) == exited)
             {
                 await exited; // A cancelled wait does not mean the process exited.
-                throw new IOException("串流内核在连接控制通道前退出");
+                throw new IOException(Tr("The streaming worker exited before connecting to the control channel"));
             }
             await connected;
             channel = new EngineChannel(pipe, process, token, transport?.ClientToken ?? "");
             channel.Message += message; channel.Log += log;
-            await channel.SendAsync(new { type = "start", version = 1, host, port, token, settings, transport, source_id = sourceId }, timeout.Token);
+            await channel.SendAsync(new { type = "start", version = 1, host, port, token, settings, transport, source_id = sourceId, language = language ?? Localization.Language }, timeout.Token);
             var engineReady = channel.ready.Task;
             if (await Task.WhenAny(engineReady, exited) == exited)
             {
                 await exited;
-                throw new IOException("串流连接失败：" + await channel.errors.WaitAsync(timeout.Token));
+                throw new IOException(Tr("Streaming connection failed: ") + await channel.errors.WaitAsync(timeout.Token));
             }
             await engineReady.WaitAsync(timeout.Token);
             return channel;
@@ -116,14 +117,14 @@ public sealed class EngineChannel : IAsyncDisposable
             if (channel is not null) await channel.DisposeAsync();
             else { pipe.Dispose(); await Processes.StopAsync(process); }
             if (error is OperationCanceledException && !cancellationToken.IsCancellationRequested)
-                throw new TimeoutException("串流内核未在 30 秒内就绪，请查看诊断日志", error);
+                throw new TimeoutException(Tr("The streaming worker did not become ready within 30 seconds. Check the diagnostics log."), error);
             throw;
         }
     }
     public async Task SendAsync(object message, CancellationToken token = default)
     {
         byte[] bytes = Wire.Encode(message);
-        if (bytes.Length > 65536) throw new ArgumentException("控制请求过大");
+        if (bytes.Length > 65536) throw new ArgumentException(Tr("Control request is too large"));
         await writer.WaitAsync(token);
         try { await pipe.WriteAsync(bytes, token); await pipe.FlushAsync(token); }
         finally { writer.Release(); }
@@ -150,10 +151,10 @@ public sealed class EngineChannel : IAsyncDisposable
                     ready.TrySetException(new IOException(message.GetProperty("message").GetString()));
                 Message?.Invoke(message);
             }
-            ready.TrySetException(new IOException("串流控制通道已关闭"));
+            ready.TrySetException(new IOException(Tr("The streaming control channel closed")));
         }
         catch (Exception error) { ready.TrySetException(error); }
-        finally { foreach (var pending in activations.Values) pending.TrySetException(new IOException("激活请求所属连接已断开")); }
+        finally { foreach (var pending in activations.Values) pending.TrySetException(new IOException(Tr("The connection for the activation request closed"))); }
     }
     public async ValueTask DisposeAsync()
     {

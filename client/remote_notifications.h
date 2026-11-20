@@ -35,7 +35,7 @@ public:
     negotiated = message.value("notifications_v1",false);
     reset();
     if (negotiated) transmit({{"type","notifications_enabled"},{"enabled",enabled && available}});
-    else publish({{"type","notification_status"},{"available",false},{"message","服务端未协商桌面通知；请更新服务端"}});
+    else publish({{"type","notification_status"},{"available",false},{"message","The server did not negotiate desktop notifications. Update the server."}});
   }
   bool receive(Json message) {
     std::string type = message.value("type", "");

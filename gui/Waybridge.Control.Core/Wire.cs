@@ -32,11 +32,11 @@ public sealed class JsonLines(Stream stream, int limit = 1024 * 1024)
                 used -= newline + 1;
                 return result;
             }
-            if (used == buffer.Length) throw new IOException("控制消息过大");
+            if (used == buffer.Length) throw new IOException(Tr("Control message is too large"));
             int count = await stream.ReadAsync(buffer.AsMemory(used), cancellationToken);
             if (count == 0)
             {
-                if (used != 0) throw new IOException("控制消息未完整接收");
+                if (used != 0) throw new IOException(Tr("The control message was incomplete"));
                 return null;
             }
             used += count;

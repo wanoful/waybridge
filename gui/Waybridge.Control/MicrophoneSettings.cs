@@ -6,27 +6,31 @@ namespace Waybridge.Control;
 internal sealed partial class MainWindow
 {
     private readonly ToggleSwitch microphone = Toggle(false);
-    private readonly TextBlock microphoneStatus = Muted("当前未连接。");
-    private string? liveMicrophoneStatus;
+    private readonly TextBlock microphoneStatus = Muted(Tr("No active connection."));
+    private JsonElement? microphoneReport;
 
     private void ReceiveMicrophoneStatus(JsonElement message)
     {
-        if (TouchFlag(message, "microphone_supported") is not { } supported) return;
-        bool enabled = TouchFlag(message, "microphone_enabled") == true;
-        string error = message.TryGetProperty("microphone_error", out var reason) ? reason.GetString() ?? "" : "";
-        liveMicrophoneStatus = !enabled ? "当前连接已关闭麦克风转发。"
-            : TouchFlag(message, "microphone_paused") == true ? "已暂停。当前连接处于只读模式。"
-            : !supported ? "当前 Linux 会话没有麦克风输入。"
-            : TouchFlag(message, "microphone_active") == true ? "正在转发 Windows 默认麦克风。"
-            : error.Length > 0 ? error : "正在连接 Windows 默认麦克风…";
+        if (TouchFlag(message, "microphone_supported") is null) return;
+        microphoneReport = message;
         UpdateMicrophoneStatus();
     }
 
     private void UpdateMicrophoneStatus()
     {
-        if (!controller.Connected || controller.ActiveProfileId != selected.Id)
-            liveMicrophoneStatus = null;
-        microphoneStatus.Text = liveMicrophoneStatus ?? (controller.Connected
-            ? "等待当前连接报告麦克风状态。" : "当前未连接。");
+        bool connected = controller.Connected && controller.ActiveProfileId == selected.Id;
+        if (!connected) microphoneReport = null;
+        if (microphoneReport is not { } message)
+        {
+            microphoneStatus.Text = connected ? Tr("Waiting for this connection to report microphone status.") : Tr("No active connection.");
+            return;
+        }
+        bool enabled = TouchFlag(message, "microphone_enabled") == true;
+        string error = message.TryGetProperty("microphone_error", out var reason) ? TrDiagnostic(reason.GetString() ?? "") : "";
+        microphoneStatus.Text = !enabled ? Tr("Microphone forwarding is off for this connection.")
+            : TouchFlag(message, "microphone_paused") == true ? Tr("Paused because this connection is view-only.")
+            : TouchFlag(message, "microphone_supported") == false ? Tr("The Linux session has no microphone input.")
+            : TouchFlag(message, "microphone_active") == true ? Tr("Forwarding the default Windows microphone.")
+            : error.Length > 0 ? error : Tr("Connecting to the default Windows microphone…");
     }
 }

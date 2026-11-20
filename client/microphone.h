@@ -156,7 +156,7 @@ private:
         awaiting.pop_front();
         changed.notify_one();
       }
-      stop("麦克风通道已断开");
+      stop("Microphone channel disconnected");
     }
     void send() {
       auto start = std::chrono::steady_clock::now();
@@ -183,7 +183,7 @@ private:
         encode(packet.data() + 25, 8, uint64_t(elapsed.count()));
         if (stopped || !writeAll(socket, packet.data(), packet.size())) break;
       }
-      stop("麦克风通道已断开");
+      stop("Microphone channel disconnected");
     }
     void capture() {
       const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -259,19 +259,19 @@ private:
       }
       if (ready) CloseHandle(ready);
       if (SUCCEEDED(initialized)) CoUninitialize();
-      stop("Windows 默认麦克风不可用（WASAPI " + std::to_string(unsigned(hr)) + "）");
+      stop("Default Windows microphone unavailable: WASAPI " + std::to_string(unsigned(hr)));
     }
     void run(const Lease &lease) {
       std::thread reader, captureWorker;
       try {
         if (!open(lease)) {
-          stop("无法连接 Linux 麦克风输入");
+          stop("Could not connect to the Linux microphone input");
           return;
         }
         reader = std::thread([this] { acknowledge(); });
         captureWorker = std::thread([this] { capture(); });
         send();
-      } catch (const std::exception &) { stop("无法启动麦克风传输"); }
+      } catch (const std::exception &) { stop("Could not start microphone forwarding"); }
       if (captureWorker.joinable()) captureWorker.join();
       if (reader.joinable()) reader.join();
     }

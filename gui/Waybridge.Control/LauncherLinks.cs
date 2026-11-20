@@ -23,7 +23,7 @@ internal sealed partial class MainWindow
         if (launchLinkInProgress is not null || busy)
         {
             ShowControlCenter();
-            Inform("Waybridge 正在处理另一个操作，请稍后重试应用链接。");
+            Inform(Tr("Waybridge is busy. Try the app link again shortly."));
             return;
         }
 
@@ -33,10 +33,10 @@ internal sealed partial class MainWindow
             await (initialization ??= InitializeAsync(refreshCatalog: false));
             if (quitting) return;
             var profile = profiles.SingleOrDefault(item => item.Id == link.ProfileId)
-                ?? throw new InvalidOperationException("应用链接对应的工作站已移除。请重新配对并创建快捷方式。");
+                ?? throw new InvalidOperationException(Tr("The workstation for this app link was removed. Pair it again and create a new shortcut."));
             if (profile.ClientId.Length == 0 || profile.CertificateSha256.Length != 64 || string.IsNullOrEmpty(secrets.Read(profile.Id)))
-                throw new InvalidOperationException($"「{profile.Name}」需要重新配对才能启动应用。");
-            if (busy) throw new InvalidOperationException("Waybridge 正在处理另一个操作，请稍后重试应用链接。");
+                throw new InvalidOperationException(Tr("Pair with “{0}” again to launch apps.", profile.Name));
+            if (busy) throw new InvalidOperationException(Tr("Waybridge is busy. Try the app link again shortly."));
 
             await RunOperationAsync(async () =>
             {
@@ -54,7 +54,7 @@ internal sealed partial class MainWindow
                     applicationSearch.Text = "";
                 }
                 if (!await ConnectForLaunchAsync(profile))
-                    throw new InvalidOperationException($"未连接到「{profile.Name}」，应用尚未启动。");
+                    throw new InvalidOperationException(Tr("Could not connect to “{0}”. The app was not launched.", profile.Name));
                 var application = applications.FirstOrDefault(app => app.Id == link.AppId);
                 await LaunchForProfileAsync(profile, link.AppId, application, shellActivation: true);
                 if (launcherPreferences.SelectedProfile != profile.Id)
@@ -68,7 +68,7 @@ internal sealed partial class MainWindow
         {
             if (quitting) return;
             ShowControlCenter();
-            Error(error is OperationCanceledException ? new IOException("连接或启动未完成，请重试应用链接。") : error);
+            Error(error is OperationCanceledException ? new IOException(Tr("Could not connect or launch the app. Try the app link again.")) : error);
         }
         finally { launchLinkInProgress = null; }
     }
@@ -81,7 +81,7 @@ internal sealed partial class MainWindow
         data.SetText(link.ToString());
         Clipboard.SetContent(data);
         Clipboard.Flush();
-        Inform("已复制应用链接。");
+        Inform(Tr("App link copied."));
         return Task.CompletedTask;
     }
 
@@ -93,9 +93,9 @@ internal sealed partial class MainWindow
         byte[]? icon = await ShortcutIconAsync(profile, app.Id);
         if (quitting) return;
         if (!profiles.Any(item => item.Id == profile.Id && item.ClientId == profile.ClientId))
-            throw new InvalidOperationException("工作站的配对配置已更改，请重新创建快捷方式。");
+            throw new InvalidOperationException(Tr("Pairing for this workstation has changed. Create a new shortcut."));
         AppShortcuts.Save(link, app.Name, profile.Name, desktop, store.DirectoryPath, icon);
-        Inform(desktop ? "已创建桌面快捷方式。" : "已添加到「开始 → 所有应用 → Waybridge」。");
+        Inform(desktop ? Tr("Desktop shortcut created.") : Tr("Added to Start → All apps → Waybridge."));
     }
 
     private async Task<byte[]?> ShortcutIconAsync(ConnectionProfile profile, string id)

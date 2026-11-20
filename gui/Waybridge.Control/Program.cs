@@ -13,6 +13,7 @@ internal static class Program
     [STAThread]
     public static void Main(string[] args)
     {
+        Localization.Initialize(LauncherPreferences.StartupLanguage(LauncherPreferences.DefaultDirectory));
         StartupDiagnostics.Install();
         try
         {
@@ -20,7 +21,7 @@ internal static class Program
             if (args.Length > 0 && (args[0] != "--launch-link" || args.Length != 2 ||
                 !AppLaunchLink.TryParse(args[1], out launchLink)))
             {
-                TrayIcon.ShowLinkError("应用链接无效。请在 Waybridge 中重新复制应用链接或创建快捷方式。");
+                TrayIcon.ShowLinkError(Tr("Invalid app link. Copy it again or create a new shortcut from Waybridge."));
                 Environment.ExitCode = 2;
                 return;
             }
@@ -32,7 +33,7 @@ internal static class Program
                 if (launchLink is null) TrayIcon.ShowExisting();
                 else if (!TrayIcon.ForwardLaunchLink(launchLink))
                 {
-                    TrayIcon.ShowLinkError("Waybridge 暂时无法接收应用链接，请稍后重试。");
+                    TrayIcon.ShowLinkError(Tr("Waybridge cannot receive app links right now. Try again shortly."));
                     Environment.ExitCode = 1;
                 }
                 return;
@@ -72,7 +73,10 @@ public sealed class ControlApplication : Application, IXamlMetadataProvider
     private readonly AppLaunchLink? launchLink;
     private readonly HashSet<string> observedTypes = [];
     private XamlControlsXamlMetaDataProvider Metadata => metadata ??= new();
-    public ControlApplication(string? stateDirectory = null) : this(stateDirectory, null) { }
+    public ControlApplication(string? stateDirectory = null) : this(stateDirectory, null)
+    {
+        if (stateDirectory is not null) Localization.Initialize(LauncherPreferences.StartupLanguage(stateDirectory));
+    }
 
     internal ControlApplication(string? stateDirectory, AppLaunchLink? launchLink)
     {

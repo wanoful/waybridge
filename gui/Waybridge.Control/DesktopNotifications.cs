@@ -49,7 +49,7 @@ internal sealed class DesktopNotifications : IAsyncDisposable
             manager.Register();
             registered = true;
             available = manager.Setting == AppNotificationSetting.Enabled;
-            if (!available) status("Windows 已关闭此应用的通知，桌面通知转发暂停；请在系统通知设置中启用 Waybridge。");
+            if (!available) status(Tr("Windows has disabled notifications for this app. Enable Waybridge in Windows notification settings to resume forwarding."));
         }
         catch (Exception error)
         {
@@ -61,7 +61,7 @@ internal sealed class DesktopNotifications : IAsyncDisposable
             manager = null;
             registered = false;
             available = false;
-            status($"Windows 原生通知不可用（0x{error.HResult:X8}）；桌面通知转发已关闭。请检查 Windows 通知设置与 Windows App Runtime。");
+            status(Tr("Windows notifications are unavailable (0x{0:X8}). Forwarding is disabled. Check Windows notification settings and the Windows App Runtime.", error.HResult));
         }
         worker = Task.Run(LoopAsync);
         polling = Task.Run(PollAsync);
@@ -72,7 +72,7 @@ internal sealed class DesktopNotifications : IAsyncDisposable
         if (!queue.Writer.TryWrite(value) && Interlocked.Exchange(ref failed, 1) == 0)
         {
             queue.Writer.TryComplete();
-            status("通知处理队列已满，已停止通知转发；请重新启动控制中心。");
+            status(Tr("The notification queue is full. Restart the control center to resume forwarding."));
         }
     }
     public void ConnectionChanged(bool value) => Enqueue(new Connection(value));
@@ -132,7 +132,7 @@ internal sealed class DesktopNotifications : IAsyncDisposable
         catch
         {
             Interlocked.Exchange(ref failed, 1);
-            status("Windows 原生通知服务失败，桌面通知转发已关闭；请检查 Windows App Runtime 和通知权限。");
+            status(Tr("Windows notification services failed. Forwarding is disabled. Check the Windows App Runtime and notification permissions."));
         }
         finally
         {
@@ -146,7 +146,7 @@ internal sealed class DesktopNotifications : IAsyncDisposable
         if (current != available && !current)
         {
             await ResetAsync();
-            status("Windows 已关闭此应用的通知，桌面通知转发暂停。免打扰仍由 Windows 管理。");
+            status(Tr("Windows has disabled notifications for this app. Forwarding is paused. Windows still manages Do not disturb."));
         }
         available = current;
         try { await send(new { type = "notification_available", available }); } catch { }
@@ -164,13 +164,13 @@ internal sealed class DesktopNotifications : IAsyncDisposable
         entries.TryGetValue(id, out var previous);
         string token = Guid.NewGuid().ToString("N");
         var builder = new AppNotificationBuilder().AddArgument("n", token)
-            .AddText(message.GetProperty("app_name").GetString() ?? "Linux 应用")
+            .AddText(message.GetProperty("app_name").GetString() ?? Tr("Linux app"))
             .AddText(message.GetProperty("summary").GetString() ?? "")
             .AddText(message.GetProperty("body").GetString() ?? "");
         var actions = message.GetProperty("actions").EnumerateArray().ToArray();
         for (int i = 0; i < actions.Length; i++)
             if (actions[i].GetProperty("key").GetString() != "default")
-                builder.AddButton(new AppNotificationButton(actions[i].GetProperty("label").GetString() ?? "操作")
+                builder.AddButton(new AppNotificationButton(actions[i].GetProperty("label").GetString() ?? Tr("Action"))
                     .AddArgument("n", token).AddArgument("a", i.ToString(System.Globalization.CultureInfo.InvariantCulture)));
         string? icon = null;
         if (message.TryGetProperty("png", out var png) && png.ValueKind == JsonValueKind.String && png.GetString() is { Length: <= 65536 } encoded)
@@ -206,7 +206,7 @@ internal sealed class DesktopNotifications : IAsyncDisposable
             // keeping the old toast would leave a visible but stale action.
             await RemoveAsync(id);
             await FeedbackAsync(message, reason: 4);
-            status("Windows 未接受一条远端通知；通知正文未写入日志。");
+            status(Tr("Windows rejected a remote notification. Its body was omitted from the log."));
         }
     }
     private static bool Same(JsonElement a, JsonElement b) =>

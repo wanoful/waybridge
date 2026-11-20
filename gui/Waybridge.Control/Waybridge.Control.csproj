@@ -25,6 +25,7 @@
     <ApplicationIcon>../../assets/branding/waybridge.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <Using Include="Waybridge.Control.Core.Localization" Static="true" />
     <Content Include="../../assets/branding/waybridge.ico" Link="Assets/waybridge.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="../../assets/branding/waybridge.png" Link="Assets/waybridge.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="../../assets/branding/waybridge-badge.png" Link="Assets/waybridge-badge.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />

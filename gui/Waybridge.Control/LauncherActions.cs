@@ -12,10 +12,15 @@ namespace Waybridge.Control;
 
 internal sealed partial class MainWindow
 {
-    private const double AppTitleLineHeight = 20;
+    private const double AppTitleFontSize = 14;
     private const double AppTileCellHeight = 122;
-    private readonly TextBox commandDirectory = new() { PlaceholderText = "使用 Linux 用户主目录" };
-    private readonly Button runCommand = Button("运行", true);
+    private const double AppTileIconSize = 43;
+    private const double AppTileTitleSpacing = 6;
+    private const double AppTileTopPadding = 10;
+    private const double AppTileBottomPadding = 9;
+    private const double AppTileGap = 7;
+    private readonly TextBox commandDirectory = L("Use the Linux home directory").Bind(new TextBox(), TextBox.PlaceholderTextProperty);
+    private readonly Button runCommand = Button(L("Run"), true);
     private readonly TextBlock commandTarget = Muted("");
     private readonly StackPanel commandHistory = new() { Spacing = 5 };
     private readonly StackPanel commandPane = new() { Visibility = Visibility.Collapsed, Spacing = 12 };
@@ -25,13 +30,12 @@ internal sealed partial class MainWindow
 
     private UIElement AppTile(RemoteApplication app, bool compact)
     {
-        var label = Heading(app.Name, 14);
-        label.MaxLines = 2;
+        var label = Heading(app.Name, AppTitleFontSize);
+        label.MaxLines = compact ? 1 : 2;
+        label.TextWrapping = compact ? TextWrapping.NoWrap : TextWrapping.Wrap;
         label.TextTrimming = TextTrimming.CharacterEllipsis;
-        label.LineHeight = AppTitleLineHeight;
-        label.LineStackingStrategy = LineStackingStrategy.BlockLineHeight;
-        var mark = LauncherMark(app, compact ? 28 : 43);
-        var content = new Grid { ColumnSpacing = 10, RowSpacing = 6, Children = { mark } };
+        var mark = LauncherMark(app, compact ? 28 : AppTileIconSize);
+        var content = new Grid { ColumnSpacing = 10, RowSpacing = AppTileTitleSpacing, Children = { mark } };
         if (compact)
         {
             content.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
@@ -41,8 +45,8 @@ internal sealed partial class MainWindow
         }
         else
         {
-            content.RowDefinitions.Add(new() { Height = new GridLength(43) });
-            content.RowDefinitions.Add(new() { Height = new GridLength(2 * AppTitleLineHeight) });
+            content.RowDefinitions.Add(new() { Height = new GridLength(AppTileIconSize) });
+            content.RowDefinitions.Add(new() { Height = GridLength.Auto });
             label.VerticalAlignment = VerticalAlignment.Top;
             Grid.SetRow(label, 1);
         }
@@ -51,14 +55,14 @@ internal sealed partial class MainWindow
         content.Children.Add(label);
         var launch = Button(app.Name);
         launch.Content = content;
-        launch.Padding = compact ? new Thickness(12, 3, 42, 3) : new Thickness(12, 10, 25, 9);
+        launch.Padding = compact ? new Thickness(12, 3, 42, 3) : new Thickness(12, AppTileTopPadding, 25, AppTileBottomPadding);
         launch.HorizontalAlignment = HorizontalAlignment.Stretch;
         launch.VerticalAlignment = VerticalAlignment.Stretch;
         launch.HorizontalContentAlignment = HorizontalAlignment.Stretch;
         launch.VerticalContentAlignment = compact ? VerticalAlignment.Center : VerticalAlignment.Top;
         launch.Click += async (_, _) => await GuardAsync(() => LaunchApplicationAsync(app));
 
-        var more = IconButton($"{app.Name} 的操作", "\uE712");
+        var more = IconButton(L("Actions for {0}", app.Name), "\uE712");
         more.Height = more.MinHeight = more.Width = more.MinWidth = 28;
         more.Padding = new Thickness(4);
         if (Application.Current.Resources.TryGetValue("SubtleButtonStyle", out var moreStyle)) more.Style = (Style)moreStyle;
@@ -68,8 +72,8 @@ internal sealed partial class MainWindow
         var menu = ApplicationMenu(app);
         launch.ContextFlyout = menu;
         more.Flyout = menu;
-        var tile = new Grid { Margin = compact ? new Thickness(0, 1, 0, 1) : new Thickness(0, 0, 7, 7),
-            MinHeight = compact ? 2 * AppTitleLineHeight + 8 : AppTileCellHeight - 7, Children = { launch, more } };
+        var tile = new Grid { Margin = compact ? new Thickness(0, 1, 0, 1) : new Thickness(0, 0, AppTileGap, AppTileGap),
+            MinHeight = compact ? 48 : AppTileCellHeight - AppTileGap, Children = { launch, more } };
         ToolTipService.SetToolTip(launch, string.IsNullOrWhiteSpace(app.Comment) ? app.Name : $"{app.Name}\n{app.Comment}");
         return tile;
     }
@@ -88,36 +92,36 @@ internal sealed partial class MainWindow
         menu.Opening += (_, _) =>
         {
             menu.Items.Clear();
-            menu.Items.Add(ActionItem("启动", () => LaunchApplicationAsync(app)));
+            menu.Items.Add(ActionItem(Tr("Launch"), () => LaunchApplicationAsync(app)));
             foreach (var action in app.Actions)
                 menu.Items.Add(ActionItem(action.Name, () => LaunchApplicationAsync(app, action.Id)));
             menu.Items.Add(new MenuFlyoutSeparator());
             bool pinned = launcherPreferences.Pinned.GetValueOrDefault(profileId)?.Any(value => value.Id == app.Id) == true;
-            menu.Items.Add(ActionItem(pinned ? "取消固定" : "固定到顶部", () => TogglePinAsync(app)));
-            var shortcuts = new MenuFlyoutSubItem { Text = "应用链接与快捷方式", IsEnabled = paired };
-            shortcuts.Items.Add(ActionItem("复制应用链接", () => CopyApplicationLinkAsync(app)));
-            shortcuts.Items.Add(ActionItem("添加到开始菜单", () => SaveApplicationShortcutAsync(app, desktop: false)));
-            shortcuts.Items.Add(ActionItem("创建桌面快捷方式", () => SaveApplicationShortcutAsync(app, desktop: true)));
+            menu.Items.Add(ActionItem(pinned ? Tr("Unpin") : Tr("Pin to top"), () => TogglePinAsync(app)));
+            var shortcuts = new MenuFlyoutSubItem { Text = Tr("App links and shortcuts"), IsEnabled = paired };
+            shortcuts.Items.Add(ActionItem(Tr("Copy app link"), () => CopyApplicationLinkAsync(app)));
+            shortcuts.Items.Add(ActionItem(Tr("Add to Start menu"), () => SaveApplicationShortcutAsync(app, desktop: false)));
+            shortcuts.Items.Add(ActionItem(Tr("Create desktop shortcut"), () => SaveApplicationShortcutAsync(app, desktop: true)));
             menu.Items.Add(shortcuts);
-            var touch = new MenuFlyoutSubItem { Text = "触控模式" };
+            var touch = new MenuFlyoutSubItem { Text = Tr("Touch mode") };
             string mode = launcherPreferences.AppTouchModes.GetValueOrDefault(profileId)?.GetValueOrDefault(app.Id) ?? "";
-            foreach (var (value, label) in new[] { ("", "自动选择"), ("native", "优先原生触控"), ("mouse", "鼠标兼容") })
+            foreach (var (value, label) in new[] { ("", Tr("Automatic")), ("native", Tr("Prefer native touch")), ("mouse", Tr("Mouse compatibility")) })
             {
                 var item = new ToggleMenuFlyoutItem { Text = label, IsChecked = mode == value };
                 item.Click += async (_, _) => await GuardAsync(() => selected.Id == profileId ? SetLauncherTouchAsync(app, value) : Task.CompletedTask);
                 touch.Items.Add(item);
             }
             menu.Items.Add(touch);
-            var stream = new MenuFlyoutSubItem { Text = "画面预设" };
+            var stream = new MenuFlyoutSubItem { Text = Tr("Streaming preset") };
             string preset = launcherPreferences.AppStreamModes.GetValueOrDefault(profileId)?.GetValueOrDefault(app.Id) ?? "";
-            foreach (var (value, label) in new[] { ("", "跟随连接"), ("clear", "文字清晰"), ("low_latency", "交互低延迟") })
+            foreach (var (value, label) in new[] { ("", Tr("Use connection default")), ("clear", Tr("Crisp text")), ("low_latency", Tr("Low latency")) })
             {
                 var item = new ToggleMenuFlyoutItem { Text = label, IsChecked = preset == value };
                 item.Click += async (_, _) => await GuardAsync(() => selected.Id == profileId ? SetAppStreamModeAsync(app, value) : Task.CompletedTask);
                 stream.Items.Add(item);
             }
             menu.Items.Add(stream);
-            menu.Items.Add(ActionItem("自定义启动…", () => CustomLaunchAsync(app)));
+            menu.Items.Add(ActionItem(Tr("Custom launch…"), () => CustomLaunchAsync(app)));
         };
         return menu;
     }
@@ -182,7 +186,7 @@ internal sealed partial class MainWindow
         else
         {
             if (modes.Count >= 128 && !modes.ContainsKey(app.Id))
-                throw new InvalidOperationException("每个工作站最多可为 128 个应用保存画面预设");
+                throw new InvalidOperationException(Tr("You can save streaming presets for up to 128 apps per workstation"));
             modes[app.Id] = value;
         }
         if (modes.Count == 0) launcherPreferences.AppStreamModes.Remove(selected.Id);
@@ -199,7 +203,7 @@ internal sealed partial class MainWindow
         await SaveLauncherPreferencesAsync();
         await ApplyLauncherPoliciesAsync();
         if (!remoteWindows.Any(window => MatchWindowApplication(window.AppId)?.Id == app.Id))
-            Inform("已保存触控策略，识别到该应用的窗口后应用。");
+            Inform(Tr("Touch preference saved. It will apply when Waybridge identifies a window belonging to this app."));
     }
 
     private Task ApplyLauncherPoliciesAsync()
@@ -225,7 +229,7 @@ internal sealed partial class MainWindow
     {
         if (!controller.Connected)
         {
-            if (controller.IsRunning) throw new InvalidOperationException("会话正在重连，连接恢复后可启动应用");
+            if (controller.IsRunning) throw new InvalidOperationException(Tr("Wait for the session to reconnect before launching apps"));
             await ConnectProfileAsync(profile);
         }
         return selected.Id == profile.Id && controller.ActiveProfileId == profile.Id && controller.Connected;
@@ -259,13 +263,13 @@ internal sealed partial class MainWindow
     private Task CustomLaunchAsync(RemoteApplication app) => RunOperationAsync(async () =>
     {
         var profile = selected;
-        var cwdField = new TextBox { PlaceholderText = "使用应用默认目录" };
-        var arguments = new TextBox { PlaceholderText = "例如 --profile \"工作配置\"" };
-        var exec = new CheckBox { Content = "用命令启动（不使用桌面激活）" };
+        var cwdField = new TextBox { PlaceholderText = Tr("Use the app's default directory") };
+        var arguments = new TextBox { PlaceholderText = Tr("For example, --profile \"Work\"") };
+        var exec = new CheckBox { Content = Tr("Launch via command instead of desktop activation") };
         string[]? extra = null;
         string? cwd = null;
-        bool edit = await PromptAsync($"自定义启动 · {app.Name}", "预览",
-            Column(Field("额外参数", arguments), Field("Linux 工作目录", cwdField), exec), () =>
+        bool edit = await PromptAsync(Tr("Custom launch · {0}", app.Name), Tr("Preview"),
+            Column(Field(L("Additional arguments"), arguments), Field(L("Linux working directory"), cwdField), exec), () =>
             {
                 extra = string.IsNullOrWhiteSpace(arguments.Text) ? null : ParseLaunchArguments(arguments.Text);
                 cwd = OptionalDirectory(cwdField.Text);
@@ -274,19 +278,19 @@ internal sealed partial class MainWindow
         bool directExec = exec.IsChecked == true;
         var preview = await controller.PreviewLaunchAsync(app: app.Id, cwd: cwd, extraArgv: extra,
             launchWithExec: directExec, expectedProfileId: profile.Id);
-        string command = preview.TryGetProperty("exec", out var value) ? value.GetString() ?? "桌面激活" : "桌面激活";
+        string command = preview.TryGetProperty("exec", out var value) ? value.GetString() ?? Tr("Desktop activation") : Tr("Desktop activation");
         string directory = preview.TryGetProperty("cwd", out var path) ? path.GetString() ?? "" : "";
-        if (!await ConfirmAsync($"启动 {app.Name}？", $"{command}\n\n工作目录 · {directory}", "启动")) return;
+        if (!await ConfirmAsync(Tr("Launch {0}?", app.Name), Tr("{0}\n\nWorking directory · {1}", command, directory), Tr("Launch"))) return;
         await controller.LaunchAsync(app: app.Id, cwd: cwd, extraArgv: extra, launchWithExec: directExec, expectedProfileId: profile.Id);
         await RememberLaunchAsync(profile, app);
     }, canCancelConnect: true);
 
     private StackPanel BuildCommandPane()
     {
-        commandPane.Children.Add(Heading("运行命令", 23));
+        commandPane.Children.Add(Heading(L("Run a command"), 23));
         commandPane.Children.Add(commandTarget);
-        AutomationProperties.SetName(commandDirectory, "Linux 工作目录");
-        commandPane.Children.Add(Row("工作目录", "可选，填写 Linux 上的绝对路径。", commandDirectory));
+        L("Linux working directory").Name(commandDirectory);
+        commandPane.Children.Add(Row(L("Working directory"), L("Optional. Enter an absolute path on Linux."), commandDirectory));
         commandPane.Children.Add(runCommand);
         commandPane.Children.Add(commandHistory);
         runCommand.Click += async (_, _) => await GuardAsync(RunCommandAsync);
@@ -302,13 +306,12 @@ internal sealed partial class MainWindow
         RenderWindows();
         UpdateCommandControls();
         if (CommandMode) RefreshCommandHistory();
-        if (ActivePage == "apps") catalogScroll.ChangeView(null, 0, null, true);
-        UpdateDirectoryStickiness();
+        if (ActivePage == "apps") ScrollCatalogTo(0);
     }
 
     private void UpdateCommandControls()
     {
-        commandTarget.Text = $"在 {selected.Name} 执行。用引号包住有空格的参数。";
+        commandTarget.Text = Tr("Runs in {0}. Quote arguments containing spaces.", selected.Name);
         runCommand.IsEnabled = !busy && paired && CommandMode && CommandText().Length > 0;
     }
 
@@ -326,7 +329,7 @@ internal sealed partial class MainWindow
         var matches = history.Where(item => item.Text.StartsWith(query, StringComparison.OrdinalIgnoreCase)).Take(5).ToArray();
         suggestedCommand = matches.FirstOrDefault();
         if (matches.Length == 0) return;
-        commandHistory.Children.Add(Muted("最近命令 · Tab 补全首条"));
+        commandHistory.Children.Add(Muted(L("Recent commands · Press Tab to complete the first match")));
         foreach (var command in matches)
         {
             var use = Button(command.Text);
@@ -391,7 +394,7 @@ internal sealed partial class MainWindow
     {
         text = text.Trim();
         if (text.Length == 0) return null;
-        if (!text.StartsWith('/')) throw new ArgumentException("请输入 Linux 上的绝对工作目录");
+        if (!text.StartsWith('/')) throw new ArgumentException(Tr("Enter an absolute working directory on Linux"));
         return text;
     }
 
@@ -420,9 +423,9 @@ internal sealed partial class MainWindow
             hasWord = true;
             current.Append(value);
         }
-        if (escaped || quote != '\0') throw new ArgumentException("命令的引号或转义符未闭合");
+        if (escaped || quote != '\0') throw new ArgumentException(Tr("The command contains an unfinished quote or escape"));
         if (hasWord) args.Add(current.ToString());
-        if (args.Count == 0) throw new ArgumentException("请输入要运行的命令或参数");
+        if (args.Count == 0) throw new ArgumentException(Tr("Enter a command or arguments"));
         return args.ToArray();
     }
 }

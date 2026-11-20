@@ -5,9 +5,13 @@ namespace Waybridge.Control;
 
 internal sealed class LauncherPreferences
 {
+    private const int MaximumBytes = 512 * 1024;
+    public static string DefaultDirectory { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Waybridge");
     public Guid? SelectedProfile { get; set; }
     public bool CloseToTray { get; set; } = true;
     public string Theme { get; set; } = "system";
+    public string Language { get; set; } = "system";
     public bool CompactApps { get; set; }
     public Dictionary<Guid, List<RemoteApplication>> Recent { get; init; } = [];
     public Dictionary<Guid, List<RemoteApplication>> Pinned { get; init; } = [];
@@ -15,11 +19,26 @@ internal sealed class LauncherPreferences
     public Dictionary<Guid, Dictionary<string, string>> AppStreamModes { get; init; } = [];
     public Dictionary<Guid, List<LaunchCommand>> Commands { get; init; } = [];
 
+    public static string StartupLanguage(string directory)
+    {
+        try
+        {
+            using var stream = File.OpenRead(Path.Combine(directory, "launcher.json"));
+            if (stream.Length > MaximumBytes) return "system";
+            using var document = JsonDocument.Parse(stream);
+            if (document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty("language", out var value) && value.ValueKind == JsonValueKind.String)
+                return value.GetString() ?? "system";
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException) { }
+        return "system";
+    }
+
     public static async Task<LauncherPreferences> LoadAsync(string directory)
     {
         string path = Path.Combine(directory, "launcher.json");
         if (!File.Exists(path)) return new();
-        if (new FileInfo(path).Length > 512 * 1024) throw new IOException("启动器偏好文件过大");
+        if (new FileInfo(path).Length > MaximumBytes) throw new IOException(Tr("Launcher preferences file is too large"));
         await using var stream = File.OpenRead(path);
         var result = await JsonSerializer.DeserializeAsync<LauncherPreferences>(stream, ProfileStore.Json);
         return result is { Recent: not null, Pinned: not null, AppTouchModes: not null, AppStreamModes: not null, Commands: not null } ? result : new();

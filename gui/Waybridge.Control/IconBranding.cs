@@ -12,10 +12,10 @@ internal static class IconBranding
     public static async Task<string> NormalizeAsync(StorageFile file)
     {
         using var input = await file.OpenReadAsync();
-        if (input.Size == 0 || input.Size > 8 * 1024 * 1024) throw new ArgumentException("角标图片不能超过 8 MiB");
+        if (input.Size == 0 || input.Size > 8 * 1024 * 1024) throw new ArgumentException(Tr("The badge image must be 8 MiB or smaller"));
         var decoder = await BitmapDecoder.CreateAsync(input);
         if (decoder.PixelWidth == 0 || decoder.PixelHeight == 0 || decoder.PixelWidth > 8192 || decoder.PixelHeight > 8192 ||
-            (ulong)decoder.PixelWidth * decoder.PixelHeight > 16 * 1024 * 1024) throw new ArgumentException("角标图片尺寸过大");
+            (ulong)decoder.PixelWidth * decoder.PixelHeight > 16 * 1024 * 1024) throw new ArgumentException(Tr("The badge image dimensions are too large"));
         double ratio = 64.0 / Math.Max(decoder.PixelWidth, decoder.PixelHeight);
         uint width = Math.Clamp((uint)Math.Round(decoder.PixelWidth * ratio), 1u, 64u);
         uint height = Math.Clamp((uint)Math.Round(decoder.PixelHeight * ratio), 1u, 64u);
@@ -29,7 +29,7 @@ internal static class IconBranding
         var encoder = await BitmapEncoder.CreateAsync(BitmapEncoder.PngEncoderId, output);
         encoder.SetPixelData(BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied, 64, 64, 96, 96, square);
         await encoder.FlushAsync();
-        if (output.Size > 24 * 1024) throw new ArgumentException("无法编码自定义角标");
+        if (output.Size > 24 * 1024) throw new ArgumentException(Tr("Could not encode the custom badge"));
         output.Seek(0);
         using var reader = new DataReader(output.GetInputStreamAt(0));
         await reader.LoadAsync((uint)output.Size);

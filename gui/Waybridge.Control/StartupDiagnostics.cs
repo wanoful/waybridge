@@ -38,7 +38,7 @@ internal static class StartupDiagnostics
         lock (gate) { if (reporting) return; reporting = true; }
         try
         {
-            MessageBoxW(IntPtr.Zero, $"启动失败（{phase}）\n\n{error.GetType().Name}: {error.Message}\nHRESULT: 0x{error.HResult:X8}\n\n日志：{LogPath}\n\n请运行目录中的 Diagnose-Startup.cmd 收集完整报告。", "Waybridge 启动失败", 0x10);
+            MessageBoxW(IntPtr.Zero, Tr("Startup failed ({0})\n\n{1}: {2}\nHRESULT: 0x{3:X8}\n\nLog: {4}\n\nRun Diagnose-Startup.cmd in the installation folder to collect a full report.", phase, error.GetType().Name, error.Message, error.HResult, LogPath), Tr("Waybridge failed to start"), 0x10);
         }
         catch { }
     }

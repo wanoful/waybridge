@@ -15,16 +15,24 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
     private volatile ConnectionProfile? active;
     private volatile Connection? connection;
     private volatile string? currentSession;
+    private volatile Func<string> statusText = static () => Tr("Disconnected");
 
     public bool Connected => connection is not null;
     public bool IsRunning => active is not null;
     public string? CurrentSession => currentSession;
+    public string CurrentStatus => statusText();
     public Guid? ActiveProfileId => active?.Id;
     public string[] Logs { get { lock (diagnostics) return diagnostics.ToArray(); } }
     public event Action<string>? Status;
     public event Action<string>? Log;
     public event Action<JsonElement>? Message;
     public event Action<bool>? ConnectionChanged;
+
+    private void SetStatus(Func<string> render)
+    {
+        statusText = render;
+        Status?.Invoke(render());
+    }
 
     private void WriteLog(string text)
     {
@@ -75,7 +83,9 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
                 token.ThrowIfCancellationRequested();
                 try
                 {
-                    Status?.Invoke(attempt == 0 ? "正在验证 Linux 服务并接入会话…" : $"正在重新连接（第 {attempt} 次）…");
+                    int currentAttempt = attempt;
+                    SetStatus(currentAttempt == 0 ? static () => Tr("Verifying the Linux service and joining the session…")
+                        : () => Tr("Reconnecting (attempt {0})…", currentAttempt));
                     var settings = profile.Settings;
                     var result = await server.CallAsync(new
                     {
@@ -84,30 +94,34 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
                         port = 0, fps = settings.Fps, bitrate = settings.Bitrate,
                         codec = settings.ServerCodec, udp = settings.Udp, hdr = settings.Hdr, gpu_input = settings.GpuInput
                     }, token);
-                    var session = result.GetProperty("name").GetString() ?? throw new IOException("Linux 服务未返回会话名称");
-                    sessionToken = result.GetProperty("token").GetString() ?? throw new IOException("Linux 服务未返回会话令牌");
+                    var session = result.GetProperty("name").GetString() ?? throw new IOException(Tr("The Linux service did not return a session name"));
+                    sessionToken = result.GetProperty("token").GetString() ?? throw new IOException(Tr("The Linux service did not return a session token"));
                     currentSession = session;
-                    WriteLog($"加密服务已验证，会话 {session} 已就绪");
-                    Status?.Invoke("正在连接串流内核…");
+                    WriteLog(Tr("Verified the encrypted service. Session {0} is ready", session));
+                    SetStatus(static () => Tr("Connecting to the streaming worker…"));
                     if (settings.Udp && string.IsNullOrWhiteSpace(settings.UdpHost))
                         settings = settings with { UdpHost = profile.Address };
 
+                    string initialLanguage = Localization.Language;
                     await using var worker = await EngineChannel.StartAsync(enginePath, profile.Address, profile.Port,
                         sessionToken, settings, message => Message?.Invoke(message), WriteLog, token,
-                        transport: server.Transport(session), sourceId: profile.Id.ToString("N"));
+                        transport: server.Transport(session), sourceId: profile.Id.ToString("N"),
+                        language: initialLanguage);
                     using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(token);
                     token.ThrowIfCancellationRequested();
-                    connection = new(profile, server, worker, session, lifetime.Token);
+                    var current = new Connection(profile, server, worker, session, lifetime.Token);
+                    connection = current;
                     try
                     {
+                        if (Localization.Language != initialLanguage) await UpdateLanguageAsync();
                         hadConnection = true;
                         attempt = 0;
                         ConnectionChanged?.Invoke(true);
-                        Status?.Invoke("已连接");
+                        SetStatus(static () => Tr("Connected"));
                         ready.TrySetResult();
                         await Task.WhenAny(worker.Exited, worker.ControlClosed, Task.Delay(Timeout.Infinite, lifetime.Token));
                         token.ThrowIfCancellationRequested();
-                        throw new IOException("连接已断开");
+                        throw new IOException(Tr("Connection closed"));
                     }
                     finally
                     {
@@ -119,18 +133,18 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
                 catch (Exception error)
                 {
-                    string safeMessage = error.Message.Replace(clientToken, "[客户端凭据已隐藏]", StringComparison.Ordinal);
+                    string safeMessage = error.Message.Replace(clientToken, Tr("[client credential redacted]"), StringComparison.Ordinal);
                     if (sessionToken.Length > 0)
-                        safeMessage = safeMessage.Replace(sessionToken, "[令牌已隐藏]", StringComparison.Ordinal);
+                        safeMessage = safeMessage.Replace(sessionToken, Tr("[session token redacted]"), StringComparison.Ordinal);
                     WriteLog(safeMessage);
                     if (!hadConnection || !profile.AutoReconnect || error is AuthenticationException or ArgumentException)
                     {
                         failure = safeMessage == error.Message ? error : new IOException(safeMessage);
-                        Status?.Invoke(safeMessage);
+                        SetStatus(() => safeMessage);
                         break;
                     }
                     attempt++;
-                    Status?.Invoke("连接中断，正在等待重连…");
+                    SetStatus(static () => Tr("Connection lost. Waiting to reconnect…"));
                 }
                 await Task.Delay(TimeSpan.FromSeconds(Math.Min(15, Math.Pow(2, Math.Min(attempt, 4)))), token);
             }
@@ -165,16 +179,16 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
         try
         {
             await StopAsync();
-            Status?.Invoke("未连接");
+            SetStatus(static () => Tr("Disconnected"));
         }
         finally { lifecycle.Release(); }
     }
 
     private Connection RequireConnection(Guid? expectedProfileId = null)
     {
-        var current = connection ?? throw new InvalidOperationException("请先连接");
+        var current = connection ?? throw new InvalidOperationException(Tr("Connect first"));
         if (expectedProfileId is { } profile && profile != current.Profile.Id)
-            throw new InvalidOperationException("当前会话属于另一台设备");
+            throw new InvalidOperationException(Tr("The current session belongs to another device"));
         current.Closed.ThrowIfCancellationRequested();
         return current;
     }
@@ -255,7 +269,7 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
             try { await current.Server.CallAsync(new { op = "end", session = current.Session }, timeout.Token); }
             catch { current.Profile.AutoReconnect = reconnect; throw; }
             await StopAsync();
-            Status?.Invoke("未连接");
+            SetStatus(static () => Tr("Disconnected"));
         }
         finally { lifecycle.Release(); }
     }
@@ -264,6 +278,14 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
     {
         var current = RequireConnection();
         return current.Worker.SendAsync(request, current.Closed);
+    }
+
+    public async Task UpdateLanguageAsync()
+    {
+        if (connection is not { } current) return;
+        try { await current.Worker.SendAsync(new { type = "language", language = Localization.Language }, current.Closed); }
+        catch (OperationCanceledException) when (current.Closed.IsCancellationRequested) { }
+        catch (IOException) when (connection != current || current.Closed.IsCancellationRequested) { }
     }
 
     public Task ActivateWindowAsync(uint id, Guid? expectedProfileId = null)

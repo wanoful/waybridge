@@ -140,7 +140,7 @@ private:
     std::unique_ptr<SDL_JoystickID, decltype(&SDL_free)> instances(
         initialized ? SDL_GetGamepads(&count) : nullptr, SDL_free);
     if (initialized && !instances) {
-      localError = "无法枚举 SDL 手柄：" + std::string(SDL_GetError());
+      localError = "Could not enumerate SDL controllers: " + std::string(SDL_GetError());
       return;
     }
     if (initialized) localError.clear();
@@ -270,7 +270,7 @@ public:
         SDL_SetGamepadEventsEnabled(false);
         SDL_SetJoystickEventsEnabled(false);
       } else {
-        localError = "无法初始化 SDL 手柄：" + std::string(SDL_GetError());
+        localError = "Could not initialize SDL controllers: " + std::string(SDL_GetError());
       }
     }
     if (rumble && !motors)
@@ -360,7 +360,7 @@ public:
       } else {
         detachPhysical(0, now);
         device.retryAfter = now + 500;
-        localError = "无法读取 Xbox 蓝牙手柄输入";
+        localError = "Could not read input from the Bluetooth Xbox controller";
       }
       return;
     }
@@ -376,7 +376,7 @@ public:
         device.controller = SDL_OpenGamepad(device.instance);
         if (!device.controller) {
           device.retryAfter = now + 500;
-          localError = "无法打开 SDL 手柄：" + std::string(SDL_GetError());
+          localError = "Could not open the SDL controller: " + std::string(SDL_GetError());
           continue;
         }
         device.rumbleCapable = SDL_GetBooleanProperty(SDL_GetGamepadProperties(device.controller),

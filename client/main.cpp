@@ -320,7 +320,7 @@ Json professionalInputStatus() {
   result["pen_native_active"]=nativePen.active();
   result["pen_hardware_available"]=(GetSystemMetrics(SM_DIGITIZER) & (NID_INTEGRATED_PEN|NID_EXTERNAL_PEN)) != 0;
   result["pen_error"]=hostedPen && !penNegotiated
-    ? "Linux 端不支持原生笔，请更新后重新连接" : "";
+    ? "Linux does not support native pen input. Update the server and reconnect." : "";
   return result;
 }
 
@@ -463,7 +463,7 @@ void startFileChannel(const std::string &key) {
     if (!FileTree::receive(message, true))
       throw std::runtime_error("Unexpected packet on file data channel");
   }, [] {
-    TransferActivity::failAll("文件数据通道已断开");
+    TransferActivity::failAll("File data channel disconnected");
     FileTree::cancelUploads();
     FileTree::cancelIncoming();
     FileDrag::disconnect();
@@ -825,7 +825,7 @@ void addMicrophoneStatus(Json &value) {
   value["microphone_enabled"] = hostedMicrophone;
   value["microphone_paused"] = hostedMicrophone && hostedReadOnly;
   value["microphone_active"] = state.active;
-  value["microphone_error"] = microphoneDenied ? "Linux 会话未启用麦克风输入" : state.error;
+  value["microphone_error"] = microphoneDenied ? "The Linux session has no microphone input enabled" : state.error;
 }
 
 std::unique_ptr<Gdiplus::Bitmap> decodeImage(const uint8_t *data, size_t size) {
@@ -2631,8 +2631,8 @@ bool tryTouchOle(const NativeTouch::InteractionSample &sample) {
   if (touchOleWarning != sample.operation) {
     touchOleWarning=sample.operation;
     hostControl.emit({{"type","settings_warning"},
-      {"message",sample.penTool ? "当前系统未能接管笔的跨端拖放；仍可在串流窗口之间拖放" :
-        "当前系统未能接管原生触控跨端拖放；可在输入设置中为此应用选择鼠标兼容后重试"},
+      {"message",sample.penTool ? "Windows could not take over cross-device pen drag and drop. Dragging between streamed windows is still available." :
+        "Windows could not take over cross-device touch drag and drop. Try mouse compatibility for this app in Input devices."},
       {"reason",TouchOle::name(result.code)}});
   }
   return false;
@@ -2685,7 +2685,7 @@ bool touchOleMouse(HWND hwnd, UINT message, WPARAM keys, ULONG_PTR extra) {
     // timed-out attempt rather than leaving an externally owned gesture idle.
     cancelContact(*owner); transfer->finish(false); resetTouchOle();
     hostControl.emit({{"type","settings_warning"},
-      {"message","拖放协商超时，本次拖动已取消，请重试"},{"reason","touch_drag_ready_timeout"}});
+      {"message","The drag request timed out and was canceled. Try again."},{"reason","touch_drag_ready_timeout"}});
   }
   return true;
 }
@@ -3598,7 +3598,7 @@ void dispatchNetwork() {
       nativeTouch.hello(touchNegotiated);
       nativeTouch.enabled(hostedTouch);
       if (hostedTouch && !touchNegotiated)
-        hostControl.emit({{"type","settings_warning"},{"message","Linux 服务端不支持原生触控，请更新服务端并重新连接"}});
+        hostControl.emit({{"type","settings_warning"},{"message","The Linux server does not support native touch input. Update the server and reconnect."}});
       dragVisual.configure(m.value("data_drag_v1", false));
       nativeActivation.hello(m.value("activation_v1", false));
       std::cout << "Connected, protocol " << m.value("version", 0) << '\n';
@@ -3620,7 +3620,7 @@ void dispatchNetwork() {
       TextDrag::configure(m.value("data_drag_result_v1",false));
       trayNegotiated = m.value("tray_v1", false);
       remoteTray.configure(trayNegotiated,hostedSettings.value("tray",true),hostedReadOnly);
-      if (!trayNegotiated) hostControl.emit({{"type","tray_status"},{"available",false},{"message","Linux 服务端未协商 tray_v1，请更新服务端"},{"xembed",false}});
+      if (!trayNegotiated) hostControl.emit({{"type","tray_status"},{"available",false},{"message","The Linux server did not negotiate tray support. Update the server."},{"xembed",false}});
       if (m.contains("features") && m["features"].is_array())
       {
         FileTree::supported = std::find(m["features"].begin(), m["features"].end(), "file_tree") != m["features"].end();
@@ -4051,7 +4051,7 @@ void dispatchNetwork() {
 void sendStreamConfiguration() {
   if (!hostControl.active()) return;
   if (!streamConfigNegotiated) {
-    hostControl.emit({{"type","settings_warning"},{"message","服务端不支持实时画面设置，请更新 Linux 服务端；本地设置仍可使用"}});
+    hostControl.emit({{"type","settings_warning"},{"message","The server does not support live video settings. Update the Linux server to use them."}});
     return;
   }
   Json request = {{"type","stream_config"},{"request_id",++streamRequest},
@@ -4061,7 +4061,7 @@ void sendStreamConfiguration() {
   const auto modes = hostedSettings.value("app_stream_modes", Json::object());
   if (appStreamModesNegotiated) request["app_modes"] = modes;
   else if (!modes.empty())
-    hostControl.emit({{"type","settings_warning"},{"message","此 Linux 服务端暂不支持按应用设置画面预设"}});
+    hostControl.emit({{"type","settings_warning"},{"message","This Linux server does not support per-app streaming presets"}});
   sendJson(request);
 }
 void applyHostedSettings(const Json &settings, bool live) {
@@ -4131,7 +4131,7 @@ void applyHostedSettings(const Json &settings, bool live) {
     for (auto &[id, window] : windows) window->icon.apply(window->hwnd, window->dpi);
     for (const char *key : {"hdr", "udp", "udp_host", "audio_device"})
       if (hostedSettings.value(key, Json()) != settings.value(key, Json())) {
-        hostControl.emit({{"type","settings_warning"},{"message","HDR、UDP 或声音设备已保存；请断开并重新连接使其生效"}});
+        hostControl.emit({{"type","settings_warning"},{"message","HDR, UDP, or audio device settings were saved. Reconnect to apply."}});
         break;
       }
     TextDrag::reset();
@@ -4144,12 +4144,12 @@ void applyHostedSettings(const Json &settings, bool live) {
     hostedTouch = requestedTouch;
   else
     hostControl.emit({{"type","settings_warning"},{"message",touchNegotiated
-      ? "触控设置已保存；当前服务端不支持实时切换，请重新连接（更新 Linux 服务端后可实时应用）"
-      : "触控设置已保存；Linux 服务端不支持原生触控，请更新服务端并重新连接"}});
+      ? "Touch settings saved. Reconnect to apply, or update the Linux server for live changes."
+      : "Touch settings saved. Update the Linux server and reconnect to use native touch."}});
   if (!live || requestedPen == hostedPen || penSettingsNegotiated) hostedPen=requestedPen;
-  else hostControl.emit({{"type","settings_warning"},{"message","笔输入设置已保存；请更新 Linux 端并重新连接后生效"}});
+  else hostControl.emit({{"type","settings_warning"},{"message","Pen settings saved. Update the Linux server and reconnect to apply."}});
   if (!live || requestedGamepads == hostedGamepads || gamepadSettingsNegotiated) hostedGamepads=requestedGamepads;
-  else hostControl.emit({{"type","settings_warning"},{"message","手柄设置已保存；请更新 Linux 端并重新连接后生效"}});
+  else hostControl.emit({{"type","settings_warning"},{"message","Controller settings saved. Update the Linux server and reconnect to apply."}});
   hostedPenGamma=penGamma; hostedGamepadDeadzone=deadzone;
   hostedGamepadRumble=settings.value("gamepad_rumble",true);
   nativePen.configure(hostedPen,hostedPenGamma);
@@ -4210,7 +4210,7 @@ void publishHostedStatus() {
   for (auto &[id,w] : windows) if (!w->popup) {
     wchar_t title[256]{}; GetWindowTextW(w->hwnd,title,256);
     list.push_back({{"id",id},{"title",utf8(title)},{"app_id",w->appId},{"width",w->width},{"height",w->height},
-      {"codec",w->frame?(VideoDecoder::videoKind(w->frame->codec)?VideoDecoder::name(w->frame->codec):"PNG"):"等待画面"},
+      {"codec",w->frame?(VideoDecoder::videoKind(w->frame->codec)?VideoDecoder::name(w->frame->codec):"PNG"):"Waiting for video"},
       {"hardware_decode",bool(w->frame && VideoDecoder::videoKind(w->frame->codec))},{"presentation",w->presentation?"D3D11 / DirectComposition":"GDI"}});
   }
   Json status=professionalInputStatus();
@@ -4258,6 +4258,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
           else if (type=="activation_launch") sendJson(request);
           else if (remoteNotifications.command(request)) {}
           else if (type=="settings") applyHostedSettings(request.at("settings"),true);
+          else if (type=="language") remoteTray.setChinese(request.value("language", "en") == "zh-Hans");
           else if (type=="tray_action") {
             if (!(request.value("epoch",uint64_t(0)) && request.value("generation",uint64_t(0)) && remoteTray.request(request.value("id",std::string()),request.value("action",std::string()),request.value("epoch",uint64_t(0)),request.value("generation",uint64_t(0)))))
               throw std::runtime_error("Tray action is unavailable or input is read-only");
@@ -4421,6 +4422,7 @@ int wmain(int argc, wchar_t **argv) {
       } bootstrapOle;
       if (FAILED(bootstrapOle.result)) throw std::runtime_error("Cannot initialize custom icon decoder");
       applyHostedSettings(start.value("settings",Json::object()),false);
+      remoteTray.setChinese(start.value("language", "en") == "zh-Hans");
       clientStats.enabled=true;
       SetEnvironmentVariableW(L"WAYBRIDGE_IME_TRACE",nullptr);
       SetEnvironmentVariableW(L"WAYBRIDGE_ICON_TRACE",nullptr);
@@ -4589,8 +4591,8 @@ int wmain(int argc, wchar_t **argv) {
   }
   freeaddrinfo(addresses);
   if (connection == INVALID_SOCKET) {
-    std::cerr << "Connection failed; check your SSH tunnel\n";
-    hostControl.emit({{"type","error"},{"message","无法连接串流服务，请检查 SSH 隧道与服务端"}});
+    std::cerr << "Connection failed; check the server and network connection\n";
+    hostControl.emit({{"type","error"},{"message","Could not connect to the streaming server. Check the server and network connection."}});
     hostControl.flush();
     return 1;
   }
@@ -4608,7 +4610,7 @@ int wmain(int argc, wchar_t **argv) {
   }
   FileIo::start([] { PostMessageW(controller, NetworkReady, 0, 0); }, [] {
     std::cerr << "File I/O queue failed; incomplete transfers cancelled\n";
-    hostControl.emit({{"type","error"},{"message","文件工作队列失败，连接已关闭以取消未完成传输"}});
+    hostControl.emit({{"type","error"},{"message","The file queue failed. The connection closed and pending transfers were canceled."}});
     shutdown(connection, SD_BOTH);
     PostMessageW(controller, WM_CLOSE, 0, 0);
   });

@@ -14,7 +14,7 @@ internal static class Processes
             StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
         };
         foreach (var argument in arguments) info.ArgumentList.Add(argument);
-        return Process.Start(info) ?? throw new IOException("无法启动 " + Path.GetFileName(executable));
+        return Process.Start(info) ?? throw new IOException(Tr("Could not launch ") + Path.GetFileName(executable));
     }
 
     public static async Task StopAsync(Process? process)

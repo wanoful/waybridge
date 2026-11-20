@@ -23,6 +23,7 @@ internal sealed partial class MainWindow
         if (kind is not ("upload" or "download" or "drag")) return;
         ulong id = message.GetProperty("id").GetUInt64();
         string name = message.GetProperty("name").GetString() ?? "";
+        if (name.Length == 0) name = Tr("Files");
         string state = message.GetProperty("state").GetString() ?? "";
         var key = (kind, id);
         if (!activeTransfers.TryGetValue(key, out var row))
@@ -30,7 +31,7 @@ internal sealed partial class MainWindow
             var title = Heading("", 14);
             var status = Muted("");
             var bar = new ProgressBar { Minimum = 0, Maximum = 100 };
-            var cancel = Button("取消");
+            var cancel = Button(L("Cancel"));
             cancel.Click += async (_, _) => await GuardAsync(async () =>
             {
                 cancel.IsEnabled = false;
@@ -44,7 +45,7 @@ internal sealed partial class MainWindow
 
         ulong bytes = message.GetProperty("bytes").GetUInt64();
         ulong total = message.GetProperty("total").GetUInt64();
-        string direction = kind switch { "upload" => "发送", "download" => "接收", _ => "拖放接收" };
+        string direction = kind switch { "upload" => Tr("Send"), "download" => Tr("Receive"), _ => Tr("Receive via drag and drop") };
         row.Title.Text = $"{direction} · {name}";
         bool canCancel = state == "active" && (!message.TryGetProperty("can_cancel", out var allowed) || allowed.GetBoolean());
         row.Cancel.Visibility = canCancel ? Visibility.Visible : Visibility.Collapsed;
@@ -52,12 +53,12 @@ internal sealed partial class MainWindow
         row.Bar.Value = total > 0 ? Math.Min(100, bytes * 100.0 / total) : state == "done" ? 100 : 0;
         row.Status.Text = state switch
         {
-            "active" when !canCancel => "正在完成…",
-            "active" => total == 0 ? "正在准备文件…" : $"{FileSize(bytes)} / {FileSize(total)}",
-            "done" => $"已完成 · {FileSize(total)}",
-            "cancelled" => "已取消",
-            _ when message.TryGetProperty("message", out var detail) => "传输失败 · " + detail.GetString(),
-            _ => "传输失败"
+            "active" when !canCancel => Tr("Finishing…"),
+            "active" => total == 0 ? Tr("Preparing files…") : $"{FileSize(bytes)} / {FileSize(total)}",
+            "done" => Tr("Complete · {0}", FileSize(total)),
+            "cancelled" => Tr("Canceled"),
+            _ when message.TryGetProperty("message", out var detail) => Tr("Transfer failed · ") + TrDiagnostic(detail.GetString() ?? "Unknown reason"),
+            _ => Tr("Transfer failed")
         };
         if (state != "active")
         {
@@ -80,7 +81,7 @@ internal sealed partial class MainWindow
         {
             row.Cancel.Visibility = Visibility.Collapsed;
             row.Bar.IsIndeterminate = false;
-            row.Status.Text = "连接已断开，传输已中断";
+            row.Status.Text = Tr("Connection lost. Transfer interrupted");
         }
         activeTransfers.Clear();
     }

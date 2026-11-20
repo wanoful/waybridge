@@ -130,13 +130,13 @@ impl Bridge {
     pub fn status(&self) -> Value {
         let available = self.provider.is_some();
         let message = if available {
-            "Waybridge 标准通知服务已接入"
+            "Waybridge notification service connected"
         } else {
             match self.diagnosis.as_str() {
-                "provider_conflict" => "用户总线已有通知服务。请在会话组件配置中明确选择通知服务；Waybridge 不会抢占其他服务。",
-                "provider_lost" => "Waybridge 通知服务已断开；旧通知及动作已失效。请检查 waybridge-notifications.service。",
-                "provider_diagnostic_unavailable" => "无法检查通知服务；请检查用户总线与 waybridge-notifications.service。",
-                _ => "尚未选用 Waybridge 标准通知服务；请显式启用 waybridge-notifications.service。",
+                "provider_conflict" => "A notification service already owns the user bus name. Select a notification service in the session component configuration.",
+                "provider_lost" => "The Waybridge notification service disconnected. Previous notifications and actions expired. Check waybridge-notifications.service.",
+                "provider_diagnostic_unavailable" => "Could not check the notification service. Check the user bus and waybridge-notifications.service.",
+                _ => "The Waybridge notification service is inactive. Enable waybridge-notifications.service to use it.",
             }
         };
         json!({"type":"notification_status","available":available,"reason":if available {"provider_connected"} else {&self.diagnosis},"message":message})

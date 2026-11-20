@@ -85,11 +85,13 @@ fn open_backend(path: &Path) -> io::Result<File> {
 }
 fn backend_error(error: &io::Error) -> String {
     match error.raw_os_error() {
-        Some(libc::EACCES | libc::EPERM) => "当前会话无权访问 /dev/uinput；手柄转发不可用".into(),
-        Some(libc::ENOENT | libc::ENODEV) => {
-            "当前主机没有可用的 /dev/uinput；手柄转发不可用".into()
+        Some(libc::EACCES | libc::EPERM) => {
+            "The session cannot access /dev/uinput. Controller forwarding is unavailable.".into()
         }
-        _ => format!("虚拟手柄后端失败：{error}"),
+        Some(libc::ENOENT | libc::ENODEV) => {
+            "No /dev/uinput device is available. Controller forwarding is unavailable.".into()
+        }
+        _ => format!("Virtual controller backend failed: {error}"),
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -454,7 +456,7 @@ impl Gamepads {
                     }
                     Ok(()) => {
                         self.supported = false;
-                        self.error = "当前 uinput 版本不支持虚拟手柄设备设置".into();
+                        self.error = "The installed uinput version does not support virtual controller setup".into();
                     }
                     Err(error) => {
                         self.supported = false;
@@ -822,7 +824,10 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert_eq!(status["supported"], false);
         assert_eq!(status["enabled"], false);
-        assert!(status["error"].as_str().unwrap().contains("无权访问"));
+        assert!(status["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot access /dev/uinput"));
         assert!(pads.devices.iter().all(Option::is_none));
     }
     #[test]

@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Globalization;
 using System.Reflection;
 using System.Security.Authentication;
 using System.Text;
@@ -107,6 +108,7 @@ if (args is ["--direct-smoke"])
     string stored = File.ReadAllText(Path.Combine(settingsDirectory,"profiles.json"));
     Check(!stored.Contains(credentials.ClientToken,StringComparison.Ordinal) && !stored.Contains(sessionSecret,StringComparison.Ordinal), "direct credential persisted in profile JSON");
     var firstTransport = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var languageChanged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
     var restored = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
     int connections = 0, bootstraps = 0;
     string appHost = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!, "Waybridge.Control.Tests" + (OperatingSystem.IsWindows() ? ".exe" : ""));
@@ -118,11 +120,22 @@ if (args is ["--direct-smoke"])
                 Check(message.GetProperty("transport_type").GetString() == "tls" && message.GetProperty("session").GetString() == sessionName, "native transport bootstrap changed");
                 Interlocked.Increment(ref bootstraps); firstTransport.TrySetResult();
             }
+            else if (message.GetProperty("type").GetString() == "observed" &&
+                     message.GetProperty("request") is var request && request.GetProperty("type").GetString() == "language" &&
+                     request.GetProperty("language").GetString() == "zh-Hans") languageChanged.TrySetResult();
         };
         controller.ConnectionChanged += value => {if (value && Interlocked.Increment(ref connections) == 2) restored.TrySetResult();};
         await controller.ConnectAsync(directProfile with {SessionMode="attach"},credentials.ClientToken);
         await firstTransport.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Check(controller.Connected && controller.CurrentSession == sessionName,"direct controller did not attach");
+        Localization.Initialize("zh-Hans");
+        await controller.UpdateLanguageAsync();
+        await languageChanged.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Check(controller.CurrentStatus == "已连接" && controller.CurrentSession == sessionName && bootstraps == 1,
+            "language change must update the connected worker and status without a new session or worker");
+        Localization.Initialize("system");
+        await controller.UpdateLanguageAsync();
+        Console.WriteLine("PASS: language changes reach the connected worker without restarting it");
         var launcherApp = (await controller.ApplicationsAsync(directProfile.Id)).Single(app => app.Id == "waybridge-direct-smoke.desktop");
         Check(launcherApp.GenericName == "Direct editor" && launcherApp.Comment == "Desktop metadata fixture" &&
             launcherApp.Categories.SequenceEqual(["Development"]) && launcherApp.Keywords.SequenceEqual(["launcher"]) &&
@@ -187,6 +200,24 @@ string directory = Path.Combine(Path.GetTempPath(), "waybridge-core-tests-" + Gu
 Directory.CreateDirectory(directory);
 try
 {
+    var uiCulture = CultureInfo.CurrentUICulture;
+    CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo("zh-CN");
+    Localization.Initialize("system");
+    Check(Localization.Tr("Connected") == "已连接" && Localization.Tr("{0} apps", 4) == "4 个应用",
+        "system Chinese locale must resolve translated labels and format placeholders");
+    Localization.Initialize("en");
+    Check(Localization.Tr("Connected") == "Connected", "explicit English must override the operating system language");
+    CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo("fr-FR");
+    Localization.Initialize("system");
+    Check(Localization.Language == "en", "unsupported locales must fall back to English");
+    Localization.Initialize("zh-Hans");
+    Check(Localization.TrDiagnostic("Could not open the SDL controller: no device") == "无法打开 SDL 手柄：no device" &&
+        Localization.Tr("Unknown remote message") == "Unknown remote message",
+        "localizing diagnostics must preserve external details and unknown messages");
+    CultureInfo.CurrentUICulture = uiCulture;
+    Localization.Initialize("system");
+    Console.WriteLine("PASS: client language selection, formatting, and diagnostic fallback");
+
     var profile = new ConnectionProfile { Host = "linux.example" };
     profile.Validate();
     Check(profile.Port == 49092, "new profiles must default to the Waybridge TLS endpoint");

@@ -12,7 +12,7 @@ internal static class AppShortcuts
 {
     private const string ProtocolKey = @"Software\Classes\waybridge";
     private static readonly Guid ShellLinkClass = new("00021401-0000-0000-C000-000000000046");
-    private static string Executable => Environment.ProcessPath ?? throw new IOException("无法找到 Waybridge 程序");
+    private static string Executable => Environment.ProcessPath ?? throw new IOException(Tr("Waybridge executable not found"));
 
     public static void RegisterProtocol()
     {
@@ -20,7 +20,7 @@ internal static class AppShortcuts
         using var protocol = Registry.CurrentUser.CreateSubKey(ProtocolKey);
         using var command = protocol.CreateSubKey(@"shell\open\command");
         if (Equals(command.GetValue(null), target) && Equals(protocol.GetValue("URL Protocol"), "")) return;
-        protocol.SetValue(null, "URL:Waybridge 应用链接");
+        protocol.SetValue(null, Tr("URL:Waybridge app link"));
         protocol.SetValue("URL Protocol", "");
         using var icon = protocol.CreateSubKey("DefaultIcon");
         icon.SetValue(null, $"\"{Executable}\",0");
@@ -33,7 +33,7 @@ internal static class AppShortcuts
     {
         var folder = Environment.GetFolderPath(desktop ? Environment.SpecialFolder.DesktopDirectory : Environment.SpecialFolder.Programs,
             Environment.SpecialFolderOption.Create);
-        if (string.IsNullOrEmpty(folder)) throw new IOException("找不到 Windows 快捷方式目录");
+        if (string.IsNullOrEmpty(folder)) throw new IOException(Tr("Windows shortcut directory not found"));
         if (!desktop) folder = Path.Combine(folder, "Waybridge");
         Directory.CreateDirectory(folder);
 
@@ -45,7 +45,7 @@ internal static class AppShortcuts
             string suffix = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(link.ToString())))[..12];
             path = Path.Combine(folder, $"{label} - {suffix}.lnk");
             if (File.Exists(path) && !IsSameShortcut(path, arguments))
-                throw new IOException("同名快捷方式已存在，请先重命名该快捷方式");
+                throw new IOException(Tr("A shortcut with this name already exists. Rename it first."));
         }
         string? iconPath = null;
         if (png is not null)

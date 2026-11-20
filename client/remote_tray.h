@@ -34,7 +34,7 @@ class RemoteTray {
   UINT nextId = 100;
   UINT iconDpi = 0;
   uint64_t badgeRevision = 0;
-  bool negotiated = false, enabled = true, readOnly = false;
+  bool negotiated = false, enabled = true, readOnly = false, chinese = false;
   std::string pendingMenu;
   uint64_t pendingGeneration = 0;
   HHOOK wheelHook = nullptr;
@@ -136,7 +136,7 @@ class RemoteTray {
     }
     return result;
   }
-  static HMENU build(const Json &children, std::map<UINT, int32_t> &actions, UINT &next,
+  HMENU build(const Json &children, std::map<UINT, int32_t> &actions, UINT &next,
                      size_t &budget, unsigned depth = 0, bool parentEnabled = true) {
     if (!children.is_array() || depth > 8 || children.size() > 256 || !budget)
       return nullptr;
@@ -163,7 +163,7 @@ class RemoteTray {
         submenu =
             build(node.value("children", Json::array()), actions, next, budget, depth + 1, active);
         if (submenu && GetMenuItemCount(submenu) == 0)
-          AppendMenuW(submenu, MF_STRING | MF_GRAYED, 0, L"暂无菜单项");
+          AppendMenuW(submenu, MF_STRING | MF_GRAYED, 0, chinese ? L"暂无菜单项" : L"No menu items");
       }
       UINT command = next++;
       if (submenu)
@@ -194,7 +194,7 @@ class RemoteTray {
     pendingMenu.clear();
     if (message.value("fallback", "") == "remote_window") {
       if (emit)
-        emit({{"type", "tray_info"}, {"message", "应用菜单已在远端窗口显示"}});
+        emit({{"type", "tray_info"}, {"message", "The app menu opened in the remote window"}});
       return;
     }
     if (!message.contains("root") || !message["root"].is_object())
@@ -281,6 +281,7 @@ public:
     if (hookTarget == this)
       hookTarget = nullptr;
   }
+  void setChinese(bool enabled) { chinese = enabled; }
   void configure(bool supported, bool show, bool readonly) {
     negotiated = supported;
     enabled = show;

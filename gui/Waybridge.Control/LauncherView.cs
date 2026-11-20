@@ -1,8 +1,12 @@
+using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Microsoft.UI;
+using Microsoft.UI.Composition;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
+using Microsoft.UI.Xaml.Automation.Peers;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Markup;
@@ -20,30 +24,34 @@ internal sealed partial class MainWindow
     private CancellationTokenSource? catalogLoad;
     private readonly TextBlock sessionStatus = Muted("");
     private readonly TextBlock catalogStatus = Muted("");
+    private UiText catalogStatusMessage = "";
+    private string catalogStatusDetail = "";
     private readonly TextBlock applicationsCount = Muted("");
     private readonly VariableSizedWrapGrid pinnedItems = Tiles();
     private readonly VariableSizedWrapGrid recentItems = Tiles();
     private readonly StackPanel pinnedSection = new() { Spacing = 6 };
     private readonly StackPanel favoritesSection = new() { Spacing = 12 };
     private readonly Border directoryHeader = new();
-    private readonly TranslateTransform directoryOffset = new();
+    private CompositionPropertySet? directoryMetrics;
+    private bool directoryCompositionUnavailable;
     private readonly Grid catalogContent = new() { Margin = new Thickness(24, 16, 24, 20) };
-    private readonly ScrollViewer catalogScroll = new()
+    private readonly ScrollView catalogScroll = new()
     {
-        HorizontalScrollMode = ScrollMode.Disabled, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-        VerticalScrollBarVisibility = ScrollBarVisibility.Auto, ZoomMode = ZoomMode.Disabled
+        HorizontalScrollMode = ScrollingScrollMode.Disabled, HorizontalScrollBarVisibility = ScrollingScrollBarVisibility.Hidden,
+        VerticalScrollBarVisibility = ScrollingScrollBarVisibility.Auto, ZoomMode = ScrollingZoomMode.Disabled
     };
-    private readonly Button matchingWindows = Button("查看匹配窗口");
+    private readonly Button matchingWindows = Button(L("Show matching windows"));
     private readonly TextBlock runningEmpty = Muted("");
     private readonly Grid dock = new() { ColumnSpacing = 12, RowSpacing = 10 };
-    private readonly TextBlock pinHint = Muted("从应用菜单固定常用应用。");
+    private readonly TextBlock pinHint = Muted(L("Pin favorite apps from their app menus."));
     private readonly TextBlock quickRtt = Muted("—");
     private readonly Ellipse connectionDot = new() { Width = 8, Height = 8, VerticalAlignment = VerticalAlignment.Center };
-    private readonly ComboBox theme = Combo(["跟随 Windows", "浅色", "深色"]);
+    private readonly ComboBox theme = Combo([L("Follow Windows"), L("Light"), L("Dark")]);
+    private readonly ComboBox language = Combo([L("Follow Windows"), "English", "简体中文"]);
     private readonly ToggleSwitch closeToTray = Toggle(true);
-    private readonly Button muteQuick = Button("静音"), readOnlyQuick = IconButton("只读查看", "\uE890");
-    private readonly MenuFlyoutItem endSessionQuick = new() { Text = "结束远端会话" };
-    private readonly Button modeButton = IconButton("切换为紧凑列表", "\uE8FD");
+    private readonly Button muteQuick = Button(L("Mute")), readOnlyQuick = IconButton(L("View only"), "\uE890");
+    private readonly MenuFlyoutItem endSessionQuick = L("End remote session").Bind(new MenuFlyoutItem(), MenuFlyoutItem.TextProperty);
+    private readonly Button modeButton = IconButton(L("Switch to compact list"), "\uE8FD");
     private readonly InfoBadge transferBadge = new() { Visibility = Visibility.Collapsed, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top, IsHitTestVisible = false };
     private readonly SplitView transferDrawer = new()
     {
@@ -51,12 +59,12 @@ internal sealed partial class MainWindow
         DisplayMode = SplitViewDisplayMode.Overlay, OpenPaneLength = 390
     };
     private int unreadTransfers;
-    private readonly VariableSizedWrapGrid categories = new() { Orientation = Orientation.Horizontal, ItemWidth = 59, ItemHeight = 35 };
-    private static readonly (string Name, string[] Tags)[] AppCategories =
+    private readonly LauncherCategoryPanel categories = new();
+    private static readonly (UiText Name, string[] Tags)[] AppCategories =
     [
-        ("全部", []), ("图形", ["Graphics", "AudioVideo", "Video", "Audio"]),
-        ("开发", ["Development"]), ("办公", ["Office", "Network", "Education"]),
-        ("游戏", ["Game"]), ("系统", ["System", "Settings", "Utility"]), ("其他", [])
+        (L("All"), []), (L("Graphics"), ["Graphics", "AudioVideo", "Video", "Audio"]),
+        (L("Development"), ["Development"]), (L("Office"), ["Office", "Network", "Education"]),
+        (L("Games"), ["Game"]), (L("System"), ["System", "Settings", "Utility"]), (L("Other"), [])
     ];
     private int category;
     private readonly StackLayout listLayout = new() { Spacing = 3 };
@@ -66,8 +74,8 @@ internal sealed partial class MainWindow
         ItemsStretch = UniformGridLayoutItemsStretch.Fill
     };
     private IReadOnlyList<RemoteApplication> filteredApplications = [];
-    private readonly Button refreshApps = Button("刷新目录");
-    private readonly Button emptyAdd = Button("添加工作站", true);
+    private readonly Button refreshApps = Button(L("Refresh catalog"));
+    private readonly Button emptyAdd = Button(L("Add workstation"), true);
     private readonly StackPanel emptyLauncher = new() { Spacing = 14 };
     private readonly StackPanel windowSection = new() { Spacing = 7 };
     private readonly StackPanel backgroundSection = new() { Spacing = 7 };
@@ -83,27 +91,27 @@ internal sealed partial class MainWindow
         Glyph = glyph, FontSize = size, FontFamily = new FontFamily("Segoe Fluent Icons")
     };
 
-    private static Button IconButton(string label, string glyph)
+    private static Button IconButton(UiText label, string glyph)
     {
-        var button = Button(label);
+        var button = Button("");
         button.Content = Glyph(glyph);
         button.MinWidth = 36;
         button.Padding = new Thickness(8, 4, 8, 4);
-        ToolTipService.SetToolTip(button, label);
-        return button;
+        label.Name(button);
+        return label.Bind(button, ToolTipService.ToolTipProperty);
     }
 
     private static VariableSizedWrapGrid Tiles() => new()
     { Orientation = Orientation.Horizontal, ItemWidth = 154, ItemHeight = AppTileCellHeight };
 
-    private static TextBlock Muted(string text)
+    private static TextBlock Muted(UiText text)
     {
         var label = Text(text, 12);
         label.Style = LauncherStyles.Muted;
         return label;
     }
 
-    private static TextBlock Heading(string text, double size = 24)
+    private static TextBlock Heading(UiText text, double size = 24)
     {
         var title = Text(text, size);
         title.FontWeight = FontWeights.SemiBold;
@@ -122,7 +130,7 @@ internal sealed partial class MainWindow
         profilePicker.ItemsSource = profiles;
         profilePicker.MinWidth = 128;
         profilePicker.MaxWidth = 196;
-        AutomationProperties.SetName(profilePicker, "选择工作站");
+        L("Select workstation").Name(profilePicker);
         profilePicker.SelectionChanged += async (_, _) =>
         {
             if (!loading && profilePicker.SelectedItem is ConnectionProfile profile && profile.Id != selected.Id)
@@ -135,40 +143,40 @@ internal sealed partial class MainWindow
         };
         connect.Click += async (_, _) => await GuardAsync(ConnectOrDisconnectAsync);
         var menu = new MenuFlyout();
-        var add = new MenuFlyoutItem { Text = "添加设备", Icon = Glyph("\uE710") };
+        var add = L("Add device").Bind(new MenuFlyoutItem { Icon = Glyph("\uE710") }, MenuFlyoutItem.TextProperty);
         add.Click += async (_, _) => await GuardAsync(PairDeviceAsync);
-        var configure = new MenuFlyoutItem { Text = "连接设置", Icon = Glyph("\uE713") };
+        var configure = L("Connection settings").Bind(new MenuFlyoutItem { Icon = Glyph("\uE713") }, MenuFlyoutItem.TextProperty);
         configure.Click += (_, _) => ShowPage("connection");
         muteQuick.Click += async (_, _) => await GuardAsync(() => QuickSettingAsync(audioSetting: true));
         readOnlyQuick.Click += async (_, _) => await GuardAsync(() => QuickSettingAsync(audioSetting: false));
         endSessionQuick.Click += async (_, _) => await GuardAsync(ConfirmEndAsync);
         foreach (MenuFlyoutItemBase item in new MenuFlyoutItemBase[] { add, configure, new MenuFlyoutSeparator(), endSessionQuick })
             menu.Items.Add(item);
-        var more = IconButton("管理工作站", "\uE712");
+        var more = IconButton(L("Manage workstations"), "\uE712");
         more.Flyout = menu;
         menu.Opening += (_, _) => add.IsEnabled = !busy && !controller.IsRunning;
         var hostControls = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center,
             Children = { connectionDot, profilePicker, connect, more } };
 
-        var audioButton = IconButton("声音与音量", "\uE767");
+        var audioButton = IconButton(L("Sound and volume"), "\uE767");
         audioButton.Flyout = AudioFlyout();
-        var linkButton = IconButton("连接质量", "\uE839");
+        var linkButton = IconButton(L("Connection quality"), "\uE839");
         linkButton.Content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, Children = { Glyph("\uE839"), quickRtt } };
         var linkSummary = Text("");
-        var diagnostics = Button("打开诊断");
-        var linkFlyout = new Flyout { Content = Column(Heading("连接质量", 16), linkSummary, diagnostics) };
-        linkFlyout.Opening += (_, _) => linkSummary.Text = $"往返延迟 · {quickRtt.Text}\n{diagnosticMediaPath.Text}";
+        var diagnostics = Button(L("Open diagnostics"));
+        var linkFlyout = new Flyout { Content = Column(Heading(L("Connection quality"), 16), linkSummary, diagnostics) };
+        linkFlyout.Opening += (_, _) => linkSummary.Text = Tr("Round-trip latency · {0}\n{1}", quickRtt.Text, diagnosticMediaPath.Text);
         diagnostics.Click += (_, _) => { linkFlyout.Hide(); ShowPage("diagnostics"); };
         linkButton.Flyout = linkFlyout;
-        var transfer = IconButton("文件传输", "\uE8B7");
+        var transfer = IconButton(L("File transfers"), "\uE8B7");
         transfer.Click += (_, _) => { transferDrawer.IsPaneOpen = !transferDrawer.IsPaneOpen; MarkTransferSeen(); };
         var transferAction = new Grid { Children = { transfer, transferBadge } };
-        var settings = IconButton("设置", "\uE713");
+        var settings = IconButton(L("Settings"), "\uE713");
         settings.Click += (_, _) => ShowPage("display");
         var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, VerticalAlignment = VerticalAlignment.Center,
             Children = { readOnlyQuick, audioButton, linkButton, transferAction, settings } };
 
-        AutomationProperties.SetName(applicationSearch, "搜索远端应用、窗口或命令");
+        L("Search remote apps, windows, or commands").Name(applicationSearch);
         applicationSearch.TextChanged += (_, _) =>
         {
             if (applicationSearch.Text.Trim().Length > 0 && (CommandMode || ActivePage is not ("apps" or "running"))) ShowPage("apps");
@@ -211,7 +219,7 @@ internal sealed partial class MainWindow
 
     private UIElement ApplicationsPage()
     {
-        AutomationProperties.SetName(applicationList, "远端应用目录");
+        L("Remote app catalog").Name(applicationList);
         refreshApps.Click += async (_, _) => await GuardAsync(async () =>
         {
             InvalidateIcons();
@@ -224,12 +232,12 @@ internal sealed partial class MainWindow
         var icon = Glyph("\uE7F4", 28);
         icon.HorizontalAlignment = HorizontalAlignment.Left;
         emptyLauncher.Children.Add(icon);
-        emptyLauncher.Children.Add(Heading("连接你的 Linux 工作站", 22));
-        emptyLauncher.Children.Add(Text("配对后即可搜索并打开工作站上的应用。"));
+        emptyLauncher.Children.Add(Heading(L("Connect to your Linux workstation"), 22));
+        emptyLauncher.Children.Add(Text(L("Pair to find and open apps on your workstation.")));
         emptyLauncher.Children.Add(emptyAdd);
-        pinnedSection.Children.Add(Muted("已固定")); pinnedSection.Children.Add(pinnedItems);
-        recentSection.Children.Add(Muted("最近启动")); recentSection.Children.Add(recentItems);
-        favoritesSection.Children.Add(Heading("固定与最近", 22));
+        pinnedSection.Children.Add(Muted(L("Pinned"))); pinnedSection.Children.Add(pinnedItems);
+        recentSection.Children.Add(Muted(L("Recently launched"))); recentSection.Children.Add(recentItems);
+        favoritesSection.Children.Add(Heading(L("Pinned and recent"), 22));
         favoritesSection.Margin = new Thickness(0, 0, 0, 20);
         favoritesSection.Children.Add(pinHint);
         favoritesSection.Children.Add(pinnedSection);
@@ -238,7 +246,7 @@ internal sealed partial class MainWindow
         var directoryTitleBar = new Grid { ColumnSpacing = 8 };
         directoryTitleBar.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
         directoryTitleBar.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
-        var directoryTitle = new StackPanel { Spacing = 2, Children = { Heading("全部应用", 19), applicationsCount } };
+        var directoryTitle = new StackPanel { Spacing = 2, Children = { Heading(L("All apps"), 19), applicationsCount } };
         directoryTitleBar.Children.Add(directoryTitle);
         var directoryActions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, Children = { refreshApps, modeButton } };
         Grid.SetColumn(directoryActions, 1); directoryTitleBar.Children.Add(directoryActions);
@@ -252,15 +260,17 @@ internal sealed partial class MainWindow
         for (int index = 0; index < AppCategories.Length; index++)
         {
             int selectedCategory = index;
-            var chip = new ToggleButton { Content = AppCategories[index].Name, IsChecked = index == 0, Padding = new Thickness(8, 3, 8, 3),
-                HorizontalAlignment = HorizontalAlignment.Stretch, Margin = new Thickness(0, 0, 6, 4) };
+            UiText name = AppCategories[index].Name;
+            var chip = new ToggleButton { Content = Text(name), IsChecked = index == 0, Padding = new Thickness(9, 4, 9, 4),
+                HorizontalAlignment = HorizontalAlignment.Left };
+            name.Name(chip);
             chip.Click += (_, _) => { category = selectedCategory; UpdateCategories(); FilterApplications(keepDirectoryAtTop: true); };
             categories.Children.Add(chip);
         }
         matchingWindows.Visibility = Visibility.Collapsed;
         matchingWindows.Click += (_, _) => ShowPage("running");
         catalogStatus.Visibility = Visibility.Collapsed;
-        directoryHeader.RenderTransform = directoryOffset;
+        directoryHeader.Style = LauncherStyles.Directory;
         directoryHeader.Padding = new Thickness(0, 9, 0, 7);
         directoryHeader.Child = new StackPanel { Spacing = 5, Children = { directoryTitleBar, categories, matchingWindows, catalogStatus } };
 
@@ -284,20 +294,37 @@ internal sealed partial class MainWindow
         // Draw the sticky strip over the scrolling tiles.
         Grid.SetRow(directoryHeader, 1); catalogContent.Children.Add(directoryHeader);
         catalogScroll.Content = catalogContent;
-        catalogScroll.ViewChanged += (_, _) => UpdateDirectoryStickiness();
-        favoritesSection.SizeChanged += (_, _) => UpdateDirectoryStickiness();
+        catalogScroll.Loaded += (_, _) => ScheduleDirectoryComposition();
+        catalogScroll.SizeChanged += (_, _) => ScheduleDirectoryComposition();
+        catalogScroll.ViewChanged += (_, _) => UpdateDirectoryFallback();
+        favoritesSection.SizeChanged += (_, _) => UpdateDirectoryAnchor();
         var empty = Card(emptyLauncher, new Thickness(22));
         empty.Margin = new Thickness(24, 20, 24, 20);
         empty.VerticalAlignment = VerticalAlignment.Top;
-        return new Grid { Children = { catalogScroll, empty } };
+        // Measure in the visual tree so WinUI applies the actual display and text scale.
+        var titleMeasure = Heading("Ag国\nAg国", AppTitleFontSize);
+        titleMeasure.TextWrapping = TextWrapping.NoWrap;
+        titleMeasure.Opacity = 0;
+        titleMeasure.IsHitTestVisible = false;
+        titleMeasure.HorizontalAlignment = HorizontalAlignment.Left;
+        titleMeasure.VerticalAlignment = VerticalAlignment.Top;
+        AutomationProperties.SetAccessibilityView(titleMeasure, AccessibilityView.Raw);
+        titleMeasure.SizeChanged += (_, args) =>
+        {
+            const double borderAndRounding = 5;
+            double chrome = AppTileIconSize + AppTileTitleSpacing + AppTileTopPadding + AppTileBottomPadding + AppTileGap + borderAndRounding;
+            double height = Math.Max(AppTileCellHeight, Math.Ceiling(args.NewSize.Height + chrome));
+            gridLayout.MinItemHeight = pinnedItems.ItemHeight = recentItems.ItemHeight = height;
+        };
+        return new Grid { Children = { catalogScroll, empty, titleMeasure } };
     }
 
     private UIElement RunningPage()
     {
-        AutomationProperties.SetName(windowList, "正在运行的窗口");
-        AutomationProperties.SetName(backgroundList, "远端后台应用");
-        windowSection.Children.Add(Heading("远端窗口", 17)); windowSection.Children.Add(windowList);
-        backgroundSection.Children.Add(Heading("后台应用", 17)); backgroundSection.Children.Add(backgroundList);
+        L("Running windows").Name(windowList);
+        L("Remote background apps").Name(backgroundList);
+        windowSection.Children.Add(Heading(L("Remote windows"), 17)); windowSection.Children.Add(windowList);
+        backgroundSection.Children.Add(Heading(L("Background apps"), 17)); backgroundSection.Children.Add(backgroundList);
         dock.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
         dock.ColumnDefinitions.Add(new() { Width = GridLength.Auto });
         dock.RowDefinitions.Add(new() { Height = GridLength.Auto });
@@ -307,7 +334,7 @@ internal sealed partial class MainWindow
         dock.SizeChanged += (_, args) => LayoutDock(args.NewSize.Width);
         windowSection.Visibility = backgroundSection.Visibility = Visibility.Collapsed;
         UpdateDockVisibility();
-        return Column(Heading("运行中", 22), runningEmpty, dock);
+        return Column(Heading(L("Running"), 22), runningEmpty, dock);
     }
 
     private bool Matches(params string[] values)
@@ -335,23 +362,70 @@ internal sealed partial class MainWindow
     private void SetDirectoryLayout()
     {
         bool compact = launcherPreferences.CompactApps;
-        applicationList.Layout = compact ? listLayout : gridLayout;
+        Layout layout = compact ? listLayout : gridLayout;
+        if (applicationList.Layout != layout)
+        {
+            // The repeater can keep realized content when only its layout changes.
+            applicationList.ItemsSource = null;
+            applicationList.Layout = layout;
+            applicationList.ItemsSource = filteredApplications;
+        }
         modeButton.Content = Glyph(compact ? "\uE80A" : "\uE8FD");
-        string label = compact ? "切换为网格" : "切换为紧凑列表";
+        string label = compact ? Tr("Switch to grid") : Tr("Switch to compact list");
         AutomationProperties.SetName(modeButton, label);
         ToolTipService.SetToolTip(modeButton, label);
     }
 
     private double DirectoryTop => catalogContent.RowDefinitions[0].ActualHeight + catalogContent.Margin.Top;
 
-    private void UpdateDirectoryStickiness()
+    private void ScheduleDirectoryComposition()
     {
-        if (catalogContent.RowDefinitions.Count == 0) return;
-        double offset = directoryHeader.Visibility == Visibility.Visible ? Math.Max(0, catalogScroll.VerticalOffset - DirectoryTop) : 0;
-        directoryOffset.Y = offset;
-        var style = offset > 0 ? LauncherStyles.Directory : null;
-        if (directoryHeader.Style != style) directoryHeader.Style = style;
+        if (directoryMetrics is null && !directoryCompositionUnavailable)
+            DispatcherQueue.TryEnqueue(BindDirectoryHeaderToScroll);
     }
+
+    private void BindDirectoryHeaderToScroll()
+    {
+        if (directoryMetrics is not null || directoryCompositionUnavailable || !directoryHeader.IsLoaded || catalogScroll.ActualHeight <= 0)
+            return;
+
+        try
+        {
+            // Loaded can run before the ScrollView template has a usable composition source.
+            var scroll = catalogScroll.ScrollPresenter?.ExpressionAnimationSources;
+            if (scroll is null) return;
+            var compositor = scroll.Compositor;
+            var metrics = compositor.CreatePropertySet();
+            metrics.InsertScalar("HeaderTop", (float)DirectoryTop);
+            using var pin = compositor.CreateExpressionAnimation("Vector3(0, Max(0, scroll.Position.Y - scroll.MinPosition.Y - layout.HeaderTop), 0)");
+            pin.SetReferenceParameter("scroll", scroll);
+            pin.SetReferenceParameter("layout", metrics);
+            pin.Target = "Translation";
+            directoryHeader.StartAnimation(pin);
+            directoryMetrics = metrics;
+        }
+        catch (Exception error) when (error is ArgumentException or COMException)
+        {
+            directoryCompositionUnavailable = true;
+            StartupDiagnostics.Write($"Directory header composition unavailable (0x{error.HResult:X8}); using scroll updates");
+            UpdateDirectoryFallback();
+        }
+    }
+
+    private void UpdateDirectoryAnchor()
+    {
+        if (directoryMetrics is { } metrics) metrics.InsertScalar("HeaderTop", (float)DirectoryTop);
+        else UpdateDirectoryFallback();
+    }
+
+    private void UpdateDirectoryFallback()
+    {
+        if (directoryMetrics is null && catalogScroll.ScrollPresenter is not null)
+            directoryHeader.Translation = new Vector3(0, (float)Math.Max(0, catalogScroll.VerticalOffset - DirectoryTop), 0);
+    }
+
+    private void ScrollCatalogTo(double offset) => catalogScroll.ScrollTo(0, offset,
+        new ScrollingScrollOptions(ScrollingAnimationMode.Disabled, ScrollingSnapPointsMode.Ignore));
 
     private void LayoutDock(double width)
     {
@@ -368,7 +442,7 @@ internal sealed partial class MainWindow
         bool hasRunning = windowList.Items.Count > 0 || backgroundList.Items.Count > 0;
         dock.Visibility = hasRunning ? Visibility.Visible : Visibility.Collapsed;
         runningEmpty.Visibility = hasRunning ? Visibility.Collapsed : Visibility.Visible;
-        runningEmpty.Text = controller.Connected ? "当前没有匹配的远端窗口或后台应用。" : "连接工作站后可查看远端窗口和后台应用。";
+        runningEmpty.Text = controller.Connected ? Tr("No matching remote windows or background apps.") : Tr("Connect to a workstation to see remote windows and background apps.");
     }
 
     private void FilterApplications(bool keepDirectoryAtTop = false)
@@ -377,11 +451,16 @@ internal sealed partial class MainWindow
         filteredApplications = applications.Where(app => MatchesApp(app) && MatchesCategory(app)).ToArray();
         applicationList.ItemsSource = filteredApplications;
         applicationList.Visibility = filteredApplications.Count > 0 && !CommandMode ? Visibility.Visible : Visibility.Collapsed;
-        applicationsCount.Text = applications.Count == 0 ? "" : filteredApplications.Count == 0 ? "没有匹配的应用" : $"{filteredApplications.Count} 个应用";
-        applicationsCount.Visibility = applicationsCount.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        UpdateApplicationCount();
         RenderRecent();
         if (scrollToDirectory)
-            DispatcherQueue.TryEnqueue(() => catalogScroll.ChangeView(null, Math.Min(DirectoryTop, catalogScroll.ScrollableHeight), null, true));
+            DispatcherQueue.TryEnqueue(() => ScrollCatalogTo(Math.Min(DirectoryTop, catalogScroll.ScrollableHeight)));
+    }
+
+    private void UpdateApplicationCount()
+    {
+        applicationsCount.Text = applications.Count == 0 ? "" : filteredApplications.Count == 0 ? Tr("No matching apps") : Tr("{0} apps", filteredApplications.Count);
+        applicationsCount.Visibility = applicationsCount.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void RenderRecent()
@@ -414,14 +493,21 @@ internal sealed partial class MainWindow
             name.MaxLines = 1; name.TextTrimming = TextTrimming.CharacterEllipsis;
             focus.Content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 9, Children = {
                 LauncherMark(MatchWindowApplication(window.AppId), 29), Column(name, Muted(window.Path)) } };
-            AutomationProperties.SetName(focus, $"切回窗口：{window.Title}");
+            L("Return to window: {0}", window.Title).Name(focus);
             focus.Click += async (_, _) => await GuardAsync(() => FocusRemoteWindowAsync(window));
             windowList.Items.Add(focus);
         }
         windowSection.Visibility = windowList.Items.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
-        matchingWindows.Visibility = !CommandMode && applicationSearch.Text.Trim().Length > 0 && windowList.Items.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
-        matchingWindows.Content = $"查看 {windowList.Items.Count} 个匹配窗口";
+        UpdateMatchingWindows();
         UpdateDockVisibility();
+    }
+
+    private void UpdateMatchingWindows()
+    {
+        matchingWindows.Visibility = !CommandMode && applicationSearch.Text.Trim().Length > 0 && windowList.Items.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        string label = Tr("Show {0} matching windows", windowList.Items.Count);
+        matchingWindows.Content = label;
+        AutomationProperties.SetName(matchingWindows, label);
     }
 
     private Task FocusRemoteWindowAsync(RemoteWindow window) =>
@@ -438,15 +524,16 @@ internal sealed partial class MainWindow
         backgroundSnapshot = null;
         backgroundSection.Visibility = Visibility.Collapsed;
         UpdateDockVisibility();
-        trayStatus.Text = "";
+        remoteTrayStatus = null;
+        UpdateRemoteTrayStatus();
         touchApplicationNames.Clear();
         RefreshTouchApplications();
-        actual.Text = diagnosticMediaPath.Text = "等待连接";
+        actual.Text = diagnosticMediaPath.Text = Tr("Waiting for connection");
         appliedVideo.Text = "";
         appliedVideo.Visibility = Visibility.Collapsed;
         quickRtt.Text = "—";
         lastTick = lastBytes = lastUpdates = 0;
-        foreach (var metric in metrics.Values) metric.Text = "等待采集";
+        foreach (var metric in metrics.Values) metric.Text = Tr("Waiting for capture");
     }
 
     private void UpdateLauncherActions()
@@ -462,20 +549,20 @@ internal sealed partial class MainWindow
         applicationSearch.IsEnabled = hasProfile && paired;
         muteQuick.IsEnabled = readOnlyQuick.IsEnabled = endSessionQuick.IsEnabled = live && !busy;
         var requested = liveSettings ?? selected.Settings;
-        string muteLabel = requested.Audio ? "静音" : "恢复声音";
+        string muteLabel = requested.Audio ? Tr("Mute") : Tr("Unmute");
         muteQuick.Content = muteLabel;
         AutomationProperties.SetName(muteQuick, muteLabel);
-        string action = requested.ReadOnly ? "恢复远端输入" : "只读查看";
+        string action = requested.ReadOnly ? Tr("Resume remote input") : Tr("View only");
         readOnlyQuick.Content = Glyph(requested.ReadOnly ? "\uE785" : "\uE890");
         AutomationProperties.SetName(readOnlyQuick, action);
         ToolTipService.SetToolTip(readOnlyQuick, action);
-        AutomationProperties.SetName(connectionDot, live ? "已连接" : controller.IsRunning ? "连接中" : "未连接");
+        AutomationProperties.SetName(connectionDot, live ? Tr("Connected") : controller.IsRunning ? Tr("Connecting") : Tr("Disconnected"));
         connectionDot.Fill = new SolidColorBrush(live ? ColorHelper.FromArgb(255, 22, 160, 93)
             : controller.IsRunning ? ColorHelper.FromArgb(255, 231, 173, 40) : ColorHelper.FromArgb(255, 126, 137, 153));
-        sessionStatus.Text = live && controller.CurrentSession is { } current ? current : controller.IsRunning ? "连接中" : "未连接";
+        sessionStatus.Text = live && controller.CurrentSession is { } current ? current : controller.IsRunning ? Tr("Connecting") : Tr("Disconnected");
         UpdateDockVisibility();
         UpdateCommandControls();
-        if (!hasProfile) status.Text = "尚未配对";
+        if (!hasProfile) status.Text = Tr("Unpaired");
     }
 
     private async Task SelectProfileAsync(ConnectionProfile profile)
@@ -490,7 +577,7 @@ internal sealed partial class MainWindow
     {
         await preferencesSave.WaitAsync();
         try { await launcherPreferences.SaveAsync(store.DirectoryPath); }
-        catch (IOException error) { Inform("无法保存启动器偏好：" + error.Message); }
+        catch (IOException error) { Inform(Tr("Could not save launcher preferences: ") + error.Message); }
         finally { preferencesSave.Release(); }
     }
 
@@ -505,13 +592,13 @@ internal sealed partial class MainWindow
         if (credential is null) return;
         using var request = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         catalogLoad = request;
-        SetCatalogStatus("正在读取应用目录…");
+        SetCatalogStatus(L("Loading the app catalog…"));
         try
         {
             var payload = await new DirectAgent(profile, credential).CallAsync(new { op = "applications" }, request.Token);
             if (!ReferenceEquals(catalogLoad, request) || selected.Id != profile.Id || request.IsCancellationRequested) return;
             var available = payload.Deserialize<List<RemoteApplication>>(Wire.Json) ?? [];
-            SetCatalogStatus(available.Count > 0 ? "" : "工作站没有可启动的应用。");
+            SetCatalogStatus(available.Count > 0 ? "" : L("No launchable apps found on the workstation."));
             if (applications.Count != available.Count || !applications.Zip(available).All(pair => SameCatalogEntry(pair.First, pair.Second)))
             {
                 applications = available;
@@ -520,11 +607,11 @@ internal sealed partial class MainWindow
                 _ = GuardAsync(ApplyLauncherPoliciesAsync);
             }
         }
-        catch (OperationCanceledException) when (ReferenceEquals(catalogLoad, request)) { SetCatalogStatus("读取目录超时，可以刷新重试。"); }
+        catch (OperationCanceledException) when (ReferenceEquals(catalogLoad, request)) { SetCatalogStatus(L("Catalog request timed out. Refresh to retry.")); }
         catch (OperationCanceledException) { }
         catch (Exception error)
         {
-            if (ReferenceEquals(catalogLoad, request)) SetCatalogStatus("无法读取应用目录：" + error.Message);
+            if (ReferenceEquals(catalogLoad, request)) SetCatalogStatus(L("Could not load the app catalog: "), error.Message);
         }
         finally { if (ReferenceEquals(catalogLoad, request)) catalogLoad = null; }
     }
@@ -539,10 +626,25 @@ internal sealed partial class MainWindow
         SetCatalogStatus("");
     }
 
-    private void SetCatalogStatus(string text)
+    private void SetCatalogStatus(UiText message, string detail = "")
     {
-        catalogStatus.Text = text;
-        catalogStatus.Visibility = text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        catalogStatusMessage = message;
+        catalogStatusDetail = detail;
+        UpdateCatalogStatus();
+    }
+
+    private void UpdateCatalogStatus()
+    {
+        catalogStatus.Text = catalogStatusMessage.Resolve() + catalogStatusDetail;
+        catalogStatus.Visibility = catalogStatus.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void UpdateRemoteTrayStatus()
+    {
+        trayStatus.Text = remoteTrayStatus is not { } message ? Tr("Tray: Waiting for connection")
+            : TouchFlag(message, "available") == true ? Tr("SNI tray connected. Legacy XEmbed tray icons are unsupported.")
+            : Tr("Tray unavailable: ") + TrDiagnostic(message.TryGetProperty("message", out var detail)
+                ? detail.GetString() ?? "Unknown reason" : "Unknown reason");
     }
 
     private static bool SameCatalogEntry(RemoteApplication first, RemoteApplication second) =>
@@ -573,8 +675,8 @@ internal sealed partial class MainWindow
 
     private Flyout AudioFlyout()
     {
-        var quickVolume = new Slider { Minimum = 0, Maximum = 100, StepFrequency = 1, MinWidth = 220, Header = "远端音量" };
-        var flyout = new Flyout { Content = Column(Heading("声音", 16), quickVolume, muteQuick) };
+        var quickVolume = L("Remote volume").Bind(new Slider { Minimum = 0, Maximum = 100, StepFrequency = 1, MinWidth = 220 }, Slider.HeaderProperty);
+        var flyout = new Flyout { Content = Column(Heading(L("Sound"), 16), quickVolume, muteQuick) };
         bool opening = false;
         Guid target = Guid.Empty;
         var timer = DispatcherQueue.CreateTimer();
@@ -620,15 +722,23 @@ internal sealed partial class MainWindow
             ApplyLauncherTheme();
             await GuardAsync(SaveLauncherPreferencesAsync);
         };
+        language.SelectionChanged += async (_, _) =>
+        {
+            if (loading || language.SelectedIndex < 0) return;
+            string preference = language.SelectedIndex switch { 1 => "en", 2 => "zh-Hans", _ => "system" };
+            await GuardAsync(() => ApplyLanguageAsync(preference));
+        };
         closeToTray.Toggled += async (_, _) =>
         {
             if (loading) return;
             launcherPreferences.CloseToTray = closeToTray.IsOn;
             await GuardAsync(SaveLauncherPreferencesAsync);
         };
-        return Column(Heading("常规"), Muted("适用于此 Windows 客户端上的所有连接。"),
-            Row("界面主题", "立即生效", theme), Row("关闭窗口时收起到托盘", "关闭此项后，关闭窗口会退出客户端并保留远端会话。", closeToTray),
-            Row("搜索远端应用", "在控制中心内使用", Text("Ctrl + K")),
-            Row("客户端架构", "", Text(System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString())));
+        return Column(Heading(L("General")), Muted(L("Applies to every connection on this Windows client.")),
+            Row(L("Appearance"), L("Applies immediately to Waybridge and supported remote apps."), theme),
+            Row(L("Display language"), L("Applies immediately"), language),
+            Row(L("Minimize to tray on close"), L("Turn this off to exit the client when closing the window. The remote session stays running."), closeToTray),
+            Row(L("Search remote apps"), L("Available in the control center"), Text("Ctrl + K")),
+            Row(L("Client architecture"), "", Text(System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString())));
     }
 }

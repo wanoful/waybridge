@@ -45,7 +45,7 @@ internal sealed class CredentialStore : ISecretStore
     public void Write(Guid profile, string value)
     {
         byte[] bytes = Encoding.Unicode.GetBytes(value);
-        if (bytes.Length > 2560) throw new ArgumentException("令牌过长，无法保存在 Windows 凭据管理器");
+        if (bytes.Length > 2560) throw new ArgumentException(Tr("The token is too long for Windows Credential Manager"));
         IntPtr pointer = Marshal.AllocHGlobal(bytes.Length);
         try
         {
@@ -129,8 +129,8 @@ internal sealed class TrayIcon : IDisposable
         if (hwnd == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
         data = new NotifyData { Size = (uint)Marshal.SizeOf<NotifyData>(), Window = hwnd, Id = 1,
             Flags = 1 | 2 | 4, Message = Callback, Icon = LoadImageW(IntPtr.Zero, Path.Combine(AppContext.BaseDirectory, "Assets", "waybridge.ico"), 1, 0, 0, 0x10 | 0x40),
-            Tip = "Waybridge · 未连接", Info = "", InfoTitle = "" };
-        if (!Shell_NotifyIconW(0, ref data)) throw new IOException("无法创建系统托盘图标");
+            Tip = Tr("Waybridge · Disconnected"), Info = "", InfoTitle = "" };
+        if (!Shell_NotifyIconW(0, ref data)) throw new IOException(Tr("Could not create the system tray icon"));
     }
     public static void ShowExisting()
     {
@@ -158,13 +158,13 @@ internal sealed class TrayIcon : IDisposable
         }
         finally { Marshal.FreeHGlobal(buffer); }
     }
-    public static void ShowLinkError(string message) => MessageBoxW(IntPtr.Zero, message, "Waybridge 应用链接", 0x30);
+    public static void ShowLinkError(string message) => MessageBoxW(IntPtr.Zero, message, Tr("Waybridge app link"), 0x30);
     public static bool ConfirmLinkSwitch(string current, string target) =>
-        MessageBoxW(IntPtr.Zero, $"要切换到「{target}」来启动此应用吗？\n\n「{current}」会断开查看，远端应用会保留。",
-            "切换 Waybridge 工作站", 0x10124) == 6; // Yes/No, with No as the default.
+        MessageBoxW(IntPtr.Zero, Tr("Switch to “{0}” to launch this app?\n\nThis disconnects from “{1}” and leaves its apps running.", target, current),
+            Tr("Switch Waybridge workstation"), 0x10124) == 6; // Yes/No, with No as the default.
     public void Update(bool value)
     {
-        connected = value; data.Tip = value ? "Waybridge · 已连接" : "Waybridge · 未连接";
+        connected = value; data.Tip = value ? Tr("Waybridge · Connected") : Tr("Waybridge · Disconnected");
         Shell_NotifyIconW(1, ref data);
     }
     private IntPtr Procedure(IntPtr window, uint message, IntPtr wp, IntPtr lp)
@@ -193,12 +193,12 @@ internal sealed class TrayIcon : IDisposable
                 var menu = CreatePopupMenu();
                 try
                 {
-                    AppendMenuW(menu, 0, 1, "打开控制中心");
-                    AppendMenuW(menu, 0, 2, connected ? "断开连接（保留应用）" : "连接");
-                    AppendMenuW(menu, 0, 3, "切换静音");
-                    AppendMenuW(menu, 0, 4, "诊断");
+                    AppendMenuW(menu, 0, 1, Tr("Open control center"));
+                    AppendMenuW(menu, 0, 2, connected ? Tr("Disconnect (keep apps running)") : Tr("Connect"));
+                    AppendMenuW(menu, 0, 3, Tr("Toggle mute"));
+                    AppendMenuW(menu, 0, 4, Tr("Diagnostics"));
                     AppendMenuW(menu, 0x800, 0, "");
-                    AppendMenuW(menu, 0, 5, "退出客户端");
+                    AppendMenuW(menu, 0, 5, Tr("Exit client"));
                     GetCursorPos(out var point); SetForegroundWindow(window);
                     uint choice = TrackPopupMenu(menu, 0x100 | 2, point.X, point.Y, 0, window, IntPtr.Zero);
                     if (choice is >= 1 and <= 5) action(new[] { "", "show", "connect", "mute", "diagnostics", "quit" }[choice]);

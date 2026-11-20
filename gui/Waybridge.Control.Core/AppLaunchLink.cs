@@ -18,7 +18,7 @@ public sealed record AppLaunchLink
     public static AppLaunchLink Create(Guid profileId, string appId)
     {
         if (profileId == Guid.Empty || !IsAppId(appId))
-            throw new ArgumentException("应用链接需要有效的工作站和桌面应用 ID");
+            throw new ArgumentException(Tr("An app link requires a valid workstation and desktop app ID"));
         return new(profileId, appId);
     }
 

@@ -417,7 +417,7 @@ inline void performUpload(UploadRequest request) {
       std::lock_guard<std::mutex> lock(uploadsMutex);
       uploads.emplace(batch, job);
     }
-    TransferActivity::begin("upload", batch, "文件", 0);
+    TransferActivity::begin("upload", batch, "", 0);
     auto source = request.open ? request.open() : std::make_unique<FileInput>(request.paths);
     parse(metadata(source->entries));
     require(valid(), "Tree upload superseded");
