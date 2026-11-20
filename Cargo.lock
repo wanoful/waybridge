@@ -1848,6 +1848,7 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 [[package]]
 name = "smithay"
 version = "0.7.0"
+source = "git+https://github.com/wanoful/waybridge-smithay.git?rev=7a43d67f26b9c738f8cd0c44a09b7b805426bbc7#7a43d67f26b9c738f8cd0c44a09b7b805426bbc7"
 dependencies = [
  "appendlist",
  "atomic_float",

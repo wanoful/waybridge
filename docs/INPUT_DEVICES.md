@@ -240,10 +240,10 @@ feedback and boolean validation. A local relay removes only the new server's
 live-setting capability to verify the old-server warning and absence of an
 unsupported toggle; it does not change system networking.
 
-The protocol fixture exposed and fixes a vendored Smithay cancellation bug:
-contacts whose last frame was already delivered were skipped by cancel. The
-generic touch implementation now cancels active focus regardless of pending
-frame state and clears retired slots; the protocol regression covers this case.
+The protocol fixture found a Smithay touch cancellation bug that skipped
+contacts after their last frame was delivered. The Smithay fork cancels active
+focus regardless of pending frame state and clears retired slots. The protocol
+regression covers this case.
 
 The protocol fixture uses actual independent Wayland surfaces and real
 `wl_touch` resources, not mocked event callbacks. The standalone PE probe runs the

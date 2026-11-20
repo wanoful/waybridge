@@ -16,10 +16,10 @@ compositor cycle. Callbacks never re-enter the locked pointer grab. The common
 coordinator in `src/data_drop.rs` owns external payload snapshots, target
 revisions and source-export leases. The Windows wire protocol is unchanged.
 
-The protocol adapters live in vendored Smithay: `input/dnd` defines Source,
-DndFocus and OfferData; Wayland data-device and XWM implement these contracts.
-This is a selective upstream backport, pinned and documented in
-[PATCHES.md](../vendor/smithay/PATCHES.md), rather than a complete Smithay upgrade.
+The protocol adapters live in the Smithay fork. The `input/dnd` module defines
+Source, DndFocus, and OfferData. The Wayland data-device and XWM implement
+these contracts. The fork backports this code onto Smithay v0.7.0.
+[Smithay patch series](https://github.com/wanoful/waybridge-smithay/blob/waybridge-0.7.0-1/PATCHES.md)
 The old COPY-only production worker was removed. Its implementation is retained
 only as the independent `tests/fixtures/xdnd_peer.rs` conformance peer; results
 from that peer alone do not establish production compositor coverage.

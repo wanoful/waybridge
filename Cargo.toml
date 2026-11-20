@@ -18,7 +18,7 @@ percent-encoding = "2"
 ring = "0.17.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "desktop", "backend_egl", "renderer_gl", "backend_drm", "xwayland"] }
+smithay = { version = "=0.7.0", default-features = false, features = ["wayland_frontend", "desktop", "backend_egl", "renderer_gl", "backend_drm", "xwayland"] }
 tempfile = "3"
 wayland-client = "0.31"
 tracing = "0.1"
@@ -32,11 +32,10 @@ lto = "thin"
 
 [workspace]
 members = ["native", "service", "config"]
-exclude = ["vendor/smithay"]
 resolver = "2"
 
 [patch.crates-io]
-smithay = { path = "vendor/smithay" }
+smithay = { git = "https://github.com/wanoful/waybridge-smithay.git", rev = "7a43d67f26b9c738f8cd0c44a09b7b805426bbc7" }
 
 [[example]]
 name = "xdnd-source-probe"

@@ -37,7 +37,6 @@ waybridge/
 ├── assets/       # Brand vector/raster icon assets
 ├── scripts/      # Build, cross-compile, packaging, session control, and test scripts
 ├── tests/        # Automated Linux, Wine/Xvfb, and opt-in physical Windows verification suites
-├── vendor/       # Vendored Smithay 0.7.0 with documented Waybridge patches (see vendor/smithay/PATCHES.md)
 └── docs/         # Architecture, protocol, configuration, feature, and validation documentation
 ```
 
@@ -125,8 +124,9 @@ For full M0/M1 Wine regressions, GPU/HDR benchmarks, and targeted smoke tests, s
 - [Microphone Forwarding](docs/MICROPHONE.md) — WASAPI capture → Linux PulseAudio/PipeWire-Pulse virtual source
 
 ### Patches
-- [Smithay Local Patches](vendor/smithay/PATCHES.md) — Documented patches applied to vendored Smithay 0.7.0
+
+The Smithay fork starts from upstream v0.7.0. Cargo pins the exact revision in `Cargo.toml` and `Cargo.lock`. Revisions used by Waybridge are tagged in the fork. To update the dependency, verify the replacement with Waybridge's compositor and input tests before changing the pin. [Smithay patch series](https://github.com/wanoful/waybridge-smithay/blob/waybridge-0.7.0-1/PATCHES.md)
 
 ## License
 
-Waybridge is licensed under the [MIT License](LICENSE). Third-party licenses for vendored Smithay ([`vendor/smithay/LICENSE.txt`](vendor/smithay/LICENSE.txt)) and `nlohmann/json` ([`client/third_party/json.LICENSE.MIT`](client/third_party/json.LICENSE.MIT)) are retained in their respective directories.
+Waybridge is licensed under the [MIT License](LICENSE). Third-party licenses are available for [Smithay](https://github.com/wanoful/waybridge-smithay/blob/waybridge-0.7.0-1/LICENSE.txt) and [nlohmann/json](client/third_party/json.LICENSE.MIT).
