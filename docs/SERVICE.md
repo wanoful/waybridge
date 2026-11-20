@@ -195,7 +195,7 @@ Run `waybridge-service tui` as the Linux user who owns the service. Use a local 
 | `Enter`, `s`, `y` in settings | Edit, validate and preview the change, then confirm saving. Use `Ctrl+S` to finish a multiline draft |
 | `q` or `Ctrl+C` | Leave the terminal interface |
 
-The main editor covers `[service]`, `[session]`, `[limits]`, and `[media_budget]`. The save preview reports when changes take effect. Restarting the service is a separate action. Application overrides use the [Waybridge TOML grammar](CONFIGURATION.md#waybridge-专用-desktop-覆写) with a launch-plan preview before saving. Desktop components expose the Waybridge Portal preferences and the optional notification provider user unit.
+The main editor covers `[service]`, `[session]`, `[limits]`, and `[media_budget]`. The save preview reports when changes take effect. Restarting the service is a separate action. Application overrides use the [Waybridge TOML grammar](CONFIGURATION.md#waybridge-specific-desktop-overrides) with a launch-plan preview before saving. Desktop components expose the Waybridge Portal preferences and the optional notification provider user unit.
 
 ## Smoke test
 

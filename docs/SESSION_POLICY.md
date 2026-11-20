@@ -1,31 +1,31 @@
-# 会话与用户数据策略
+# Session and User Data Policy
 
-决策日期：2026-11-14。本文件取代 M1 最初的多桌面并行、私有钱包和浏览器 profile 默认隔离方案。
+Decision date: 2026-11-14. This document supersedes the initial M1 design that defaulted to multi-desktop parallel sessions, private wallets, and isolated browser profiles.
 
-配置归属、标准桌面集成边界和 Waybridge 专用 `.desktop` 追加/覆写见 [CONFIGURATION_POLICY.md](CONFIGURATION_POLICY.md)。实际操作见 [配置](CONFIGURATION.md) 与 [桌面组件](INTEGRATION.md)。
+For configuration ownership, standard desktop integration boundaries, and Waybridge-specific `.desktop` appends/overrides, see [CONFIGURATION_POLICY.md](CONFIGURATION_POLICY.md). For operational instructions, see [Configuration and Application Launching](CONFIGURATION.md) and [Desktop Components](INTEGRATION.md).
 
-## 已确认的行为
+## Confirmed Behavior
 
-- 默认共享 Linux 用户的 HOME、应用配置、缓存和数据，包括 Chrome profile 与 KWallet。Waybridge 不自动复制、迁移或重写旧隔离数据，也不强制指定浏览器密码后端；显式传入的应用参数保持有效。
-- 同一用户仅支持一个 Waybridge 图形会话。创建前查询 logind：同一 UID 已有活跃或后台的 Wayland/X11 用户会话时拒绝创建，并提示先注销。锁屏不等于注销；登录界面、SSH、TTY、用户服务管理器和其他用户不阻止创建。
-- 已有 Waybridge 会话优先重连；查看端断开及连接服务重启不结束会话。再次请求新会话时提示先结束现有会话。直接启动合成器也执行检查，并用运行期锁避免多个 Waybridge 同时创建。
-- Waybridge 启动后再通过其他 DM 登录，交由该 DM 处理。不增加 PAM 登录拦截、不实现双向互斥，也不持续监控并终止后来出现的桌面。
-- Waybridge 负责自己的图形、输入、音频节点和临时资源；普通用户服务与应用数据锁遵循系统和应用原有机制，不扫描或强杀该用户的其他后台进程。
+- By default, Waybridge shares the Linux user's `HOME`, application configurations, caches, and data—including Chrome profiles and KWallet. Waybridge does not automatically copy, migrate, or overwrite legacy isolated data, nor does it force a browser password backend; explicitly passed application arguments remain effective.
+- Only one Waybridge graphical session is supported per user. Before creating a session, Waybridge queries `logind`: if the same UID already has an active or background Wayland/X11 user session, creation is rejected with a prompt to log out first. Locking the screen does not count as logging out; login greeters, SSH, TTYs, user service managers, and other users do not block session creation.
+- Reconnecting to an existing Waybridge session takes precedence; viewer disconnects and connection-service restarts do not terminate the session. Requesting a second new session prompts the user to end the existing session first. Direct compositor startup runs the same check and uses a runtime lock to prevent concurrent Waybridge session creation.
+- Logging in via another display manager (DM) after Waybridge has started is left to that DM. Waybridge does not add PAM login hooks, does not implement bidirectional mutual exclusion, and does not continuously monitor or terminate desktops started later.
+- Waybridge manages its own graphics, input, audio nodes, and temporary resources. Ordinary user services and application data locks follow standard system and application mechanisms; Waybridge does not scan for or force-kill other background processes belonging to the same user.
 
-## 服务边界
+## Service Boundaries
 
-使用标准用户 D-Bus 与用户原有密钥服务，更新本会话的服务激活显示环境。钱包由原服务处理解锁与授权，不做跨桌面钱包调用转发，不另起使用同一钱包文件的私有存储后端。
+Waybridge uses the standard user D-Bus session bus and the user's existing keyring/secret service, updating the service activation display environment for the active session. The native wallet service handles unlocking and authorization; Waybridge does not forward wallet calls across desktops or launch a private storage backend backed by the same wallet files.
 
-组件选择由用户或可选集成配置决定；Waybridge 提供可靠会话入口和标准生命周期接入，不建立按钱包或应用名称自动修复行为的核心兼容层。用户可通过标准配置或 Waybridge 专用 desktop 覆写显式定制启动行为，原始应用文件保持不变。
+Component selection is controlled by the user or optional integration configs. Waybridge provides a reliable session entry point and standard lifecycle integration without building a core compatibility layer that patches behavior by wallet or application name. Users can explicitly customize launch behavior through standard configs or Waybridge-specific desktop overrides while leaving original application files untouched.
 
-Portal 通过静态原生配置选择适合 Waybridge 的后端，保留用户配置与持久数据；Waybridge 未实现的 ScreenCast 等能力仍不宣称支持。已有常驻服务沿用自身生命周期，不以进程名清理。会话结束先停止明确归属的服务，再撤销仍属于本会话的环境；不恢复失效旧显示，不覆盖后登录桌面的环境。D-Bus daemon 无删除变量接口的限制在诊断与集成文档中明确记录。
+Portals select backends suitable for Waybridge via static native configuration while preserving user configs and persistent data; unimplemented capabilities such as ScreenCast are still not advertised as supported. Existing long-lived services follow their own lifecycles and are not killed by process name. On session shutdown, Waybridge first stops services explicitly bound to the session, then revokes activation environment variables still owned by the session; it does not restore stale displays or overwrite the environment of a desktop started later. The limitation that `dbus-daemon` lacks an unset-variable API is explicitly documented in diagnostics and integration docs.
 
-## 兼容与验证
+## Compatibility and Verification
 
-logind 查询失败时报告无法检查，而不是猜测没有桌面。无需新增特权登录代理；Waybridge 自己的会话以现有描述文件和运行期锁管理，本次不增加 PAM/logind 会话注册入口。
+If the `logind` query fails, Waybridge reports that the check could not be performed rather than assuming no desktop is running. No privileged login daemon is required; Waybridge manages its own sessions via existing descriptor files and runtime locks, without adding a PAM/`logind` session registration entry point.
 
-默认数据共享不保证应用支持同时打开同一数据目录。用户已接受 Chrome 轮流使用；应用自身仍报告占用时正常呈现其错误，不绕过锁。Chrome 的密码后端另由 Chromium 按桌面身份选择；Waybridge 不伪装 KDE/GNOME。如果原数据使用 KWallet 6，应在应用命令或用户浏览器 flags 中显式保留 `--password-store=kwallet6`；共享目录本身不转换密码后端。
+Default data sharing does not guarantee that an application supports opening the same data directory concurrently. Users accept alternating between local desktop and Waybridge sessions for applications like Chrome; if an application reports a data lock conflict, Waybridge surfaces its error normally instead of bypassing locks. Chromium selects its password backend based on desktop identity, and Waybridge does not spoof KDE or GNOME. If existing data uses KWallet 6, explicitly keep `--password-store=kwallet6` in the launch command or browser flags; sharing a directory does not convert password storage backends.
 
-旧版本的 `~/.local/share/waybridge/sessions/*/browser-profiles` 和 `wallet` 目录原样保留，用户可显式指定旧 Chrome 目录。钱包迁移需使用原生工具另行安排，禁止自动合并钱包文件。
+Legacy `~/.local/share/waybridge/sessions/*/browser-profiles` and `wallet` directories are left untouched so users can explicitly reference old Chrome directories if desired. Any wallet migration must be handled separately with native tools; automatic merging of wallet files is forbidden.
 
-测试用临时用户总线、临时 XDG 数据和模拟 logind，不访问真实钱包，不修改当前桌面的用户服务环境。历史 M0/M1 验证仅证明当时的隔离实现，不能当作本策略的验证结果。
+Automated tests use temporary user buses, temporary XDG directories, and simulated `logind` state so they never access real wallets or modify the active desktop's user service environment. Historical M0/M1 verification proves only the earlier isolated implementation and does not substitute for validating this policy.

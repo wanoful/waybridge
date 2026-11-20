@@ -22,12 +22,11 @@ The Windows viewer and the running Linux compositor both negotiate
 compositor session starts. A connection to an existing older session can still
 receive Windows mouse-style scroll and zoom events.
 
-Run the Wayland and Windows fixtures with a current checkout.
+Run the Wayland fixture with a current checkout:
 
 ```sh
 cargo build --locked -p waybridge --bin waybridge
 python3 tests/session_fixture.py python3 tests/touchpad_smoke.py
-python3 tests/windows_touchpad_laptop.py --host laptop --exercise
 ```
 
 The Wayland fixture covers finger-source axis and stop, native pinch, and

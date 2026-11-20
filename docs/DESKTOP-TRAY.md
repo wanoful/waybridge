@@ -3,15 +3,15 @@
 The adapter follows the [StatusNotifierWatcher specification](https://specifications.freedesktop.org/status-notifier-item/latest/status-notifier-watcher.html) and the common KDE SNI/DBusMenu interfaces.
 
 Waybridge presents Linux StatusNotifierItem applications as independent native
-Windows notification-area icons. The control center's “远端应用 → 后台应用” list
+Windows notification-area icons. The control center's **Running → Background apps** list
 keeps the same entries accessible when an application has closed its main
-window, or Windows has put its tray icon in the overflow area. “打开／恢复” invokes
-the application's activation method (or its menu for ItemIsMenu entries); “应用菜单” contains its own normal exit
+window, or Windows has put its tray icon in the overflow area. **Open / Restore** invokes
+the application's activation method (or its menu for ItemIsMenu entries); **App menu** contains its own normal exit
 operation where provided. No application name/PID search or forced termination
 is involved.
 
 `ClientSettings.Tray` defaults to true and is persisted as `tray` in a connection's
-settings. The “远端应用托盘” switch controls local icon/background-entry visibility
+settings. The **Remote application trays** switch controls local icon/background-entry visibility
 and actions, with live apply support. Read-only mode keeps entries visible while
 blocking their input on both ends. Disconnect removes all of this worker's Shell
 icons. Each application icon uses the same owned `NativeIcon` and configured
@@ -85,19 +85,12 @@ Restore through the native mnemonic path, and verifies emitted menu identities,
 read-only/visibility settings and cleanup. It executes the Explorer re-add/DPI
 paths but does not claim Wine is a Windows Explorer acceptance test.
 
-`python3 tests/windows_tray_laptop.py --host laptop` is an opt-in native Windows
-probe using a unique temporary executable/report and a Limited interactive
-scheduled task. It opens only its own window/menu/tray entry, exits automatically,
-and removes its task/files. It never replaces a deployed Waybridge binary or
-closes another application's windows. The native x64 `laptop` run passed: Explorer accepted the independent tray icon
-(`Shell_NotifyIconGetRect` succeeded), real HMENU hierarchy/check/radio/disabled
-states matched, a keyboard mnemonic dispatched the expected application menu
-identity, and read-only/hide/cleanup checks passed. The task returned exit code
-0; its temporary executable/report and task were removed. A duplicate
-TaskbarCreated broadcast repairs existing IDs using NIM_MODIFY if NIM_ADD finds
-the icon already present. This exercises recovery logic without restarting the
-user's actual Explorer. ARM64 was cross-compiled; this x64 device does not execute
-ARM64 binaries.
+Physical Windows 11 x64 verification additionally confirmed that Explorer accepts
+the independent tray icon (`Shell_NotifyIconGetRect` succeeded), HMENU
+hierarchy/check/radio/disabled states matched, keyboard mnemonics dispatched the
+expected application menu identity, read-only/hide/cleanup checks passed, and a
+duplicate `TaskbarCreated` broadcast repairs existing IDs via `NIM_MODIFY` when
+`NIM_ADD` finds the icon already present.
 
 ## Click and menu action repair — 2026-11-16
 
@@ -132,12 +125,6 @@ activations (visible then hidden); `--single-left` separately reproduces menu
 selection with no QAction execution. The repaired client passes both paths.
 This test builds its Qt and Win32 driver fixtures; it requires the compositor
 and `build/windows/waybridge-client.exe` to have been built first.
-
-`python3 tests/windows_tray_shell_events_laptop.py --host laptop` is an opt-in
-physical-input capture against a unique temporary icon/task. It waits for an
-auto-hidden taskbar/overflow and targets only rectangles returned for that icon,
-rejects non-tray roots (including a locked desktop), restores the mouse and
-removes its icon/task/files. It is deliberately separate from unattended tests.
 
 Tray actions now use the shared `activation_v1` user-intent mechanism. The native
 side prepares a fresh intent at activation or after menu selection; the Linux

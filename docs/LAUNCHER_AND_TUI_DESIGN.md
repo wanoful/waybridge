@@ -1,41 +1,41 @@
-# Waybridge Client Launcher 与 Server TUI 重构设计规格
+# Waybridge Client Launcher and Server TUI Design Specification
 
-当前实现包括 WinUI 主启动器、八类客户端设置、TLS 单连接路径和 Linux 管理 TUI。主启动器具备全局栏、应用墙、应用菜单、应用链接、Windows 快捷方式和 TLS 批量图标。原型阶段可同步更新两端，使用新版时可重新添加设备并配对。Avalonia 迁移和粘贴配对口令按后续阶段推进。
+Current implementation includes the WinUI main launcher, eight client settings categories, the single TLS connection path, and the Linux management TUI. The main launcher features the global bar, app wall, app menus, app links, Windows shortcuts, and TLS batch app icons. During the prototype phase both ends can be updated together, and users can re-add and re-pair workstations when adopting the new version. Avalonia migration and pasteable pairing URIs are staged for subsequent iterations.
 
-## 1. 目标与核心决策
+## 1. Goals and Core Decisions
 
-本次重构旨在改善 Waybridge 日常连接、应用启动与服务端管理的操作直觉与视觉体验，同时消除 WinUI 3 无 XAML 交叉编译的复杂构建链路。
+This redesign improves everyday connection, application launching, and server administration ergonomics while eliminating the complex XAML-less WinUI 3 cross-compilation pipeline.
 
-| 决策项 | 选型与边界 |
+| Decision | Choice and Boundary |
 |---|---|
-| Client UI 技术栈 | 优先验证 **Avalonia UI（.NET 10 + FluentAvalonia）**，通过便携包与系统集成验收后再替换 WinUI 3 与 Windows App SDK |
-| Client 构建方式 | 保持在 Linux 上交叉发布 `win-x64` 与 `win-arm64` 便携包。迁移验收后清理原有 PRI 提取与 manifest 拼接脚本 |
-| Client 核心复用 | 复用 `Waybridge.Control.Core`、Windows 凭据管理器和系统托盘，按新版连接流程更新回归测试 |
-| Client 连接方式 | 仅通过认证加密的 Waybridge TLS 接入 Linux 用户服务。移除内置 SSH 和原始会话隧道模式 |
-| Client 形态 | **应用墙与系统快捷方式**：控制中心管理远端应用，`waybridge://` 链接和 Windows 开始菜单、桌面快捷方式直接启动 |
-| 图标与目录 | 扩展 `applications` 元数据，新增 `app_icons` 批量 PNG 接口，控制中心缓存并显示应用原图 |
-| 配对体验 | 首版沿用一次性配对码与完整带外指纹核对，后续支持粘贴可信来源的 `wbpair://` 口令 |
-| Server 管理界面 | **`waybridge-service tui`**（Rust `ratatui` + `crossterm`），支持在线/离线双态运行 |
+| Client UI stack | Validate **Avalonia UI (.NET 10 + FluentAvalonia)** first; replace WinUI 3 and the Windows App SDK only after portable packaging and OS integration pass verification |
+| Client build | Keep Linux cross-publishing of portable `win-x64` and `win-arm64` bundles; remove legacy PRI extraction and manifest-merging scripts after migration sign-off |
+| Client core reuse | Reuse `Waybridge.Control.Core`, Windows Credential Manager, and system tray; update regressions for the streamlined connection flow |
+| Client transport | Connect to the Linux user service exclusively over authenticated, encrypted Waybridge TLS; retire embedded SSH and raw tunnel modes |
+| Client form factor | **App wall + OS shortcuts**: Control Center manages remote apps, while `waybridge://` links and Windows Start Menu / Desktop shortcuts launch directly |
+| Catalog & icons | Extend `applications` metadata and add an `app_icons` batch PNG endpoint so the Control Center caches and renders original app icons |
+| Pairing UX | Keep one-time pairing codes with full out-of-band fingerprint verification first; add pasteable `wbpair://` URIs from trusted channels later |
+| Server admin UI | **`waybridge-service tui`** (Rust `ratatui` + `crossterm`) supporting both online and offline modes |
 
 ---
 
-## 2. 实现边界与验收基线
+## 2. Implementation Boundaries and Acceptance Baseline
 
-首批实现验证以下分工和用户流程。
+The initial implementation preserves the following separation of responsibilities and verification contracts:
 
-1. **媒体与控制职责边界**（[ARCHITECTURE.md](ARCHITECTURE.md)）：视频解码、DirectComposition、远端窗口、IME、音频和 OLE 继续留在 C++ 原生内核 `waybridge-client.exe`；C# 仅通过当前用户专用 named pipe 收发控制/状态 JSON，不转发媒体字节。
-2. **原生引擎 named pipe 协议**（[client/main.cpp](../client/main.cpp)、[EngineChannel.cs](../gui/Waybridge.Control.Core/EngineChannel.cs)）负责连接生命周期、窗口激活、文件传输、托盘、通知、设置与诊断。协议字段可以随 GUI 和 worker 一起更新。
-3. **配置与凭据**（[Profiles.cs](../gui/Waybridge.Control.Core/Profiles.cs)）采用仅含 TLS 连接和客户端偏好的配置结构。使用新版时可重新添加设备并配对。持久凭据存入 Windows 凭据管理器，诊断内容与配置 JSON 排除令牌及配对码。
-4. **Core 与服务测试**覆盖 `Waybridge.Control.Tests`、`tests/gui_direct_smoke.py` 和 `service/tests/direct_service_smoke.py` 的新版直连流程。随旧连接模式退役专用 SSH Agent 和 `tests/gui_ssh_smoke.py`。
-5. **UI 自动化**（[Probe.cs](../gui/Waybridge.GuiFocus.Probe/Probe.cs)）随新版界面更新。覆盖触控、手写笔和手柄，验证离线保存与实际应用状态可区分，以及保存设置不会意外建立连接。
+1. **Media vs. control boundary** ([ARCHITECTURE.md](ARCHITECTURE.md)): Video decoding, DirectComposition, remote windows, IME, audio, and OLE remain in the native C++ worker `waybridge-client.exe`. C# communicates only control/status JSON over a current-user private named pipe and never relays media bytes.
+2. **Native engine named-pipe protocol** ([client/main.cpp](../client/main.cpp), [EngineChannel.cs](../gui/Waybridge.Control.Core/EngineChannel.cs)) governs connection lifecycle, window activation, file transfers, trays, notifications, settings, and diagnostics. Protocol fields evolve in lockstep with the GUI and worker.
+3. **Profiles and credentials** ([Profiles.cs](../gui/Waybridge.Control.Core/Profiles.cs)) store only TLS connection data and client preferences. Persistent client tokens remain in Windows Credential Manager; diagnostics and profile JSON exclude tokens and pairing codes.
+4. **Core and service tests** cover the direct TLS flow in `Waybridge.Control.Tests`, `tests/gui_direct_smoke.py`, and `service/tests/direct_service_smoke.py`. Legacy SSH-specific agent code and `tests/gui_ssh_smoke.py` retire alongside the old connection modes.
+5. **UI automation** tracks the new layout, covering touch, pen, and gamepads, verifying that offline saved preferences and live applied states remain distinguishable and that saving settings never opens an unintended connection.
 
 ---
 
-## 3. 跨端协议与服务端扩展
+## 3. Cross-Platform Protocol and Server Extensions
 
-### 3.1 扩展 `op: "applications"` 目录元数据
+### 3.1 Extended `op: "applications"` Catalog Metadata
 
-修改 [scripts/session-control.py](../scripts/session-control.py) 的 `app_catalog()`，在保留既有字段 `id`、`name`、`icon`（以及内部使用的 `path`）的基础上，补充解析 `[Desktop Entry]` 中的标准轻量字段：
+Extend `app_catalog()` in [scripts/session-control.py](../scripts/session-control.py) to retain `id`, `name`, `icon` (and internal `path`) while parsing lightweight standard `[Desktop Entry]` fields:
 
 ```json
 {
@@ -53,16 +53,16 @@
 }
 ```
 
-约束：
-* 每个字符串字段需做长度截断（例如 `name`/`generic_name` ≤ 256，`comment` ≤ 512，`categories`/`keywords`/`actions` ≤ 32 项），继续受 `.desktop` 单文件 `65536` 字节与最多 `1024` 个应用的上限保护。
-* 目录接口仅返回展示和启动所需的公开元数据，`Exec`、环境变量及文件系统路径留在服务端。
-* `actions` 列表直接复用 `session-control.py` 已支持的 `{"op": "launch", "app": "<id>", "action": "<action_id>"}` 契约。
+Constraints:
+* Bound every string field (e.g., `name`/`generic_name` ≤ 256, `comment` ≤ 512, `categories`/`keywords`/`actions` ≤ 32 entries) while keeping the existing 65,536-byte per-`.desktop` cap and 1,024-application catalog cap.
+* Expose only public display and launch metadata; keep `Exec`, environment variables, and filesystem paths on the server.
+* `actions` directly reuses `session-control.py`'s existing `{"op": "launch", "app": "<id>", "action": "<action_id>"}` contract.
 
-### 3.2 新增 `op: "app_icons"` 批量图标接口
+### 3.2 Batch `op: "app_icons"` Endpoint
 
-当前窗口图标由 Linux 合成器在运行时经 [src/app_icon.rs](../src/app_icon.rs) 解析，而未启动的应用目录缺少实际位图。Launcher 通过认证后的 TLS 管理接口获取这些图标，独立于串流会话状态。
+Runtime window icons are resolved by the Linux compositor via [src/app_icon.rs](../src/app_icon.rs), whereas unlaunched catalog entries lacked bitmaps. The launcher fetches them over the authenticated TLS management interface independently of active streaming sessions.
 
-* **TLS 管理请求**
+* **TLS management request**:
   ```json
   {
     "id": 10,
@@ -70,7 +70,7 @@
     "apps": ["google-chrome.desktop", "blender.desktop"]
   }
   ```
-* **响应格式**：
+* **Response**:
   ```json
   {
     "icons": {
@@ -83,134 +83,133 @@
     "omitted": []
   }
   ```
-* **尺寸与安全预算**：
-  * 复用 [src/app_icon.rs](../src/app_icon.rs) 的 `Resolver`、常规文件检查、`rsvg-convert` 子进程 `rlimit` 隔离以及 `128x128`（`EDGE = 128`、`MAX_PNG = 96 * 1024`）缩放规范。建议将纯无头图标解析逻辑抽为共享 workspace crate（或提供 `waybridge --resolve-app-icons` 命令行工具，供 `waybridge-service` 与 `session-control.py` 共用），避免在 Python 中重复实现 XDG 图标主题扫描。
-  * 单次请求最多接受 24 个应用。按 Base64 和响应封装在内的最终 JSON 行大小分页，确保满足 TLS 管理接口的 4 MiB 限额。剩余项放入 `omitted`，由客户端分批拉取。
-  * 仅解析桌面目录中实际存在的受信任应用图标名/绝对图标路径，禁止接受任意路径穿越。
+* **Size and security budgets**:
+  * Reuse [src/app_icon.rs](../src/app_icon.rs)'s `Resolver`, regular-file validation, `rlimit`-isolated `rsvg-convert` subprocess, and `128×128` (`EDGE = 128`, `MAX_PNG = 96 * 1024`) normalization (via a shared crate or `waybridge --resolve-app-icons` CLI helper rather than duplicating XDG icon-theme scanning in Python).
+  * Accept at most 24 apps per request and paginate by final JSON line size (including Base64 and framing) so responses stay within the 4 MiB TLS management line limit; return remaining IDs in `omitted` for subsequent batches.
+  * Resolve only icon names or absolute icon paths belonging to trusted catalog entries—never allow arbitrary path traversal.
 
-### 3.3 简化配对体验与安全边界
+### 3.3 Streamlined Pairing UX and Security Boundary
 
-保持 [SERVICE.md](SERVICE.md) 的核心安全原则：**绝不自动信任来自同一未信网络响应的证书指纹**，必须保留人类或带外通道核对。
+Preserve the core security invariant from [SERVICE.md](SERVICE.md): **never auto-trust a certificate fingerprint received solely over an untrusted network response**; human or out-of-band verification remains mandatory.
 
-1. **首版使用现有配对机制。** `waybridge-service pair` 生成一次性、限时配对码，输出完整证书指纹与监听信息。失败请求没有可验证的配对码归属，失败限流另行设计。
-2. **地址、指纹、配对码按步骤录入。** 用户从可信来源复制完整的 64 个十六进制字符的 SHA-256 指纹。若提供 IP 探测，展示 TLS 握手实际看到的叶证书指纹供比对。分组用于可读性，确认时核对完整指纹。客户端持该指纹建立固定证书的 TLS 连接后才发送配对码，并把 `client_token` 存入 Windows 凭据管理器。
-3. **后续支持粘贴配对口令。** TUI 可用可达主机地址生成 `wbpair://v1?host=<host>&port=<port>&fp=<certificate_sha256>&code=<code>`。向导把可信渠道传来的口令解析为地址、完整指纹和配对码，先显示目标并由用户确认，再进行同样的固定证书校验。配对口令含一次性秘密，只用于本次配对。
-
----
-
-## 四、Server 管理界面：`waybridge-service tui`
-
-### 4.1 运行架构与双态边界
-
-在 [service/](../service) 中新增 `waybridge-service tui` 子命令（基于 Rust `ratatui` + `crossterm`），适配本地 Linux TTY 与系统 SSH 终端。只通 SSH 的网络可由系统 SSH 转发 Waybridge 的 TLS 入口，Windows 端按同一套直连方式配对和连接。UDP 媒体仍需要独立可达。
-
-* **在线态（`waybridge-service serve` 正在运行）**：
-  * 避免直接读写 `trust.json` 与 `service.lock`（[service/src/main.rs#L151](../service/src/main.rs#L151)）冲突，TUI 通过同 UID `0o600` 的 `$XDG_RUNTIME_DIR/waybridge-service/control.sock` 与守护进程通信。
-  * 在 `control.sock` 上扩展**仅限本地管理 socket** 的操作（绝不向公网 TLS `remote()` 暴露）：`sessions`（列举当前活跃会话）、`end_session`（安全终止指定会话）、`preflight`（环境自检）等；也可复用现有 `helper()` 执行 `applications` 与 `launch_plan`。
-* **离线态（`waybridge-service serve` 未启动）**：
-  * TUI 仍可正常进入，展示“服务未运行”状态与快捷操作（一键尝试 `systemctl --user start waybridge.service` 或显示前台运行命令），同时完整支持环境前置检查、配置编辑与 Desktop Overrides 生成。
-
-### 4.2 界面结构（4 个键盘 Tab）
-
-支持 `1–4`、`Tab`/`Shift+Tab`、方向键、`Enter`、`Esc` 全键盘操作，不依赖鼠标：
-
-1. **`[1] 总览与配对`**：
-   * 显示 `waybridge.service` / 进程运行状态、TLS 监听地址、分段证书指纹、已加载配置文件路径。
-   * **前置环境自检面板**：
-     * 调用等价于 `waybridge --check-session` 的检测，提前告知同一 UID 下是否有本地 X11/Wayland 桌面占用（需先注销才能建会话）；
-     * 检查 NVENC/CUDA 可用性、Xwayland、`pactl`/`parec`、`rsvg-convert`、`fusermount3`、Portal 配置与 `waybridge-notifications.service` 冲突状态。
-   * **配对操作区**：按快捷键（如 `p`）生成一次性配对码，显示可复制的完整证书指纹和剩余有效时间。粘贴口令随对应向导交付。
-2. **`[2] 会话与日志`**：
-   * 列表展示当前运行中的 Waybridge 会话（名称、PID、监听端口、运行时长）。
-   * 下方/右侧窗格实时 tail `$XDG_RUNTIME_DIR/waybridge-control-center/<session>.log`（支持暂停滚动、关键字过滤、上下翻页）。
-   * 选中会话支持安全结束操作（二次确认后走 `pidfd` 校验发 `SIGTERM`）。
-3. **`[3] 已信任设备`**：
-   * 列表展示 `trust.json` 中已配对设备（`label`、`client_id`、配对时间）。
-   * 支持选中设备并二次确认后调用 `revoke` 撤销信任（同时立即关闭该设备的活动 TLS 隧道）。
-4. **`[4] 设置`**：
-   * **监听与服务、会话默认值、性能与资源**覆盖 `[service]`、`[session]`、`[limits]` 和 `[media_budget]`。以服务实际加载的配置路径为准，支持 XDG 默认路径和显式 `--config`。在线态区分当前运行值、已保存值和草稿，显示内置默认值、文件或启动参数等来源。离线态显示下次启动预计值。沿用 [config/src/lib.rs](../config/src/lib.rs) 的配置校验与生效阶段报告。
-   * **检查并保存**先校验整个草稿并展示变更和生效时机，再原子保存。若原文件在编辑期间发生变化，提示重新读取。需要重启的项目提供独立的重启操作，明确连接影响。新会话配置在下次创建时生效。
-   * **应用启动**按完整 Desktop ID 编辑 Waybridge 专用覆写的默认项及具体 Desktop Action。保存前复用现有启动解析逻辑，用未保存草稿预览有效命令和 `field_sources`。没有运行会话时可基于已安装条目与选定配置做离线预览。预览标明 `DBusActivatable` 与进程覆写冲突，并显示下一次启动的预期行为。
-   * **桌面组件**管理 Waybridge 负责的 Portal 与通知等集成配置，展示实际配置来源、用户单元以及可读取的运行状态。修改写入相应的标准配置和 Waybridge 用户单元 `drop-in`，沿用 [桌面集成](INTEGRATION.md) 的归属规则。
+1. **Initial flow keeps the existing mechanism.** `waybridge-service pair` generates a short-lived one-time pairing code and prints the full certificate fingerprint and listener address. Failed requests carry no authenticated pairing-code identity; failure throttling is designed separately.
+2. **Step-by-step host, fingerprint, and code entry.** Users copy the full 64-hex-character SHA-256 fingerprint from a trusted terminal. If IP probing is offered, display the observed leaf certificate fingerprint for comparison, grouped for readability while verifying the complete hash on confirmation. The client pins that certificate for TLS before sending the pairing code and stores `client_token` in Windows Credential Manager.
+3. **Follow-up: pasteable pairing URI.** The TUI can render `wbpair://v1?host=<host>&port=<port>&fp=<certificate_sha256>&code=<code>` using a reachable host address. The wizard parses the URI from a trusted channel into address, full fingerprint, and code, displays the target for explicit confirmation, and runs the exact same pinned-certificate TLS verification. The URI carries a one-time secret valid only for that pairing attempt.
 
 ---
 
-## 五、Client 重构：UI 技术栈与双形态 Launcher
+## 4. Server Administration UI: `waybridge-service tui`
 
-### 5.1 工程结构与 WinUI 3 移除清单
+### 4.1 Runtime Architecture and Online/Offline Modes
 
-先制作最小 Avalonia 便携包。从 Linux 交叉发布 x64 与 ARM64，在 Windows 实机验证解压启动、托盘、UI 自动化、原生通知及通知动作回传。确认通知身份与激活注册方案适用于便携包后，再开始移除 WinUI 和 App SDK 打包步骤。
+Add a `waybridge-service tui` subcommand in [service/](../service) (built with Rust `ratatui` + `crossterm`) for local Linux TTYs and system SSH terminals. On SSH-only networks, system SSH can forward the TLS entry port while Windows still pairs and connects over TLS (UDP media remains independently reachable).
 
-1. **移除依赖与黑魔法**：
-   * 移除 `UseWinUI`、`WindowsPackageType`、`WindowsAppSDKSelfContained`、`Microsoft.WindowsAppSDK`、`AppxGeneratePriEnabled`、`EnablePriGenTooling`、`DISABLE_XAML_GENERATED_MAIN`、自定义 MSBuild task `WaybridgeExtractResourceIndex` 以及 `TrackCrossHostManifestTool`。
-   * 删除 [scripts/extract-runtime-resources.cs](file:///home/wano/workspace/streaming/waybridge/scripts/extract-runtime-resources.cs) 与 [scripts/merge-windows-manifest.py](file:///home/wano/workspace/streaming/waybridge/scripts/merge-windows-manifest.py)（及对应的 build 校验逻辑）；更新 [scripts/build-control-center.sh](file:///home/wano/workspace/streaming/waybridge/scripts/build-control-center.sh) 为标准 `dotnet publish -r win-$arch --self-contained true` + 拷贝 `waybridge-client.exe`、文档与许可证。
-   * [Program.cs](../gui/Waybridge.Control/Program.cs) 保留单实例 `Mutex`（`Local\Waybridge.ControlCenter`）和启动日志诊断，入口改为标准 Avalonia `AppBuilder.Configure<App>().UsePlatformDetect()`。
-2. **建议模块拆分**：
-   * `Waybridge.Control.Core/`（保持可跨平台测试）：
-     * 新增 `LauncherModels.cs` & `LauncherStore.cs`（管理 `launcher.json` 与本地图标磁盘缓存）；
-     * 新增 `PairingHelper.cs`（完整指纹输入和核对，后续加入 `wbpair://v1` 解析）；
-     * 扩展 `SessionController.cs`（暴露 `AppIconsAsync`、`LaunchPlanAsync`、`ClickToLaunchAsync` 等协调方法，并支持带 `action`/`uris`/`argv`/`cwd` 的启动）。
-   * `Waybridge.Control/`（Avalonia 桌面项目）：
-     * `Views/MainWindow.axaml(.cs)`：完整应用墙与控制中心；
-     * `Views/PairingWizardDialog.axaml(.cs)`：分步 TLS 配对；
-     * `Views/SettingsView.axaml(.cs)`：分栏设置中心；
-     * `Views/ActivityDrawer.axaml(.cs)`：文件传输活动与诊断延迟面板；
-     * `ViewModels/`：严格分离状态、命令与跨线程调度（UI Dispatcher）；
-     * `Services/DesktopNotifications.cs`：先验证通知替代方案，包括便携包应用身份、激活注册以及通知动作回到正确会话。迁移时复用现有通知协议与生命周期规则；
-     * `IconBranding.cs`：将自定义角标规范化为 64×64。原生 Windows 窗口和托盘在目标像素尺寸合成角标。
+* **Online mode (`waybridge-service serve` is running)**:
+  * To avoid conflicting writes to `trust.json` and `service.lock` ([service/src/main.rs#L151](../service/src/main.rs#L151)), the TUI communicates with the daemon over the same-UID `0o600` socket `$XDG_RUNTIME_DIR/waybridge-service/control.sock`.
+  * Extend `control.sock` with **local-only** operations (never exposed over remote TLS): `sessions` (list active sessions), `end_session` (safely terminate a session), and `preflight` (environment checks), reusing `helper()` for `applications` and `launch_plan`.
+* **Offline mode (`waybridge-service serve` is stopped)**:
+  * The TUI still launches cleanly, displays "service not running" with quick actions (attempt `systemctl --user start waybridge.service` or show the foreground command), and fully supports preflight checks, config editing, and desktop override editing.
 
-### 5.2 本地存储与缓存策略
+### 4.2 Interface Layout (4 Keyboard Tabs)
 
-TLS 连接配置、Launcher 状态和图标缓存各自持久化。
+Full keyboard navigation via `1–4`, `Tab`/`Shift+Tab`, arrow keys, `Enter`, and `Esc` with no mouse required:
 
-* **`%LOCALAPPDATA%\Waybridge\profiles.json`**：保存 TLS 地址、证书指纹、设备标识和连接偏好，按需简化 `ConnectionProfile` / `ClientSettings`。
-* **`%LOCALAPPDATA%\Waybridge\launcher.json`**：
-  * 全局偏好保存布局、选中工作站、主题和关闭到托盘。
-  * 按 `profile_id` 隔离：`pinned_apps`（有序 `desktop_id` 数组）、`recent_apps`（最近启动与时间戳，上限 32 条）、`command_history`（自定义 `argv` + `cwd` 历史，上限 20 条）、`cached_applications`（上次拉取的扩展应用目录快照）。
-* **`%LOCALAPPDATA%\Waybridge\cache\icons\`**：
-  * 原始图标缓存：`raw/<sha256>.png`，由启动器各页共享。
-
-### 5.3 主窗口（Full Launcher）布局与交互
-
-1. **顶部全局栏（Omnibar）**：
-   * 左侧：**主机切换胶囊**——显示连接状态灯（绿=已连、黄=连接中、灰=断开）、主机名与当前会话名；下拉可切换主机、一键连接/断开、打开“添加/管理主机”、或触发需二次确认的“结束远端会话”。
-   * 中间：**全局搜索框**（`Ctrl+K` / `/` 聚焦）：
-     * 普通输入实时过滤已安装应用（匹配 `name`、`generic_name`、`id`、`keywords`、`comment`）以及当前活动窗口；
-     * 输入以 `>` 开头切换为**命令运行模式**（支持自动补全历史命令、可选工作目录，回车即通过 `argv` 启动到会话）。
-   * 右侧：**快捷胶囊**——「只读模式」一键切换、「声音/音量」Flyout、「状态/延迟（RTT + 实际编解码路径）」Flyout、「文件传输」抽屉（带活动徽章）、以及「设置」入口。
-2. **启动器与运行中页面**：
-   * **运行中**由固定左侧导航进入，集中显示远端窗口和 SNI 后台应用：
-     * 活动窗口卡片显示图标 + 标题 + 编码/解码标签（如 `HEVC · GPU`），单击立即调用 `ActivateWindowAsync` 切回前台；
-     * SNI 后台应用卡片提供“恢复窗口”与“应用菜单”入口。
-   * **Pinned & Recent**：置顶与最近启动的应用网格卡片，视觉权重最高。
-   * **All Apps** 与固定和最近应用同在一个滚动区。继续向下滚动时，目录标题、刷新、布局切换和分类筛选停留在视口顶部。全部应用支持网格和紧凑列表。
-   * **应用名称**在网格和紧凑列表中均最多显示两行，超长文本在第二行末尾使用省略号，悬停可查看全名。
-   * **点击与上下文操作**：
-     * **单击卡片即启动**：已连接直接 `LaunchAsync`；未连接且选中有效已配对主机时自动触发 **Click-to-Launch**（显示轻量连接进度，不跳页打断），连接就绪后自动发射启动请求。
-     * **右键 / 悬停 `...` 菜单**：
-       * 启动；
-       * 各个 Desktop Actions（如有）；
-       * 固定到顶部 / 取消固定；
-       * 触控模式（自动选择 / 优先原生触控 / 鼠标兼容）。按连接和完整 Desktop ID 保存应用级覆写，将已确认的目录身份映射到原生内核实际使用的窗口 `app_id`。身份未知时可从运行中窗口设置，并继续使用自动触控判定作为默认行为。
-       * 自定义启动（修改/追加工作目录或参数，支持调用 `launch-plan` 预览生效方案）。
-   * **首次使用冷启动**：当本地尚无已配对/可用的主机配置时，主区域展示清晰的「添加第一台 Linux 主机」引导卡片，直接唤起配对向导。
-3. **二级视图**：
-   * **设备与配对向导**填写 TLS 地址、核对完整指纹并输入一次性配对码。后续增加从可信渠道粘贴配对口令。已配对连接的日常视图显示状态摘要和「撤销此设备配对」，证书指纹与设备标识按需查看。
-   * **设置中心**分「画面」「声音」「输入设备」「共享与权限」「网络」「连接」「桌面集成」「常规」。显示当前正在编辑的连接或全局范围，并按实际能力标注实时、重连或新建会话生效。触控、笔、手柄的总开关与本机识别、远端支持、焦点和实际转发状态直接可见。压感、死区和逐应用兼容覆盖放入高级设置。离线编辑可保存，在线应用在收到确认后显示生效结果，保留自动化探针依赖的行为。
-   * **文件传输与诊断**：文件发送按钮、接收目录快捷打开与传输记录；RTT / TCP 接收速率 / 呈现更新数 / 解码与呈现阶段耗时仪表，以及日志导出（不导出令牌、剪贴板或通知正文）。
-
-### 5.4 应用链接与系统快捷方式
-
-* 应用卡片菜单提供复制链接、添加到 Windows 开始菜单和创建桌面快捷方式。开始菜单入口放在 Waybridge 文件夹下。
-* 链接格式为 `waybridge://launch/<配对配置 UUID>/<Base64URL 编码的 UTF-8 Desktop ID>`。控制中心据此查找本机的配对配置，再按目录中的应用身份启动。
-* 已运行的控制中心接收外部请求，初次启动则在后台初始化。启动沿用 Click-to-Launch。切换正在查看的工作站需要用户确认，远端会话与应用保留。错误在控制中心显示。
+1. **`[1] Overview & Pairing`**:
+   * Displays `waybridge.service` / daemon status, TLS listen address, grouped certificate fingerprint, and loaded config path.
+   * **Environment preflight panel**:
+     * Runs the equivalent of `waybridge --check-session` to flag any active same-UID X11/Wayland desktop that must log out before session creation;
+     * Checks NVENC/CUDA availability, Xwayland, `pactl`/`parec`, `rsvg-convert`, `fusermount3`, Portal configuration, and `waybridge-notifications.service` bus conflicts.
+   * **Pairing area**: press a shortcut (e.g., `p`) to mint a one-time pairing code showing the copyable full certificate fingerprint and countdown timer (pasteable URI follows with the wizard update).
+2. **`[2] Sessions & Logs`**:
+   * Lists running Waybridge sessions (name, PID, listen port, uptime).
+   * Lower/side pane tails `$XDG_RUNTIME_DIR/waybridge-control-center/<session>.log` live (with pause, keyword filter, and paging).
+   * Safe session termination with confirmation, sending `SIGTERM` after `pidfd` identity verification.
+3. **`[3] Trusted Devices`**:
+   * Lists paired devices from `trust.json` (`label`, `client_id`, paired timestamp).
+   * Supports selecting a device and revoking trust after confirmation (immediately terminating active TLS tunnels for that device).
+4. **`[4] Settings`**:
+   * **Service & listeners, session defaults, and performance/resources** cover `[service]`, `[session]`, `[limits]`, and `[media_budget]` using the service's actual loaded config path (XDG default or explicit `--config`). Online mode distinguishes running, saved, and draft values along with sources (default, file, CLI); offline mode shows effective values for the next start, reusing validation and apply-stage reporting from [config/src/lib.rs](../config/src/lib.rs).
+   * **Validate & save** validates the full draft, previews diffs and apply stages, and writes atomically—prompting to reload if the file changed on disk during editing. Service restarts are offered as an explicit separate action explaining connection impact; session defaults take effect on the next new session.
+   * **Application launches** edit Waybridge-specific overrides by full Desktop ID for both `[default]` and named Desktop Actions, previewing the effective command and `field_sources` against the unsaved draft (working offline against installed entries when no session is running), highlighting `DBusActivatable` conflicts, and showing expected next-launch behavior.
+   * **Desktop components** manage Waybridge-owned Portal and notification integration settings, displaying effective config sources, user units, and readable runtime status while writing standard configs and Waybridge user-unit drop-ins per [Desktop Integration](INTEGRATION.md).
 
 ---
 
-## 6. 建议实施顺序与验收点
+## 5. Client Redesign: UI Stack and Dual-Mode Launcher
 
-1. **客户端主窗口、设置与便携包验证。** 收敛为单一 TLS 路径，清理内置 SSH、原始会话隧道及其配置。使用现有配对和应用目录，先交付接回会话、搜索启动、切回窗口和完整设置。并行验证最小 Avalonia 便携包，通过后再迁移 Windows 系统集成与构建脚本。运行新版直连链路和 Windows UI 自动化回归。
-2. **服务端 TUI 和配置编辑并行推进。** 验收本机和 SSH 终端里的在线／离线切换、配对、受控会话操作、日志、配置来源与生效阶段、草稿校验与应用启动预览。
-3. **主启动器和目录。** 交付顶部全局栏、网格和紧凑列表、固定与最近、运行窗口与后台区、应用上下文操作。通过 TLS 扩展目录元数据和批量图标，验证响应预算与缺失图标回退。粘贴配对口令单独验收完整指纹匹配、一次性使用和过期。
-4. **应用链接与 Windows 快捷方式。**
-   * 按已配对工作站和 Desktop ID 创建快捷方式，验证 Windows 外部呼出、已运行实例转发和未连接时的自动连接。
+### 5.1 Project Structure and WinUI 3 Removal Checklist
+
+First build a minimal portable Avalonia bundle cross-published from Linux for x64 and ARM64 and verify extraction, startup, tray, UI Automation, native notifications, and notification action callbacks on physical Windows. Only after portable notification identity and activation registration are confirmed should WinUI and Windows App SDK packaging be removed.
+
+1. **Remove legacy dependencies and build workarounds**:
+   * Remove `UseWinUI`, `WindowsPackageType`, `WindowsAppSDKSelfContained`, `Microsoft.WindowsAppSDK`, `AppxGeneratePriEnabled`, `EnablePriGenTooling`, `DISABLE_XAML_GENERATED_MAIN`, custom MSBuild task `WaybridgeExtractResourceIndex`, and `TrackCrossHostManifestTool`.
+   * Delete [scripts/extract-runtime-resources.cs](../scripts/extract-runtime-resources.cs) and [scripts/merge-windows-manifest.py](../scripts/merge-windows-manifest.py) (and their build checks); simplify [scripts/build-control-center.sh](../scripts/build-control-center.sh) to standard `dotnet publish -r win-$arch --self-contained true` plus copying `waybridge-client.exe`, docs, and licenses.
+   * Keep the single-instance `Mutex` (`Local\Waybridge.ControlCenter`) and startup diagnostic logging in [Program.cs](../gui/Waybridge.Control/Program.cs), switching entry to standard Avalonia `AppBuilder.Configure<App>().UsePlatformDetect()`.
+2. **Suggested module layout**:
+   * `Waybridge.Control.Core/` (cross-platform testable):
+     * `LauncherModels.cs` & `LauncherStore.cs` (persisting `launcher.json` and local icon disk cache);
+     * `PairingHelper.cs` (full fingerprint entry/verification, later `wbpair://v1` parsing);
+     * `SessionController.cs` extensions (`AppIconsAsync`, `LaunchPlanAsync`, `ClickToLaunchAsync`, and launches with `action`/`uris`/`argv`/`cwd`).
+   * `Waybridge.Control/` (Avalonia desktop project):
+     * `Views/MainWindow.axaml(.cs)`: full app wall and control center;
+     * `Views/PairingWizardDialog.axaml(.cs)`: step-by-step TLS pairing;
+     * `Views/SettingsView.axaml(.cs)`: categorized settings hub;
+     * `Views/ActivityDrawer.axaml(.cs)`: file transfer activity and diagnostics;
+     * `ViewModels/`: clean separation of state, commands, and UI dispatcher marshaling;
+     * `Services/DesktopNotifications.cs`: verify portable notification identity, activation registration, and session-scoped action routing while keeping existing notification protocol and lifecycle rules;
+     * `IconBranding.cs`: normalize custom badges to 64×64; native Windows windows and trays composite badges at target pixel size.
+
+### 5.2 Local Storage and Caching
+
+TLS profiles, launcher state, and icon caches persist separately:
+
+* **`%LOCALAPPDATA%\Waybridge\profiles.json`**: TLS address, certificate fingerprint, client ID, and connection preferences (`ConnectionProfile` / `ClientSettings`).
+* **`%LOCALAPPDATA%\Waybridge\launcher.json`**:
+  * Global preferences: layout, selected workstation, theme, and close-to-tray.
+  * Per-`profile_id` data: `pinned_apps` (ordered `desktop_id` array), `recent_apps` (recent launches with timestamps, cap 32), `command_history` (custom `argv` + `cwd` history, cap 20), and `cached_applications` (last fetched extended catalog snapshot).
+* **`%LOCALAPPDATA%\Waybridge\cache\icons\`**:
+  * Raw icon cache `raw/<sha256>.png` shared across launcher views.
+
+### 5.3 Main Window (Full Launcher) Layout and Interactions
+
+1. **Top global bar (Omnibar)**:
+   * Left: **Workstation switcher pill** showing status indicator (green = connected, amber = connecting, gray = disconnected), workstation name, and session name; dropdown switches workstations, connects/disconnects, opens "Add/Manage Workstations", or triggers confirmed "End remote session".
+   * Center: **Global search box** (`Ctrl+K` / `/` to focus):
+     * Normal input filters installed apps (`name`, `generic_name`, `id`, `keywords`, `comment`) and active windows live;
+     * Input starting with `>` switches to **Command Runner mode** (history autocomplete, optional working directory, `Enter` launches via `argv`).
+   * Right: **Quick controls** — Read-only toggle, Audio/Volume flyout, Status/Latency (RTT + active codec path) flyout, File Transfers drawer (with activity badge), and Settings entry.
+2. **Launcher and Running views**:
+   * **Running** (accessed from the fixed left navigation rail) consolidates remote windows and SNI background apps:
+     * Active window cards show icon + title + codec/decode badge (e.g., `HEVC · GPU`); clicking calls `ActivateWindowAsync` immediately;
+     * SNI background app cards offer "Restore window" and "App menu".
+   * **Pinned & Recent**: prominent top grid of pinned and recently launched apps.
+   * **All Apps** shares the same scroll container; as you scroll down, the catalog title, refresh, layout toggle, and category filter stick to the top of the viewport. Supports both grid and compact list views.
+   * **App names** wrap to at most two lines with trailing ellipsis in both grid and compact list, showing the full name on hover.
+   * **Click and context actions**:
+     * **Single click launches immediately**: calls `LaunchAsync` when connected; when disconnected with a valid paired workstation selected, triggers **Click-to-Launch** (lightweight inline connection progress without jarring navigation) and dispatches the launch once ready.
+     * **Right-click / hover `…` menu**:
+       * Launch;
+       * Named Desktop Actions (if any);
+       * Pin / Unpin;
+       * Touch mode (Auto / Prefer native touch / Mouse compatibility), saved per profile and full Desktop ID, mapping confirmed catalog identity to the native worker's window `app_id` (unknown identities can be configured from running windows and default to auto detection);
+       * Custom launch (override/append working directory or arguments with `launch-plan` preview).
+   * **First-run empty state**: when no paired workstation exists yet, displays an "Add your first Linux workstation" onboarding card opening the pairing wizard.
+3. **Secondary views**:
+   * **Workstations & Pairing Wizard**: enters TLS address, verifies full fingerprint, and submits one-time pairing code (later adding pasteable pairing URIs from trusted channels). Paired workstations show a clean summary and "Revoke this device", with full fingerprint and client ID expandable on demand.
+   * **Settings Hub**: organized into **Display**, **Audio**, **Input Devices**, **Sharing & Permissions**, **Network**, **Connection**, **Desktop Integration**, and **General**. Clearly labels per-workstation vs. global scope and live vs. reconnect vs. new-session apply stages. Top-level toggles and live local/remote/focus/forwarding statuses are visible directly for touch, pen, and gamepads, with pressure curve, deadzone, and per-app compatibility under Advanced. Offline edits save cleanly; online applies display effective results after confirmation, preserving UI automation probe contracts.
+   * **File Transfers & Diagnostics**: file/folder send actions, receive directory shortcut, transfer history, RTT / TCP receive rate / presentation update / decode & present stage telemetry, and log export (excluding tokens, clipboard, and notification bodies).
+
+### 5.4 App Links and OS Shortcuts
+
+* The app card menu offers Copy link, Add to Windows Start Menu (under the `Waybridge` folder), and Create desktop shortcut.
+* Link format: `waybridge://launch/<profile-uuid>/<base64url-utf8-desktop-id>`. The Control Center looks up the local paired profile and launches by catalog identity.
+* An already running Control Center receives external invocations directly; cold starts initialize in the background. Launches reuse Click-to-Launch, confirm before switching away from another active workstation (keeping its remote session alive), and surface errors in the Control Center.
+
+---
+
+## 6. Recommended Implementation Order and Acceptance Checkpoints
+
+1. **Client main window, settings, and portable bundle verification.** Converge on the single TLS path and retire embedded SSH and raw tunnel modes. Deliver session reattach, search-to-launch, window switching, and complete settings using existing pairing and catalog endpoints. Validate the minimal portable Avalonia bundle in parallel before migrating Windows OS integrations and build scripts. Run direct TLS and Windows UI automation regressions.
+2. **Server TUI and config editing in parallel.** Verify online/offline transitions over local TTY and SSH, pairing, controlled session termination, log tailing, config sources and apply stages, draft validation, and offline/online launch-plan previews.
+3. **Full launcher and catalog.** Deliver the global bar, grid/compact views, pinned/recent, running windows and background apps, and app context actions. Extend catalog metadata and batch icon fetching over TLS, verifying response size budgets and missing-icon fallbacks. Verify pasteable pairing URIs separately for full fingerprint matching, one-time use, and expiration.
+4. **App links and Windows shortcuts.** Create shortcuts keyed by paired workstation and Desktop ID; verify external invocation from Windows, forwarding to an already-running instance, and auto-connect when disconnected.

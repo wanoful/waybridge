@@ -1,46 +1,46 @@
-# 网络体验：UDP 节流与编码码率联动
+# Network Experience: UDP Pacing and Encoder Bitrate Coordination
 
-更新日期：2026-11-19。认证 UDP 的交付反馈同时驱动发送节流和 NVENC 编码目标。线协议仍为 v3 / `udp_fec_v1`，现有 Windows 客户端即可使用。
+Updated: 2026-11-19. Delivery feedback from authenticated UDP drives both transmit pacing and NVENC encoder targets. The wire protocol remains v3 / `udp_fec_v1`, compatible with existing Windows clients.
 
-## 当前链路与范围
+## Current Paths and Scope
 
-控制、媒体及音频继续使用独立认证连接。UDP 需要显式配置可达地址；未启用、尚未绑定、保活过期、载荷过大或缓存不足时保留 TCP 路径。每窗口呈现 ACK、UDP 全局在途额度和原始捕获背压分别承担不同职责。
+Control, media, and audio continue using independently authenticated connections. UDP requires an explicitly configured reachable address; TCP remains the fallback when UDP is disabled, not yet bound, keepalive-expired, or when payloads exceed size or buffer limits. Per-window presentation ACKs, global UDP in-flight credits, and raw capture backpressure each serve distinct roles.
 
-UDP 全局最多八个未确认消息、64 MiB 在途字节阈值（保留单条较大消息的既有例外），修复缓存为 32 MiB。发送、修复和逐窗口解码沿用既有顺序。
+UDP allows at most 8 unacknowledged messages globally and a 64 MiB in-flight byte threshold (keeping the existing exception for a single larger message), with a 32 MiB repair cache. Transmission, repair, and per-window decoding preserve existing ordering.
 
-## 反馈与节流
+## Feedback and Pacing
 
-- `--udp-mbps` 仍是发送上限，初始按这个上限发送。每个数据报按加密载荷及 UDP/IP 基本头计入节流，包括认证头、认证标签和 XOR 校验包；链路层及 VPN 额外封装开销不在此估算中。节流时刻跨消息延续，阻塞后的调度不补发一串追赶突发。
-- 最后一个 DATA 数据报提交发送前记本机 `Instant`（不等待尾随校验包），以认证控制通道上该消息的 `udp_ack` 计算交付确认耗时。它包括接收端组装、调度及反馈通道延迟，不是网络 RTT，更不是物理输入到显示延迟。
-- 只使用仍在途、已到达最终 DATA 发送边界且未请求 TCP 修复的消息训练恢复；未知、重复、提前到达的 ACK 和 TCP 回退交付不训练。累积 ACK 继续正常释放额度。
-- 对到达最终 DATA 发送边界至少 20 ms 后的首次有效修复请求，速率减为当前的 75%，250 ms 内不重复降低。更早的请求立即走 TCP 修复，但只将它计为修复请求，因为接收端的周期检查可能与仍在路上的 DATA 交叉。
-- 用交付确认耗时的 EWMA 与十秒窗口内最小值比较；超过基线加 `max(基线/2, 50 ms)` 时保守降低速率，最多每秒一次。该余量容纳接收端及反馈调度抖动；延迟升高也可能来自接收端，不声称准确定位网络拥塞。
-- 稳定反馈下至少四次有效 ACK、距离上次增长至少 500 ms、距离修复至少一秒，才增长 `max(当前速率的5%, 250 kbit/s)`，始终不超过配置上限。下限为 `min(配置上限, 2 Mbit/s)`。
+- `--udp-mbps` remains the ceiling rate and the initial transmit rate. Each datagram accounts for its encrypted payload plus base UDP/IP headers, including auth headers, auth tags, and XOR parity packets; link-layer and VPN encapsulation overhead is not estimated here. Pacing deadlines carry across messages so blocked scheduling does not emit a catch-up burst.
+- The server records a local `Instant` right before submitting the final DATA datagram (without waiting for trailing parity packets) and computes delivery-ACK elapsed time from the matching `udp_ack` on the authenticated control channel. This includes receiver reassembly, scheduling, and feedback-path delay; it is neither network RTT nor physical input-to-display latency.
+- Only messages still in flight that have reached the final DATA boundary and have not requested TCP repair train recovery; unknown, duplicate, early ACKs, and TCP fallback deliveries do not train the controller. Cumulative ACKs still release credits normally.
+- On the first valid repair request arriving at least 20 ms after the final DATA boundary, the rate drops to 75% of the current rate, with a 250 ms cooldown against repeated drops. Earlier requests still trigger immediate TCP repair but are only counted as repairs, because the receiver's periodic check can race with DATA still in flight.
+- An EWMA of delivery-ACK time is compared against a 10-second rolling minimum; exceeding `baseline + max(baseline / 2, 50 ms)` conservatively reduces the rate at most once per second. The margin absorbs receiver and feedback scheduling jitter; rising delay may also originate on the receiver and does not claim precise network congestion attribution.
+- Under stable feedback—at least 4 valid ACKs, at least 500 ms since the last increase, and at least 1 s since any repair—the rate grows by `max(5% of current rate, 250 kbit/s)` up to the configured cap. The floor is `min(configured cap, 2 Mbit/s)`.
 
-周期基线会重新建立，避免路径/接收端的永久延迟变化永远阻止恢复。单个丢包若被 XOR 直接恢复，现有协议不会报告它，因此本轮没有独立丢包率估计。较大画面在低速节流时可能先触发既有 100 ms 接收器修复计时器而经 TCP 交付，本批未调整该计时器。这是有界、保守的交付反馈节流，不是对任意共享网络的公平性或最优吞吐承诺。
+Periodic baseline re-anchoring prevents permanent path or receiver delay shifts from blocking recovery indefinitely. Single-packet losses recovered directly by XOR parity are not reported by the current protocol, so there is no independent loss-rate estimate in this pass. Larger frames under low pacing rates can hit the existing 100 ms receiver repair timer first and complete via TCP; that timer was not changed here. This is a bounded, conservative delivery-feedback pacer rather than a fairness or optimal-throughput guarantee on arbitrary shared networks.
 
-## 编码码率
+## Encoder Bitrate
 
-- 已认证且在三秒内收到保活的 UDP 会话，将当前节流速率的 75% 分给过去两秒有视频编码活动的窗口。每个窗口的目标受 `--bitrate` 或客户端应用的码率上限约束，NVENC 最低目标为 1 Mbit/s。
-- 编码器运行至少 500 ms 后可处理 10% 或更大的降幅，小幅变化等到 2 秒后再处理。目标高于当前码率持续至少 2 秒后才恢复，每步最多增加当前目标的 20% 或 500 kbit/s，取较大值。TCP 会话用配置码率，UDP 保活过期后已有窗口按同样的恢复步长升回配置码率。
-- 实际切换时重新初始化该窗口的编码器，从新的解码 epoch 和 IDR 帧开始。同码率下仍可复用已有的窗口尺寸缓存。重建期间有初始化开销，已编码的引用帧仍按顺序交付。
-- 预留带宽用于校验、头部、透明度数据和编码突发。该策略控制视频目标码率，实际流量还受 PNG、透明度数据、音频、关键帧和最低编码目标影响。分辨率、FPS 和媒体资源调度沿用各自配置。
+- An authenticated UDP session that has received a keepalive within the last 3 seconds allocates 75% of the current pacing rate across windows that encoded video within the last 2 seconds. Each window's target is capped by `--bitrate` or the client-applied bitrate limit, with an NVENC minimum target of 1 Mbit/s.
+- Once an encoder has run for at least 500 ms, drops of 10% or more are applied immediately, while smaller changes wait 2 seconds. Increases require the target to stay above the current bitrate for at least 2 seconds and step up by at most `max(20% of current target, 500 kbit/s)`. TCP sessions use the configured bitrate; after a UDP keepalive expires, existing windows ramp back up to the configured bitrate using the same step limits.
+- Actual bitrate switches reinitialize that window's encoder, starting a new decode epoch and IDR keyframe. Window-size caches remain reusable at matching bitrates. Reinitialization incurs setup cost while already-encoded reference frames continue delivering in order.
+- Headroom is reserved for parity, headers, alpha channels, and encoder bursts. This policy controls video target bitrate; total wire traffic is still influenced by PNG frames, alpha data, audio, keyframes, and the minimum encoder floor. Resolution, FPS, and media-resource scheduling follow their own configurations.
 
-## 诊断
+## Diagnostics
 
-使用 `--stats` 每两秒报告：
+With `--stats`, the server reports every two seconds:
 
-- `udp_delivery_ack`：本机时钟上的交付确认耗时及分位数。
-- `udp_pacing_kbps`：当前速率和区间最高值。
-- `udp_pending_messages` / `udp_pending_bytes`：在途消息数/载荷字节的最近值和区间最高值。
-- `udp_pacing_backoff_repair` / `udp_pacing_backoff_delay` / `udp_pacing_recovery`：实际速率调整次数。
-- `udp_tcp_repair_requests` / `udp_tcp_send_fallback`：有效修复请求及数据报发送失败后的 TCP 回退次数。
-- `udp_repair_feedback_grace`：最后一个 DATA 发送边界之后 20 ms 内的修复请求。传输立即修复，节流估计忽略这类样本。
-- `video_target_kbps`：成功编码帧的最近目标与区间最高值。NVENC 启动日志也记录窗口、目标码率、UDP 节流速率和解码 epoch。
+- `udp_delivery_ack`: local-clock delivery-ACK elapsed time and percentiles.
+- `udp_pacing_kbps`: current pacing rate and interval maximum.
+- `udp_pending_messages` / `udp_pending_bytes`: latest and interval-peak in-flight message count and payload bytes.
+- `udp_pacing_backoff_repair` / `udp_pacing_backoff_delay` / `udp_pacing_recovery`: counts of actual rate adjustments.
+- `udp_tcp_repair_requests` / `udp_tcp_send_fallback`: counts of valid repair requests and TCP fallbacks after datagram send failure.
+- `udp_repair_feedback_grace`: repair requests within 20 ms of the final DATA boundary (repaired immediately, excluded from pacing feedback).
+- `video_target_kbps`: latest and interval-peak target bitrate for successfully encoded frames. NVENC startup logs also record window ID, target bitrate, UDP pacing rate, and decode epoch.
 
-## 验证
+## Verification
 
-`cargo test --locked udp::` 验证退避冷却、上下限、恢复、延迟变化、跨消息节流，以及无效/重复/提前 ACK、即时修复与延迟采样、在途字节归还。真实本地 UDP 套接字的低速夹具在最终 DATA 和校验包之间留出约 500 ms，要求在校验包仍等待发送时的 ACK 已具备有效采样边界，防止低延迟接收端永久错过恢复反馈。
+`cargo test --locked udp::` verifies backoff cooldowns, floor/ceiling bounds, recovery, delay shifts, cross-message pacing, invalid/duplicate/early ACKs, immediate repair vs. delayed samples, and in-flight byte accounting. A slow-rate local UDP socket fixture inserts ~500 ms between the final DATA and parity packets to verify that ACKs arriving while parity is still queued already establish a valid sampling boundary, preventing low-latency receivers from permanently missing recovery feedback.
 
 ```sh
 python3 tests/session_fixture.py python3 tests/udp_adaptive_smoke.py
@@ -50,20 +50,20 @@ python3 tests/session_fixture.py python3 tests/udp_flow_smoke.py
 WAYBRIDGE_UDP_TEST_KINDS=1,2 python3 tests/session_fixture.py python3 tests/windows_udp_smoke.py
 ```
 
-自适应回归使用生产 PE/CNG 接收器、私有 Wine/Xvfb、真实合成器，以及只连接本地临时端口的代理。它丢弃首个 UDP 消息全部分片，经 TCP 修复；注入 200 ms 控制反馈延迟后恢复；要求 PNG 逐帧内容、序号一致，诊断能证明速率下降后回升并保持在上限内。现有接收器每 100 ms 请求缺失消息，200 ms 反馈延迟可能先触发修复，因此该实测按修复反馈分类；无修复时的纯延迟退避另由确定性时钟测试覆盖。它不会更改宿主路由、qdisc、网络服务或显示配置。
+The adaptive regression runs the production PE/CNG receiver under private Wine/Xvfb, the real compositor, and a loopback-only local proxy. It drops all chunks of the first UDP message so it repairs via TCP, injects 200 ms of control feedback delay, then recovers—asserting frame-by-frame PNG pixel and sequence identity plus diagnostics showing backoff followed by recovery within the cap. Because the current receiver requests missing messages every 100 ms, a 200 ms feedback delay can trigger repair first, classifying that run as repair backoff; pure delay-only backoff without repairs is covered separately by deterministic clock tests. None of these tests modify host routing, qdiscs, network services, or display settings.
 
-2026-11-17 实测：七项 UDP/控制器测试通过；生产 PE/CNG 经本地代理完整接收 180 帧，首消息 16 个分片被丢弃，10 条 ACK 注入 200 ms 延迟；80 Mbit/s 上限下记录到约 8.0 Mbit/s 的退避与随后高于 24 Mbit/s 的恢复，逐帧序号及像素一致。这些速率是该夹具中的调节轨迹，不是吞吐或延迟改进幅度。
+2026-11-17 test run: all 7 UDP/controller unit tests passed; the production PE/CNG receiver received 180 frames cleanly through the local proxy with 16 chunks of the first message dropped and 10 ACKs delayed by 200 ms, recording backoff to ~8.0 Mbit/s under an 80 Mbit/s cap followed by recovery above 24 Mbit/s with exact per-frame sequence and pixel match. These numbers illustrate controller behavior in the fixture rather than throughput or latency gains.
 
-既有 20 窗口／40 帧、600 ms 首次修复延迟下的八消息额度，及 1 Mbit/s 大帧断开后 100 ms 内停止发送回归通过；生产 PNG/H.264 的丢包、损坏、重放与 UDP 黑洞转 TCP 修复检查也通过，引用链与 alpha 保持正确。
+Existing regressions also pass: 20 windows / 40 frames with 600 ms initial repair delay under the 8-message credit limit, cancellation within 100 ms on disconnect during 1 Mbit/s large-frame sends, and production PNG/H.264 loss, corruption, replay, and UDP-blackhole-to-TCP repair with intact reference chains and alpha.
 
-生成证据：`build/tests/udp-adaptive.log`、`build/tests/udp-adaptive-report.json`。窗口更多时的全局顺序、修复和断开取消沿用 `udp_flow_smoke.py`；H.264 引用链和精确 alpha 沿用生产 PE 回归。
+Artifacts are written to `build/tests/udp-adaptive.log` and `build/tests/udp-adaptive-report.json`. Global ordering with more windows, repairs, and disconnect cancellation remain covered by `udp_flow_smoke.py`, and H.264 reference chains and exact alpha remain covered by production PE regressions.
 
-`--nvenc` 使用同一生产接收器和代理，丢弃第一个 UDP 消息后恢复正常反馈，验证降码率及分步恢复、逐帧顺序、每次切换从 IDR 开始及实际解码。`--two-windows` 检查两个活跃窗口各按同一 UDP 预算分配码率并分别解码。报告写入 `build/tests/udp-adaptive-nvenc-report.json` 和 `build/tests/udp-adaptive-nvenc-two-report.json`。
+`--nvenc` uses the same production receiver and proxy, dropping the first UDP message and then restoring normal feedback to verify bitrate drop, stepped recovery, frame ordering, IDR start on each switch, and actual decoding. `--two-windows` checks two active windows splitting the same UDP budget and decoding independently. Reports are written to `build/tests/udp-adaptive-nvenc-report.json` and `build/tests/udp-adaptive-nvenc-two-report.json`.
 
-2026-11-19 本地注入丢包实测：单窗口收到 270 帧，编码目标从 6 降到 4.5 Mbit/s，再经 5.4 恢复到 6 Mbit/s。双窗口收到 360 帧，两个窗口在修复后各分得 2.25 Mbit/s，恢复后各为 3 Mbit/s。每个窗口的解码 epoch 均可从首帧独立解码。同轮 PNG 回归收到 180 帧，逐帧序号及像素一致。
+2026-11-19 local loss-injection run: a single window received 270 frames as the encoder target stepped from 6 to 4.5 Mbit/s and recovered via 5.4 back to 6 Mbit/s. Two windows received 360 frames, splitting 2.25 Mbit/s each after repair and recovering to 3 Mbit/s each. Every decode epoch decoded cleanly from its first frame. In the same pass, the PNG regression received 180 frames with exact sequence and pixel match.
 
-同日 Windows x64 实机在有线 LAN 和 Tailscale 各收到 360 帧。媒体 UDP 分别走两条实际链路，控制和 TCP 媒体连接经 SSH 隧道。UDP 上限 5 Mbit/s、配置码率 6 Mbit/s，两次 H.264 均保持 3.75 Mbit/s。Tailscale 的七次即时修复均处于 20 ms 采样宽限内，两条链路均未触发节流退避。报告见 `build/tests/udp-native-paths-report.json`。Wi-Fi 与持续容量、公平性测量待完成。
+On the same day, physical Windows x64 runs over wired LAN and Tailscale each received 360 frames. Media UDP traversed each actual network path while control and TCP media used an SSH tunnel. With a 5 Mbit/s UDP cap and 6 Mbit/s configured bitrate, both H.264 runs held 3.75 Mbit/s. Seven immediate Tailscale repairs fell within the 20 ms sampling grace window, and neither link triggered pacing backoff. See `build/tests/udp-native-paths-report.json`. Wi-Fi and sustained capacity/fairness measurements remain open.
 
-## 后续
+## Next Steps
 
-后续工作包括 FPS 与传输预算联动、按流交付、文件独立数据通道、真实 LAN/VPN 容量与公平性测量。
+Follow-up work includes coupling FPS to transport budgets, per-stream delivery, dedicated file data channel integration, and real LAN/VPN capacity and fairness measurements.

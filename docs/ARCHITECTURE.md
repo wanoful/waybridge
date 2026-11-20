@@ -1,340 +1,340 @@
-# Waybridge 架构基线
+# Waybridge Architecture Baseline
 
-更新日期：2026 年 11 月 16 日。版本：v1 架构基线，含 M0/M1 生命周期修复与 M2 首轮只读交付、桌面入口、图标及纯文本拖放整理。下文区分目标设计、当前实现与待验证优化；Windows 11 x64 首轮流程、HMCL/Minecraft 指针复测及本轮 Chrome 双向文字拖放已通过，Linux/Wine 回归与当前两端部署见 [VALIDATION.md](VALIDATION.md)。ARM64 完整实机交互和剩余应用/设备矩阵仍待验收。
+Updated: 2026-11-16. Version: v1 architecture baseline, incorporating M0/M1 lifecycle fixes and the first M2 pass for read-only file delivery, desktop entry points, icons, and plain-text drag-and-drop. This document distinguishes target design, current implementation, and pending optimizations; initial Windows 11 x64 end-to-end runs, HMCL/Minecraft pointer retests, and bidirectional Chrome text drag-and-drop have passed. Full physical ARM64 interaction and the remaining app/device matrices remain open.
 
-Waybridge 提供独立于宿主 DE 的 Linux 远程应用会话，以 Windows 原生独立窗口承载 Blender 等专业软件、日常办公和游戏，网络覆盖同一局域网与异地 VPN。v1 沿用现有 Rust/Smithay、原生编解码层、Windows C++ 内核与 C# 控制中心，围绕会话、窗口、媒体、外设与传输划清职责。
+Waybridge provides a Linux remote application session independent of any host desktop environment, presenting professional software such as Blender, everyday productivity apps, and games as independent native Windows windows over LAN or VPN. v1 builds on Rust/Smithay, a native codec layer, a Windows C++ engine, and a C# Control Center with clear boundaries across sessions, windows, media, peripherals, and transport.
 
-产品功能与建议支持范围见 [FEATURES.md](FEATURES.md)，交付里程碑见 [ROADMAP.md](ROADMAP.md)。办公和游戏共用会话、窗口、输入及协议模型，按窗口选择画面策略。每个会话保留一个 Linux 主进程，在进程内分清模块、线程与资源归属，并管理现成桌面服务子进程；独立连接通过 Linux 用户级服务入口提供。
+See [FEATURES.md](FEATURES.md) for product scope and recommended baselines and [ROADMAP.md](ROADMAP.md) for delivery milestones. Productivity and gaming share one session, window, input, and protocol model with per-window visual policies. Each session runs one primary Linux process with bounded internal modules, threads, and resource ownership plus managed desktop service subprocesses; standalone remote connectivity is provided by a Linux user-level service.
 
-功能中的设备数量、分辨率、帧率和延迟数值仍按 [推荐支持规格](FEATURES.md#推荐支持规格) 建立实测基线后校准。直接编码、局部更新和 surface 分层保留为优化实验，不作为应用接入或功能模块的前提。
+Device counts, resolutions, frame rates, and latency targets are calibrated against empirical baselines per [Recommended Support Baseline](FEATURES.md#recommended-support-baseline). Direct encoding, partial updates, and surface layering remain measurement-driven experiments rather than prerequisites for application onboarding.
 
-会话与数据策略以 [SESSION_POLICY.md](SESSION_POLICY.md) 为准：默认共享用户数据，创建时单向检查，同一用户本地与远程桌面轮流使用。
+Session and data semantics follow [SESSION_POLICY.md](SESSION_POLICY.md): shared user data by default, one-way creation checks, and alternating use between local and remote desktops for the same user.
 
-配置与桌面集成采用 [CONFIGURATION_POLICY.md](CONFIGURATION_POLICY.md) 的边界：核心提供通用会话机制，外部组件通过标准配置接入；提供用户显式的 Waybridge 专用 desktop 追加/覆写，不内置按应用名称猜测参数的兼容引擎。首版 TOML、GIO 覆写启动与独立 systemd session target 已实现，操作见 [配置](CONFIGURATION.md) 与 [桌面组件](INTEGRATION.md)。
+Configuration and desktop integration follow [CONFIGURATION_POLICY.md](CONFIGURATION_POLICY.md): core provides generic session mechanisms, external components integrate via standard configs, and explicit Waybridge-specific desktop overrides replace any hardcoded per-app guessing engine. Initial TOML configuration, GIO override launches, and standalone systemd session targets are implemented; see [Configuration](CONFIGURATION.md) and [Desktop Components](INTEGRATION.md).
 
-## v1 架构决策
+## v1 Architectural Decisions
 
-| 决策 | v1 基线 |
+| Decision | v1 Baseline |
 |---|---|
-| 产品形态 | 独立远程应用会话；应用在会话中启动，每会话一个活动查看端 |
-| 宿主关系 | 不要求运行 KWin 或其他 DE；使用现成组件及标准接口，Waybridge 管理会话环境与必要服务 |
-| Linux 实现 | 沿用 Rust/Smithay；编解码继续通过现有原生适配层，首轮以当前 NVIDIA 主机为基线 |
-| Windows 实现 | C# / WinUI 3 管理连接与设置，独立 C++ 原生内核管理窗口、输入、媒体及本地设备 |
-| 进程划分 | 每会话一个 Rust 主进程，媒体、网络和文件 I/O 使用有界工作队列；Xwayland 为会话子进程，钱包及 Portal 使用共享用户服务，通知 provider 为显式选用的独立会话服务 |
-| 窗口与画面 | 保留每个远端顶层窗口对应 Windows 原生窗口的模式；首轮沿用 Linux 合成窗口内部 surface 树的路径 |
-| 办公与游戏 | 共用核心状态和协议；按窗口选择清晰度、帧率、码率、排队和静止后细化策略 |
-| 网络 | Windows 控制中心通过 Waybridge TLS 连接 Linux 用户服务。系统 SSH 可用于 Linux 部署、管理和转发 TLS 入口 |
-| 外设与数据 | 建立独立的能力适配模块，覆盖键鼠、手柄、触控、笔、双向音视频、剪贴板、文件和打印 |
-| 演进方式 | 在现有仓库渐进调整；先移出阻塞 I/O、统一状态和配置契约，再补桌面服务与功能，不以整体重写为前提 |
+| Product form | Standalone remote application session; apps launch inside the session with one active viewer per session |
+| Host relationship | Does not require KWin or any host DE; reuses standard interfaces and existing components while Waybridge manages the session environment and required services |
+| Linux stack | Rust/Smithay compositor with native codec/GPU interop layer, baselined initially on NVIDIA Linux hosts |
+| Windows stack | C# / WinUI 3 for connection management and settings; standalone C++ native engine for windows, input, media, and local devices |
+| Process boundaries | One Rust process per session with bounded worker queues for media, network, and file I/O; Xwayland as a session child process; wallets and Portals via shared user services; notification provider as an explicit opt-in session service |
+| Windows & visuals | One native Windows window per remote toplevel; initial pass composites each window's internal surface tree on Linux |
+| Productivity & gaming | Unified core state and wire protocol; per-window clarity, FPS, bitrate, queuing, and idle-refinement policies |
+| Networking | Windows Control Center connects via Waybridge TLS to the Linux user service; system SSH supports deployment, administration, and optional TLS port forwarding |
+| Peripherals & data | Dedicated capability adapters for keyboard/mouse, gamepads, touch, pen, bidirectional audio/video, clipboard, files, and printing |
+| Evolution strategy | Incremental evolution within the current repository—move blocking I/O off interactive threads and unify state/config contracts first, without a ground-up rewrite |
 
-## 架构总览
+## Architecture Overview
 
 ```mermaid
 flowchart LR
-    subgraph Linux["Linux 独立会话"]
-        Apps["应用与桌面服务"]
-        Core["Rust 会话核心与 Smithay"]
-        Media["媒体与传输工作模块"]
+    subgraph Linux["Linux Standalone Session"]
+        Apps["Applications & Desktop Services"]
+        Core["Rust Session Core & Smithay"]
+        Media["Media & Transport Workers"]
         Apps <--> Core
         Core <--> Media
     end
-    Service["Linux 用户级服务入口"]
-    Engine["Windows C++ 原生内核"]
-    Windows["Windows 原生应用窗口与设备"]
-    GUI["C# 控制中心"]
-    GUI <-->|"TLS 配对与会话管理"| Service
-    Service -->|"本地管理接口"| Core
-    Media <-->|"本地 v3 通道"| Service
-    Service <-->|"TLS 控制/媒体/音频"| Engine
+    Service["Linux User-Level Service"]
+    Engine["Windows C++ Native Engine"]
+    Windows["Native Windows App Windows & Devices"]
+    GUI["C# Control Center"]
+    GUI <-->|"TLS Pairing & Session Mgmt"| Service
+    Service -->|"Local Mgmt Interface"| Core
+    Media <-->|"Local v3 Channels"| Service
+    Service <-->|"TLS Control / Media / Audio"| Engine
     Engine <--> Windows
-    GUI <-->|"本地 IPC"| Engine
+    GUI <-->|"Local IPC"| Engine
 ```
 
-图中方框表示职责，不都对应独立进程。窗口消息、媒体、设备和文件按各自模块与通道处理；视频帧和逐次输入不绕经 C# 控制中心。
+Boxes represent logical responsibilities rather than strict process boundaries. Window messages, media, peripherals, and files flow through their own modules and channels; video frames and per-event input never detour through the C# Control Center.
 
-## 进程与模块边界
+## Process and Module Boundaries
 
-| 模块 | 职责与接口边界 |
+| Module | Responsibilities & Interface Boundary |
 |---|---|
-| Linux 用户级服务入口 | 脱离 SSH 提供配对、客户端信任、会话列举、创建和接入；授予对应会话的连接权限 |
-| Linux 会话管理 | 创建会话身份、环境与运行目录，监督必要服务，启动应用，处理查看端接入、断开与显式结束 |
-| 合成器与窗口输入 | 拥有 Wayland/X11 协议对象、应用窗口关系、焦点、IME、菜单、触控和笔状态；生成窗口事件并执行客户端请求 |
-| 媒体调度 | 根据窗口状态和预算决定捕获时机、呈现策略及编码配置；维护每条媒体流的代次、序列、时钟与背压 |
-| 编解码适配 | 封装 GPU 导入、颜色和 alpha 处理及编码；Windows 对应模块封装解码和呈现，显式管理 buffer 与 GPU 同步生命周期 |
-| 桌面集成 | 发布正确的会话环境与生命周期，通过标准 unit、D-Bus 和 Portal 接入用户选择的组件；实现需要合成器配合的接口，组件选择和应用偏好留在显式配置 |
-| 桌面入口适配 | 将远端应用的托盘、菜单、通知及动作映射到 Windows；跟踪应用身份与后台状态，独立于视频捕获和编码 |
-| 外设与数据适配 | 把协议能力转换成两端应用可用的输入、音视频设备、剪贴板格式、文件任务和打印任务 |
-| 传输 | 认证、连接和通道绑定，消息封装、排队、流量预算与重传；不决定应用焦点或画面内容策略 |
-| Windows 原生内核 | 拥有 HWND、DPI 和显示器信息、原生设备句柄、Win32 交互及媒体呈现；执行本地操作并报告能力与实际结果 |
-| C# 控制中心 | TLS 配对与连接生命周期、应用目录与启动请求、设备和共享设置、文件活动及诊断 |
+| Linux user-level service | SSH-free pairing, client trust management, session listing/creation/reattach, and per-session connection authorization |
+| Linux session manager | Creates session identity, environment, and runtime dirs; supervises required services; launches apps; handles viewer attach/detach and explicit teardown |
+| Compositor & window/input | Owns Wayland/X11 protocol objects, window hierarchy, focus, IME, popups, touch, and pen state; emits window events and applies client requests |
+| Media scheduler | Decides capture timing, presentation policy, and codec configuration from window state and budgets; tracks per-stream epochs, sequences, clocks, and backpressure |
+| Codec adapter | Encapsulates GPU import, color/alpha handling, and encoding on Linux, and decoding/presentation on Windows with explicit buffer and GPU sync lifetimes |
+| Desktop integration | Publishes session environment and lifecycle via standard units, D-Bus, and Portals; implements compositor-coupled interfaces while keeping component selection and app flags in explicit user config |
+| Desktop entry adapter | Maps remote app trays, menus, notifications, and actions to Windows; tracks app identity and background status independently of video capture |
+| Peripheral & data adapters | Translates protocol capabilities into OS-usable input, audio/video devices, clipboard formats, file tasks, and print jobs |
+| Transport | Authentication, connection/channel binding, framing, queuing, bandwidth budgets, and repair; does not decide focus or visual content policy |
+| Windows native engine | Owns HWNDs, DPI/monitor state, native device handles, Win32 interactions, and media presentation; executes local actions and reports real capabilities/results |
+| C# Control Center | TLS pairing and connection lifecycle, app catalog and launch requests, device and sharing settings, file activity, and diagnostics |
 
-独立的 `waybridge-service` Rust 进程提供 TLS 入口与用户级管理 socket，可选安装 systemd 用户单元。入口重启关闭网络连接但保留存活的会话。每会话的应用及运行期状态仍归相应会话主进程。服务通过 Python 会话管理助手调用部署时指定的合成器。应用和服务记录所属会话，结束时通过受管进程及可用的进程组或 cgroup 清理。
+The standalone `waybridge-service` Rust daemon exposes the TLS entry point and a user-private management socket, optionally managed as a systemd user unit. Restarting the entry service closes network connections while keeping live compositor sessions intact. Per-session app and runtime state stays owned by each session's main compositor process. The service invokes the configured compositor through the Python session-control helper; apps and services record session ownership and clean up via managed processes and available process groups or cgroups.
 
-合成器与 Windows UI 线程处理必要的平台调用；编码、网络等待、落盘和大块格式转换放到工作线程。GPU 对象遵守各自上下文的线程与同步要求，跨线程任务携带明确的 buffer 所有权或引用及同步信息。模块先沿现有语言边界实现，不要求每个模块拆成 crate 或动态插件。
+The compositor and Windows UI threads handle required platform calls while encoding, network waits, disk writes, and bulk format conversions run on worker threads. GPU objects respect context thread/synchronization rules, and cross-thread tasks carry explicit buffer ownership/references and sync tokens. Modules follow existing language boundaries without prematurely splitting every module into separate crates or dynamic plugins.
 
-同进程工作线程可以隔离排队和可处理的错误，不能隔离原生崩溃。若实测编解码崩溃或重启需求要求独立进程，再从已明确的媒体接口拆出；合成器崩溃后的应用恢复不作为 v1 保证。
+In-process worker threads isolate queuing and recoverable errors, not native crashes. If measured codec crash rates or restart needs demand out-of-process isolation, the media interface is cleanly separable; surviving a compositor crash is not a v1 guarantee.
 
-## 状态与生命周期
+## State and Lifecycle
 
-| 状态 | 权威归属 |
+| State | Authoritative Owner |
 |---|---|
-| 会话、应用和服务 | Linux 会话管理；查看连接具有独立生命周期 |
-| 应用窗口关系、约束及焦点 | Linux 合成器；Windows 发请求，接收生效状态与确认 |
-| 本地窗口位置、显示器和物理设备 | Windows 内核；DPI、尺寸和设备能力变化通知远端 |
-| 期望配置 | 用户配置；由服务端依据两端能力统一解析实际策略，并将结果反馈给 GUI |
-| 媒体引用链、缓存和呈现 | 编码与解码端各自维护，按流身份、代次和序列协作 |
-| 文件、打印和设备任务 | 具有独立任务身份与状态，所属模块负责取消、清理及恢复 |
+| Sessions, apps, and services | Linux session manager (viewer connections have an independent lifecycle) |
+| Window relationships, constraints, and focus | Linux compositor (Windows sends requests and receives effective state/confirmations) |
+| Local window geometry, monitors, and physical devices | Windows engine (notifies Linux on DPI, size, and hardware capability changes) |
+| Desired configuration | User config; server resolves effective policy against both sides' capabilities and reports back to GUI |
+| Media reference chains, caches, and presentation | Maintained jointly by encoder and decoder using stream IDs, epochs, and sequences |
+| File, print, and device tasks | Independent task IDs and lifecycles owned by their respective modules for cancel, cleanup, and recovery |
 
-区分会话身份、查看连接代次、窗口身份与映射代次、媒体流身份与编码代次。旧连接的输入、旧窗口消息或旧媒体帧不得作用于新目标；新字段通过能力协商引入。
+Session IDs, viewer connection epochs, window IDs/mapping generations, and media stream IDs/encode epochs are tracked separately. Input, window messages, or media frames from older generations never mutate newer targets; new fields roll out via capability negotiation.
 
-会话按创建、服务就绪、可接入、结束的流程管理，必要服务失败时给出明确错误，可选服务失败时报告相应能力不可用。接入顺序为认证、能力协商、完整窗口与状态快照、增量更新，再启用输入与共享。快照与增量具有明确的顺序边界，避免重连时重复或漏掉窗口变化。
+Sessions progress through create → services ready → attachable → shutdown, failing explicitly when required services fail and reporting degraded capabilities when optional services are unavailable. Viewer attach follows: authentication → capability negotiation → complete window/state snapshot → incremental updates → enable input and sharing, with an explicit ordering boundary between snapshots and deltas so reconnects neither duplicate nor miss transitions.
 
-查看端断开时停止输入与设备传输，释放键鼠、触点、笔接触和手柄状态，保留正常运行的 Linux 应用与会话服务。重连接回同一会话；显式结束会话才关闭所属应用与服务。持久钱包、用户工程和已提交文件保留，临时资源按任务状态清理。Linux 主机或合成器重启后需要新建会话，不承诺恢复原 Wayland/X11 连接。
+On viewer disconnect, input and peripheral streams stop, releasing keyboard/mouse, touch contacts, pen contacts, and gamepad state while keeping Linux apps and session services running. Reconnecting attaches to the same session; only explicit session termination shuts down owned apps and services. Persistent wallets, user projects, and committed files remain intact while temporary task state cleans up. After a Linux host or compositor restart, a new session is required; restoring prior Wayland/X11 connections is not guaranteed.
 
-当前实现已补齐以下生命周期约束；原生触控实验子集已接入取消语义，笔和手柄仍按上述设计要求继续实现：
+Current implementation enforces these lifecycle invariants (experimental native touch already implements cancellation; pen and gamepads follow the same design):
 
-- 正常结束、应用启动失败、描述符发布失败和主循环可返回错误，共用显示仍可工作的服务收尾路径；先停声明归属的服务，再撤销环境、关闭显示。诊断写入失败只告警，不中断必要清理。进程被强制终止或显示本身不可用时，不能保证组件完成显示交互。
-- Wayland 输出 global 先停止向新客户端公布，再延迟回收，容纳已经排队的绑定请求。Windows OLE 回调在外部调用后重新检查目标窗口生命周期；窗口关闭或替换后，旧回调与排队上传失效。
-- Xwayland 窗口坐标保持在共享根屏范围内；Windows 完整显示器尺寸与工作区尺寸分开报告，避免最大化、全屏或负坐标导致显示与绝对输入不一致。
+- Normal exit, app-launch failure, descriptor-publication failure, and returnable event-loop errors all share a teardown path while the display is still active: stop declared bound services first, then revoke the environment and shut down the display. Diagnostic write failures warn without aborting cleanup. Forced termination (`SIGKILL`) or a broken display cannot guarantee components complete display interactions.
+- Wayland output globals stop advertising to new clients before delayed reclamation, accommodating in-flight bind requests. Windows OLE callbacks re-verify target window lifetimes after every external call so closing or replacing a window invalidates stale callbacks and queued uploads.
+- Xwayland window coordinates stay bounded within the shared root screen, and Windows reports full monitor geometry separately from work-area geometry so maximize, fullscreen, and negative coordinates never desynchronize visual output and absolute input.
 
-## 画面与资源策略
+## Visual and Resource Policies
 
-首轮保留已有路径：Linux 合成窗口内部 surface 树，编码后由 Windows 解码，映射为独立原生窗口；弹出窗口保留自己的关系与画面。显示策略按窗口选择，窗口身份、输入和恢复语义保持统一。
+The first pass retains the existing pipeline: Linux composites each window's internal surface tree, encodes it, and Windows decodes and presents it into an independent native window (popups preserve their own relationships and surfaces). Visual policy is chosen per window while window identity, input, and recovery semantics remain uniform.
 
-| 预设 | 策略目标 |
+| Preset | Policy Goal |
 |---|---|
-| 清晰 | 静态文字、细线与颜色优先；使用无损路径或高保真更新，静止后可细化，减少未变化区域的工作 |
-| 专业软件交互 | 兼顾 Blender 等软件的界面清晰度与持续更新的视图；交互时保证响应，停止后恢复精细显示 |
-| 游戏低延迟 | 优先控制帧龄和排队，高效视频编码，按带宽与设备能力调整分辨率、帧率及码率 |
+| Text clarity | Prioritize crisp small text, fine lines, and accurate color via lossless or high-fidelity updates with optional idle refinement and minimal work on unchanged areas |
+| Interactive workstation | Balance UI crispness and continuously updating viewports (e.g., Blender)—stay responsive during interaction and sharpen once motion stops |
+| Low-latency gaming | Minimize frame age and queuing using hardware video encoding, adapting resolution, FPS, and bitrate to bandwidth and hardware |
 
-预设由同一策略模块解析，不直接等同于固定 codec。首轮保留 H.264 动态画面与 PNG 无损/兼容路径，HEVC/AV1 按已验证的能力启用。自动静止细化、局部更新等是待实现的策略能力；在支持前不把 4:2:0 视频路径宣称为无损办公画质。HDR 与更广颜色工作流继续单列能力验收。
+Presets resolve through a single policy module rather than hard-binding to a single codec. The initial pass uses H.264 for dynamic motion and PNG for lossless/fallback paths, enabling HEVC/AV1 where verified. Automatic idle refinement and partial updates are planned policy capabilities; until shipped, 4:2:0 video is never misrepresented as lossless office text quality. HDR and wide-gamut workflows remain tracked under separate capability verification.
 
-捕获前检查下游额度，保留 dirty 状态，容量恢复时捕获最新内容；等待期间继续处理协议与必要回调。设置全局和每窗口的内存、GPU 资源、带宽及排队预算，并按前台交互、持续画面和后台状态调度。第一阶段保留现有有界编码缓存及呈现确认机制，依据实测调整具体预算。
+Capture checks downstream credits beforehand, retains dirty flags, and captures the latest state once capacity opens while continuing to service protocol events and frame callbacks. Global and per-window budgets cover memory, GPU resources, bandwidth, and queuing, scheduled by foreground interactivity, continuous animation, and background status. Phase one retains bounded encoder caches and presentation ACKs, tuning concrete limits from measurements.
 
-原始画面和独立图像可以合并到最新状态；已编码的引用帧按流顺序处理，需要丢弃引用链时通过新代次与独立关键帧恢复。局部图块缓存和 surface 分层须定义自己的基准与同步规则，通过实验后再接入，见 [画面研究](#画面路径的研究方向)。
+Raw frames and standalone images coalesce to the latest state; inter-frame encoded access units remain strictly ordered per stream, recovering from dropped reference chains via a fresh epoch and IDR keyframe. Partial tile caches and surface layering must define their own reference/resync rules and pass isolated experiments before adoption; see [Display Pipeline Research Directions](#display-pipeline-research-directions).
 
-## 通道与协议
+## Channels and Protocol
 
-继续演进现有协议。控制消息采用可校验的结构化定义，媒体与大块数据使用二进制载荷；Rust、C++、C# 共享字段约定、范围、版本和测试样例，避免同一设置在启动与实时更新时有不同含义。
+The existing protocol evolves incrementally: control messages use validated structured schemas while media and bulk transfers carry binary payloads. Rust, C++, and C# share field names, ranges, versions, and test fixtures so startup and live updates always agree.
 
-| 逻辑通道 | 交付与调度语义 |
+| Logical Channel | Delivery & Scheduling Semantics |
 |---|---|
-| 会话与窗口控制 | 可靠交付，生命周期和请求确认保留因果顺序；快照与任务消息限制单次处理量 |
-| 输入 | 高优先级；按下、释放、焦点、IME 和手势边界保持顺序。绝对位置可在边界内合并，相对位移累计，按钮事件前保留对应坐标关系 |
-| 视频与摄像头 | 按流维护引用链、时序和预算，避免一个窗口缺帧阻塞所有其他窗口 |
-| 声音与麦克风 | 独立时钟、序列与有界缓冲，处理设备恢复；会议与视频播放定义音画同步策略 |
-| 文件与大载荷 | 可靠分块、进度、取消、续传和配额，单独调度；控制通道只传任务与格式等元数据及有界小载荷 |
+| Session & window control | Reliable delivery preserving causal ordering for lifecycle and acknowledgements; bounded per-batch work for snapshots and tasks |
+| Input | High priority; preserves ordering across press/release edges, focus, IME, and gesture boundaries. Absolute motion coalesces within boundaries, relative deltas accumulate, and button events preserve preceding coordinates |
+| Video & webcam | Per-stream reference chains, timing, and budgets so one stalled window never blocks all others |
+| Audio & microphone | Independent clocks, sequences, and bounded buffers with device recovery; distinct sync policies for playback vs. conferencing |
+| Files & bulk payloads | Reliable chunking, progress, cancellation, resume, and quotas scheduled independently; control channel carries only task/format metadata and small bounded payloads |
 
-目标路径由 Windows 客户端直接连接 Linux 服务在局域网或 VPN 地址上的端口。用户级入口提供初次配对、服务端身份验证、已信任客户端授权和撤销；运行通道绑定已认证的会话与查看连接，日常连接、应用启动与结束会话无需 SSH。首轮以明确配置的地址为入口，自动发现和公网中继另列扩展。
+The target topology connects Windows clients directly to the Linux service over LAN or VPN. The user-level service handles initial pairing, server authentication, client trust, and revocation; runtime channels bind to authenticated sessions and active viewer connections so daily use requires no SSH. Explicit host configuration comes first, with auto-discovery and public relays deferred.
 
-M1 选用标准 TLS：Linux 使用 rustls TLS 1.2/1.3，Windows C# 使用 SslStream，C++ 使用 Schannel TLS 1.2。客户端先校验固定的服务端证书 SHA-256，再发送一次性配对码或客户端凭据；持久客户端令牌存 Windows 凭据管理器，服务端仅存 HMAC 校验值。每条控制、媒体和音频连接分别认证，撤销立即关闭该客户端的活动隧道。业务 v3 封装保持不变；具体握手与限制见 [服务协议](SERVICE.md)。QUIC、实时数据报与按流隔离作为 M2 测量项目。
+M1 adopts standard TLS: `rustls` TLS 1.2/1.3 on Linux, `SslStream` in C#, and Schannel TLS 1.2 in C++. Clients verify the pinned server certificate SHA-256 before transmitting any one-time pairing code or client token; persistent tokens live in Windows Credential Manager, and Linux stores only HMAC digests. Control, media, and audio connections authenticate independently, and revoking a client terminates its active tunnels immediately. Business-layer v3 framing remains unchanged; see [Service Protocol](SERVICE.md). QUIC, real-time datagrams, and per-stream isolation remain M2 measurement topics.
 
-控制中心统一使用 Waybridge TLS 验证服务端并管理会话。系统 SSH 终端可管理 Linux 服务，网络仅允许 SSH 时可由系统 SSH 转发 TLS 入口。网络体验线继续推进独立文件数据通道、按流调度、音频格式和共同带宽预算。
+The Control Center connects uniformly via Waybridge TLS, while system SSH handles Linux administration and optional TLS forwarding on SSH-only networks. The network track advances dedicated file data channels, per-stream scheduling, audio codecs, and shared bandwidth budgets.
 
-VPN 验收覆盖可直达的 UDP 及 TCP 回退。通过外部 SSH 转发时，多个 Waybridge TCP 通道共享外层 TCP 连接。独立连接也共享总带宽，统一限制文件吞吐和媒体排队。
+VPN acceptance covers both directly reachable UDP and TCP fallback. Over external SSH forwarding, multiple Waybridge TCP channels share the outer TCP connection; even independent connections share total link bandwidth and require unified pacing across file throughput and media queues.
 
-UDP 发送另接基于认证消息交付 ACK 与修复反馈的自适应节流，上限沿用 `--udp-mbps`；交付耗时含接收端调度，尚不等同完整拥塞控制或编码负载自适应，见 [网络体验](NETWORK.md)。
+UDP transmit pacing uses authenticated delivery ACKs and repair feedback under the `--udp-mbps` ceiling; delivery time includes receiver scheduling and is distinct from full congestion control or full encoder-load adaptation (see [Network Experience](NETWORK.md)).
 
-所有附属通道认证并绑定当前查看连接，能力、密钥与回退结果明确反馈。当前 TLS 网关先验证客户端信任与目标会话，再转发本地 v3；v3 token 与 media_key 继续约束查看连接与附属通道。原始 TCP 必须经 TLS 或 SSH 等受保护传输，现有 UDP 有独立认证加密。兼容扩展使用版本与能力协商，不能兼容的变更提升协议版本，[PROTOCOL.md](PROTOCOL.md) 继续只记录实际实现的线协议。
+All auxiliary channels authenticate and bind to the active viewer connection, reporting negotiated capabilities, keys, and fallbacks explicitly. The TLS gateway validates client trust and target session before forwarding local v3; v3 tokens and `media_key` continue guarding viewer and auxiliary channels. Raw TCP must always ride over TLS, SSH, or an equivalent protected transport; optional UDP carries its own authenticated encryption. Compatible extensions use version and capability negotiation, breaking changes bump protocol versions, and [PROTOCOL.md](PROTOCOL.md) documents only the wire protocol actually implemented.
 
-## 外设与数据能力
+## Peripheral and Data Capabilities
 
-七项新增能力及显示、文件等功能按 [功能规格](FEATURES.md#推荐支持规格) 实现，各自具有能力描述、配置、运行状态、停止与恢复流程。UI 显示用户选择、设备实际支持范围和生效结果；数据处理留在原生适配及工作模块。
+The seven new capabilities alongside display and file workflows follow [Recommended Support Baseline](FEATURES.md#recommended-support-baseline), each with capability descriptors, settings, runtime status, stop, and recovery flows. The UI shows user intent, actual hardware capabilities, and effective state while data processing stays in native adapters and worker threads.
 
-触控和笔输入优先进入本会话的 Wayland 输入模型，再处理 Xwayland 兼容。手柄通过 Linux 应用可识别的设备接口适配，并单列虚拟设备跨会话可见性和所需权限；同 UID 会话不提供设备沙箱。需要额外权限时使用范围明确的辅助组件，不默认让整个会话以 root 运行。
+Touch and pen target the session's native Wayland input model first, then Xwayland compatibility. Gamepads expose Linux-standard virtual devices while explicitly documenting cross-session visibility and permissions (same-UID sessions are not device sandboxes). Any elevated permission stays isolated in a tightly scoped helper—never running the whole session as root.
 
-麦克风与摄像头在 Linux 提供目标应用能识别的源，普通应用与 Flatpak 的设备和 Portal 授权分别处理。剪贴板以多格式数据提供和选择为核心，大载荷沿任务通道传输。打印将远端文档任务交给选定的 Windows 打印队列，按任务标识处理取消和状态查询，重连不自动重复提交。
+Microphones and webcams expose standard Linux sources with separate handling for native apps vs. Flatpak device/Portal grants. Clipboard centers on multi-format offer/selection with large payloads offloaded to task channels. Printing routes Linux jobs to chosen Windows print queues with job-ID cancellation and status polling, never auto-reprinting on reconnect.
 
-文件操作明确 Linux 路径、Windows 路径与临时文件的区别。收到文件先写任务临时区，完成校验后提交，已提交文件的生命周期不依赖当前查看连接。数据格式转换、落盘与打印等待不阻塞窗口或输入处理。
+File handling keeps Linux paths, Windows paths, and temporary staging distinct. Inbound files write to task staging areas, validate, and commit atomically; committed file lifetimes do not depend on the active viewer connection. Format conversions, disk writes, and print waits never block window or input loops.
 
-跨端文件交付统一采用只读输入语义：应用可读取/导入，不能覆盖公开的交付文件或通过目录操作替换它。用户通过 Dolphin/Explorer 等文件管理器将输入复制到明确选择的位置，得到独立、正常可写的文件；之后由原应用正常保存，不向源端自动回写。Linux 通过会话持有的只读 FUSE 视图公开完整缓存，返回普通可写 mode，使文件管理器副本按目标权限使用；Windows 实体缓存的 DACL 禁止写入、删除和父目录替换操作，不设置会随复制传播的 READONLY 属性。保护能力不足时拒绝发布并清理本批缓存。此处不是同 UID/管理员安全沙箱；成功缓存仍保留至会话生命周期，不随查看连接断开删除。详见 [只读交付规格](FEATURES.md#跨端文件的只读交付)。
+Cross-machine file delivery enforces uniform read-only input semantics: apps can read and import delivered files without overwriting them in place or replacing them via rename. Users copy delivered items into a chosen directory through Dolphin or Explorer to obtain independent writable copies managed normally by the destination OS without automatic write-back. Linux publishes completed caches via a session-owned read-only FUSE view returning normal writable permission bits so file-manager copies inherit normal destination permissions; Windows materialized caches use DACLs denying write, delete, and parent-directory replacement without setting the propagating `READONLY` attribute. If read-only protection cannot be enforced, publication is rejected and staged caches are cleaned up. This is not a same-UID/admin security sandbox; completed caches live for the session lifetime rather than disappearing on viewer disconnect. See [Read-Only Delivery](FEATURES.md#read-only-delivery-of-cross-machine-files).
 
-文件适配层负责只读导出、元数据、缓存及生命周期，不判定目标应用是否为编辑器，不逐个适配未命名文档或强制另存为。只读性与源文件不可修改由文件访问层保证，复制出的新文件按目标正常权限使用；跨网络按需读取属于后续可选优化，当前只读 FUSE 视图只公开已完整接收的本地字节。继续沿用标准拖放/剪贴板和原生文件选择，不增加通用跨端文件选择器或编辑同步框架。
+The file adapter owns read-only export, metadata, caching, and lifecycle without inspecting whether a target app is an editor, forcing Save As dialogs, or rewriting unnamed documents. On-demand network FUSE reads are a future optimization; the current FUSE view exposes fully received local bytes. Standard drag-and-drop, clipboard, and native file dialogs remain the interaction model without building a custom cross-machine file picker or bidirectional sync framework.
 
-拖放按不可变数据表示、会话协商/终结、原生协议适配、输入和视觉分别管理。跨端文字独立于文件及剪贴板开关；松手后保留交付状态，以目标 Finish 判定完成。源 generation、目标 revision 与 COM 回调租约分别防止迟到读取、旧接受和重入影响新目标。OLE 同步回调与 Wayland 异步协商之间采用运行消息泵的有界等待，具体边界及已验证组合见 [拖放设计](DRAG_AND_DROP.md)，不承诺任意延迟下的交付或应用级回滚。
+Drag-and-drop separates immutable data representation, session negotiation/finalization, native protocol adapters, input, and visuals. Cross-machine text drag-and-drop is independent of file and clipboard switches; delivery state survives drop until target `Finish`. Source generations, target revisions, and COM callback leases prevent late reads, stale acceptances, and reentrancy from corrupting newer targets. Bounded STA message-pumped waits bridge synchronous OLE callbacks and asynchronous Wayland negotiation; see [Drag-and-Drop Design](DRAG_AND_DROP.md) for limits (no arbitrary-latency delivery guarantees or app-level rollbacks).
 
-## 已确认的需求
+## Confirmed Requirements
 
-- 大型专业软件以 Blender 为核心目标；本机安装的其他应用与游戏见 [功能范围](FEATURES.md#本机应用与游戏清单)，具体首批验收组合待确定。
-- 应用在 Waybridge 私有会话中启动，这是当前选定的应用入口。
-- 输入除键鼠外，需要手柄、触控和触控笔；音视频需要麦克风语音和摄像头；数据交换需要富文本复制粘贴与打印。具体设备、子集和交付批次待确定。
-- 支持同一局域网和异地 VPN。网络策略需要依据实际带宽、往返时间、抖动与丢包情况调整。
-- 记录并评估直接编码、局部更新和按需分层传输三条画面优化路径；具体采用哪些路径，由应用行为和测量结果决定。
+- Blender is the core professional workstation target; other installed apps and games are cataloged in [FEATURES.md](FEATURES.md#installed-applications-and-games-snapshot), with initial acceptance subsets refined incrementally.
+- Applications launch inside a private Waybridge session.
+- Input covers keyboard, mouse, gamepads, multitouch, and stylus pen; A/V covers playback, microphone, and webcam; data exchange covers rich-text clipboard and printing.
+- Networking covers both LAN and remote VPN, adapting to real bandwidth, RTT, jitter, and packet loss.
+- Direct encoding, partial updates, and selective layered transfer are evaluated empirically rather than assumed upfront.
 
-## 会话独立性原则
+## Session Independence Principles
 
-Waybridge 定义为可独立启动的远程应用会话环境。部署不要求运行 KWin、Plasma、GNOME Shell 或其他宿主桌面；Waybridge 负责组织本会话的合成器、应用环境和必要服务，优先复用标准接口及现成组件。
+Waybridge is a standalone remote application session that does not require KWin, Plasma, GNOME Shell, or any other host desktop environment. Waybridge organizes its own compositor, app environment, and required services while reusing standard interfaces and existing components.
 
-| 范围 | 职责边界 |
+| Scope | Boundary |
 |---|---|
-| 合成、窗口与输入 | Waybridge 的 Smithay 合成器负责，不经宿主窗口管理器转接 |
-| 会话管理 | Waybridge 管理环境、用户服务激活与状态、应用启动及结束会话时的资源清理 |
-| 密钥、文件选择与常用交互 | 在本会话启动可独立运行的现成实现，原生对话框沿用远程窗口路径；通过接口检查能力，不要求宿主 DE 已经启动服务 |
-| 音频与其他用户服务 | 明确本会话拥有的节点和配置；允许使用能脱离 DE 运行的用户服务，是否独立启动服务进程按隔离需求确定 |
-| Portal、通知与窗口共享 | 使用标准应用接口，选择适合本会话的后端；需要合成器配合的部分对接 Waybridge |
-| 系统能力 | GPU 驱动、文件系统、网络、系统 D-Bus、logind 与 polkit 等按实际需要使用；桌面独立性不要求复制这些系统设施 |
+| Compositing, windows & input | Owned by Waybridge's Smithay compositor without routing through a host window manager |
+| Session management | Waybridge manages environment, service activation/status, app launching, and teardown cleanup |
+| Secrets, file pickers & dialogs | Runs standalone native implementations inside the session; dialogs render as remote windows without requiring a host DE |
+| Audio & user services | Explicitly tracks session-owned nodes and configs; reuses DE-independent user services with isolation where needed |
+| Portals, notifications & sharing | Uses standard application interfaces with session-appropriate backends; compositor-coupled backends integrate with Waybridge |
+| System facilities | Uses host GPU drivers, filesystem, network, system D-Bus, `logind`, and polkit as normal without duplicating OS infrastructure |
 
-KWallet、Qt、GTK 或 KDE Frameworks 可以成为组件依赖，是否采用取决于它们能否在目标会话独立运行。应用要求的 KDE 专用接口逐项记录兼容范围，不将其等同于必须启动整个 Plasma。用户通过原生 D-Bus、unit 和应用参数选择组件，核心不建立按 provider 名称激活、降级或监控的框架。KWallet 当前版本的接口与后端分工见 [上游说明](https://raw.githubusercontent.com/KDE/kwallet/v6.31.0/README.md)。
+Components such as KWallet, Qt, GTK, or KDE Frameworks may be used whenever they run independently inside the session; KDE-specific interfaces required by apps are tracked per app without implying all of Plasma must run. Users select components via native D-Bus, systemd units, and app flags rather than a core framework that activates or patches providers by name (see [KWallet upstream docs](https://raw.githubusercontent.com/KDE/kwallet/v6.31.0/README.md)).
 
-本会话使用 Waybridge 桌面身份和标准用户 D-Bus。[会话集成](../src/session_services.rs) 发布显示环境并异步启动独立的 `waybridge-session.target`；结束时先停止声明归属的服务，继续处理其显示请求，再撤销环境。失效旧显示不恢复，后登录桌面的环境不覆盖。D-Bus daemon 无 unset API 的限制明确记录。Portal 选择采用 `integration/` 中可选安装的静态标准配置，不生成运行期替代配置，不强制全局 Qt/GDK 后端。
+Sessions publish a Waybridge desktop identity on the standard user D-Bus bus. [Session Services](../src/session_services.rs) exports the display environment and asynchronously activates the standalone `waybridge-session.target`; shutdown stops bound services while continuing to service display requests, then revokes environment variables still owned by the session (never restoring stale displays or overwriting a later desktop login, documenting `dbus-daemon`'s lack of an unset API). Portal selection uses optional static standard configs in `integration/` without runtime config generation or global Qt/GDK overrides.
 
-显示、输入、音频节点和诊断按会话管理；HOME、应用及钱包配置和数据默认共享。断开保留会话，结束时清理会话资源；共享服务遵循用户正常生命周期，不扫描或强杀其他后台进程。旧隔离数据保留，见 [会话策略](SESSION_POLICY.md)。
+Display, input, audio nodes, and diagnostics are session-scoped while `HOME`, app configs, wallets, and data are shared by default. Disconnects keep sessions alive; explicit shutdown cleans up session resources while shared services follow normal user lifecycles without sweeping unrelated background processes. Legacy isolated directories remain untouched per [SESSION_POLICY.md](SESSION_POLICY.md).
 
-没有本地图形桌面时验证独立启动。创建前检查 logind 中同一 UID 的活跃或后台 Wayland/X11 用户会话，锁屏仍占用；SSH、TTY、greeter 和其他用户不阻止创建。运行期锁防止多个 Waybridge 同时启动，已有会话重连不重复检查。启动后的 DM 登录交给 DM，不增加 PAM 拦截。本次策略验证与历史设备基线分开记录。
+Standalone startup is verified with no local graphical desktop running. Pre-creation checks query `logind` for active or background Wayland/X11 sessions belonging to the same UID (locked screens still count; SSH, TTYs, greeters, and other users do not block). A runtime lock prevents concurrent Waybridge startups, and reattaching skips creation checks. Subsequent logins through other display managers are left to those DMs with no PAM hooks.
 
-## 当前架构
+## Current Architecture
 
-Linux 侧运行基于 Smithay 的私有无头 Wayland 合成器，并可启动私有 Xwayland。应用在 Linux 绘制内容；合成器管理窗口和输入，将每个窗口的 surface 树绘制到离屏目标，再交给 PNG 或 NVENC 编码。弹出窗口具有独立元数据和画面。
+Linux runs a private headless Smithay Wayland compositor with optional private rootless Xwayland. Applications render on Linux; the compositor manages windows and input, composites each window's surface tree to an offscreen target, and encodes via PNG or NVENC. Popups maintain independent metadata and surfaces.
 
-Windows C++ 内核负责 Win32 窗口、D3D11 解码、DirectComposition 呈现、IME、指针锁定、OLE 和音频。Windows 已经在本地将这些远程应用窗口与其他桌面窗口组合起来；当前主要在 Linux 完成单个窗口内部的 surface 合成。
+The Windows C++ engine handles Win32 windows, D3D11 decoding, DirectComposition presentation, IME, pointer lock, OLE, and audio—letting Windows natively composite remote app windows alongside local windows while Linux composites each window's internal surface tree.
 
-C# 控制中心通过当前用户专用 named pipe 管理原生内核，通过 TLS 管理 API 或兼容 SSH/Python 入口创建或接入 Linux 会话、启动应用。原生内核独立建立 TLS 流，C# 不转发媒体。查看端断线后，正常运行的远端合成器保留应用。合成器崩溃或重启后的应用恢复是另一项能力：应用依赖原 Wayland/X11 连接，进程监督本身不能保证恢复原有应用状态。
+The C# Control Center controls the native engine over a current-user private named pipe and manages Linux sessions and app launches over the TLS management API. The native engine opens its own TLS streams so C# never proxies media. Viewer disconnects leave remote apps running on the live compositor. Recovering app state after a compositor crash or reboot is a separate problem because Wayland/X11 clients depend on live compositor connections.
 
-TCP 控制、媒体和音频连接分别认证，窗口控制与文件数据目前共用控制连接。可选 UDP 使用认证加密、XOR FEC 和 TCP 补帧，并按全局消息顺序交付媒体。TLS 网关与现有 SSH 隧道均可承载这些 TCP 连接。
+TCP control, media, and audio connections authenticate independently; window control and file metadata share control while negotiated peers offload file bytes to the dedicated file channel. Optional UDP uses authenticated encryption, XOR FEC, and TCP frame repair with global media ordering. Both the TLS gateway and external SSH tunnels can carry the TCP channels.
 
-现有 M0/M1 验收作为继续开发的基线，当前推进媒体调度与 M2 日常体验。捕获前背压和队列诊断已接入；上文的逐窗口清晰/交互/游戏策略、覆盖完整媒体资源的全局预算、文件独立通道和网络/编码负载的完整自适应联动尚未完成；原生触控、笔和手柄/震动已有显式启用的实验子集，实体设备和应用覆盖仍待扩展；麦克风、摄像头、富文本和打印尚未交付。已有编码器、UDP 或文件工作队列不代表这些目标已经达成，状态以 [Roadmap](ROADMAP.md#当前进展) 为准。
+Existing M0/M1 verification is the baseline while media scheduling and M2 everyday features progress. Pre-capture backpressure and queue diagnostics are active; per-window clarity/interactive/gaming policies, full media resource budgets, dedicated file channels, and full network/encoder coordination are being rolled out incrementally; experimental native touch, pen, and gamepads/rumble are available opt-in with physical device/app matrices still expanding; webcam, window sharing, and printing remain ahead. Status is tracked authoritatively in [ROADMAP.md](ROADMAP.md#current-progress).
 
-实现入口：[TLS 用户入口](../service/src/main.rs)、[合成器](../src/main.rs)、[共享配置](../config/src/lib.rs)、[应用启动助手](../scripts/session-control.py)、[会话环境](../src/launch.rs)、[桌面服务](../src/session_services.rs)、[文件工作队列](../src/transfer_worker.rs)、[网络](../src/network.rs)、[捕获](../src/capture.rs)、[编码调度](../src/video.rs)、[Windows 内核](../client/main.cpp)、[Windows 呈现](../client/presentation.h)、[GUI 会话控制](../gui/Waybridge.Control.Core/SessionController.cs)。当前线协议见 [PROTOCOL.md](PROTOCOL.md)，设备验证范围见 [VALIDATION.md](VALIDATION.md)。
+Key entry points: [TLS user service](../service/src/main.rs), [compositor](../src/main.rs), [shared config](../config/src/lib.rs), [session helper](../scripts/session-control.py), [session launch env](../src/launch.rs), [desktop services](../src/session_services.rs), [file worker](../src/transfer_worker.rs), [network](../src/network.rs), [capture](../src/capture.rs), [video scheduling](../src/video.rs), [Windows engine](../client/main.cpp), [Windows presentation](../client/presentation.h), [GUI session controller](../gui/Waybridge.Control.Core/SessionController.cs). See [PROTOCOL.md](PROTOCOL.md) for the implemented wire protocol.
 
-## 画面路径的研究方向
+## Display Pipeline Research Directions
 
-### Surface 与 buffer 的边界
+### Surface vs. Buffer Boundaries
 
-Surface 是应用提交显示内容的对象；buffer 是某次绘制得到的像素内容。一个 surface 可以依次使用多个 buffer。应用的按钮、文字和图片可能已经被工具包合成进同一个 buffer，因此无法根据 surface 自动还原控件或应用内部渲染图层。
+A Wayland surface receives display state from a client, while a buffer holds one rendered pixel frame. Toolkits frequently composite buttons, text, and images into a single buffer before committing, so Wayland surfaces cannot automatically reconstruct widget trees or arbitrary internal app layers.
 
-Wayland 提供 buffer 交付与显示状态模型，跨机器传输和 Windows 资源适配需要额外协议。把合成移到 Windows，仍然需要传输远端应用渲染出的内容。参考 [Wayland FAQ](https://wayland.freedesktop.org/faq/) 和 [Wayland 渲染模型](https://wayland.freedesktop.org/docs/book/Architecture.html#wayland-rendering)。
+Wayland defines buffer delivery and display state, not cross-machine transport or Windows resource mapping. Even if compositing moves to Windows, remotely rendered pixels must still cross the network. References: [Wayland FAQ](https://wayland.freedesktop.org/faq/) and [Wayland Rendering Architecture](https://wayland.freedesktop.org/docs/book/Architecture.html#wayland-rendering).
 
-### 候选路径
+### Candidate Optimizations
 
-| 路径 | 适用条件与预期收益 | 必须处理的问题 |
+| Path | Conditions & Expected Gain | Required Problems to Solve |
 |---|---|---|
-| 简单窗口直接编码 | 对满足条件的单 surface 窗口，将应用 buffer 导入编码路径，有机会减少离屏合成和复制 | GPU 与格式兼容、裁剪和变换、颜色与 alpha、buffer 生命周期及同步；复杂窗口继续使用现有合成路径 |
-| 局部更新 | 对文字、表格和工具界面，只传输发生变化的区域，降低小范围变化的传输成本 | damage 的准确性、缓存基准、更新顺序、缩放和重连后的重新同步；同一 surface 也可使用 |
-| 按需分层传输 | 应用确实提供独立更新的多个 surface 时，分别编码，在 Windows 按层级组合 | 多层状态与画面的原子更新、裁剪、变换、透明度、色彩、输入坐标与资源销毁 |
+| Direct single-surface encoding | Import qualifying single-surface client buffers directly into encoding to reduce offscreen compositing and copies | GPU/format compatibility, crops and transforms, color and alpha, buffer lifetime and sync; complex windows retain compositing |
+| Partial updates | Transmit only changed regions for text, spreadsheets, and tool UIs to cut small-change bandwidth | Damage accuracy, cache baselines, ordering, scaling, and reconnect resync (applicable within a single surface too) |
+| Selective layered transfer | When an app genuinely submits independently updating subsurfaces, encode separately and composite on Windows | Atomic multi-layer state/frame commits, clipping, transforms, alpha, color, input coordinates, and teardown |
 
-GTK 的常规渲染会将控件渲染结果提交到 surface，graphics offload 则在满足条件时把视频等内容交给 subsurface，说明分层收益取决于实际应用行为。参考 [GTK graphics offload](https://blogs.gnome.org/gtk/2023/11/15/introducing-graphics-offload/)。
+GTK's regular rendering flattens widgets into one surface while graphics offload promotes qualifying video into subsurfaces, illustrating that layering wins depend strongly on real app behavior (see [GTK graphics offload](https://blogs.gnome.org/gtk/2023/11/15/introducing-graphics-offload/)).
 
-现有视频编码已经利用帧间重复内容，分层或局部更新的带宽收益需要与当前路径对照测量。直接编码也不等于全链路零拷贝。三条路径应保留一致的窗口身份、输入和恢复语义，并提供可观测的路径选择与回退原因。
+Existing video codecs already exploit temporal redundancy, so partial updates or layering must be benchmarked against the baseline, and direct encoding is not automatically end-to-end zero-copy. All three paths must preserve window identity, input, and recovery semantics with observable path selection and fallback reasons.
 
-### 首轮测量
+### Initial Measurements
 
-选择常用浏览器、办公软件、文件管理器及游戏，记录：
+Benchmark representative browsers, office apps, file managers, and games, recording:
 
-- 每个窗口的 surface 数量、尺寸、更新频率、damage 面积和 buffer 类型。
-- 合成、GPU 同步、回读或复制、编码、网络排队、解码及呈现提交的耗时。
-- CPU、GPU、显存和传输开销，以及文字、透明度、颜色和输入坐标的正确性。
+- Per-window surface counts, sizes, update rates, damage areas, and buffer types.
+- Stage latencies across compositing, GPU sync, readback/copy, encoding, network queuing, decoding, and presentation submit.
+- CPU, GPU, VRAM, and bandwidth cost alongside text crispness, alpha, color, and input coordinate accuracy.
 
-对比保持相同应用操作、尺寸、DPI、编解码配置和网络条件。先建立现有路径基线，再选择一条路径做最小实验。
+Hold app actions, window dimensions, DPI, codec config, and network conditions constant—baseline the current path first, then run one minimal experiment.
 
-## 现有实现的调整重点
+## Current Implementation Focus Areas
 
-以下记录从当前实现迁移到 v1 基线的具体工作。参数与优化算法通过测量选择，不改变上文的模块职责与状态边界。
+Concrete transition steps from the current codebase to the v1 baseline (parameters and algorithms are chosen by measurement without shifting module boundaries):
 
-### 入口与模块拆分
+### Entry Points and Modularization
 
-从 `src/main.rs` 与 `client/main.cpp` 中按会话、窗口输入、媒体策略、传输、设备和数据任务提取职责。已有独立模块和平台适配继续复用，入口负责组装与事件分发。拆分以明确状态归属和解除阻塞为目标，每步保留可运行版本及对应集成验收。
+Extract session, window/input, media policy, transport, device, and data-task modules cleanly out of `src/main.rs` and `client/main.cpp` while keeping runnable builds and passing integration regressions at every step.
 
-Rust、原生编解码、C++ 与 C# 的语言边界保持；新增跨边界接口先定义字段、所有权、错误与取消语义，再接入具体功能。
+Maintain existing Rust, native codec, C++, and C# boundaries; define fields, ownership, error, and cancellation semantics before wiring new cross-boundary features.
 
-### 桌面服务与应用联动
+### Desktop Services and Application Integration
 
-应用联动见 [FEATURES.md](FEATURES.md#应用与桌面服务联动)。默认使用用户总线上的原有钱包服务与数据，不做钱包转发，也不创建使用同一钱包文件的私有后端。同 UID 会话不提供文件系统安全沙箱。
+See [FEATURES.md](FEATURES.md#application-and-desktop-service-integration). Waybridge defaults to the native secret service and data on the user bus without forwarding wallets or spawning duplicate private backends over the same wallet files. Same-UID sessions do not provide a filesystem security sandbox.
 
-建议优先复用 Linux 现成服务及其原生交互界面，让它们与应用运行于同一 Waybridge 显示和总线环境。普通对话框通过现有远程窗口路径显示；通知、窗口共享及明确选择在 Windows 打开的链接、文件与设备请求再按需适配，不预先为所有服务重写 Windows 界面。
+Prefer reusing existing Linux services and their native UIs inside the Waybridge display/bus environment so ordinary dialogs stream as normal remote windows. Only notifications, window sharing, and explicit Windows-side link/file/device integrations require native Windows UI adapters.
 
-历史双私有总线、两套钱包测试仅验证旧方案。当前共享策略已使用临时用户数据上的真实 KWallet/GTK Portal 验证，本机 Chrome 在实际钱包解锁后也由用户确认恢复登录。该结果不代表任意旧隔离钱包迁移、其他密码后端或所有应用工作流已经通过。
+Historical dual-private-bus wallet tests validated the older isolated design. The shared-data policy has been validated against real KWallet and GTK Portals on temporary user data, and real Chrome login recovery after native wallet unlock has been confirmed—without claiming migration of legacy isolated wallets, every password backend, or all app workflows.
 
-Portal 前端、后端及服务激活环境必须一致。共享用户总线时同步 D-Bus 与 systemd 用户服务环境。应用单实例与数据锁遵循原有机制，不绕过锁，不为通用残留后台进程增加扫描清理。
+Portal frontends, backends, and service activation environments must stay aligned by syncing D-Bus and systemd user environments. Single-instance locks follow native app rules without bypassing locks or sweeping unrelated background processes.
 
-polkit 认证代理与真实登录会话或进程的关联、屏幕共享的 PipeWire 输出、Flatpak 文档访问授权分别设计，不将它们等同于普通 D-Bus 名称转发。具体进程部署在完成目标应用的最小验证后确定。
+Polkit authentication agents bound to real login sessions, PipeWire ScreenCast outputs, and Flatpak document-portal grants are designed separately rather than conflated with plain D-Bus name forwarding.
 
-远端应用托盘、通知和后台入口已形成 M2 首轮实现。SNI/DBusMenu 使用 Linux 有界工作线程，Windows C++ 适配为 Shell 托盘和原生菜单；后台列表只展示有 SNI 身份的项目，恢复与退出沿用应用提供的动作。XEmbed、更多动态菜单及完整应用矩阵仍单列验证。功能及验收边界见 [桌面集成清单](FEATURES.md#桌面集成的交付清单) 与 [托盘说明](DESKTOP-TRAY.md)。
+Remote app trays, notifications, and background entries form the first M2 pass: SNI/DBusMenu runs on a bounded Linux worker and maps to native Windows Shell trays and menus; the background list shows SNI-identified entries and invokes app-provided restore/exit actions. XEmbed, richer dynamic menus, and broader app matrices remain tracked separately. See [Desktop Integration Delivery Checklist](FEATURES.md#desktop-integration-delivery-checklist) and [Application Trays](DESKTOP-TRAY.md).
 
-通知采用显式选择的 `waybridge --notification-provider` 进程与可选会话 user unit，承载标准 `org.freedesktop.Notifications`，通过当前会话私有 Unix datagram socket 接入合成器。它不抢占已有通知服务，不观察他人的消息来猜测转发。Linux 的阻塞 D-Bus、图标解析及租约维护留在 helper/诊断线程；合成器只处理有界结构化事件。
+Notifications run through the explicitly opted-in `waybridge --notification-provider` process and optional session user unit hosting standard `org.freedesktop.Notifications`, talking to the compositor over a session-private Unix datagram socket. It never steals an existing daemon or snoops on another daemon's traffic; blocking D-Bus, icon resolution, and leases stay in helper/diagnostic threads while the compositor handles bounded structured events.
 
-Windows C++ worker 校验通知身份、连接绑定、revision、共享和只读权限，再经私有 named pipe 交给 C# 的 Windows App SDK AppNotifications 呈现。C# 在独立有界队列处理通知、系统通知设置和动作；视频及逐次键鼠仍留在 C++。只有 GUI 报告原生通知可用后才打开转发，平台不可用或处理溢出时明确停用，断开与 provider 失联清除旧动作。Windows 管理免打扰和通知中心。
+The Windows C++ worker validates notification identity, connection binding, revision, sharing, and read-only policy before passing structured payloads over the private named pipe to C# Windows App SDK AppNotifications. C# processes notifications, OS settings, and actions on an independent bounded queue while video and input stay in C++. Forwarding activates only after GUI confirms native notifications are ready, disables cleanly on platform unavailability or overflow, and clears stale actions on disconnect or provider loss. Windows manages Do Not Disturb and Notification Center.
 
-应用图标与任务栏身份是独立概念：每个顶层窗口按连接配置 ID 和 Linux app_id 设置 AppUserModelID，同应用的多个窗口归组，未知应用按窗口分开，重连仍用稳定来源。直接启动 worker 时以 host/port 作为来源。属性在窗口销毁前清除；固定与重启动作尚未提供，避免固定出无法恢复远端应用的通用 worker 快捷方式。Windows 的属性及资源契约见 [SHGetPropertyStoreForWindow](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shgetpropertystoreforwindow)。
+Window icons and taskbar identity are independent: each toplevel receives an `AppUserModelID` keyed by connection profile ID and Linux `app_id` so multi-window apps group together, unknown apps stay separate, and reconnects keep stable identity (direct worker launches use host/port). Properties clear before window destruction; taskbar pinning and relaunch shortcuts are withheld so Windows never pins a generic worker shortcut that cannot restore the remote app (see [SHGetPropertyStoreForWindow](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shgetpropertystoreforwindow)).
 
-Linux 适配层维护标准接口对象、应用来源和状态，Windows 原生系统集成层负责托盘/菜单/通知呈现与用户动作，控制中心提供配置和后台应用列表。双方传递结构化状态与动作，不将托盘图标当作视频窗口编码；复用可靠消息与能力协商，不要求单独进程，也不依赖 KWin 或 Plasma。阻塞的 D-Bus 查询不进入合成器/UI 主循环。
+The Linux adapter owns standard interface objects, app provenance, and state; the Windows native integration layer owns tray/menu/notification presentation and user actions; the Control Center owns configuration and the background-app list. Both sides exchange structured state/actions rather than video-encoding tray icons, keeping blocking D-Bus I/O out of compositor and UI loops.
 
-托盘优先按 StatusNotifierItem 的 Host/Watcher 和菜单接口接入；XEmbed 托盘单列兼容路径。通知需要显式选择可对接 Windows 的标准通知服务，不能仅靠订阅总线观察推定已接通。共享用户总线已有名称所有者时检测并尊重其归属，配置冲突须报告。没有主窗口不能推定应用已退出；正常退出、窗口隐藏、查看端断开和结束会话分别处理。
+Trays prioritize StatusNotifierItem Host/Watcher + DBusMenu, tracking legacy XEmbed separately. Notifications require explicit provider opt-in; existing bus name owners are respected and conflicts are surfaced cleanly. Having no open toplevel window never implies an app exited; exit, hide-to-tray, viewer disconnect, and session shutdown remain distinct.
 
-项目及菜单使用稳定身份、对象来源和代次；重连发送当前快照，旧点击或菜单回调失效，Windows 桌面组件重启后可重建呈现。图标、菜单深度、更新频率及通知数据有界；Linux 图标路径在 Linux 侧解析，原生菜单不可用时按能力回退到远端菜单窗口。线协议通过 `tray_v1` / `notifications_v1` 协商，详见 [PROTOCOL.md](PROTOCOL.md)。
+Items and menus carry stable IDs, source identity, and generations; reconnects send fresh snapshots, invalidating stale clicks and callbacks, and Explorer restarts rebuild icons cleanly. Icons, menu depth, update rates, and notification sizes are bounded; Linux resolves icon paths locally, falling back to remote menu windows when native menus are unavailable. Wire negotiation uses `tray_v1` and `notifications_v1` (see [PROTOCOL.md](PROTOCOL.md)).
 
-Windows 原生窗口和托盘图标通过 `NativeIcon` / `IconBadge` 合成来源角标。合成在目标像素尺寸完成，按 DPI 或连接角标变化更新，原图单独保留。控制中心通过目录接口取得原图，Windows 通知则显示经缩放的原图。连接配置保存规范化 PNG，角标仅由 Windows 客户端处理。来源和边界见 [图标与远端标识](FEATURES.md#图标与远端标识)。
+Windows composites source badges onto native window and tray icons via `NativeIcon` / `IconBadge` at the target pixel size, refreshing on DPI or badge changes while preserving originals separately. The Control Center fetches raw catalog icons and Windows notifications show scaled originals. Profiles store normalized PNGs, and badging lives strictly on the Windows client. See [Icons and Remote Identity](FEATURES.md#icons-and-remote-identity).
 
-### 会话恢复与输入一致性
+### Session Recovery and Input Consistency
 
-会话、查看连接、窗口映射和媒体编码分别维护身份或代次，避免旧连接中的按键、IME 提交、拖放结果或画面影响新目标。完整窗口快照与后续增量更新需要定义一致的恢复边界。
+Sessions, viewer connections, window mappings, and media encoders maintain distinct identities/generations so late keys, IME commits, drag results, or frames from old connections never affect new targets. Full window snapshots and subsequent deltas share a clear recovery boundary.
 
-焦点、IME、popup grab、原生 OLE 和指针锁定应由统一的输入状态模型协调。键盘及鼠标按下、释放和焦点切换需要保留因果顺序；绝对鼠标位置可以在明确边界内保留最新值，相对鼠标位移则需要累计，不能按绝对坐标的方式覆盖。
+Focus, IME, popup grabs, native OLE, and pointer lock coordinate through one input-state model: key/button press-release edges and focus switches keep strict causal order, absolute pointer motion coalesces within boundaries, and relative deltas accumulate rather than overwrite.
 
-首个恢复目标可限定为查看端或网络中断后的重新接入。服务端崩溃后的工作环境恢复，需要另行确定应用重启、用户数据与恢复能力的范围。
+The primary recovery target is viewer or network drop recovery against a live session; recovering apps after a server crash requires a separate workspace-recovery design.
 
-### 全局预算与背压
+### Global Budgets and Backpressure
 
-当前已有每窗口两帧呈现 credit、128 MiB 原始帧队列和 UDP 传输预算。Linux 捕获/编码工作区、GL 目标、CUDA 池及活动/空闲编码器已接入会话与每窗口预算，凭证跟随真实资源生命周期；GPU/编解码器使用明确标记的估算，详见 [媒体预算](MEDIA_BUDGET.md)。Windows 解码/呈现纹理、传输载荷及驱动私有资源的完整覆盖继续扩展。
+In addition to per-window 2-frame presentation credits, the 128 MiB raw frame queue, and UDP transport budgets, Linux capture/encode workspaces, GL targets, CUDA pools, and active/idle encoders are accounted under session and per-window budgets backed by live resource leases (with explicitly labeled estimates for GPU/codec memory; see [Media Budget](MEDIA_BUDGET.md)). Windows decode/present textures, transport payloads, and driver-private resources continue expanding coverage.
 
-背压应影响捕获决策。当前 `src/capture.rs` 在合成和回读前检查呈现 credit、每窗口待编码槽和原始队列容量；下游忙时保留 dirty，额度恢复后捕获当前内容，同时继续处理 Wayland 协议、窗口元数据和 frame callback。原始队列维持 128 MiB 上限；提交时按实际 CPU/CUDA 字节复核，拒绝后保留 dirty，不驱逐其他窗口的最终更新。编码线程重排队时同样检查上限，无法保留的未编码更新请求重新捕获。128 MiB 仍是原始队列自身上限；新资源账户另行覆盖出队后的捕获/编码工作区、GL 目标与编解码器生命周期，Windows 解码纹理及传输载荷尚未并入。
+Backpressure governs capture directly: `src/capture.rs` checks presentation credits, per-window pending encode slots, and raw queue capacity before compositing and readback, keeping surfaces marked dirty when downstream is busy and capturing fresh pixels once capacity frees while continuing to process Wayland protocol, metadata, and frame callbacks. The raw queue enforces its 128 MiB ceiling against actual CPU/CUDA bytes on enqueue—rejecting without evicting other windows' final updates—and re-enqueued unencoded updates trigger recapture if the cap is hit.
 
-前台游戏、正在交互的办公窗口和后台窗口可使用不同调度权重。排队预算需要同时考虑字节数、资源数和帧龄，防止平均吞吐正常但交互延迟持续增长。
+Foreground games, active office windows, and background windows can receive distinct scheduling weights. Queue budgets account for bytes, resource counts, and frame age together so average throughput cannot mask growing interactive latency.
 
-依赖前帧的视频访问单元在同一 epoch 内保持有序；丢弃引用链需要通过新 epoch 和独立关键帧恢复。增量图块也需要缓存基准及重新同步机制。只有能够独立替换的更新才适合保留最新值。
+Inter-frame encoded units stay strictly ordered within an epoch; dropping a reference chain recovers via a new epoch and IDR keyframe. Incremental tiles likewise require reference baselines and resync rules; only self-contained updates can coalesce to latest.
 
-### 控制与媒体传输
+### Control and Media Transport
 
-按数据语义划分调度，而不是按单个 socket 的先进先出处理所有工作：
+Schedule by data semantics instead of single-socket FIFO:
 
-- 窗口生命周期、输入边沿、IME、配置和文件提交使用可靠且具有因果顺序的消息。
-- 文件字节使用有界批量传输；其吞吐不应占用输入和窗口控制的响应预算。
-- 视频按窗口或媒体流维护顺序，评估去掉当前全局有序交付造成的跨窗口阻塞。
-- 音频具有独立时钟和有界播放队列；视频播放与游戏场景可以有不同的同步策略。
+- Window lifecycle, input edges, IME, config, and file commits use reliable causally ordered messages.
+- File bytes use bounded bulk transfer without stealing interactive responsiveness from input or window control.
+- Video maintains per-window/per-stream order, evaluating removal of cross-window head-of-line blocking from global media ordering.
+- Audio keeps an independent clock and bounded playback queue with distinct sync policies for video playback vs. gaming.
 
-局域网和 VPN 共享应用协议，具体数据路径根据能力与测量协商。M1 已以 TLS 独立连接承载日常操作，提供用户服务入口、配对信任与各通道认证；SSH 作为可选管理与隧道兼容路径。通道拆分后的共同拥塞和总带宽预算也必须处理。
+LAN and VPN share the same application protocol while negotiating transport behavior from capabilities and measurements. M1 runs daily traffic over independent TLS connections with user-service pairing/trust and per-channel auth, keeping SSH as an optional admin/tunnel path; split channels still share total link bandwidth and require coordinated congestion budgets.
 
-### 配置与能力协商
+### Configuration and Capability Negotiation
 
-区分用户期望配置、两端协商能力和实际运行路径，并由统一的策略解析生成有效配置。每次设置更新返回接受结果、实际选择及回退原因，连接初始化和实时修改沿用相同语义。
+Distinguish user-desired config, negotiated capabilities, and effective runtime paths through one unified policy resolver. Every setting update returns acceptance, effective choices, and fallback reasons with identical semantics at startup and live update.
 
-M0 已统一启动与实时设置的 codec 解析：auto + SDR 选择 H.264，auto + HDR 偏好选择 HEVC；实际 HDR 仍受客户端 Main10/PQ 和显示器能力约束。`stream_config` 返回期望 codec、实际选择、HDR 偏好及 PNG 硬限制原因。关闭 HDR 同时阻止每窗口色彩策略继续启用 HDR，并触发重新捕获；真实 NVENC 回归覆盖两个方向及新关键帧代次。JSON 消息可先统一类型、范围、版本及测试样例，再决定是否生成绑定。
+M0 unified startup and live codec resolution: `auto` + SDR selects H.264, `auto` + HDR preference selects HEVC, while actual HDR remains gated by client Main10/PQ and display capabilities. `stream_config` reports desired codec, effective choice, HDR preference, and PNG hard-limit reasons. Disabling HDR prevents per-window color policy from staying in HDR and triggers recapture (verified in both directions with real NVENC and new keyframe epochs). JSON schemas align types, bounds, versions, and shared test vectors across languages before considering code generation.
 
-### 实时线程与故障隔离
+### Real-Time Threads and Fault Isolation
 
-M0 已将 Linux 和 Windows 文件接收移至有界顺序工作队列，完成事件携带连接/选择代次，断线或关闭共享会作废迟到结果；Windows socket 发送由独立有界 FIFO 执行。队列耗尽显式失败并关闭相应连接，避免 UI 等待或无声丢失可靠消息。Linux 故意阻塞落盘及 Windows 慢 I/O/取消风暴回归已覆盖响应性。旧客户端非 file_tree 上传的少量元数据预检仍有同步路径；媒体 GPU 同步和大入口拆分继续渐进改善。
+M0 moved Linux and Windows file receiving to bounded sequential worker queues with connection/selection generations so disconnects or disabling sharing invalidate late completions, and moved Windows socket sends to a dedicated bounded FIFO. Queue exhaustion fails explicitly and closes the affected connection rather than blocking the UI or silently dropping reliable messages. Deliberately stalled Linux disk writes and slow Windows I/O / cancellation storms are covered by regressions. Small metadata prechecks on legacy non-`file_tree` uploads remain synchronous; media GPU sync and entry-point modularization continue incrementally.
 
-编解码器或单个媒体流失败时，尽量缩小回退范围，并保证输入能够释放、窗口状态能够同步。客户端进程退出与远端会话结束使用明确的不同操作。
+Codec or single-stream failures fall back with the narrowest possible blast radius while ensuring inputs release and window state stays synced. Exiting the client and terminating the remote session remain distinct operations.
 
-### 质量指标与验收
+### Quality Metrics and Verification
 
-`--stats` 每两秒报告同一时钟下的阶段平均值、最大值和 P50/P95/P99；分位数使用固定大小的微秒直方图，报告桶上界并以实际最大值封顶，舍入误差最多 6.25%。已记录捕获、原始编码队列、捕获至编码/网络队列、媒体发送队列，以及原始队列条目/字节数的最近值和区间峰值。等待计数分别标记呈现额度、编码槽和队列预算不足；它们统计轮询次数，不是丢帧数。完整每窗口资源、回退次数和物理性能基线继续扩展。
+`--stats` reports local-clock stage averages, maximums, and P50/P95/P99 every two seconds using fixed-size microsecond histograms (reporting bucket upper bounds capped by observed maximums, ≤ 6.25% rounding error). It tracks capture, raw encode queue, capture-to-encode/network queue, media send queue, and latest/peak raw queue counts and bytes. Wait counters separate presentation-credit, encode-slot, and queue-budget stalls (poll counts, not dropped frames). Per-window resources, fallback counters, and physical latency baselines continue expanding.
 
-呈现提交时长、控制 RTT 和各端阶段时间不能直接相加作为物理输入到显示延迟。物理延迟需要单独的端到端实验。
+Presentation submit times, control RTT, and per-endpoint stage durations cannot simply be summed as physical input-to-display latency; physical latency requires dedicated end-to-end measurement.
 
-验收矩阵同时覆盖办公与游戏、局域网与 VPN、多窗口并发、文件传输、连续缩放及断线恢复。具体分辨率、刷新率、网络参数和资源上限由目标设备及使用预期确定。
+Verification matrices span productivity and gaming, LAN and VPN, multi-window concurrency, file transfers, continuous resizing, and disconnect recovery, calibrated against target hardware and user expectations.
 
-## 实施顺序
+## Implementation Sequence
 
-| 阶段 | 主要工作 | 完成依据 |
+| Phase | Core Work | Completion Evidence |
 |---|---|---|
-| 核心收敛 | 按职责拆入口，移出文件及输入发送的阻塞等待；统一身份代次、配置解析与能力结果，修复 auto/HDR 冲突 | 文件传输、缩放和重连期间仍能操作；启动与实时设置一致；GUI 最新修正在 Windows/WoA 完成实机确认 |
-| 独立会话与连接 | 用户级服务入口、配对及认证加密直连、本会话服务管理、原生钱包、Portal 与激活环境、应用启动和单实例处理 | 无宿主 DE、客户端无 OpenSSH 时完成连接及选定应用流程；与宿主桌面并行运行不接管或改写其环境 |
-| 媒体与网络 | 捕获前背压、全局预算、逐窗口策略、文件独立通道、按流交付与网络适配 | LAN/VPN 固定场景下测量帧龄、输入响应、清晰度和资源；多窗口及大传输不产生无界积压 |
-| 功能交付 | 按功能文档三批接入富文本、麦克风、手柄、触控、笔、摄像头、窗口共享和打印等能力 | 每项达到选定支持范围，实际应用与外设通过；对应的任务、取消和恢复流程可用 |
-| 定向优化 | 依据测量选择直接编码、局部更新或 surface 分层中的最小实验 | 性能改善与输入、透明度、颜色及恢复正确性同时成立，保留兼容路径 |
+| Core consolidation | Split large entry points, remove blocking file/send waits, unify IDs/generations/config resolution, fix `auto`/HDR conflict | UI stays responsive across transfers, resizes, and reconnects; startup and live settings match; latest GUI fixes confirmed on Windows/WoA |
+| Standalone sessions & connectivity | User-level service, pairing & encrypted direct transport, session service management, native wallets/Portals/activation env, app launching & single-instance rules | Connect and run selected apps with no host DE and no Windows OpenSSH; run cleanly alongside host desktop policies without hijacking its env |
+| Media & network | Pre-capture backpressure, global budgets, per-window policies, dedicated file channel, per-stream delivery, network adaptation | Measured frame age, input responsiveness, clarity, and resource bounds on LAN/VPN; zero unbounded buildup under multi-window + large transfers |
+| Feature delivery | Deliver rich text, microphone, gamepads, touch, pen, webcam, window sharing, and printing in three waves per [FEATURES.md](FEATURES.md) | Each meets target baseline on real apps and hardware with working task/cancel/recovery flows |
+| Targeted optimization | Run minimal measurement-backed experiments for direct encoding, partial updates, or surface layering | Measured gains hold simultaneously with input, alpha, color, and recovery correctness, preserving compatible fallbacks |
 
-每阶段保持可运行版本，新增功能沿相应模块接入；功能交付可在稳定接口上并行推进，不必等所有画面实验完成。交付顺序与阶段完成条件以 [ROADMAP.md](ROADMAP.md) 为准，功能支持子集见 [功能计划](FEATURES.md#建议的交付批次)。本文件不设未经实现评估的工期。
+Every phase maintains a runnable build; features plug into stable module interfaces in parallel without waiting on display-pipeline experiments. Delivery order and exit criteria live in [ROADMAP.md](ROADMAP.md), and feature batches live in [FEATURES.md](FEATURES.md#recommended-delivery-batches).
 
-## 验收与待校准项
+## Verification and Items to Calibrate
 
-架构验收覆盖无宿主 DE 启动、同用户本地桌面准入拒绝与轮流使用、Windows x64/ARM64、多窗口与混合 DPI、LAN/VPN、网络和设备中断、大文件并发及长时间运行。Waybridge 启动后的其他 DM 登录仍不拦截。优先采用功能文档中的 Blender/GIMP、Minecraft、代表性原生及 Windows 游戏、办公与会议应用组合，记录实际运行器及设备能力。
+Architectural verification covers headless startup without a host DE, same-UID local-desktop admission rejection and alternating use, Windows x64/ARM64, multi-window + mixed DPI, LAN/VPN, network/device interruptions, concurrent large file transfers, and long-running soak tests. Later DM logins after Waybridge startup remain unblocked. Representative combinations prioritize Blender/GIMP, Minecraft, native and Windows games, and productivity/conferencing apps, recording exact runners and device capabilities.
 
-性能数字先作为测量目标，按本地应用基线、远程链路增量及物理输入到画面变化分别报告。待校准的是预算、队列长度、编码与丢包恢复算法、具体设备矩阵，以及直接编码或局部更新等优化路径；会话归属、模块职责、Windows 原生窗口及 DE 独立性作为 v1 基线保持一致。
+Performance numbers start as measurement targets reported separately as local app baseline, remote-link overhead, and physical input-to-photon response. Parameters to calibrate include budgets, queue depths, encoding and loss-recovery algorithms, device matrices, and display optimizations; session ownership, module boundaries, native Windows windows, and DE independence remain fixed as the v1 baseline.
 
-合成器崩溃恢复、主机重启后恢复应用、多人同时控制及 Windows 之外的查看端另行扩展。新增范围或需要更改基线时，更新本文件的决策及影响，再调整实现和验收。
+Compositor crash recovery, post-reboot app recovery, multi-user control, and non-Windows viewers are future extensions. Any scope expansion or baseline change updates this document's decisions and impact analysis before modifying implementation and verification.
 
-### 原生拖放与后端边界（2026-11-17）
+### Native Drag-and-Drop and Backend Boundaries (2026-11-17)
 
-键盘、指针、触控和拖放使用同一个 Wayland/X11 焦点目标；命中仍尊重原 surface 输入区。Smithay 的 Source／DndFocus／OfferData 子系统负责数据源、目标和协议 offer，Waybridge 的 TrackedSource 负责源身份及一次终结，Coordinator 负责外部快照、目标 revision 和导出租约。协议回调不重入输入锁；清理在主循环进行，旧来源的清理不能结束新导出。
+Keyboard, pointer, touch, and drag-and-drop share one unified Wayland/X11 focus target while respecting surface input regions. Smithay's `Source` / `DndFocus` / `OfferData` subsystem handles sources, targets, and protocol offers; Waybridge's `TrackedSource` enforces source identity and single finalization; `Coordinator` owns external snapshots, target revisions, and export leases. Protocol callbacks never re-enter input locks; cleanup runs on the main loop, and cleaning up a stale source can never terminate a newer export.
 
-原 Linux 会话内保留原 selection、MIME 和 COPY/MOVE。跨设备仍只导出选定的文本／文件表示，并保持只读 COPY。X11 使用私有 root 上的影子目标连接原生拖放与独立 HWND，输入菜单捕获不能被拖拽视觉抢占。这里选择回移固定版本的上游通用 DND 子系统，删除旧的单向 COPY 生产适配器，不按应用名称扩展分支。XWM 查询仍在合成器线程，完整隔离阻塞往返和更广泛应用验收尚未完成；具体来源、动作、时序及验证见 [XDND.md](XDND.md)。
+Intra-session Linux drags preserve native selections, MIME types, and COPY/MOVE; cross-machine drags export selected text/file representations as read-only COPY. X11 uses shadow targets on the private root to connect native drags with independent HWNDs, and drag visuals never steal menu input grabs. Waybridge selectively backports a pinned upstream generic DND subsystem and removes the legacy one-way COPY production adapter without adding app-name branches. XWM queries still run on the compositor thread, so isolating blocking X11 round-trips and expanding real-app verification remain open; see [XDND.md](XDND.md) for provenance, actions, timing, and verification.

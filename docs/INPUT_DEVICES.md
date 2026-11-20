@@ -8,10 +8,10 @@ touch remain follow-up work. This does not mark M3 complete.
 
 ## Control-center setting
 
-In the control center's input/sharing settings, enable **原生多点触控（实验）**.
+In the control center's input/sharing settings, enable **Native multitouch (experimental)**.
 The choice is saved per connection as the boolean `touch`, defaulting to false
-for a new profile. **保存设置** persists it for subsequent connections;
-**应用到当前连接** also changes the active native worker and Linux session.
+for a new profile. **Save settings** persists it for subsequent connections;
+**Apply to current connection** also changes the active native worker and Linux session.
 Touch remains subject to the existing read-only input setting. When enabled,
 mode selection is automatic: a native Wayland application with a live `wl_touch`
 resource receives touch, while an unsubscribed or X11 window retains mouse
@@ -179,11 +179,6 @@ checks.
 ```
 python3 tests/touch_interaction_smoke.py
 python3 tests/windows_touch_smoke.py
-# Opt-in unlocked, logged-in Windows test device; exact fixture ownership guards:
-python3 tests/windows_touch_client_laptop.py --host laptop
-# Requires an interactive desktop with Windows Snap enabled:
-python3 tests/windows_touch_client_laptop.py --host laptop --expect-snap
-python3 tests/windows_touch_ole_laptop.py --host laptop
 ```
 
 ## Protocol extension
@@ -234,12 +229,6 @@ python3 tests/session_fixture.py python3 tests/touch_settings_smoke.py
 cmake --build build/windows --target waybridge-client
 scripts/build-windows-arm64.sh
 dotnet run --project gui/Waybridge.Control.Tests -c Release
-# Publish the production-source settings-only probe before running on a test PC:
-dotnet publish gui/Waybridge.GuiFocus.Probe/Waybridge.GuiFocus.Probe.csproj -c Release \
-  -r win-x64 --self-contained true -p:WindowsAppSDKSelfContained=true \
-  -p:MicrosoftWindowsAppSDKPackageDir= \
-  "-p:ManifestTool=$PWD/scripts/merge-windows-manifest.py" -o build/gui-settings-probe-x64
-python3 tests/windows_touch_settings_laptop.py --host laptop
 ```
 
 The live-preference tests exercise an initially disabled negotiated viewer,

@@ -87,10 +87,8 @@ socket deadline. This is a remaining responsiveness boundary; the old worker's
   read-only URI delivery copied by a real X11 file model.
 - `windows_data_drag_smoke.py --backend xcb`: production Windows PE worker in
   private Wine, native X11 cross-window dragging, OLE-return and Unicode out/in.
-- `windows_data_drag_laptop.py --host laptop --backend xcb`: the same input and
-  completion contract on physical Windows, manipulating disposable fixtures only.
 - Existing Wayland source-feedback, delayed-offer, visual and Chrome regressions
-  remain mandatory. Full commands/results are recorded in [VALIDATION.md](VALIDATION.md).
+  remain mandatory.
 
 The protocol basis is [XDND](https://wiki.freedesktop.org/www/Specifications/XDND/).
 No application-name branches were added. This does not certify every QQ,

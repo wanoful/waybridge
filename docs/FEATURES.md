@@ -1,328 +1,310 @@
-# Waybridge 功能范围与实现状态
+# Waybridge Feature Scope and Implementation Status
 
-更新日期：2026 年 11 月 18 日。状态：已确认范围与推荐验收规格，按当前实现标注进展；跨端只读交付、SNI 托盘/后台入口、原生通知、品牌和来源角标已形成 M2 首轮实现，分层验证见 VALIDATION.md。
+Updated: 2026-11-18. Status: confirmed feature scope and recommended acceptance baselines annotated with current implementation progress. Cross-machine read-only file delivery, SNI trays/background entries, native notifications, branding, and source badges have landed as the initial M2 wave.
 
-目标使用场景是 Blender 等大型专业软件、日常办公和游戏，网络覆盖同一局域网与异地 VPN。本文记录功能、使用流程和验收标准，模块职责与实施顺序见 [v1 架构基线](ARCHITECTURE.md)。已确认需求与其他候选分开记录，具体交付批次、设备型号和验收指标仍按建议规格与实际验证收敛。
+Target use cases include large creative/professional workloads such as Blender, everyday productivity, and gaming across both LAN and remote VPNs. This document records features, user workflows, and acceptance criteria; see [v1 Architecture Baseline](ARCHITECTURE.md) for module boundaries and sequencing. Confirmed requirements and optional candidates are separated, and specific delivery waves, hardware models, and numeric targets converge against empirical verification.
 
-## 已确认的功能范围
+## Confirmed Feature Scope
 
-- 应用在 Waybridge 私有会话中启动，这是当前选定的应用入口。
-- 大型专业软件以用户明确点名的 Blender 为核心目标；其他已安装软件作为兼容性候选。
-- 游戏目标根据本机安装清单选择，同时覆盖 Minecraft、Linux 原生游戏及带 Windows 可执行文件的游戏与启动器。
-- 输入覆盖键鼠、手柄、触控和触控笔。
-- 音视频覆盖声音播放、麦克风语音和摄像头。
-- 数据交换覆盖现有文本、图片、文件与目录，以及新增的富文本复制粘贴和打印。
+- Applications launch inside a private Waybridge session.
+- Blender is the primary professional workstation target; other installed apps serve as compatibility candidates.
+- Gaming targets cover Minecraft, native Linux games, and Windows games/launchers running via compatibility layers.
+- Input covers keyboard, mouse, gamepads, multitouch, and pressure-sensitive stylus pens.
+- Audio/video covers audio playback, microphone voice uplink, and webcam.
+- Data exchange covers text, images, files/directories, rich-text clipboard, and printing.
 
-这些需求已确认，完整版本保留七项新增能力，按 [Roadmap](ROADMAP.md) 分阶段交付；具体设备和性能数字按推荐规格与实测校准。
+All seven new capabilities remain in scope for the complete release and ship in staged waves per [ROADMAP.md](ROADMAP.md), calibrated against recommended baselines and real measurements.
 
-2026 年 11 月 14 日，Windows 11 x64 真机已通过 GUI 启动、配对与凭据管理、Tailscale 直连、硬件 H.264、中文名文件上传及会话保留/结束流程；Blender 与 Ghostty 完成启动显示验证。完整操作覆盖及剩余范围见 [VALIDATION.md](VALIDATION.md)。
+On 2026-11-14, physical Windows 11 x64 testing passed GUI startup, pairing and credential storage, Tailscale direct connection, hardware H.264, Unicode-filename uploads, and session detach/reattach/end workflows, with Blender and Ghostty launch-and-render verified.
 
-后续已完成 HMCL 按钮与启动游戏、Minecraft 窗口/最大化/全屏主菜单坐标复测；本机 Chrome 在解锁原钱包后由用户确认恢复登录。异常退出、状态写入失败及 Windows 拖放关闭竞态已有回归，修复已部署。上述结果不扩大到完整游戏操作、Blender 工程流程、任意旧钱包迁移或全部 Windows 外设验收。
+Subsequent testing verified HMCL button interaction and game launch, Minecraft windowed/maximized/fullscreen menu coordinates, and Chrome login recovery after unlocking the user's native wallet. Regressions and fixes for abnormal exits, status-write failures, and Windows drag-and-drop close races are deployed. These results do not yet generalize to full gameplay sessions, full Blender editing pipelines, arbitrary legacy wallet migrations, or all Windows peripherals.
 
-纯文本拖放已用真实 Windows Chrome ↔ 原生 Wayland Chrome 验证，覆盖立即松手、附加延迟、拒绝/取消、串流窗口互拖和源跨目标。新两端使用目标 revision 和完成回执，协商/完成等待有界；独立「文字拖放」开关不依赖文件共享。设计与网络边界见 [DRAG_AND_DROP.md](DRAG_AND_DROP.md)，X11 源／目标和混合后端已接通通用路径，富格式跨端及真实应用矩阵仍待完善。
+Plain-text drag-and-drop has been validated between real Windows Chrome and native Wayland Chrome across immediate release, injected latency, rejection/cancellation, cross-window remote drags, and multi-target drags. Updated peers negotiate target revisions and completion receipts with bounded waits and an independent **Text drag-and-drop** toggle separate from file sharing. See [DRAG_AND_DROP.md](DRAG_AND_DROP.md) for design and latency bounds; X11 source/target and mixed-backend generic paths are also wired, while cross-machine rich-format drags and broader app matrices remain open.
 
-## 本机应用与游戏清单
+## Installed Applications and Games Snapshot
 
-以下为 2026 年 11 月 13 日的安装快照。Steam 项目依据本地 `appmanifest_*.acf` 和对应安装目录确认；其他项目依据软件包、应用入口和游戏文件确认。安装存在与 Waybridge 兼容通过是两种状态，以下项目尚未因本次盘点获得新的运行验收。
+Reference application and game catalog used to assemble representative compatibility matrices. Presence in this list is distinct from verified compatibility; items listed here are test candidates until explicitly verified.
 
-### 专业软件与办公应用
+### Professional and Productivity Applications
 
-| 应用 | 本机证据 | 建议覆盖的用户操作 |
+| Application | Host Evidence | Suggested User Workflows |
 |---|---|---|
-| Blender | 软件包与可执行程序；用户明确点名 | 三维视图导航、中键操作、连续变换、弹窗和菜单、中文文本或路径、预览及项目保存 |
-| GIMP | 软件包与可执行程序 | 大画布缩放与平移、工具切换、笔触与压感、颜色和透明图像 |
-| WPS 文字、表格、演示和 PDF | 软件包与可执行程序 | 中文输入、富文本、单元格和图片复制、文件选择与打印 |
-| LibreOffice Writer、Calc、Impress 等 | 软件包与应用入口 | 文档及表格、富文本互通、演示全屏、文件与打印 |
-| IntelliJ IDEA、VS Code、Ghostty | 安装目录或可执行程序 | 小字号清晰度、快捷键、终端输入、弹窗和多窗口 |
-| Chrome、Dolphin、mpv、VLC | 软件包或可执行程序 | 网页与文件操作、复制粘贴、拖放、视频及声音 |
-| 飞书、QQ、微信、Telegram、OBS Studio | 软件包、Flatpak 或应用入口 | 可作为麦克风、摄像头、媒体与通知等功能的应用候选，实际使用优先级待确定 |
+| Blender | System package & binary (primary target) | 3D viewport navigation, middle-mouse orbit, continuous transforms, popups/menus, Unicode text/paths, previews, and project saving |
+| GIMP | System package & binary | Large canvas zoom/pan, tool switching, brush strokes with pressure, color accuracy, and alpha transparency |
+| WPS Writer, Spreadsheets, Presentation, PDF | System package & binary | CJK IME input, rich text, cells and images via clipboard, file dialogs, and printing |
+| LibreOffice Writer, Calc, Impress | System package & desktop entries | Documents/spreadsheets, rich-text interop, fullscreen presentations, files, and printing |
+| IntelliJ IDEA, VS Code, Ghostty | Install directory or binary | Small-font legibility, keyboard shortcuts, terminal input, popups, and multi-window workflows |
+| Chrome, Dolphin, mpv, VLC | System package or binary | Web browsing, file management, copy/paste, drag-and-drop, video and audio playback |
+| Feishu, QQ, WeChat, Telegram, OBS Studio | Package, Flatpak, or desktop entry | Candidate apps for microphone, webcam, media, and notifications (priority TBD) |
 
-Blender 和 GIMP 同时涉及精细界面与持续变化的图形内容，功能目标需要兼顾清晰文字、细线、颜色和实时视图。大型项目和素材目录也要求重新确定当前单文件 1 GiB、目录批次 8 GiB 的传输范围。
+Blender and GIMP combine crisp UI chrome with continuously updating canvases, requiring sharp text, fine lines, accurate colors, and responsive viewports simultaneously. Large creative projects and asset folders also motivate lifting the current 1 GiB single-file and 8 GiB directory-batch transfer limits.
 
-### Steam 安装项目
+### Steam Titles (Reference Catalog)
 
-| 安装名称 | Steam App ID | 本机确认范围 |
+| Title | Steam App ID | Notes |
 |---|---|---|
-| Cyberpunk 2077 | 1091500 | 安装清单、目录与 Windows 游戏可执行文件 |
-| Split Fiction 双影奇境 | 2001120 | 安装清单、目录与 Windows 游戏可执行文件 |
-| Stellar Blade | 3489700 | 安装清单、目录与 Windows 游戏可执行文件 |
-| Stellar Blade Demo | 3564860 | 安装清单与目录 |
-| Assassin's Creed Odyssey | 812140 | 安装清单与目录 |
-| The Great Ace Attorney Chronicles | 1158850 | 安装清单与目录 |
-| Brotato | 1942280 | 安装清单、目录与 Linux ELF 可执行文件 |
-| Stardew Valley | 413150 | 安装清单、目录与 Linux ELF 可执行文件 |
-| Human Resource Machine | 375820 | 安装清单、目录与 Linux ELF 可执行文件 |
-| Message From Aliens Demo | 5195140 | 安装清单与目录 |
-| Wallpaper Engine | 431960 | 安装清单与目录，作为辅助工具单列 |
+| Cyberpunk 2077 | 1091500 | Windows executable via Proton |
+| Split Fiction | 2001120 | Windows executable via Proton (co-op dual-gamepad candidate) |
+| Stellar Blade | 3489700 | Windows executable via Proton |
+| Stellar Blade Demo | 3564860 | Demo build |
+| Assassin's Creed Odyssey | 812140 | Windows executable via Proton |
+| The Great Ace Attorney Chronicles | 1158850 | Windows executable via Proton |
+| Brotato | 1942280 | Native Linux ELF |
+| Stardew Valley | 413150 | Native Linux ELF |
+| Human Resource Machine | 375820 | Native Linux ELF |
+| Message From Aliens Demo | 5195140 | Demo build |
+| Wallpaper Engine | 431960 | Utility entry |
 
-本机另有 Proton Experimental、Proton 11.0 和 Steam Linux Runtime。每款游戏实际选择的运行器、启动状态和 Waybridge 兼容性，需在验收时分别记录。
+Proton Experimental, Proton 11.0, and Steam Linux Runtime are installed; each game's selected runner, launchability, and Waybridge compatibility are recorded individually during verification.
 
-### 其他游戏与启动器
+### Other Games and Launchers
 
-- **Minecraft 与 HMCL**：HMCL 和 Minecraft Launcher 已安装；HMCL 使用的版本目录中有基础版本、Fabric、NeoForge 及多个整合包，并有对应 JAR。候选验收应包含游戏内视角、菜单或背包、输入法、启动器与游戏之间的焦点恢复。
-- **鸣潮 Wuthering Waves**：`Games/WutheringWaves` 中有游戏目录及 Windows 可执行文件。实际使用的运行器和本机可启动性待确认。
+- **Minecraft & HMCL**: HMCL and Minecraft Launcher with vanilla, Fabric, NeoForge, and modpack instances; acceptance covers 3D camera look, menus/inventory, IME chat, and focus handoff between launcher and game.
+- **Wuthering Waves**: Windows game binary; compatibility runner and native launchability recorded separately.
 
-建议从 Minecraft、一个 Linux 原生游戏及一个大型 Windows 游戏开始建立代表性验收，再扩展到其余安装项目。通过 Steam 或其他启动器启动的目标窗口也应出现在 Waybridge 会话中。游戏本身的运行器或反作弊兼容问题，需要与 Waybridge 的输入和显示问题分别记录。
+Start representative gaming acceptance with Minecraft, one native Linux game, and one large Windows game before expanding to the full catalog. Game windows spawned by Steam or other launchers must appear inside the Waybridge session; runner or anti-cheat issues are tracked separately from Waybridge input/display issues.
 
-## 当前已有的功能
+## Currently Implemented Features
 
-“已有”表示源码已具备相应实现。Linux 集成测试、Wine 下 Windows API 测试和真实 Windows/WoA 验收分别记录，不能互相替代。WinUI 控制中心启动及所选连接、应用、文件与会话流程已在 Windows 11 x64 实机通过；更新版 WoA、物理 HDR 和完整应用/设备矩阵仍待补验收；SNI 原生菜单操作及 Qt QAction 退出已有 Windows x64 实测。详细证据见 [VALIDATION.md](VALIDATION.md)。
+"Implemented" means code exists in the repository. Linux integration tests, Wine Windows-API tests, and physical Windows/WoA runs are tracked separately and do not substitute for each other. WinUI Control Center startup and selected connection, app, file, and session flows have passed on physical Windows 11 x64; updated WoA, physical HDR, and broader app/device matrices remain open; SNI native menu actions and Qt `QAction` exits have passed on Windows x64.
 
-| 功能 | 当前已有内容 | 当前边界 |
+| Capability | Currently Implemented | Current Boundaries |
 |---|---|---|
-| 连接与配置 | TLS 指纹、一次性配对、客户端撤销、多份配置、创建/接入会话及重连 | GUI 同时管理一个活动连接。信任客户端可管理同一 Linux 用户的全部 Waybridge 会话 |
-| 应用启动 | 已安装 desktop 应用目录、搜索、启动终端、命令行启动额外应用 | 启动到 Waybridge 私有会话；宿主桌面已打开的窗口不会迁入 |
-| 会话保留 | 查看端断开后保留 Linux 应用，再连接恢复窗口；可显式结束会话 | 每个服务端会话一个查看端；合成器或 Linux 主机重启后的应用状态恢复另需设计 |
-| Windows 独立窗口 | 顶层窗口、菜单、透明度、模态、标题栏协商、最小最大尺寸、最小化、最大化和全屏 | 原生语义存在应用与平台子集；跨进程透明点穿和毛玻璃未实现 |
-| 显示与缩放 | 跟随 Windows DPI、手动缩放、分数缩放、窗口调整大小 | X11 应用共享客户端密度；物理多显示器和混合 DPI 组合仍需验收 |
-| 键鼠与输入法 | 键盘、鼠标、滚轮、本地光标、微软拼音桥接 Wayland text-input-v3 | Qt 基础微软拼音场景有 WoA 实机记录；更多输入法、切换组合和 X11/XIM 未覆盖 |
-| 原生触控（实验） | Windows WM_POINTER → Wayland wl_touch，十点、分数缩放、代次及取消恢复；应用确认后委托 Windows 拖窗和吸附 | 按连接保存、实时开关与自动订阅检测，可选应用级鼠标兼容；x64 系统注入验证拖窗和原生吸附，实体触控、混合 DPI 和 Windows OLE 仍待验，见 [INPUT_DEVICES.md](INPUT_DEVICES.md) |
-| 精确触摸板（实验） | Windows Direct Manipulation 的双指滚动、横移和捏合，转为 Wayland 指滑轴和原生捏合手势 | 双端自动协商。未协商时沿用滚轮。Windows 三／四指系统手势留在本机，见 [TOUCHPAD.md](TOUCHPAD.md) |
-| 压感笔（实验） | Windows PT_PEN → tablet-v2。悬停、笔尖、压感、倾斜、旋转、侧键、橡皮擦、窗口操作及原生 Wayland 拖放 | 默认关闭，未订阅和 X11 使用鼠标兼容。Windows OLE 的实体笔接管待验证，见 [PEN.md](PEN.md) |
-| 游戏手柄（实验） | 最多四个 SDL3 手柄 → Linux uinput。支持按钮、摇杆、扳机、死区、双电机震动和同设备短时重连 | 默认关闭，需可访问 uinput。真实 evdev 已验证切窗及双手柄短时重连后的句柄保留，Steam 玩家顺序和实体震动待验，见 [GAMEPADS.md](GAMEPADS.md) |
-| 游戏鼠标 | Raw Input 相对位移、指针锁定、隐藏与裁剪、失焦释放、紧急解锁 | 尚无 confined-pointer；手柄当前转发标准游戏手柄布局；实际游戏兼容性须按游戏验收 |
-| 剪贴板 | 双向 UTF-8、HTML、RTF、PNG、文件和目录。支持方向、图片和文件共享开关 | 富文本实际保真度取决于应用提供和接收的格式。应用私有格式单列验收 |
-| 文件传输与拖放 | 独立认证文件通道传输文件与目录。文件抽屉提供进度和取消，共享设置提供限速 | 跨设备只 COPY，原会话内保留 COPY/MOVE。支持只读交付及可写副本，暂停与断网续传待实现。见 [文件传输](FILE_TRANSFERS.md) |
-| 文字拖放及反馈 | Windows Unicode 与 Wayland/X11 UTF-8 双向 COPY、原会话跨 HWND 拖放与 OLE 返回、源提供的透明动画虚影 | HTML/RTF/图像拖放、X11 专用虚影和文件 hover 尚未覆盖；具体方向与限制见 DESKTOP_INTERACTIONS.md |
-| 声音播放与采集 | 私有会话音频、Windows WASAPI、音量、静音、输出设备选择及可选默认麦克风回传 | 播放为立体声 PCM，回传为单声道 PCM。实体麦克风、会议应用及输出设备热切换待验证，见 [麦克风](MICROPHONE.md) |
-| 基础画面 | PNG、H.264、独立无损 alpha、Windows GPU 解码和 PNG 回退。可按应用保存文字清晰、交互低延迟或跟随连接 | 实际帧率、编码器与解码器仍受协商能力和资源预算约束 |
-| 可选画面能力 | HEVC、AV1、CUDA 颜色输入、实验 scRGB HDR | auto/HDR 启动与实时策略已统一，真实 NVENC 回归通过；新 codec、Main10 和物理 HDR 的 WoA 验收待完成 |
-| 网络 | Waybridge TLS、加密 UDP、丢包修复和 TCP 回退。认证交付反馈驱动 UDP 节流与 NVENC 目标码率。可用外部 SSH 转发 TLS 入口 | 需要手工配置可达 UDP 地址。FPS 自适应待接入，媒体全局有序可能跨窗口阻塞 |
-| I/O 响应性 | 双端有界文件队列、连接与选择代次、独立文件通道、捕获前背压和双端媒体预算 | 旧端使用原有文件通道路径。断网续传安排在 M4 |
-| 控制与诊断 | 控制中心及远端 SNI 托盘、原生通知、只读键鼠、共享开关、实时帧率和码率配置、实际画面路径、阶段分位数/帧龄及原始队列诊断、导出日志 | XEmbed 及更广应用矩阵待验；没有游戏内状态浮层；阶段时间和 RTT 不等于物理输入到显示延迟 |
-| 配置与应用启动 | Linux TOML 默认值/限额/来源查询，按完整 desktop ID 的独立覆写，GIO 字段与动作，HOME/Path/cwd 规则 | 无配置 UI；action 与 URI 不能同请求；应用单实例转交不保证覆写作用于既有进程 |
-| 桌面服务 | 共享用户 D-Bus 与数据、激活环境、独立 systemd target；原生钱包/GTK Portal 可按标准配置接入 | 组件由用户选择，集成文件需明确安装；旧隔离钱包迁移、Flatpak 文档授权未验证；ScreenCast 属于 M4 |
-| 应用与平台 | 原生 Wayland、私有 Xwayland，Windows x64 与原生 ARM64 构建；桌面密钥服务在本会话原生运行 | X11 无 PRIMARY、XIM 和完整 EWMH；XDND 仅覆盖文档列出的动作与验证范围；构建成功不代表所有应用、设备组合可用 |
+| Connection & profiles | TLS fingerprint pinning, one-time pairing, client revocation, multiple profiles, session create/reattach/reconnect | GUI manages one active connection at a time; trusted clients can manage all Waybridge sessions for the same Linux user |
+| App launching | Installed `.desktop` catalog, search, launch terminal, CLI launch of extra commands | Launches into Waybridge's private session; existing host-desktop windows are not migrated |
+| Session persistence | Viewer disconnects keep Linux apps alive and reconnects restore windows; explicit session termination | One active viewer per session; recovering app state after a compositor or Linux host reboot requires separate design |
+| Independent Windows windows | Toplevels, popups/menus, transparency, modality, SSD/CSD negotiation, min/max size, minimize/maximize/fullscreen | Platform/app subsets apply; cross-process transparent click-through and blur-behind are not implemented |
+| Display & scaling | Follows Windows DPI, manual scale, fractional scaling, live resize | X11 apps share one client density; physical multi-monitor and mixed-DPI combinations still need full validation |
+| Keyboard, mouse & IME | Keyboard, mouse, scroll, native cursors, Windows IME → Wayland `text-input-v3` | Basic Qt + Microsoft Pinyin tested on physical WoA; broader IMEs, switching combos, and X11/XIM remain uncovered |
+| Native multitouch (experimental) | Windows `WM_POINTER` → Wayland `wl_touch`, up to 10 contacts, fractional scale, generations, cancel recovery; app-confirmed Windows move/snap handoff | Saved per profile, live toggle, automatic subscription detection, optional per-app mouse compatibility; x64 system injection verified move/snap; physical touchscreens, mixed DPI, and Windows OLE remain open ([INPUT_DEVICES.md](INPUT_DEVICES.md)) |
+| Precision Touchpad (experimental) | Windows Direct Manipulation two-finger scroll/pan and pinch mapped to Wayland finger axis and native pinch gestures | Auto-negotiated on both ends; falls back to wheel when unnegotiated; Windows 3/4-finger OS gestures stay local ([TOUCHPAD.md](TOUCHPAD.md)) |
+| Pressure pen (experimental) | Windows `PT_PEN` → `tablet-v2` (hover, tip, pressure, tilt, rotation, barrel button, eraser, window ops, native Wayland drag-and-drop) | Off by default; unsubscribed apps and X11 use mouse compatibility; physical pen Windows OLE handoff pending verification ([PEN.md](PEN.md)) |
+| Gamepads (experimental) | Up to 4 SDL3 gamepads → Linux `uinput` (buttons, sticks, triggers, deadzone, dual-motor rumble, short same-device reconnect) | Off by default; requires `/dev/uinput` access; real `evdev` verified window switches and 2-controller short reconnects; Steam player order and physical rumble pending ([GAMEPADS.md](GAMEPADS.md)) |
+| Gaming mouse | Raw Input relative motion, pointer lock, cursor hide/clip, unfocus release, emergency unlock | No `confined-pointer` yet; gamepads forward standard layout; game compatibility verified per title |
+| Clipboard | Bidirectional UTF-8, HTML, RTF, PNG, files, and directories with direction, image, and file toggles | Rich-text fidelity depends on formats offered/accepted by each app; proprietary app formats tracked separately |
+| File transfer & drag-and-drop | Dedicated authenticated file channel for files and directories; drawer shows progress/cancel; bandwidth cap in Sharing & Permissions | Cross-machine COPY only; intra-session preserves COPY/MOVE; read-only delivery with writable user copies; pause and disconnect resume pending ([FILE_TRANSFERS.md](FILE_TRANSFERS.md)) |
+| Text drag-and-drop & feedback | Bidirectional Windows Unicode ↔ Wayland/X11 UTF-8 COPY, cross-HWND intra-session drags with OLE return, animated alpha DND icons | Cross-machine HTML/RTF/image drags, X11 drag visuals, and pre-transfer file hover not yet covered ([DESKTOP_INTERACTIONS.md](DESKTOP_INTERACTIONS.md)) |
+| Audio playback & capture | Private session audio, Windows WASAPI playback, volume, mute, output device selector, optional default microphone uplink | Stereo PCM playback, mono PCM uplink; physical mics, conferencing apps, and output hot-switching pending verification ([MICROPHONE.md](MICROPHONE.md)) |
+| Core display | PNG, H.264, independent lossless alpha, Windows GPU decode with PNG fallback; per-app presets (text clarity, interactive low latency, follow connection) | Effective FPS, encoder, and decoder remain governed by negotiated capabilities and resource budgets |
+| Optional display features | HEVC, AV1, CUDA GPU color input, experimental scRGB HDR | Startup and live `auto`/HDR resolution unified with real NVENC regressions passing; WoA verification of new codecs, Main10, and physical HDR pending |
+| Networking | Waybridge TLS, encrypted UDP, packet repair, TCP fallback; delivery feedback drives UDP pacing and NVENC bitrate; external SSH can forward TLS | Reachable UDP address configured manually; FPS adaptation pending; global media ordering can block across windows |
+| I/O responsiveness | Bounded file queues on both sides, connection/selection generations, dedicated file channel, pre-capture backpressure, dual-side media budgets | Legacy peers use the older file message path; disconnect resume scheduled for M4 |
+| Control & diagnostics | Control Center + remote SNI trays, native notifications, read-only toggle, sharing toggles, live FPS/bitrate, active pipeline, stage percentiles/frame age/raw queue metrics, log export | XEmbed and wider app matrices pending; no in-game HUD overlay; stage timings and RTT do not equal physical input-to-display latency |
+| Config & app launching | Linux TOML defaults/limits/source inspection, per-desktop-ID overrides, GIO fields/actions, `HOME`/`Path`/`cwd` rules | No GUI editor on Windows (Linux TUI has full editor); `action` and `uris` are mutually exclusive; single-instance forwarding cannot force overrides onto existing processes |
+| Desktop services | Shared user D-Bus/data, activation environment, standalone systemd targets; native wallets and GTK Portal via standard config | Components are user-chosen and explicitly installed; legacy isolated-wallet migration and Flatpak document-portal grants unverified; ScreenCast is M4 |
+| Apps & platforms | Native Wayland, private Xwayland, Windows x64 and native ARM64 builds; native desktop secret services inside session | X11 lacks `PRIMARY`, XIM, and full EWMH; XDND scope is limited to documented verified paths; building cleanly does not guarantee every app/hardware combo |
 
-原生多点触控、触控笔和手柄已有显式启用的实验功能，M3 继续扩大设备与应用验收范围。M2 已接入富文本和一路麦克风回传。摄像头、窗口共享和打印安排在 M4。
+Experimental native multitouch, pen, and gamepads are opt-in while M3 expands physical device and application verification. M2 has landed rich-text clipboard and single-channel microphone uplink. Webcam, window sharing, and printing are scheduled for M4.
 
-文件目前单个文件最多 1 GiB，目录批次内容最多 8 GiB、512 个条目；Windows 路径、名称、符号链接及 reparse point 等还有兼容限制。详见 [文件说明](README.md#使用数据交换) 与 [协议](PROTOCOL.md)。
+Current file limits are 1 GiB per file and 8 GiB / 512 entries per directory batch, with strict Windows path/name, symlink, and reparse-point rules. See [Data Exchange](README.md#data-exchange) and [PROTOCOL.md](PROTOCOL.md).
 
-## 建议先完善的既有能力
+## Existing Capabilities Prioritized for Hardening
 
-| 项目 | 用户得到的结果 | 验收方式 |
+| Area | User Outcome | Acceptance Criteria |
 |---|---|---|
-| 可启动且可诊断的控制中心 | 解压后能连接、启动应用、收起托盘、断开及退出；失败时能看见原因 | 在目标 Windows x64/WoA 设备走完整使用流程 |
-| 主要应用兼容性 | 常用办公应用和游戏能够输入、显示、播放声音，并正确切换焦点 | 固定应用清单；覆盖中文输入、复制粘贴、菜单、全屏和游戏鼠标释放 |
-| 网络中断恢复 | 短时断网、客户端重启后可以接回仍运行的会话 | 分别测试局域网和 VPN，确认窗口恢复、输入释放及共享状态 |
-| 可理解的设置与回退 | 设置的期望值、实际生效结果和回退原因一致 | 验证 auto/HDR/codec 等组合以及不支持能力时的提示 |
-| 多窗口基本体验 | 切换、拖动、缩放、隐藏与恢复可预测，传文件期间仍可操作 | 同时运行办公与游戏，叠加文件传输和窗口调整 |
+| Reliable, diagnosable Control Center | Extract, connect, launch apps, minimize to tray, disconnect, and exit cleanly; surface clear diagnostics on failure | Complete end-to-end flow on physical Windows x64 and WoA |
+| Core application compatibility | Everyday productivity apps and games handle input, rendering, audio, and focus transitions reliably | Fixed app list covering CJK IME, copy/paste, menus, fullscreen, and pointer-lock release |
+| Network drop recovery | Reattach cleanly to running sessions after brief outages or client restarts | Verify on both LAN and VPN for window restoration, input release, and sharing state |
+| Transparent settings & fallbacks | Desired config, active state, and fallback reasons always agree | Verify `auto`/HDR/codec combinations and warnings when capabilities are missing |
+| Multi-window everyday feel | Switching, dragging, resizing, hiding, and restoring stay predictable even during active file transfers | Run office apps + games alongside concurrent file transfers and window resizes |
 
-## 新增与增强功能
+## New and Enhanced Capabilities
 
-### 建议优先讨论
+### High-Priority Experience Tracks
 
-| 功能 | 用户价值 | 与现有能力的区别 |
+| Feature | User Value | Difference from Earlier Baseline |
 |---|---|---|
-| 办公清晰模式 | 小字号、彩色文字和表格边线清晰，静态界面低流量 | 已有手动 PNG；新增目标是清晰度与流量的策略及操作入口，具体编码方案后定 |
-| 专业软件图形交互 | Blender 视图、GIMP 画布等持续变化内容流畅，同时保持工具界面、细线和颜色可辨 | 以真实专业软件操作验收，不能只用静态文字或单一全屏视频代替 |
-| 游戏低延迟模式 | 输入响应和帧间节奏稳定，游戏前台时保持合适画质 | 已有视频编码、锁鼠和全屏；新增模式、可验收目标及配套调节 |
-| 按应用保存设置 | 办公软件与游戏分别记住画质、帧率、缩放、键鼠和声音偏好 | 当前主要按连接保存，画面设置会作用于会话内多个窗口 |
-| 网络自动适配 | 局域网和异地 VPN 下自动选择合适质量，并解释卡顿原因 | 当前依赖手动码率、帧率和 UDP 配置；已有重连继续保留 |
-| 文件传输管理 | 查看进度、速度、剩余量，取消任务并限制传输带宽 | 当前只有活动和完成记录；暂停与断点续传可独立选择范围 |
-| 应用收藏与快捷启动 | 控制中心固定应用，通过应用链接、桌面或开始菜单快捷方式启动已配对工作站中的应用 | 链接使用本机配对配置；切换正在查看的工作站时先确认 |
-| 远端应用托盘 | Linux 应用的图标、状态、激活和菜单在 Windows 通知区域可用；关闭主窗口后仍能重新打开或退出应用 | SNI/DBusMenu 与后台入口首轮已实现；旧式 XEmbed 未实现，更多应用及 Windows Shell 组合待验收 |
-| 快捷键路由设置 | 决定 Alt+Tab、Win 键等由本地还是远端处理，并保留紧急释放键 | 当前已有键盘转发和部分本地处理；需要明确用户可配置的规则 |
-| 多显示器完整体验 | 在不同 DPI 显示器之间移动，保持清晰、尺寸和全屏目标正确 | 已有 DPI 和窗口支持；新增明确设备矩阵与稳定行为 |
-| 音画同步与声音恢复 | 看视频时口型对齐，耳机插拔或音频连接中断后可恢复播放 | 当前有声音播放，但同步和热切换能力不足 |
+| Office clarity mode | Crisp small/colored text and gridlines with low static bandwidth | Goes beyond manual PNG by introducing policy + UI presets independent of one hardcoded codec |
+| Interactive creative graphics | Smooth Blender viewports and GIMP canvases while keeping toolbars, fine lines, and colors legible | Verified on real creative software rather than static text or single fullscreen video alone |
+| Low-latency gaming mode | Consistent input response and frame pacing while keeping foreground games sharp | Builds on existing video encode, pointer lock, and fullscreen with explicit presets and targets |
+| Per-application settings | Remember visual, FPS, scale, input, and audio preferences per app rather than only per connection | Replaces purely connection-wide settings |
+| Automatic network adaptation | Automatically adapt quality across LAN and VPN and explain stalls | Reduces reliance on manual bitrate, FPS, and UDP tuning while keeping reconnect recovery |
+| File transfer management | View progress, speed, remaining bytes, cancel transfers, and cap transfer bandwidth | Extends activity history with active controls; pause/resume scoped separately |
+| Favorites & quick launch | Pin apps in the Control Center and launch paired workstation apps via `waybridge://` links, Start Menu, or Desktop shortcuts | Links bind to local paired profiles and confirm before switching active workstations |
+| Remote application trays | Show Linux app icons, status, activation, and menus in the Windows notification area so background apps can reopen or exit cleanly | SNI/DBusMenu and background list landed; legacy XEmbed and wider app/Shell combos pending |
+| Shortcut routing settings | Control whether `Alt+Tab`, `Win`, etc. stay local or go remote while keeping emergency unlock | Makes shortcut routing explicit and user-configurable |
+| Full multi-monitor experience | Move windows cleanly across mixed-DPI displays with accurate sharpness, sizing, and fullscreen targets | Establishes an explicit multi-monitor device matrix and consistent behavior |
+| A/V sync & audio recovery | Lip-synced video playback and automatic recovery across headphone hotplug or audio channel drops | Upgrades current best-effort playback with sync and hot-switching |
 
-“清晰模式”和“低延迟模式”是体验目标。直接编码、局部更新、surface 分层、编解码器或传输协议是实现候选，记录在 [ARCHITECTURE.md](ARCHITECTURE.md)，在功能范围确定后再比较。
+"Clarity mode" and "low-latency mode" define user outcomes; direct encoding, partial updates, surface layering, codecs, and transports are implementation candidates evaluated in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-### 图标与远端标识
+### Icons and Remote Identity
 
-远端窗口与 SNI 托盘图标支持在右上角显示连接级自定义角标。控制中心和 Windows 通知使用应用原图，控制中心自身及其托盘使用主品牌图标。
+Remote windows and SNI tray icons display a configurable upper-right source badge per connection. The Control Center catalog and Windows notifications display original app icons; the Control Center itself and its tray use the primary Waybridge brand icon.
 
-首版图标采用蓝底白色拱桥：主图标为圆角方形，角标使用更紧凑的圆形底图。矢量源文件为 [主图标](../assets/branding/waybridge.svg)、[角标](../assets/branding/waybridge-badge.svg) 和 [单色标记](../assets/branding/waybridge-mark.svg)。右上角位置和保留应用原图标的规则保持一致。
+The initial brand mark is a white arch bridge on blue: rounded square for the primary app icon and a compact circular badge for overlays. Vector sources live at [primary icon](../assets/branding/waybridge.svg), [badge](../assets/branding/waybridge-badge.svg), and [monochrome mark](../assets/branding/waybridge-mark.svg).
 
-- 系统标题栏、任务栏、Alt+Tab 使用合成后的窗口图标，Windows 通知区使用合成后的远端托盘图标。
-- 角标位于右上角，初始目标约为边长的 40%；在最终目标尺寸合成，按 DPI 调整，16/24/32/48/64 像素分别验收。使用细衬边保持浅色、深色背景和相近颜色原图上的辨识度；同时检查应用自带状态图标的可读性。
-- 默认角标为 Waybridge 标识；允许在 Windows 连接配置中导入自定义角标，可导入 PNG/JPEG/BMP/ICO，保持比例规范为 64×64 PNG 并随配置保存，同一连接统一使用。自定义角标替代默认角标，保持单一标记；它属于客户端外观，不修改 Linux 应用和主题文件。
-- Waybridge 控制中心自身使用主图标。没有原应用图标时使用统一应用占位图并叠角标，避免重复叠加 Waybridge 标识。
-- 图标变化、角标设置变化、DPI 切换及重连后重建呈现；原始应用图标和合成结果分别缓存。动态托盘状态继续来自应用，角标只表达远端来源。通知图片在创建/替换时合成，外观切换不重新弹出已显示的通知。
+- Title bars, taskbar buttons, and Alt+Tab use badged window icons; Windows notification area uses badged remote tray icons.
+- Badges sit in the upper-right corner at ~40% of icon edge length, composited at the exact target pixel size per DPI (verified at 16/24/32/48/64 px) with a subtle outline for contrast on light, dark, and similar-colored icons while checking legibility alongside app status emblems.
+- Default badge is the Waybridge mark; users can import a custom PNG/JPEG/BMP/ICO badge per connection (normalized to 64×64 PNG with aspect ratio preserved), replacing the default badge as a client-only visual customization without altering Linux files.
+- When a remote app provides no icon, Waybridge uses a neutral app placeholder plus the badge to avoid double-badging the Waybridge mark.
+- Icon updates, badge changes, DPI switches, and reconnects rebuild composites while caching raw and badged variants separately. Dynamic tray state remains app-driven; notification images composite on creation/replacement without re-toasting already shown notifications on appearance changes.
 
-资源已嵌入原生 EXE 和控制中心包；在「输入与共享」导入或重置角标并实时应用。原生窗口提供连接级应用任务栏身份，避免同一 worker 中不同应用共用一个分组；固定/重启快捷方式尚未提供。具体操作见 [GUI](GUI.md)，小尺寸/DPI、身份属性及 Windows 实测见 [验证记录](VALIDATION.md)。
+Assets are embedded into both the native EXE and Control Center bundle and configurable live under **Desktop Integration → Remote icon badge**. Native windows set per-profile, per-app `AppUserModelID` taskbar identities so different apps in one worker never merge into one taskbar group (pinning/relaunch shortcuts remain deferred). See [GUI.md](GUI.md).
 
-### 已确认需要新增的能力
+### Confirmed New Capabilities
 
-手柄、触控、触控笔、麦克风语音、摄像头、富文本剪贴板和打印均已纳入目标功能范围。建议默认值、支持子集和验收标准见下文 [推荐支持规格](#推荐支持规格)，交付批次对应 [Roadmap](ROADMAP.md)；设备能力与数字目标按实际验证校准。
+Gamepads, multitouch, stylus pen, microphone uplink, webcam, rich-text clipboard, and printing are all confirmed in scope. Recommended defaults, supported subsets, and acceptance criteria appear below under [Recommended Support Baseline](#recommended-support-baseline), mapped to milestones in [ROADMAP.md](ROADMAP.md).
 
-### 其他候选
+### Other Candidates
 
-| 功能 | 可选范围 | 需要先确认 |
+| Feature | Optional Scope | Open Questions |
 |---|---|---|
-| 远端文件浏览与主动下载 | 在控制中心浏览指定远端目录，主动上传和下载 | 是否需要独立文件管理，还是剪贴板与拖放已足够 |
-| 本地打开链接或文件 | 用户选择让远端链接交给 Windows 浏览器，或将文件取回本地应用 | 哪些类型由哪一端处理，以及每次确认或持久规则 |
-| 应用启动组合 | 保存一组应用、启动参数和目录，一次进入工作环境 | 需要恢复启动清单，还是还需恢复已打开文档等应用内部状态 |
-| 跨设备接续 | 从另一台 Windows 设备接回同一会话，并明确接管旧查看端的行为 | 单人轮流接入是否足够，还是需要多人同时查看与控制 |
+| Remote file browser & pull download | Browse selected Linux directories from the Control Center to upload/download directly | Whether a dedicated browser is needed beyond clipboard and drag-and-drop |
+| Open links or files locally | Let users open remote links in Windows browsers or pull files into local Windows apps | Type routing rules and per-action vs. persistent confirmation |
+| Launch groups / workspaces | Save a group of apps, arguments, and directories to restore a workspace in one click | Whether launch list alone suffices vs. in-app document state |
+| Cross-device handoff | Take over a live session from a second Windows device with explicit takeover semantics | Whether single-user alternating access suffices vs. concurrent multi-viewer |
 
-### 其他扩展方向
+### Future Exploration
 
-- **多人同时查看与控制**：需要定义控制权、数据共享和权限，当前为单查看端模型。
-- **扫描和通用 USB**：按设备和应用定义支持范围，区别于已确认的打印、触控和笔输入需求。
-- **更高画质与显示能力**：稳定 HDR、更高分辨率或高刷新率组合，需要先选目标设备和可验收配置。当前已有 1–120 FPS 配置范围，不代表已验收对应持续帧率。
+- **Concurrent multi-viewer / collaborative control**: requires explicit control-transfer, sharing, and permission semantics beyond the single-viewer model.
+- **Scanners and generic USB passthrough**: scoped separately from printing, touch, and pen.
+- **Higher display tiers**: sustained high refresh rates (1–120 FPS is configurable today without certifying sustained 120 FPS), sustained 4K60, and full HDR/wide-gamut pipelines calibrated per target hardware.
 
-## 推荐支持规格
+## Recommended Support Baseline
 
-本节给出一套可调整的建议基线。数量、分辨率、帧率和时间指标均为目标规格或验收样例，尚不代表当前实现已经达到，也不表示用户已确认全部默认值。先按此基线建立测量和兼容矩阵，再校准性能目标。
+Adjustable engineering baselines and verification targets—these numbers represent test targets rather than claims of current completion across every device.
 
-### 平台与通用体验
+### Platform and Core Experience
 
-- Linux 服务端先以当前 NVIDIA 主机为基线。Windows 11 原生 ARM64 与 x64 作为首轮主验平台，Windows 10 保留现有兼容范围并单列测试结果。
-- 客户端通过 Waybridge TLS 连接 LAN/VPN 内的 Linux 服务，提供认证、加密和配对。系统 SSH 用于 Linux 部署、管理和转发 TLS 入口。Windows 11 x64/Tailscale 首轮流程已通过，WoA、更多网络及完整应用验收见 [Roadmap M1](ROADMAP.md#m1-独立会话与连接)。
-- 会话不要求宿主运行 KWin 或其他 DE；Waybridge 管理必要的服务组合，原生桌面组件按需复用。没有本地图形桌面时验证启动，已有同用户桌面时验证拒绝创建，边界见 [会话独立性原则](ARCHITECTURE.md#会话独立性原则)。
-- 应用从 Waybridge 会话启动，每个会话一个活动查看端。通过 Steam、HMCL 等启动器继续启动的窗口同样进入该会话。
-- 首轮同时打开四个顶层窗口，覆盖一个持续更新的前台窗口和多个办公窗口。双显示器覆盖 100%、175%、200% 等混合 DPI；X11 共享应用密度的行为需要清楚呈现。
-- 动态画面的标准配置为 1080p60 和 1440p60。4K 静态办公清晰度单独验收，1080p120、持续 4K60、HDR 和广色域作为增强配置分别报告。
-- 首版颜色基线为 SDR/sRGB。专业软件验收同时检查文字、细线、透明度和颜色；更完整的 ICC 与 HDR 工作流另列规格。
-- 提供清晰、专业软件交互、游戏低延迟三个预设，按应用保存，允许手动覆盖。预设描述实际效果，不绑定某一种编码或合成技术。
-- 默认 Alt+Tab、Win 键留给 Windows，普通应用快捷键交给远端。提供显式的远端快捷键操作；`Ctrl+Alt+Shift+F12` 始终作为本地紧急释放入口。
-- 设备能力由诊断页读取并展示，包括设备名称、输入字段、音视频格式和打印能力。具体型号进入兼容矩阵，无需在定义功能时穷举所有品牌。
+- Linux server baselined on NVIDIA hosts; Windows 11 native ARM64 and x64 as primary clients, with Windows 10 tracked separately.
+- Windows clients connect over Waybridge TLS to the Linux user service on LAN/VPN; system SSH handles deployment, administration, and optional TLS forwarding. Initial Windows 11 x64/Tailscale passed; WoA, wider networks, and full app matrices continue under [Roadmap M1](ROADMAP.md#m1-standalone-sessions-and-connectivity).
+- Host-DE-independent startup verified with no local graphical desktop running and one-way rejection when a same-UID local desktop exists; see [Session Independence Principles](ARCHITECTURE.md#session-independence-principles).
+- Apps (and child windows spawned by Steam/HMCL) launch inside the session with one active viewer per session.
+- Initial multi-window workload: four concurrent toplevels (one continuously updating foreground window plus productivity windows) across dual displays at mixed DPI (100%, 175%, 200%), surfacing X11 shared-density behavior transparently.
+- Standard dynamic video profiles: 1080p60 and 1440p60; 4K static office clarity tested separately; 1080p120, sustained 4K60, HDR, and wide gamut tracked as enhanced tiers.
+- Initial color baseline: SDR/sRGB checking text, fine lines, alpha, and color; full ICC and HDR tracked separately.
+- Three per-app saved presets (clarity, interactive workstation, low-latency gaming) with manual override, decoupled from specific codecs or compositing strategies.
+- Default shortcut routing keeps `Alt+Tab` and `Win` local on Windows while forwarding ordinary app shortcuts remotely, with `Ctrl+Alt+Shift+F12` permanently reserved as local emergency unlock.
+- Diagnostics inspect and display real device names, input capabilities, A/V formats, and print queues rather than hardcoding hardware brand lists.
 
-### 七项新增能力的基线
+### Baseline for the Seven New Capabilities
 
-| 能力 | 推荐的完整首版基线 | 验收结果 |
+| Capability | Recommended First Complete Baseline | Acceptance Criteria |
 |---|---|---|
-| 手柄 | 标准 Xbox 风格布局，双摇杆、双扳机、十字键、常用按键、基础双马达震动；最多四个手柄，热插拔、重连及死区设置；失焦或断线时归零并停止震动 | 实机至少两个手柄同时使用；四设备容量可由受控输入源补测。Steam、一个原生游戏与一个 Windows 游戏分别检查识别、输入和震动 |
-| 触控 | 真实触屏输入，最多十点，实际数量受设备限制；提供按应用选择的鼠标兼容或手势映射模式，默认优先原生触控 | 单点操作、双指操作及多点独立性；跨 DPI 坐标正确，取消触摸和失焦后无残留触点；目标应用支持的手势正确触发 |
-| 触控笔 | 独立笔身份与绝对坐标，笔尖、离开感应范围、连续压感、悬停、侧键与橡皮擦；倾斜及旋转在硬件报告有效时传递；压感曲线可调 | 在 GIMP 与 Blender 的笔输入操作中检验位置、轻重变化、抬笔及切换窗口；按设备能力检查倾斜和按钮，不把笔输入整体退化成鼠标点击 |
-| 麦克风语音 | 一路活动麦克风，48 kHz 单声道语音基线；支持设备选择、增益、静音、按键说话、热插拔与重连 | 远端 Chrome 中的通话测试及一个目标会议或语音应用可识别并持续使用；以耳机通话为基础场景，静音与断开后停止传输 |
-| 摄像头 | 一路活动摄像头，默认 720p30；设备与带宽允许时可选 1080p30，支持选择设备、切换、停用和使用状态显示 | 远端 Chrome 与一个目标会议应用能选择设备、持续预览和通话；摄像头与麦克风同时使用 30 分钟，重连后恢复逻辑明确 |
-| 富文本剪贴板 | 双向 HTML 和 RTF，并提供纯文本与 PNG 回退；覆盖中英文、基本字体样式、段落、链接、表格值与基础样式、内嵌静态图片 | Chrome、WPS、LibreOffice 之间完成固定图文表格样例的双向复制；保留可编辑文字与结构。公式、图表和应用专用嵌入对象单列增强项 |
-| 打印 | Linux 应用打印到选定的 Windows 可用打印队列，另提供保存 PDF；纸型、方向、页码、份数及打印机支持的彩色和双面选项；可见任务状态与取消，重连不自动重复出纸 | WPS 或 LibreOffice 打印中文、图片和表格；至少一台实机打印机与 PDF 输出分别通过。任务完成状态对应 Windows 队列，实机另检查纸面结果 |
+| Gamepads | Standard Xbox-style layout (dual sticks, analog triggers, D-pad, standard buttons, dual-motor rumble); up to 4 controllers, hotplug, reconnect, deadzone; zero inputs & stop rumble on unfocus/disconnect | At least 2 physical controllers simultaneously (4-slot verified with controlled sources); Steam, one native Linux game, and one Windows game checked for discovery, input, and rumble |
+| Multitouch | Native touchscreen input up to 10 contacts (hardware-limited); per-app native touch vs. mouse/gesture compatibility, defaulting to native | Single-touch, two-finger, and multi-contact independence; accurate cross-DPI coordinates; clean cancel/unfocus recovery; target app gestures work |
+| Stylus pen | Distinct pen identity, absolute coordinates, tip/proximity, continuous pressure, hover, barrel button, eraser; tilt & rotation forwarded when hardware-valid; adjustable pressure curve | Verified in GIMP and Blender for accuracy, pressure variation, lift, and window switching; tilt/buttons verified per hardware without collapsing pen into plain mouse clicks |
+| Microphone | Single active mic at 48 kHz mono voice baseline; device selection, gain, mute, push-to-talk, hotplug, reconnect | Recognized and sustained in remote Chrome call test + one conferencing/voice app; headset scenario; silence/stop on mute or disconnect |
+| Webcam | Single active camera at 720p30 default (1080p30 optional when hardware/link permit); device selection, switching, disable, active indicator | Selectable for continuous preview and 30-minute simultaneous webcam + mic call in Chrome + one conferencing app with clean reconnect recovery |
+| Rich-text clipboard | Bidirectional HTML and RTF with plain-text and PNG fallbacks covering multilingual text, basic typography, paragraphs, links, tables with basic styling, and embedded static images | Bidirectional copy/paste of fixed text/image/table fixtures across Chrome, WPS, and LibreOffice preserving editable text and structure (equations/charts/proprietary embeds tracked separately) |
+| Printing | Print from Linux apps to selected Windows print queues plus Save to PDF; paper size, orientation, page ranges, copies, and printer-supported color/duplex; job status & cancel without duplicate reprints on reconnect | Print CJK text, images, and tables from WPS or LibreOffice to both a physical printer and PDF, checking Windows queue status and physical output |
 
-标准手柄基线参考 Windows 常见的四设备及基础震动能力，见 [XInput 官方说明](https://learn.microsoft.com/en-us/windows/win32/xinput/getting-started-with-xinput)。它用于确定产品覆盖范围，具体输入接口留到架构阶段选择。
+Gamepad baseline references [Windows XInput four-controller conventions](https://learn.microsoft.com/en-us/windows/win32/xinput/getting-started-with-xinput) for scope (independent of backend API choice). Touch events follow [Wayland `wl_touch` semantics](https://wayland.freedesktop.org/docs/html/apa.html), separate from app-level gesture mapping. Pen axes honor Windows validity masks per [Pen Mask Constants](https://learn.microsoft.com/en-us/windows/win32/inputmsg/pen-mask-constants) and [`POINTER_PEN_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-pointer_pen_info) rather than treating zero defaults as supported axes. Rich-text HTML follows [Windows HTML Clipboard Format](https://learn.microsoft.com/en-us/windows/win32/dataxchg/html-clipboard-format), verified per app pair. Print capabilities query live queue attributes per the [PWG IPP model](https://www.pwg.org/ipp/ippguide.html).
 
-触控事件本身与应用手势识别分开验收。Wayland 按触点提供按下、移动、抬起、分帧和取消语义，见 [Wayland 触控协议](https://wayland.freedesktop.org/docs/html/apa.html)。Blender 等应用需要的视图手势可通过明确的应用配置提供。
+### Application and Desktop Service Integration
 
-笔的压感、倾斜和旋转按系统有效字段处理。Windows 会标识这些字段是否有效，不能把默认的零值当成设备能力，见 [笔字段有效性](https://learn.microsoft.com/en-us/windows/win32/inputmsg/pen-mask-constants) 和 [笔输入数据](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-pointer_pen_info)。
+Users should complete target workflows entirely from Windows without ever walking over to the Linux host desktop for a hidden file picker, wallet prompt, or dialog. Service installation, D-Bus reachability, and end-to-end interactive completion are recorded separately.
 
-富文本依据双方应用提供和接受的格式选择保真路径。Windows HTML 剪贴板可以保存选中片段及上下文，解释结果由接收应用决定，因此需要按应用组合验收，见 [HTML 剪贴板格式](https://learn.microsoft.com/en-us/windows/win32/dataxchg/html-clipboard-format)。
-
-打印设置依据实际队列能力显示。纸型、双面和文档格式等是可查询能力，不假定每台设备完全相同，见 [PWG 打印能力模型](https://www.pwg.org/ipp/ippguide.html)。打印方向建议采用 Windows 侧打印机，属于待确认的默认选择。
-
-### 应用与桌面服务联动
-
-建议将桌面服务兼容作为基础功能单列。用户应能从 Windows 完成目标应用的完整操作，不需要到 Linux 宿主桌面寻找文件选择、钱包授权或其他隐藏对话框。安装有服务、D-Bus 调用能返回、交互流程可完成分别记录。
-
-| 场景 | 推荐默认行为 | 验收重点 |
+| Scenario | Recommended Default Behavior | Acceptance Focus |
 |---|---|---|
-| KWallet / Secret Service | 共享用户总线上的原生密钥服务与原有数据，解锁和授权窗口作为远程窗口显示；不做钱包转发 | 临时测试钱包覆盖已解锁、锁定、首次授权、取消、服务重启及无宿主桌面；本地与远程轮流使用，创建时检查已有桌面 |
-| 打开和保存文件 | 保留 Linux 应用原生文件操作；跨端使用现有拖放/复制并统一只读交付。用户通过 Dolphin/Explorer 等复制到自己的目录后正常编辑保存 | 普通 Qt/GTK 与 Flatpak 的本端文件操作单独验收；交付输入不可原位覆盖，用户复制出的文件独立可写；不强制应用弹另存为，不自动回写另一端 |
-| 打开链接和其他应用 | 普通操作默认留在本会话，提供“在 Windows 打开”。登录链接默认在远端浏览器处理；应用专用 URI 交给对应远端应用 | `https:`、`mailto:`、`steam:` 等分别验证；登录回调能返回发起应用，不被宿主已有进程接走 |
-| 远端应用托盘 | Windows 显示远端应用的独立图标；按应用协议处理主/次激活、菜单和状态更新；控制中心保留可访问的应用入口 | 图标、提示、菜单子项及勾选/禁用状态可用；关闭主窗口后仍能重新打开/正常退出；应用退出、断开及重连不残留或重复图标 |
-| 桌面通知 | Linux 应用通知映射为 Windows 通知，点击或动作返回原应用；通知有替换、关闭和过期语义 | 消息、动作及关闭事件对应正确应用；尊重共享开关和 Windows 免打扰；重连不重放过期通知或动作 |
-| 后台应用与窗口关闭 | 控制中心提供已接入后台应用入口；关闭窗口、应用自行隐藏、正常退出、断开连接和结束会话分别处理 | 无窗口不等于已退出；根据应用支持的激活接口恢复；应用提供退出动作时调用它，不按名称终止同 UID 进程 |
-| 任务栏身份 | 窗口按远端应用显示名称、图标和分组，保持父子及模态关系 | 区分 Waybridge 管控入口与远端应用；多实例、重连、前台激活和跨 DPI 后身份一致；固定快捷方式另按显式配置处理 |
-| Flatpak 与门户服务 | 会话内提供可用的文件选择、打开链接等 portal 流程；设备和打印请求沿用相应共享规则 | 飞书、OBS 等已安装 Flatpak 候选分别验收，不能用普通安装包的结果替代 |
-| 会议屏幕共享与录制 | 优先支持选择 Waybridge 会话内的单个应用窗口；共享 Windows 桌面另列能力 | 会议应用或 OBS 能选中、预览和停止共享 Blender 窗口，授权对话框在当前会话可见 |
-| 权限认证 | 需要系统授权的已选应用，在当前会话显示认证或明确说明不支持；不改变宿主授权规则 | 注册与调用归属对应实际 Linux 登录会话或进程，认证可取消；系统设置类操作按需扩展 |
-| SSH / GPG 与开发工具 | 默认使用 Linux 侧现有身份与 agent；需要交互时提供本会话可见路径。Windows 密钥代理另列可选功能 | Git 操作、SSH 密钥口令及 GPG 签名按实际工具选择验收，不把 KWallet 通过视为 agent 集成通过 |
+| KWallet / Secret Service | Native secret service and existing data on the shared user bus; unlock/auth prompts render as remote windows; no wallet forwarding | Temporary test wallets covering unlocked, locked, first-time auth, cancel, service restart, and headless startup; alternating local/remote use with creation check |
+| Open & save files | Keep native Linux file dialogs; cross-machine transfers use drag/copy with uniform read-only delivery; users copy via Dolphin/Explorer into editable directories | Verify native Qt/GTK and Flatpak local dialogs separately; confirm delivered inputs resist in-place overwrite while user copies are writable; no forced Save As or auto write-back |
+| Links & cross-app launches | Stay inside the remote session by default with explicit "Open in Windows" option; login callbacks stay in the remote browser; custom URIs route to remote apps | Test `https:`, `mailto:`, `steam:`; confirm OAuth/login callbacks return to the calling app rather than a host process |
+| Remote app trays | Independent Windows tray icons with primary/secondary activation, menus, and status updates plus Control Center background list | Verify icons, tooltips, submenus, checked/disabled items, reopen/exit after closing main window, and clean removal on exit/disconnect/reconnect |
+| Desktop notifications | Map Linux notifications to Windows native notifications with click/action callbacks, replacement, close, and expiry | Verify app attribution, actions, close events, sharing toggles, Windows Do Not Disturb, and no stale replay on reconnect |
+| Background apps & window close | Surface managed background apps in Control Center; keep window close, hide-to-tray, clean exit, disconnect, and session shutdown distinct | Zero visible windows ≠ exited; restore via app activation interface; invoke app-provided quit rather than killing same-UID processes by name |
+| Taskbar identity | Group windows by remote app name and icon while preserving parent/modal relationships | Separate Waybridge Control Center from remote apps; keep identity consistent across multi-instance, reconnect, foreground activation, and DPI changes |
+| Flatpak & Portals | Provide working file-picker and URI-open Portal flows inside the session; enforce sharing toggles for devices and printing | Verify installed Flatpak apps (Feishu, OBS, etc.) separately from native packages |
+| Conferencing screen sharing & capture | Prioritize sharing individual windows inside the Waybridge session (sharing the Windows desktop is separate) | Conferencing app or OBS can select, preview, and stop sharing a Blender window with auth prompts visible in-session |
+| System authorization (polkit) | Show auth dialogs in-session for selected apps or report unsupported cleanly without weakening host rules | Bind auth agent properly to real Linux login session/process with working cancellation |
+| SSH / GPG & dev tools | Use existing Linux identities and agents with in-session prompts (Windows agent forwarding is optional) | Verify Git, SSH passphrases, and GPG signing independently rather than assuming KWallet covers agents |
 
-已实现的会话环境及组件生命周期见 [桌面服务](../src/session_services.rs)、[集成步骤](INTEGRATION.md) 与 [验证记录](VALIDATION.md)。上表包含后续交付目标，托盘、通知等状态以下面的清单为准。原有用户总线上的 Secret Service/KWallet 沿用原生解锁和授权，按应用请求或用户 unit 配置启动；核心不强制激活某个钱包。SSH 密钥登录本身不提供钱包密码。
+Implemented session environment and lifecycle code lives in [session_services.rs](../src/session_services.rs) and [INTEGRATION.md](INTEGRATION.md). Native Secret Service/KWallet on the user bus handles unlocking natively (SSH key login does not supply wallet passwords). KWallet 6.31.0 pairs `kwalletd6` compatibility with the `ksecretd` backend. See [SESSION_POLICY.md](SESSION_POLICY.md) for alternating local/remote data sharing.
 
-应用与用户服务共享用户数据和总线，Waybridge 配置当前显示和激活环境，不另做通用密码对话框。
+Portal backends and service activation environments must stay synchronized (see [Portal System Integration](https://flatpak.github.io/xdg-desktop-portal/docs/system-integration.html) and [`portals.conf`](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html)), preserving Flatpak document-portal grants; Windows paths are never passed directly as Linux-readable paths. Conferencing window sharing additionally requires [ScreenCast Portal + PipeWire](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html), and [polkit](https://www.freedesktop.org/software/polkit/docs/latest/polkit.8.html) operates over the system bus with session-bound agents rather than plain session-bus forwarding.
 
-本机 KWallet 6.31.0 由 `kwalletd6` 兼容接口与 `ksecretd` 后端配合。历史双私有总线测试使用隔离数据，仅验证旧方案；当前策略见 [SESSION_POLICY.md](SESSION_POLICY.md)。
+Wallets and basic file pickers are verified; M2 landed the initial wave of trays, notifications, and background entries while expanding link/file flows; single-window ScreenCast lands in M4.
 
-本地桌面与 Waybridge 轮流使用原有钱包、Chrome 等数据。创建时拒绝同用户已有图形桌面；启动后不拦截其他 DM。旧隔离数据保留，不自动合并或迁移。应用原有数据锁仍生效，不额外清理通用后台进程。
+### Desktop Integration Delivery Checklist
 
-Portal 的后端选择及服务激活环境需要随会话配置；仅给应用设置 `WAYLAND_DISPLAY` 不足以保证后续服务在同一会话启动，见 [Portal 系统集成](https://flatpak.github.io/xdg-desktop-portal/docs/system-integration.html) 与 [后端配置](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html)。文件选择还需保留 Flatpak 的文档访问授权。Windows 文件路径不能直接充当 Linux 应用可读路径。
+Distinguishes current capabilities from remaining targets:
 
-会议里的“摄像头可用”和“能共享窗口”分别验收：后者通常还需要 [ScreenCast Portal 与 PipeWire 流](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)。权限认证又是另一条路径，polkit 通过系统总线与认证代理协作，不能通过接通私有 session bus 直接获得，见 [polkit 模型](https://www.freedesktop.org/software/polkit/docs/latest/polkit.8.html)。
-
-钱包和普通文件选择已有验证。M2 已接入首轮应用托盘、通知和后台入口，继续扩展所选应用的链接跳转/文件流程；会议单窗口共享在 M4 单独验收。更多系统权限操作、Windows 代理和更广的应用专用集成按实际需要扩展。
-
-### 桌面集成的交付清单
-
-此清单区分当前能力与剩余目标；SNI、通知及任务栏身份首轮已实现，各自的协议和实机验证范围见 [VALIDATION.md](VALIDATION.md)。
-
-| 能力 | 当前状态 | 计划与验收边界 |
+| Capability | Current Status | Planned Scope & Boundaries |
 |---|---|---|
-| SNI 应用托盘及菜单 | 首轮已实现：SNI、DBusMenu、Windows 独立图标 | M2：StatusNotifierItem/Host/Watcher 接入和 D-Bus 菜单；Windows 独立托盘图标、状态与动作；覆盖图标更新、主窗口隐藏/重开、退出和重连 |
-| 旧式 X11 托盘 | 未实现 | 独立检查 XEmbed/System Tray；先探测目标应用实际协议。所选应用依赖它时前移适配，M4 完整应用验收前补齐；不能用 SNI 通过代替 |
-| 通知及动作回传 | 首轮已实现：显式标准 provider、Windows 原生通知与动作 | M2：标准通知接口与 Windows 呈现，通知身份、替换/关闭、动作及免打扰；不默认提供断开期间的通知存档 |
-| 后台应用入口 | 已有基于 SNI 的后台列表、激活与应用菜单；无 SNI 的后台进程不列入 | M2：登记可管理应用及其托盘/窗口关系；展示仍在后台运行的应用；按其能力激活与退出 |
-| 任务栏分组与激活 | 已按连接/应用设置窗口 AppUserModelID；完整 Shell 操作矩阵待验 | M2：补应用身份映射、窗口恢复及分组；多实例与模态关系单独验收 |
-| 文件/URI 与登录回调 | 已有 GIO 启动及部分文件选择流程；跨端只读交付及独立副本可写已实现 | M2：保留原生打开/保存，扩展应用兼容验收；URI 和登录回调按所选应用验证。“在 Windows 打开”按用户显式选择，不改写全局默认关联 |
-| 全局快捷键与媒体键 | 已有基础键盘路由，缺少完整配置与后端 | M2 明确本地/远端快捷键规则；GlobalShortcuts Portal 和 MPRIS 媒体控制列为待确认子集 |
-| 锁屏、睡眠与恢复 | 尚未形成完整处理与验收矩阵 | M2 补 Windows 状态变化下的输入释放、会话保留及连接恢复；M3/M4 随新增设备补取消和恢复 |
-| 授权与开发工具交互 | 钱包已接入，不能推定其他授权路径可用 | 所选应用的 polkit、SSH/GPG agent 交互分别验证；服务选择继续使用标准用户配置 |
+| SNI app trays & menus | Initial wave landed: SNI, DBusMenu, independent Windows icons | M2: StatusNotifierItem Host/Watcher + DBusMenu, independent Windows icons/status/actions, icon updates, hide/reopen, exit, and reconnect |
+| Legacy X11 trays | Not implemented | Probe XEmbed/System Tray per target app; pull forward if required before M4 full app sign-off (SNI does not substitute) |
+| Notifications & action callbacks | Initial wave landed: opt-in standard provider + Windows native notifications/actions | M2: Standard notification spec + Windows presentation, identity, replace/close, actions, and Do Not Disturb; no offline backlog by default |
+| Background app entries | SNI-based background list, restore, and app menus landed (non-SNI processes excluded) | M2: Track manageable apps and tray/window relationships; surface running background apps with native activate and quit |
+| Taskbar grouping & activation | Per-profile/app `AppUserModelID` landed; full Shell matrix pending | M2: Complete app identity mapping, window restoration, and grouping; verify multi-instance and modal relationships |
+| Files / URIs & login callbacks | GIO launches, partial file pickers, and read-only cross-machine delivery + writable user copies landed | M2: Keep native open/save, expand app compatibility, verify URIs/login callbacks; explicit "Open in Windows" without hijacking global defaults |
+| Global shortcuts & media keys | Basic keyboard routing exists; full config and backends missing | M2 defines local/remote shortcut rules; GlobalShortcuts Portal and MPRIS media control tracked as optional subsets |
+| Lock, sleep & resume | Full handling and test matrix pending | M2 adds input release, session preservation, and reconnect across Windows power/lock transitions; M3/M4 extend to new peripherals |
+| Auth & dev-tool interactions | Wallets wired; other auth paths not assumed | Verify polkit and SSH/GPG agent prompts individually using standard user configuration |
 
-托盘首轮优先基于 [Status Notifier Item](https://specifications.freedesktop.org/status-notifier-item/latest-single/) 的结构化状态和菜单适配；[X11 System Tray](https://specifications.freedesktop.org/systemtray/latest-single/) 使用 XEmbed，作为独立兼容项。只有 `ContextMenu` 而没有可导出菜单的项目，需要验证在 Linux 侧打开菜单并通过现有窗口路径呈现的回退。不能承诺任意应用均可生成 Windows 原生菜单。
+Trays prioritize [StatusNotifierItem](https://specifications.freedesktop.org/status-notifier-item/latest-single/) with [X11 System Tray](https://specifications.freedesktop.org/systemtray/latest-single/) (XEmbed) tracked separately; items offering only `ContextMenu` without exportable menus verify Linux-window fallback rather than assuming native Windows menus for every app. Shared user buses respect existing tray watchers and [notification service](https://specifications.freedesktop.org/notification/latest-single/) owners without hijacking or snooping.
 
-共享用户总线上已有托盘 watcher 时优先按标准接入；[通知服务](https://specifications.freedesktop.org/notification/latest-single/)已有名称所有者时必须检测并明确配置服务选择，不抢占或猜测转发。关闭与断开规则适用于远端项目，Waybridge 自身托盘继续承担连接和管控入口。
+Theme/font sync, autostart/launch bundles, MPRIS, global menus, and auto-updates remain separate candidates rather than v1 commitments.
 
-主题/字体偏好、自启动与应用启动组合、MPRIS、全局菜单和自动更新保留为单独候选；它们尚未全部确认为首版承诺。各项需记录目标应用、状态、负责模块、交付阶段与验收步骤，避免再次用“桌面集成”概括而漏掉实际入口。
+### Default Sharing Behavior
 
-### 默认共享行为
+Microphone and webcam are opt-in per session with visible active indicators, stopping transmission on disconnect and recovering cleanly from transient local device faults. Gamepads, touch, pen, clipboard, and printing each have independent toggles showing active state across connection switches.
 
-麦克风和摄像头按会话显式开启，使用期间展示状态，断开后停止向远端传输；本地临时设备故障应能单独恢复。手柄、触控、笔输入、共享剪贴板和打印也有独立开关，切换连接时显示当前选择。
+Compatibility results are tracked separately for native Wayland, Xwayland, Windows game runners, and Flatpak apps, pairing peripherals to representative apps (Blender/GIMP for pen, games for gamepads, conferencing apps for A/V, WPS/LibreOffice for rich text and printing).
 
-原生 Wayland、Xwayland、Windows 游戏运行器和 Flatpak 应用分别记录外设兼容结果。首轮按应用匹配能力：Blender/GIMP 验笔，游戏验手柄，会议应用验音视频，WPS/LibreOffice 验富文本和打印。
+### Read-Only Delivery of Cross-Machine Files
 
-### 跨端文件的只读交付
+Implemented 2026-11-16: cross-machine files are always delivered as read-only inputs. Linux exposes completed caches via a read-only FUSE view; Windows protects materialized clipboard caches with NTFS DACLs; OLE virtual-file streams reject writes. Drag-and-drop `COPY` alone is never treated as sufficient read-only enforcement.
 
-2026-11-16 已实现：跨端文件统一以只读输入交付。Linux 将完整接收缓存公开为只读 FUSE 视图；Windows 实体文件/目录剪贴板缓存通过 DACL 保护，OLE 虚拟文件流拒绝写入。不能仅将拖放 Copy 动作等同于只读保护。
+- Receiving apps can read and import delivered files but cannot overwrite them in place or atomically replace them via temp-file rename; source files stay untouched.
+- To keep or edit files persistently, users drag or paste them into Dolphin or Explorer to copy into their own directory; the resulting user copy has normal writable destination permissions without propagating read-only restrictions.
+- One uniform file/directory/virtual-stream adapter serves all apps without inspecting app names or extensions, synthesizing unnamed projects, or intercepting Save As shortcuts. Apps handle Save As natively if an in-place save fails.
+- Receive caches accommodate lazy reads, reopens, and random seeks; user copies survive cache cleanup. On-demand network FUSE reads remain a future optimization.
+- Waybridge does not add transparent remote drive letters, replace native file dialogs globally, or auto-sync edits back to the sender.
 
-- 接收应用可以读取和导入交付文件，不能原位覆盖交付文件或通过创建临时文件再重命名替换它；源端文件保持不变。保护范围需要覆盖公开的文件及目录访问，不能只依赖拖放 Copy 标志。
-- 用户希望长期保存或继续正常编辑时，将文件拖入或粘贴到 Dolphin、Explorer 等文件管理器，复制到自己选择的目录。新副本由用户和目标应用管理，按目标位置的正常权限可写；只读交付限制不应被强制传播到该副本。
-- 使用同一套文件/目录与虚拟流适配，不按应用名称、扩展名或“是否为编辑器”决定是否接收，不实现逐应用的未命名工程转换，也不拦截快捷键强制另存为。应用自行提供的导入和另存为继续可用；原位保存失败后是否显示另存为由应用决定。
-- 接收缓存属于传输实现，生命周期需要容纳应用的延迟读取、重开与随机读取；复制到用户目录后的文件不随缓存清理。完整落盘与按需虚拟文件是实现选择，FUSE 按需读取按收益另行推进。
-- 不增加透明 Windows 盘符浏览、通用跨端文件选择器替换或自动保存回传/双向编辑同步；原生 Linux 文件选择、URI 和登录回调仍按各自范围验收。
+Read-only delivery is not a same-UID/admin security sandbox (it does not block a user from altering ACLs, unmounting, or bypassing public paths). Linux requires `fusermount3` and accessible `/dev/fuse`; Windows temp directories require NTFS DACLs that do not map to a propagating `READONLY` attribute. When protection is unavailable (including under Wine's attribute mapping), publication is rejected and staged caches are cleaned up rather than downgrading to writable delivery; Wine uploads and read-only virtual streams remain usable.
 
-只读保护不构成同 UID 或管理员安全沙箱：不抵抗用户主动改 ACL、解挂载或绕过公开路径读取私有实现缓存。Linux 需要 `fusermount3` 与可用 `/dev/fuse`；Windows 临时目录需要支持 DACL 且不把它映射成会传播的 READONLY 属性，能力不足时明确拒绝该批发布并清理，不降级为可写交付。Wine 当前属于该不支持情形；其文件上传与只读虚拟流仍可用。
+Acceptance covers: directly dropped projects cannot overwrite or atomically replace in place; images/assets still read and import cleanly; copies made through file managers edit and save normally; source files stay intact; cancels, disconnects, and cache cleanups never delete user copies.
 
-验收覆盖：直接拖入的工程不能原位保存或原子替换；图片等内容仍可读取/导入；经文件管理器复制出的文件及目录可正常编辑保存；源端不变；取消、断线与缓存清理不删除用户已保存的副本。应用不自动弹出另存为不视为传输接口失败。
+### Large Projects and File Exchange
 
-### 大型项目与文件交换
+Target lifting the fixed 1 GiB single-file limit in favor of user-configured quotas and available disk space, testing at 10 GiB single files, 50 GiB project trees, and 10,000-file batches (test scales, not new hard caps).
 
-建议取消单文件 1 GiB 作为产品级固定限制，按用户设置的配额和目标磁盘空间处理。首轮使用 10 GiB 单文件、50 GiB 工程目录及一万个文件作为验收样例；这些是测试规模，不是新的硬上限。
+Transfer management provides per-task progress, speed, cancellation, rate limiting, and partial-completion reporting on error. Resuming interrupted transfers across network drops while the remote session remains alive is part of the full specification (resume across process restarts is tracked as an enhancement). Committed files remain readable across viewer disconnects.
 
-传输管理提供逐任务进度、速度、取消和限速，出错后明确指出哪些内容完成。断点续传纳入完整规格，至少覆盖保持远端会话运行时的网络中断恢复；两端进程重启后的续传作为增强能力单列。成功文件保持可被应用读取，不因查看连接断开而立即回收。
+### Display and Network Acceptance Targets
 
-### 显示与网络验收目标
-
-| 场景 | 建议的受控网络条件 | 目标行为 |
+| Scenario | Controlled Network Conditions | Target Behavior |
 |---|---|---|
-| 局域网 | RTT 不高于 5 ms，可用带宽至少 100 Mbit/s，无注入丢包 | 在服务端应用能产生相应帧率时，1080p60 和 1440p60 持续运行，办公文字保持可读 |
-| 常规 VPN | RTT 50 ms，可用带宽 30 Mbit/s，随机丢包 1% | 以 1080p60 为优化目标，允许自动降低画质；输入、声音和文件控制保持可用 |
-| 受限 VPN | RTT 100 ms，可用带宽 10 Mbit/s，随机丢包 2% | 自动转向较低质量或 720p30，用户可覆盖；资源与排队保持有界，连接不因持续增长的积压失去交互 |
+| LAN | RTT ≤ 5 ms, bandwidth ≥ 100 Mbit/s, 0% injected loss | Sustained 1080p60 and 1440p60 whenever the server app produces frames; crisp readable office text |
+| Typical VPN | RTT 50 ms, bandwidth 30 Mbit/s, 1% random loss | Optimize for 1080p60 with automatic quality scaling; input, audio, and file controls remain responsive |
+| Constrained VPN | RTT 100 ms, bandwidth 10 Mbit/s, 2% random loss | Automatically scale down quality or 720p30 (user-overridable); bounded queues and resources with responsive interaction |
 
-固定输入响应场景的物理输入到显示延迟，建议以局域网 P95 不高于 80 ms、常规 VPN P95 不高于 130 ms 为初始目标。先测量当前设备基线，再确认是否调整预算。测量应包含服务端响应输入后改变的画面，客户端本地光标移动不计入该响应。
+Initial physical input-to-display latency targets (to be calibrated against real hardware baselines): P95 ≤ 80 ms on LAN and P95 ≤ 130 ms on typical VPN, measuring actual server-rendered visual response to input (excluding local client cursor motion).
 
-真实游戏和 Blender 同时记录本地运行基线，区分应用绘制速度与远程链路开销。阶段计时、RTT 和呈现提交不能相加冒充该物理延迟。视频与会议场景建议将音画偏差的绝对值控制在 80 ms 内，测量同样作为待校准目标。
+Record local baselines alongside remote overhead for real games and Blender; never sum stage timers, RTT, and presentation submit times as physical latency. Target |A/V sync offset| ≤ 80 ms for video playback and conferencing, likewise calibrated empirically.
 
-断网 1 秒、5 秒、30 秒后恢复各重复十次，目标为网络可用后十秒内重新接回仍运行的会话，且无残留按键、触点、笔接触或震动。工作台连续运行八小时，并反复开启关闭窗口，检查 Waybridge 自身资源在缓存稳定后有界。
+Reconnect reliability: 10 repetitions each of 1 s, 5 s, and 30 s network outages reattaching within 10 s once connectivity returns with zero stuck keys, touches, pen contacts, or rumble. Stability: 8-hour workstation soak with repeated window open/close confirming bounded steady-state Waybridge resource use.
 
-### 首批应用验收集合
+### Initial Representative Application Acceptance Suite
 
-| 组合 | 建议完成的操作 |
+| Suite | Target Workflows |
 |---|---|
-| Blender 与 GIMP | 打开、编辑和保存工程；三维视图与大画布操作；菜单、中文路径、笔压、连续输入和跨窗口切换 |
-| Minecraft 与 HMCL | 启动器进入游戏，整合包加载，视角与菜单切换、聊天输入、锁鼠释放及返回启动器 |
-| Brotato 或 Stardew Valley | 原生 Linux 游戏的键鼠、手柄、声音、全屏和重连 |
-| Cyberpunk 2077 | Windows 游戏运行器路径的画面、键鼠、手柄、声音和全屏；先确认本机相同配置能够正常运行。游戏与语音应用并行使用时另测麦克风 |
-| Split Fiction | 两个手柄的独立性、连接变化、震动和前后台切换；游戏提供共享或分屏合作模式，见 [Steam 官方功能说明](https://store.steampowered.com/app/2001120/Split_Fiction/) |
-| WPS、LibreOffice 与 Chrome | 中文及图文表格复制、文件传输、PDF 和实机打印；Chrome 与一个目标会议应用验证摄像头和语音 |
+| Blender & GIMP | Open, edit, and save projects; 3D viewport and large canvas navigation; menus, Unicode paths, pen pressure, continuous input, and window switching |
+| Minecraft & HMCL | Launch from HMCL, load modpacks, camera look and inventory/menu switches, chat input, pointer-lock release, and return to launcher |
+| Brotato or Stardew Valley | Native Linux game keyboard/mouse, gamepad, audio, fullscreen, and reconnect |
+| Cyberpunk 2077 | Windows game runner display, keyboard/mouse, gamepad, audio, and fullscreen (after verifying local playability), plus parallel microphone voice chat |
+| Split Fiction | Dual independent gamepads, hotplug, rumble, and foreground/background switches ([Steam page](https://store.steampowered.com/app/2001120/Split_Fiction/)) |
+| WPS, LibreOffice & Chrome | Multilingual rich-text/image/table copy-paste, file transfers, PDF and physical printing; Chrome + conferencing app for webcam and microphone |
 
-其余已安装游戏逐项扩展矩阵，记录本机运行器、应用版本和实测结果。功能规格与具体游戏运行器的可用性分别判定。
+Additional titles expand the matrix incrementally with runner versions and measured outcomes, keeping game-runner issues distinct from Waybridge issues.
 
-## 建议的交付批次
+## Recommended Delivery Batches
 
-基础工作与完整里程碑见 [ROADMAP.md](ROADMAP.md)。M0 完成核心整理，M1 补齐独立会话及连接，下面三批分别对应 M2、M3、M4。
+Foundational work and full milestones are tracked in [ROADMAP.md](ROADMAP.md): M0 consolidates the core, M1 delivers standalone sessions and connectivity, and the three batches below map to M2, M3, and M4.
 
-| 批次 | 交付范围 | 完成标志 |
+| Batch | Scope | Exit Milestone |
 |---|---|---|
-| 第一批 日常工作台 | GUI 与窗口输入收尾、Blender 等首批应用、钱包与文件选择等基础联动、清晰和低延迟预设、网络适配、富文本、麦克风及基本传输管理 | 能完成日常工作和基础游戏操作，连接、登录与数据交换流程可重复验收 |
-| 第二批 专业输入与游戏设备 | 手柄和震动、多点触控、笔压与硬件扩展字段，以及相应应用配置 | 专业绘图操作、双手柄游戏和各类输入取消恢复通过实机验收 |
-| 第三批 完整协作能力 | 摄像头、音画同步、会议单窗口共享、Windows 打印队列、工程规模传输与续传收尾 | 会议、打印及大工程交换通过；七项已确认新增能力均达到选定基线 |
+| Batch 1 — Daily Workstation | GUI & window/input polish, Blender & initial apps, wallet & file-picker integration, clarity/low-latency presets, network adaptation, rich text, microphone, basic transfer management | Everyday productivity and core gaming work repeatably end-to-end |
+| Batch 2 — Professional Input & Gaming Devices | Gamepads & rumble, multitouch, stylus pen with hardware-valid axes, and per-app configs | Creative pen workflows, dual-gamepad play, and input cancellation/recovery pass on physical hardware |
+| Batch 3 — Full Collaboration | Webcam, A/V sync, single-window conferencing share, Windows print queues, project-scale transfers & resume | Conferencing, printing, and large project workflows pass; all seven new capabilities meet baseline |
 
-第一批和第二批作为可用预览；首个完整稳定版本在三批目标全部验收后形成。高刷新率或 HDR 扩展、特殊手柄效果、多摄像头和更广设备矩阵再分别推进。日期与开发工期留待原型、实机基线和工作量评估后安排。
+Batches 1 and 2 serve as usable previews; the first full stable release follows completion of all three batches. High refresh/HDR extensions, advanced controller features, multi-camera setups, and broader device matrices follow in subsequent phases.
 
-## 功能确定方法
+## Feature Scoping Process
 
-每项功能记录目标用户操作、现有状态、首版必要性、支持范围和验收场景。候选功能经选择后再形成版本清单；架构需要覆盖已选功能之间的关系。
+Every feature records target user workflows, current status, v1 necessity, supported subset, and acceptance criteria. Candidate features enter version plans only after explicit selection, with architecture updated to cover cross-feature interactions.
 
-后续主要工作是将推荐规格逐项标为采用、调整或延后，记录设备能力与游戏运行器，再通过受控基线校准数字目标。设备型号与应用特例补入兼容矩阵，避免重新把每个默认行为都交给用户逐项设计。
+Ongoing work marks each baseline item as adopted, adjusted, or deferred, logs exact device capabilities and game runners, and calibrates numeric targets against controlled baselines.
 
-功能来源追溯见 [PARALLEL_FEATURES.md](PARALLEL_FEATURES.md)，实际使用边界见 [README.md](README.md) 和 [GUI 说明](GUI.md)。
+For current usage limits, see [Usage and Building](README.md) and [Control Center](GUI.md).

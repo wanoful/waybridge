@@ -1,38 +1,38 @@
-# 游戏手柄（实验）
+# Gamepads (Experimental)
 
-更新日期：2026-11-18。Windows 通过 SDL3 Gamepad 识别实体手柄，再通过认证连接转发为 Linux 会话拥有的 uinput 虚拟手柄。默认关闭。开启后可在后台显示本地设备数量，只有前台窗口取得输入租约才打开设备并转发输入。
+Updated: 2026-11-18. Windows discovers physical gamepads via SDL3 Gamepad and forwards them over the authenticated connection as session-owned Linux `uinput` virtual controllers. Disabled by default. When enabled, the local device count can be displayed in the background, while devices are only opened and forwarded once a foreground remote window holds the input lease.
 
-## GUI 与配置
+## GUI and Configuration
 
-连接配置的输入设置中提供以下字段；保存到 profile 的 `settings`，不需要环境变量：
+The connection profile's input settings expose the following fields, persisted under `settings` in `profiles.json` without environment variables:
 
-| GUI 设置 | Profile 字段 | 默认值 | 范围与含义 |
+| GUI Setting | Profile Field | Default | Range and Meaning |
 | --- | --- | --- | --- |
-| 游戏手柄 | `gamepads` | `false` | 启用手柄转发 |
-| 手柄震动 | `gamepad_rumble` | `true` | 允许当前会话的游戏回传震动 |
-| 摇杆死区（%） | `gamepad_deadzone` | `15` | 整数 `0–50`；当前同时作用于摇杆和模拟扳机 |
+| Gamepads | `gamepads` | `false` | Enable gamepad forwarding |
+| Gamepad rumble | `gamepad_rumble` | `true` | Allow games in the active session to send rumble feedback |
+| Stick deadzone (%) | `gamepad_deadzone` | `15` | Integer `0–50`; currently applies to both sticks and analog triggers |
 
-摇杆使用径向死区并重新缩放剩余行程，扳机独立应用阈值并重新缩放。初始 hello 协商 `gamepad_v1`、`gamepad_enabled`；支持 `gamepad_settings_v1` 的服务端可通过 `gamepad_enabled` 实时切换。旧端缺少能力时显示状态，不把保存偏好误报为已生效。
+Sticks use a radial deadzone and rescale the remaining range; triggers apply the threshold independently and rescale. The initial `hello` negotiates `gamepad_v1` and `gamepad_enabled`; servers supporting `gamepad_settings_v1` can toggle forwarding live via `gamepad_enabled`. When an older endpoint lacks capability, status reports the mismatch rather than claiming a saved preference is active.
 
-`gamepad_enabled` 表示协商后的启用偏好，`gamepad_active` 表示当前前台窗口取得了输入租约。`gamepad_local_count` 是 Windows 可转发的设备数（最多四个），`gamepad_devices` 是已创建的 Linux 虚拟设备。另报告 `rumble_supported`、`gamepad_error` 和 `gamepad_backend`。
+`gamepad_enabled` reflects the negotiated preference, and `gamepad_active` indicates whether the current foreground window holds an input lease. `gamepad_local_count` reports forwardable Windows devices (up to four), and `gamepad_devices` lists created Linux virtual devices. Diagnostics also report `rumble_supported`, `gamepad_error`, and `gamepad_backend`.
 
-## 输入、焦点与震动
+## Input, Focus, and Rumble
 
-SDL3 负责设备发现、标准按键映射和支持设备上的双电机震动。最多四个槽位按 SDL 实例 ID 分配，插拔一只手柄不重排其他已连接手柄。SDL 无设备时，暂时保留 `045e:0b13` Xbox Series 的单设备蓝牙 HID 回退，等待这只实体手柄的 SDL 验收。这条回退不支持震动。活跃输入采样上限为 125 Hz，设备清单每 500 ms 更新一次。实际频率受 UI 定时器和调度影响。
+SDL3 handles device discovery, standard button mapping, and dual-motor rumble on supported controllers. Up to four slots are assigned by SDL instance ID so plugging or unplugging one controller does not reorder other connected slots. When SDL sees no devices, a single-device Bluetooth HID fallback for Xbox Series (`045e:0b13`) is temporarily retained pending SDL verification on that physical controller; this fallback does not support rumble. Active input polling is capped at 125 Hz, and the device list refreshes every 500 ms. Actual cadence is subject to UI timers and OS scheduling.
 
-Windows 构建下载并校验固定版本的 [SDL3 源码](https://github.com/libsdl-org/SDL/releases/tag/release-3.4.20)，将游戏手柄库静态链接到 worker。便携包包含 SDL 许可证。
+The Windows build downloads and verifies a pinned [SDL3 release](https://github.com/libsdl-org/SDL/releases/tag/release-3.4.20) and links the gamepad library statically into the worker. Portable packages include the SDL license.
 
-只有本地前台远端窗口、服务端焦点和非只读输入策略同时匹配才取得租约。输入快照绑定窗口 ID、服务端 generation、槽位、设备 incarnation 和递增序号；过期、重复及越界状态不产生输入。普通切窗或失焦会清空按钮、摇杆和震动。仍连接的 Linux 虚拟设备及其槽位在同一连接内保留，游戏可以继续使用已打开的设备。重新取得焦点后，客户端使用新租约提交当前手柄状态。默认关闭时不会轮询手柄或清零其他应用的电机。
+A lease is granted only when a local foreground remote window, server-side focus, and non-read-only policy all match. Each input snapshot is bound to window ID, server generation, slot, device incarnation, and a monotonic sequence number; stale, duplicate, or out-of-range states produce no input. Switching windows or losing focus zeroes buttons, sticks, and rumble, while keeping connected Linux virtual devices and their slots intact for the duration of the connection so games retain their open handles. When focus returns, the client submits the current controller state under a new lease. While disabled by default, the client neither polls gamepads nor clears motors belonging to other applications.
 
-Linux 使用标准 Xbox 360 的 BTN/ABS/HAT 布局，按 evdev 约定反转摇杆 Y 轴。游戏的 `FF_RUMBLE` 上传、播放、停止和有限时长结束，经当前租约回传到原 Windows 槽位；旧设备反馈不能作用于重连后的设备。持续震动每 250 ms 续发，反馈租期为 750 ms，客户端在轮询中检查超时并归零；它不是独立于 UI 调度的实时硬截止。
+Linux exposes a standard Xbox 360 BTN/ABS/HAT layout with inverted stick Y axes per `evdev` conventions. Game `FF_RUMBLE` uploads, plays, stops, and finite-duration expirations are routed back over the active lease to the originating Windows slot; feedback from an old incarnation cannot affect a reconnected device. Continuous rumble is refreshed every 250 ms with a 750 ms feedback lease, checked and zeroed on the client poll loop (not a hard real-time deadline independent of UI scheduling).
 
-协商 `gamepad_reconnect_v1` 后，能够识别设备路径的手柄短时掉线会立即归零，并保留虚拟槽位最多 5 秒。SDL 设备使用 SDL 路径和 GUID 识别回来的设备，现有蓝牙 HID 回退使用自己的设备路径。相同设备及时返回时，游戏可继续使用原 evdev 句柄，输入和震动切换到新的设备代次。未经识别的拔出和宽限期过期会删除对应虚拟设备。只读、关闭转发或断开连接会删除全部对应设备。虚拟设备由本会话创建并随生命周期删除，内核设备节点仍对系统可见。
+When `gamepad_reconnect_v1` is negotiated, a brief disconnect of a controller with a recognizable device path zeroes inputs immediately and preserves its virtual slot for up to 5 seconds. SDL devices match returning hardware by SDL path and GUID; the Bluetooth HID fallback uses its device path. If the same device returns in time, games keep using the existing `evdev` handle while input and rumble switch to the new device incarnation. Unrecognized unplugs or expired grace windows destroy the virtual device. Read-only mode, disabling forwarding, or disconnecting destroys all corresponding virtual devices. Virtual devices are created and destroyed with the session lifecycle, though kernel input nodes remain visible system-wide.
 
-## 后端与验收
+## Backend and Verification
 
-Linux 检查 `/dev/uinput` 的读写访问及版本（需要支持设备设置的 v5 及以上），只有有效、已连接且持有焦点租约的输入才创建设备。缺少节点、权限不足或 ioctl 失败会通过 `gamepad_error` 报告并停止手柄功能，不修改系统权限，也不影响其他输入功能。
+Linux checks read/write access and version for `/dev/uinput` (requiring v5+ for device setup) and creates virtual devices only when valid connected input arrives under an active focus lease. Missing nodes, insufficient permissions, or `ioctl` failures are reported via `gamepad_error` and stop gamepad forwarding without altering system permissions or disrupting other input paths.
 
-已通过严格 x64/ARM64 交叉编译，以及以下定向验证：
+Strict x64/ARM64 cross-compiles and the following targeted checks pass:
 
 ```sh
 cargo test --locked gamepad::tests
@@ -42,8 +42,8 @@ python3 tests/windows_gamepad_smoke.py
 python3 tests/session_fixture.py python3 tests/gamepad_smoke.py
 ```
 
-真实 Linux 测试只操作由唯一名称、phys 和 sysname 确认的临时虚拟设备，验证 evdev 按钮/轴/方向键、真实 `EVIOCSFF` 上传和震动回传、效果到期归零、热插拔隔离、双手柄重连后保持设备句柄及超时删除。负例覆盖缺失/无权限后端、非 uinput 节点、非法数值、旧租约和重放。Windows 测试在私有 Wine/Xvfb 中运行生产适配器和 SDL 虚拟手柄，覆盖四槽、热插拔、方向键、轴和扳机、焦点、死区、同槽重连及震动路由。
+The real Linux tests operate exclusively on temporary virtual devices verified by unique name, `phys`, and `sysname`, checking `evdev` buttons/axes/hats, real `EVIOCSFF` uploads and rumble round-trips, effect-expiration zeroing, hotplug isolation, handle preservation across short two-controller reconnects, and timeout removal. Negative tests cover missing/unprivileged backends, non-`uinput` nodes, invalid values, stale leases, and replays. The Windows test runs the production adapter and SDL virtual gamepads in private Wine/Xvfb, covering four slots, hotplug, D-pad, axes and triggers, focus, deadzone, same-slot reconnect, and rumble routing.
 
-真实合成器协议到 evdev 的端到端测试覆盖默认关闭、双端焦点匹配、按钮/轴/HAT、非法/过期/重复输入拒绝、切焦点时同一 evdev 设备归零并恢复、失焦期间拔出、只读/关闭/断线清理。只读取由本次合成器 PID、name、phys 和 sysname 确认的临时节点。
+End-to-end compositor-to-`evdev` tests verify default-off behavior, bidirectional focus matching, buttons/axes/HATs, rejection of invalid/stale/duplicate input, zeroing and recovery on focus switches on the same `evdev` node, unplug while unfocused, and read-only/disable/disconnect cleanup—reading only temporary nodes verified by compositor PID, name, `phys`, and `sysname`.
 
-Xbox 蓝牙手柄已由用户确认可以转发输入。真实 SDL/Steam 游戏中的玩家顺序、蓝牙重连和实体震动仍需专项验收。Windows x64 的实际 WinUI 设置保存、重载和状态已通过私有 provider 测试。
+Input forwarding with a physical Xbox Bluetooth controller has been confirmed by users. Player ordering in real SDL/Steam games, Bluetooth reconnects, and physical rumble still require dedicated on-device verification. Windows x64 WinUI settings save, reload, and status reporting pass via private provider tests.

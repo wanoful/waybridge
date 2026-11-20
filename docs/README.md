@@ -1,143 +1,143 @@
-# Waybridge 0.3.0
+# Waybridge 0.3.0 — Usage, Architecture Summary, and Build Guide
 
-Linux TOML、配置检查、Waybridge 专用 `.desktop` 追加/覆写与工作目录规则见 [配置与应用启动](CONFIGURATION.md)；钱包、Portal 和 systemd 生命周期的安装与接入见 [桌面组件](INTEGRATION.md)。设计依据见 [配置决策](CONFIGURATION_POLICY.md)。
+For a step-by-step Linux host installation tutorial (distro packages, `systemd --user`, `linger`, firewall, Portals, and troubleshooting), see [Linux Host Setup Guide](LINUX_SETUP.md). For Linux TOML configuration, validation, Waybridge-specific `.desktop` appends/overrides, and working-directory rules, see [Configuration and Application Launching](CONFIGURATION.md). For wallet, Portal, and systemd session lifecycle setup, see [Desktop Components](INTEGRATION.md). For design rationale, see [Configuration Policy](CONFIGURATION_POLICY.md).
 
-M2 首轮已接入只读文件交付、SNI 应用托盘/后台入口、原生通知和来源角标。通知需按 [桌面集成](INTEGRATION.md#明确选用通知服务) 显式选择 provider；托盘范围见 [DESKTOP-TRAY.md](DESKTOP-TRAY.md)。两端更新后使用，现有部署和完整设备验收与源码进度分别记录。
+The first M2 wave adds read-only cross-machine file delivery, SNI application trays/background entries, native notifications, and source icon badges. Notifications require explicitly opting into the provider per [Desktop Integration](INTEGRATION.md#explicitly-opting-into-the-notification-provider); tray scope is documented in [DESKTOP-TRAY.md](DESKTOP-TRAY.md). Update both ends together; active deployments and full hardware verification are tracked separately from source progress.
 
-这是 Linux → Windows 独立应用窗口原型。服务端是私有无头 Smithay Wayland 合成器，可选择启动 rootless Xwayland；不接入 KWin，不迁移已有桌面窗口。Windows 客户端为 Win32，提供 x64 和原生 ARM64 构建。功能来源见 [整合清单](PARALLEL_FEATURES.md)，实际验收范围见 [VALIDATION.md](VALIDATION.md)。
+Waybridge is a Linux → Windows standalone remote application windowing system. The server is a private headless Smithay Wayland compositor with optional rootless Xwayland—it neither attaches to KWin nor migrates existing host desktop windows. The Windows client is native Win32 with x64 and native ARM64 builds.
 
-本文档位于 `docs/`，文中的构建和运行命令均在 Git 仓库根目录执行。根目录的 `src/` 是 Linux 合成器，`native/` 是编解码与 GPU 适配，`client/` 是 Windows 原生内核，`gui/` 是控制中心，`scripts/` 和 `tests/` 分别提供构建与验证入口。构建产物写入已忽略的 `target/`、`build/` 和 .NET `bin/`、`obj/`。
+This document lives in `docs/`, and all build and run commands below execute from the Git repository root. Layout: `src/` (Linux compositor), `native/` (codecs & GPU interop), `config/` (shared Linux config crate), `service/` (TLS user service & TUI), `client/` (Windows native C++ engine), `gui/` (C# / WinUI 3 Control Center), `integration/` (systemd targets & Portal preset), `scripts/` (build/packaging helpers), and `tests/` (verification suite). Build outputs write into Git-ignored `target/`, `build/`, and .NET `bin/`/`obj/`.
 
-现有能力与目标范围见 [功能规格](FEATURES.md)，技术边界见 [架构](ARCHITECTURE.md)，里程碑见 [Roadmap](ROADMAP.md)。默认采用[共享用户数据与单向会话检查](SESSION_POLICY.md)：先注销同一用户的本地桌面，再创建 Waybridge；已有会话可以重连。M0/M1 设备验证与本次策略变更分开记录，见 [VALIDATION.md](VALIDATION.md)。
+See [FEATURES.md](FEATURES.md) for capabilities and target scope, [ARCHITECTURE.md](ARCHITECTURE.md) for technical boundaries, and [ROADMAP.md](ROADMAP.md) for milestones. Sessions follow [Session Policy](SESSION_POLICY.md) by default: shared user data with a one-way check requiring logout from any same-UID local desktop before creating a new session (reconnecting to an existing session is allowed).
 
-窗口、托盘、焦点及拖放的支持矩阵见 [桌面交互](DESKTOP_INTERACTIONS.md)；纯文本拖放的状态、协议适配、超时边界与 Chrome 实机测试入口见 [拖放设计](DRAG_AND_DROP.md)。
+See [DESKTOP_INTERACTIONS.md](DESKTOP_INTERACTIONS.md) for the window, tray, focus, and drag-and-drop support matrix, and [DRAG_AND_DROP.md](DRAG_AND_DROP.md) for plain-text drag state, protocol adaptation, timeout bounds, and real Chrome testing.
 
-仓库同级的 `sunshine/` 和 `moonlight/` 是未修改的本地参考源码，不纳入本仓库；参考版本见 [upstreams.json](../upstreams.json)。完整 Git 历史与功能来源分支保留，早期提交使用 `waybridge/` 路径前缀。协议为独立 v3，普通 Moonlight 不能直接连接。
+Waybridge uses an independent v3 wire protocol—standard Moonlight clients cannot connect.
 
-每个顶层窗口对应一个 Windows 窗口，标题栏只由一端拥有；越界/嵌套菜单映射为独立 owned popup，不改变父窗口尺寸。绘制跟随 Windows DPI，Qt 分数缩放、透明 alpha、父子对话框与原生输入分别处理。断线保留应用，重连恢复窗口；旧焦点的按键、组合和指针锁定不会继续作用于新目标。
+Every remote toplevel maps to an independent native Windows window with title bars owned by exactly one side; overflowing or nested menus map to independent owned popups without resizing their parent. Rendering follows Windows DPI, handling Qt fractional scaling, transparent alpha, parent/child dialogs, and native input separately. Disconnects keep remote apps running and reconnects restore live windows; keys, IME compositions, and pointer locks from prior focus never leak onto new targets.
 
-默认 `--codec auto` 在 SDR 下选择 NVENC H.264，启用 HDR 偏好时选择 HEVC，菜单使用 PNG；实际路径仍取决于能力协商。可选 HEVC/AV1 保留独立无损 alpha。Windows 使用实际能力探测后的系统 Media Foundation/D3D11 解码和 DirectComposition；不可用或运行失败按窗口回退 PNG。`--codec png` 强制无损图像。默认 60 FPS，原始更新合并，编码引用帧有序，每窗口最多两个呈现确认在途帧。捕获前检查下游额度和原始队列，拥堵时保留最新待更新状态，恢复后补发；`--stats` 提供阶段分位数、帧龄和队列诊断。
+The default `--codec auto` selects NVENC H.264 for SDR and HEVC when HDR preference is enabled, with PNG for menus (actual paths depend on capability negotiation). Optional HEVC/AV1 preserves independent lossless alpha. Windows probes real hardware support before using Media Foundation / D3D11 decoding and DirectComposition, falling back per window to PNG if unavailable or on runtime error. `--codec png` forces lossless frames. Default is 60 FPS with raw-update coalescing, ordered encoded reference frames, and at most 2 in-flight presentation-ACK frames per window. Pre-capture checks downstream credits and raw queue capacity, keeping windows marked dirty under congestion and resending once capacity recovers; `--stats` reports stage percentiles, frame age, and queue diagnostics.
 
-控制/文件、媒体与可选音频使用独立认证连接，可经同一 TLS 入口或 SSH 转发端口承载。UDP 是额外可直达端口，保留原 TCP 控制/补帧。编码、解码和两端文件接收落盘在工作线程执行，Windows 输入发送使用有界有序队列。文件字节仍与控制共用通道；UDP 已接认证反馈自适应节流，独立文件通道、按流调度和编码负载联动继续在 M2 推进，见 [网络体验](NETWORK.md)。常见尺寸有界缓存，复用后仍强制新 epoch/独立关键帧；首次遇到新尺寸、资源限制和同步回读仍可能产生停顿。
+Control/files, media, and optional audio use independently authenticated connections carried over the same TLS entry point or SSH forwarded port. Optional UDP uses an additional directly reachable port while preserving TCP control and frame repair. Encoding, decoding, and disk writes on both sides run on worker threads, and Windows input sends use a bounded ordered queue. Negotiated peers offload file bytes to the dedicated file data channel, and UDP uses delivery-feedback adaptive pacing plus NVENC bitrate adaptation (see [Network Experience](NETWORK.md) and [File Transfers](FILE_TRANSFERS.md)). Common window sizes use bounded encoder/decoder caches while still enforcing fresh epochs and IDR keyframes on reuse; brand-new sizes, resource limits, and synchronous readbacks can still introduce occasional stalls.
 
-**请同时更新并重启两端，再启动远端应用。** 协议保持独立 v3，不兼容普通 Moonlight。Windows 要求 Windows 10/11；历史 H.264/透明呈现的 WoA 实测不能替代新功能和整合版的实机验收。本版仍是开发原型，HDR 是明确标记的 scRGB 子集。
+**Update and restart both ends together before launching remote applications.** The wire protocol remains independent v3 (incompatible with standard Moonlight). Windows 10/11 is required; earlier WoA H.264/alpha tests do not substitute for full on-device verification of newer features. Waybridge remains an active development prototype, and HDR is an explicitly scoped scRGB subset.
 
-## Windows GUI 控制中心
+## Windows GUI Control Center
 
-**C# / WinUI 3 控制中心**提供原生 ARM64 和 x64 便携包。使用 Waybridge TLS 配对、连接、管理会话和启动远端应用。控制中心提供画面、输入及共享设置、文件活动、托盘与诊断，视频由独立 C++ worker 处理。
+The **C# / WinUI 3 Control Center** ships as portable native ARM64 and x64 packages. It handles Waybridge TLS pairing, connections, session management, app launching, display/input/sharing settings, file transfer activity, trays, and diagnostics while delegating video and remote windows to the standalone C++ worker.
 
-解压 `build/Waybridge-Control-win-{arm64,x64}.zip` 的整个目录后运行 `Waybridge.Control.exe`。Linux 先构建并启动用户级入口，在另一个本机终端生成一次性配对码：
+Extract the full `build/Waybridge-Control-win-{arm64,x64}.zip` archive and launch `Waybridge.Control.exe`. On Linux, build and start the user-level service, then generate a one-time pairing code from a second local terminal:
 
 ```bash
 cargo build --release --workspace --locked
 ./target/release/waybridge-service serve --compositor "$PWD/target/release/waybridge"
-# 另一个 Linux 终端：
+# In another Linux terminal:
 ./target/release/waybridge-service pair --expires 120
 ```
 
-在 GUI 添加设备，填写 Linux LAN/VPN 地址及端口 `49092`，从可信 Linux 终端核对并填写完整 `certificate_sha256` 指纹和一次性配对码，再配对、连接。客户端令牌保存到 Windows 凭据管理器，指纹变化会拒绝连接。默认服务监听 `0.0.0.0:49092`，可用 `--listen` 绑定具体 LAN/VPN 地址。用户服务、信任撤销及协议细节见 [服务说明](SERVICE.md)，客户端操作见 [控制中心](GUI.md)。
+In the GUI, add a workstation with the Linux LAN/VPN address and port `49092`, verify and enter the full `certificate_sha256` fingerprint from the trusted Linux terminal together with the one-time pairing code, then pair and connect. Client tokens are stored in Windows Credential Manager, and connections are rejected if the server certificate fingerprint changes. The service defaults to listening on `0.0.0.0:49092`; pass `--listen` to bind a specific LAN/VPN interface. See [Service Documentation](SERVICE.md) for systemd installation, trust revocation, and protocol details, and [Control Center Guide](GUI.md) for client usage.
 
-Linux 接收跨端文件需要 `fusermount3` 和允许当前用户访问的 `/dev/fuse`（发行版通常在 `fuse3` 软件包中）。首次完整接收时创建只读导出视图；不可用时该批传输报错，窗口串流继续运行。Windows 临时目录需要正常 NTFS DACL 支持。经 Dolphin/Explorer 复制到用户选择位置的新副本正常可写；原位修改交付缓存会失败，不自动回传。Wine 目前将此 DACL 映射成可传播的 READONLY 属性，因此拒绝实体文件剪贴板下载；只读虚拟流拖出及 Windows→Linux 上传可继续验证。
+Receiving cross-machine files on Linux requires `fusermount3` and user access to `/dev/fuse` (typically from the `fuse3` package). A read-only export view is mounted upon the first completed transfer; if unavailable, that transfer reports an error while window streaming continues. Windows temp directories require normal NTFS DACL support. Copies created through Dolphin or Explorer into a user-chosen folder are normally writable; modifying delivered caches in place fails and never writes back automatically. Because Wine currently maps this DACL into a propagating `READONLY` attribute, materialized clipboard file downloads are rejected under Wine, while read-only virtual-file drag-out and Windows → Linux uploads remain testable.
 
-## 直接运行
+## Running Directly (Low-Level CLI)
 
-构建产物：
+Build artifacts:
 
-- Linux：`target/release/waybridge`、`target/release/waybridge-service`
-- Windows x64：`build/windows/waybridge-client.exe`。
-- Windows on ARM 原生 ARM64：`build/windows-arm64/waybridge-client.exe`。
+- Linux: `target/release/waybridge`, `target/release/waybridge-service`
+- Windows x64: `build/windows/waybridge-client.exe`
+- Windows on ARM native ARM64: `build/windows-arm64/waybridge-client.exe`
 
-两个 Windows 版本均只依赖系统 DLL，启动参数相同。WoA 设备可选用 ARM64 版，避免 x64 仿真开销。
+Both Windows builds depend only on system DLLs and accept identical CLI arguments. Use the native ARM64 build on WoA devices to avoid x64 emulation overhead.
 
-在 Linux 启动测试应用：
+Launch a test application on Linux:
 
 ```bash
 cd /path/to/waybridge
 ./target/release/waybridge -- weston-terminal
 ```
 
-服务端默认创建 `waybridge-0` socket，监听 `127.0.0.1:49090`，与 Sunshine 的 47990 管理端口分开。首次运行在 `$XDG_RUNTIME_DIR/waybridge.token` 创建 0600 权限的认证 token。可以在另一个 Linux 终端读取这个文件，将 token 用于 Windows 客户端：
+By default, the compositor creates socket `waybridge-0` and listens on `127.0.0.1:49090` (distinct from Sunshine's 47990 port). First run writes a `0600` auth token to `$XDG_RUNTIME_DIR/waybridge.token`. Read it from another Linux terminal:
 
 ```bash
 cat "$XDG_RUNTIME_DIR/waybridge.token"
 ```
 
-把 `.exe` 复制到 Windows。在 PowerShell 中建立 SSH 隧道并保持运行：
+Copy `waybridge-client.exe` to Windows. Open a PowerShell tunnel and leave it running:
 
 ```powershell
-ssh -N -L 49090:127.0.0.1:49090 wano@<Linux-IP>
+ssh -N -L 49090:127.0.0.1:49090 <user>@<linux-host>
 ```
 
-再开一个 PowerShell，启动客户端：
+In a second PowerShell window, launch the client:
 
 ```powershell
 .\waybridge-client.exe 127.0.0.1 49090 "<token>"
 ```
 
-以上是低层客户端的 SSH 兼容用法。原始 v3 TCP 协议自身不加密，需通过 TLS 入口或 SSH 等受保护传输；可选 UDP 媒体另有 AES-GCM 认证加密。认证握手和版本检查在任何窗口数据发送前完成；每个会话一次只允许一个查看端连接。
+This is the low-level SSH-compatible invocation. Raw v3 TCP is not intrinsically encrypted and must ride over the TLS entry point, SSH, or an equivalent protected transport; optional UDP media has its own AES-GCM authenticated encryption. Authentication and version checks complete before any window data is sent; each session allows one active viewer at a time.
 
-升级后先结束旧版 Waybridge 会话，再创建新版会话。创建前请注销同一用户的本地桌面，锁屏不够。可先运行 `./target/release/waybridge --check-session` 查看结果；GUI/TLS/SSH 和直接启动均执行相同检查。已有 Waybridge 会话优先接回，第二个会话会被拒绝；启动后其他 DM 的登录交给该 DM。
+After upgrading, terminate older Waybridge sessions before creating new ones. Log out of any same-UID local desktop first (screen lock is not sufficient). Run `./target/release/waybridge --check-session` to inspect admission state; GUI/TLS, SSH, and direct launches run the same check. Reattaching to an existing Waybridge session takes priority and a second concurrent session is rejected; logins via other display managers after startup are left to those DMs.
 
-在 Waybridge 打开的终端内启动应用会继承正确的环境。从另一个 SSH 终端加入正在运行的会话，请使用：
+Apps launched from a terminal running inside Waybridge inherit the session environment automatically. To launch additional apps into a running session from another terminal:
 
 ```bash
 ./target/release/waybridge --launch -- dolphin --new-window
 ./target/release/waybridge --launch -- hmcl-bin
 ./target/release/waybridge --launch -- vlc
 ./target/release/waybridge --launch -- mpv "/path/to/video.mkv"
-# 默认使用原有 Chrome 数据；显式 --user-data-dir 仍可选：
+# Uses your existing Chrome profile by default; explicit --user-data-dir still works:
 ./target/release/waybridge --launch -- google-chrome-stable
 ```
 
-自定义 socket 的会话同时指定 `--socket <名称>`。`--launch` 读取 0600 权限描述文件，带上 Waybridge 的显示、用户 D-Bus、IME 和音频环境。过期描述会被拒绝，正常退出时移除。已有本地窗口不会迁入 Waybridge。
+Pass `--socket <name>` for custom session sockets. `--launch` reads the `0600` session descriptor and injects Waybridge's display, user D-Bus, IME, and audio environment. Stale descriptors are rejected and removed on clean exit. Already-open local host windows are never migrated into Waybridge.
 
-会话使用标准用户 D-Bus、原有钱包及应用配置和数据。Waybridge 发布显示环境，并通过独立的 systemd session target 管理用户声明的组件；结束时先停归属服务，再撤销环境和关闭显示。钱包和 Portal 采用用户配置的原生实现，不在核心按 provider 名称强制启动。集成文件需明确安装，步骤见 [桌面组件](INTEGRATION.md)，状态见 `WAYBRIDGE_DESKTOP_SERVICES`。不要求运行 KWin 或其他 DE；Flatpak 文档授权待逐项验证，窗口共享尚未实现。
+Sessions use the standard user D-Bus bus, existing wallets, and existing app configs/data. Waybridge exports the display environment and manages user-declared components through standalone systemd session targets; shutdown stops bound services first before revoking the environment and closing the display. Wallets and Portals use user-configured native implementations without hardcoded provider launching in core. Integration files must be installed explicitly (see [Desktop Components](INTEGRATION.md)); inspect status via `WAYBRIDGE_DESKTOP_SERVICES`. Neither KWin nor any other DE is required; Flatpak document-portal grants require per-app testing, and window sharing is not yet implemented.
 
-控制中心、管理 API 和 `--launch` 均不自动添加 Chrome 的 `--user-data-dir` 或密码后端参数，默认使用原有数据，显式参数原样保留。旧 `~/.local/share/waybridge/sessions/` 隔离数据保留，不自动迁移或覆盖。数据目录占用沿用应用原有机制，不按应用名称扫描或终止冲突进程。应用目录启动会应用用户明确设置的 [Waybridge desktop 覆写](CONFIGURATION.md)。
+The Control Center, management API, and `--launch` never auto-inject Chrome `--user-data-dir` or password-store flags—your existing data is used by default and explicit flags are preserved verbatim. Legacy isolated `~/.local/share/waybridge/sessions/` directories are kept untouched without auto-migration or overwrite. Data-directory locking follows each app's native mechanism without killing competing processes by name. Catalog launches apply explicit [Waybridge desktop overrides](CONFIGURATION.md#waybridge-specific-desktop-overrides).
 
-Chrome 会按桌面身份选择密码后端。原来使用 KDE/KWallet 6 的用户可运行 `waybridge --launch -- google-chrome-stable --password-store=kwallet6`，或使用专用 desktop 覆写保存该参数；这仍使用原有 profile。Waybridge 不自动转换密码存储后端，见 [Chromium 说明](https://chromium.googlesource.com/chromium/src/+/HEAD/docs/linux/password_storage.md)。
+Chromium picks its password backend based on desktop identity. Users coming from KDE / KWallet 6 can launch `waybridge --launch -- google-chrome-stable --password-store=kwallet6` or save that flag in a Waybridge desktop override to keep using their existing profile; Waybridge never converts password backends automatically (see [Chromium Linux Password Storage](https://chromium.googlesource.com/chromium/src/+/HEAD/docs/linux/password_storage.md)).
 
-正常启动 `./target/release/waybridge -- ghostty` 会自动启用已安装的 Xwayland，以及可用的私有音频 sink。`--no-xwayland` / `--no-audio` 可分别关闭；`--xwayland` / `--audio` 则要求该功能初始化成功，失败时直接报错。可选功能不可用时默认保留原生 Wayland 窗口。
+Normal startup (`./target/release/waybridge -- ghostty`) automatically enables Xwayland (if installed) and a private audio sink (if available). Use `--no-xwayland` / `--no-audio` to disable, or `--xwayland` / `--audio` to require initialization and fail fast on error. When optional subsystems are unavailable, native Wayland windows still work.
 
-可用 `--render-node /dev/dri/renderD129` 指定 GPU，`--fps 60` 指定帧回调上限（现在默认 60）；`--codec auto|png|h264-nvenc|hevc-nvenc|av1-nvenc` 选择编码，`--bitrate 30000` 指定每个视频流的 kbps；旧 `--quality` 参数保留兼容，但无损 PNG 不使用它；`--help` 列出完整选项。正常操作不需要 root、DRM master 或显示器。
+Additional flags include `--render-node /dev/dri/renderD129` (select GPU), `--fps 60` (frame callback ceiling, default 60), `--codec auto|png|h264-nvenc|hevc-nvenc|av1-nvenc`, and `--bitrate 30000` (kbps per video stream). Legacy `--quality` is accepted for compatibility but ignored by lossless PNG; run `--help` for the full list. Normal operation requires no root privileges, DRM master, or attached physical monitor.
 
-## 光标、图标与窗口语义
+## Cursors, Icons, and Window Semantics
 
-光标、XDG 应用图标和窗口语义按 v3 能力自动协商。支持系统形状、隐藏、自定义/动画光标及 DPI 热点；自定义动画独立于窗口画面，最多 30 FPS。窗口优先使用应用通过 Wayland `xdg-toplevel-icon-v1` 或 X11 `_NET_WM_ICON` 提供的运行时图标；没有可用运行时图标时，Wayland 优先按 app_id 查 `.desktop`，非标准 app_id 也走 desktop ID／StartupWMClass 兼容匹配；X11 按 `StartupWMClass` 匹配 WM_CLASS 的 class/instance，并兼容 desktop ID 大小写差异。PNG/SVG 查找、X11 属性读取和缩放编码在后台执行；清除图标后回到 desktop/default，不执行 desktop 文件中的 Exec。
+Cursors, XDG app icons, and window semantics negotiate automatically over v3. Supported cursor features include system shapes, hidden cursors, custom/animated cursors (up to 30 FPS independently of window frames), and DPI-scaled hotspots. Windows prefer runtime icons via Wayland `xdg-toplevel-icon-v1` or X11 `_NET_WM_ICON`, falling back to `.desktop` lookup by `app_id`, desktop ID / `StartupWMClass`, and case-insensitive X11 `WM_CLASS` matching. PNG/SVG lookups, X11 property reads, and scaling run off the compositor thread; clearing an icon reverts to desktop/default without ever executing `Exec` from `.desktop` files.
 
-已实现真正的 xdg-dialog 模态提示、动态 owner、最小/最大尺寸、全屏恢复、unmap/remap 与隐藏/最小化后的 suspended/低频回调。仅有 parent 关系不代表模态。输入区域与视觉透明度分别映射；排除的客户区像素使用 `HTTRANSPARENT`，只保证同一 UI 线程中的 Waybridge 窗口间穿透，不能点穿到其他进程或桌面。未实现 KDE 毛玻璃。
+Supported window semantics include genuine `xdg-dialog` modal hints, dynamic owners, min/max sizes, fullscreen restoration, unmap/remap, and suspended/low-rate callbacks when hidden or minimized (a parent relationship alone does not imply modality). Input regions and visual alpha map independently; excluded client pixels use `HTTRANSPARENT`, supporting click-through across Waybridge windows on the same UI thread (not through to unrelated OS processes or the desktop). KDE blur-behind is not implemented.
 
-尊重 `xdg-decoration` 的客户端/服务端请求，Chrome 自绘标签栏时不再叠加 Windows 标题栏。原生 Wayland Chrome 支持 `xdg-toplevel-drag-v1`：标签可拖出成独立 Windows 窗口、拖回另一个窗口合并，Esc 取消。拖拽期间保持 Wayland data-device grab，按本地窗口遮挡和实际画面坐标选择目标；拖动中的窗口不参与目标命中。需要更新并重启两端，应用启动时发现新的 Wayland 接口；通用 X11 XDND 源／目标路径已接入；X11 Chrome 的标签行为不属于这个 Wayland toplevel 协议，尚未单独验收，范围见 [XDND](XDND.md)。
+`xdg-decoration` client/server decoration requests are honored so self-decorated apps like Chrome do not get doubled Windows title bars. Native Wayland Chrome supports `xdg-toplevel-drag-v1`—tabs detach into independent Windows windows, reattach into another Chrome window, and cancel with `Esc` while preserving the Wayland data-device grab and hit-testing real local window z-order (excluding the dragged window itself). Both ends must be updated so apps discover the Wayland global at startup. Generic X11 XDND source/target paths are wired; X11 Chrome tab tearing does not use this Wayland toplevel protocol and is not separately certified (see [XDND.md](XDND.md)).
 
-## 相对鼠标与指针锁定
+## Relative Mouse and Pointer Lock
 
-实现 `zwp_relative_pointer_manager_v1` 与 locked-pointer 子集，Windows 使用 Raw Input、隐藏光标和裁剪。只有目标已映射、具有焦点、指针位于有效区域且无 popup grab 时才申请锁定，原生建立成功确认后才向应用报告 locked；消息使用 target/generation 拒绝过时输入。
+Implements `zwp_relative_pointer_manager_v1` and a `locked-pointer` subset backed by Windows Raw Input, hidden cursors, and cursor clipping. Lock requests engage only when the target is mapped, focused, contains the pointer inside a valid region, and has no active popup grab, reporting `locked` to the app only after native confirmation; messages carry target/generation IDs to reject stale events.
 
-**Ctrl+Alt+Shift+F12** 紧急解锁。焦点丢失、弹出菜单、移动/缩放、约束移除、断线和退出均释放原生锁定并恢复当前光标。confined-pointer、未锁定的独立相对运动、popup 锁定及光标位置提示未启用。
+Press **`Ctrl+Alt+Shift+F12`** for emergency unlock. Focus loss, popup menus, move/resize, constraint removal, disconnects, and exits all release native lock and restore the active cursor. `confined-pointer`, unlocked standalone relative motion, popup locking, and cursor-position hints are not enabled.
 
-## Windows 本地输入法
+## Windows Native Input Method (IME)
 
-本版提供 Windows 本地 IME → Wayland `text-input-v3` 通道。需要更新并重新启动服务端及客户端，让应用发现新的 Wayland 全局接口；连接命令和协议版本仍为 v3。
+Bridges Windows native IME to Wayland `text-input-v3`. Update and restart both server and client so apps discover the global; CLI usage and wire version remain v3.
 
-在远端应用输入框获得焦点后，可用 Windows 的 `Win+Space` 切换到微软拼音。候选窗口显示在 Windows；预编辑文字由远端应用绘制，确认后才提交文本。候选位置跟随应用报告的光标矩形，并考虑 Windows DPI、画面缩放及裁剪原点。切换窗口会取消旧预编辑，迟到的提交由焦点 generation 拒绝。英文文本走同一文本通道，Ctrl/Alt/Win 快捷键与导航按键继续转发。
+When a text input inside a remote app has focus, switch Windows IME normally (e.g., `Win+Space` to Microsoft Pinyin). The candidate UI stays native on Windows while preedit text renders inside the remote app and commits on confirmation. Candidate positioning tracks the app's cursor rectangle across Windows DPI, scaling, and crop origin. Switching windows cancels stale preedit, and late commits are rejected by focus generation. Plain English text flows through the same channel while `Ctrl`/`Alt`/`Win` shortcuts and navigation keys stay on the physical key channel.
 
-快捷键不会再额外提交其翻译字符，例如 Ctrl+Space 不会额外插入空格。组合输入结束或取消后，仍按住的 Ctrl/Shift 等修饰键会恢复同步，已经松开的键保持松开；AltGr 继续用于本地键盘布局的文本输入。
+Shortcuts no longer emit spurious translated characters (e.g., `Ctrl+Space` will not insert an extra space). After composition finishes or cancels, held modifiers such as `Ctrl`/`Shift` resynchronize while released keys stay up; `AltGr` continues working for local keyboard layouts.
 
-已验证真实 Qt 和 Ghostty/GTK 在 175% 下的中文、emoji、预编辑/取消及焦点保护。2026-11-10 的 WoA 实机测试已覆盖微软拼音原生候选框、`ni` 选词提交“你”、不切焦点立即退格和回车；Ghostty 的 Linux 真终端回归也检查提交后立即收到退格/回车。其他输入法、GTK 实机候选行为及更多切换场景仍需扩展验收；Wine Unicode 注入与实机测试分别记录。
+Real Qt and Ghostty/GTK are verified at 175% DPI for Chinese, emoji, preedit/cancel, and focus protection. Physical WoA testing (2026-11-10) verified Microsoft Pinyin's native candidate UI, selecting and committing CJK text, and immediate Backspace/Return without refocusing; Ghostty's real Linux PTY regression checks immediate `DEL`/`CR` after commit. Other IMEs, physical GTK candidate behavior, and broader switching scenarios remain to be expanded; Wine Unicode injection and physical device runs are tracked separately.
 
-仅支持实现 `text-input-v3` 的 Wayland 应用；X11/XIM、文档重转换和周边文本查询暂未支持。应用周边文本不传到 Windows。启动命令和 `--launch` 自动清除宿主 `GTK_IM_MODULE` / `QT_IM_MODULE` 等覆盖，Qt/GTK 优先选择原生 Wayland，避免将远端输入交给宿主的 fcitx。
+Only Wayland apps implementing `text-input-v3` are supported; X11/XIM, reconversion, and surrounding-text queries are not implemented (surrounding app text is never sent to Windows). Startup commands and `--launch` automatically strip host `GTK_IM_MODULE` / `QT_IM_MODULE` overrides and prefer native Wayland for Qt/GTK so remote input is not hijacked by a host fcitx instance.
 
-## 会话音频（可选）
+## Session Audio (Optional)
 
-Linux 安装 `pactl` 和 `parec` 并有可用 PulseAudio/PipeWire-Pulse 时，音频默认自动启用。服务端创建私有 sink，通过 `PULSE_SINK` 路由 PulseAudio 应用，并通过 `PIPEWIRE_NODE`/流属性路由 mpv 等原生 PipeWire 应用；不修改系统默认输出。后续应用使用 `--launch` 自动加入同一 sink，无需手工抄 PID。原生 PipeWire 流禁止在目标消失时回退到宿主输出；直接使用硬件 ALSA 的应用仍需选择兼容后端。
+When `pactl`, `parec`, and a PulseAudio / PipeWire-Pulse daemon are available on Linux, audio enables automatically. The server creates a private sink, routing PulseAudio apps via `PULSE_SINK` and native PipeWire apps such as `mpv` via `PIPEWIRE_NODE` / stream properties without altering the host default output. Apps started via `--launch` join the same sink automatically. Native PipeWire streams forbid falling back to host speakers if the sink vanishes; direct hardware-ALSA apps must choose a compatible backend.
 
-新版 Windows 客户端自动协商独立音频连接，经 TLS 入口或原来的 SSH 端口，使用 WASAPI 播放到默认输出设备。出现 `WASAPI 48 kHz stereo audio playback active` 表示音频设备已启动；设置 `WAYBRIDGE_NO_AUDIO=1` 可关闭客户端音频，`WAYBRIDGE_AUDIO_DEVICE` 可指定 WASAPI endpoint ID。无声卡或音频连接失败不影响画面。
+Windows clients auto-negotiate a dedicated audio connection over the TLS entry point or SSH tunnel and play via WASAPI to the default output device (`WASAPI 48 kHz stereo audio playback active` confirms startup). Set `WAYBRIDGE_NO_AUDIO=1` to disable client playback or `WAYBRIDGE_AUDIO_DEVICE` to select a WASAPI endpoint ID. Missing sound cards or audio failures never interrupt video.
 
-首版为 48 kHz、16-bit 双声道 PCM，每秒约 1.536 Mbit，不含协议开销；每包 10 ms，服务端待发队列最多 40 ms、在途最多 40 ms，客户端待播放队列最多 100 ms，另有系统缓冲。拥堵时丢弃旧 PCM，优先恢复实时播放。尚未接入 Opus、跨设备时钟同步、严格音画同步、麦克风或输出设备热切换。正常退出/SIGINT/SIGTERM 清理自身 sink；强制 SIGKILL 无法清理，遗留模块可按日志确认后手动卸载。音频应用应随会话退出。
+Playback streams 48 kHz, 16-bit stereo PCM (~1.536 Mbit/s before framing) in 10 ms packets, capping server pending queue at 40 ms, in-flight at 40 ms, and client playback queue at 100 ms (plus OS buffers), dropping old PCM under congestion to recover real-time latency. Opus, cross-device clock sync, strict A/V sync, and output hot-switching are not yet implemented (see [MICROPHONE.md](MICROPHONE.md) for optional mono PCM microphone uplink). Clean exits (`SIGINT`/`SIGTERM`) unload the private sink; forced `SIGKILL` cannot clean up automatically, leaving modules that can be unloaded manually using logged IDs.
 
-## 可选 X11 应用
+## Optional X11 Applications
 
-安装 `Xwayland` 后默认自动启用。Java/JavaFX、选择 X11 后端的 Chrome 等应用可直接从会话终端或 `--launch` 启动。例如在独立端口和 socket 强制要求 X11：
+Enabled automatically when `Xwayland` is installed so Java/JavaFX apps, X11-mode Chrome, etc. launch seamlessly from session terminals or `--launch`. Example requiring X11 on an explicit port and socket:
 
 ```bash
 ./target/release/waybridge --xwayland \
@@ -145,208 +145,167 @@ Linux 安装 `pactl` 和 `parec` 并有可用 PulseAudio/PipeWire-Pulse 时，�
   --token-file "$XDG_RUNTIME_DIR/waybridge-x11.token" -- glxgears
 ```
 
-Windows 通过对应的 SSH 转发连接 49101，使用该 token 文件。Windows 客户端无新增运行时依赖，已有 v3 客户端可显示 X11 窗口。
+Connect Windows to port 49101 with the corresponding token; no extra Windows runtime dependencies are needed.
 
-日志 `private rootless Xwayland ready display=":1000"` 给出实际 DISPLAY，后续 X11 应用使用此值。显示号从 1000–4095 的空闲范围选取，同时避开现有文件和 abstract socket；只监听权限 0700 的文件系统 Unix socket，限同一 Linux 用户连接。启动命令自动获得 DISPLAY，原生 Wayland 应用仍可加入相同会话。例如（按日志替换 `:1000`）：
+Look for `private rootless Xwayland ready display=":1000"` in server logs for the allocated `DISPLAY` (selected from free displays `1000–4095` avoiding existing filesystem and abstract sockets, bound solely to a `0700` same-user Unix socket). Startup commands inherit `DISPLAY` automatically, and native Wayland apps coexist in the same session:
 
 ```bash
 DISPLAY=:1000 QT_QPA_PLATFORM=xcb ./build/tests/qt-app
 WAYLAND_DISPLAY=waybridge-x11 QT_QPA_PLATFORM=wayland ./build/tests/qt-app
 ```
 
-已接入独立顶层窗口、transient owner、无边框 override-redirect 菜单/嵌套菜单、原生移动后的点击路由、resize/关闭、键盘焦点、文本/PNG/URI 剪贴板及大文本 INCR。X11 菜单在 Windows 捕获鼠标时仍能越出父窗口，Tooltip 不建立输入捕获。剪贴板按代际丢弃过时读取，缓存写出最多 16 worker、每次最多 10 秒。
+Supported X11 features include independent toplevels, transient owners, borderless override-redirect menus/submenus, post-move click routing, resize/close, keyboard focus, text/PNG/URI clipboard, and large-text `INCR`. X11 menus can extend beyond their parent window under mouse capture, while tooltips avoid input grabs. Clipboard reads drop stale generations with bounded cache workers (max 16 workers, 10 s timeout).
 
-Xft/DPI 和 X11 客户端密度为这个 X 服务器共享，初始跟随 Windows 连接 DPI；各 Windows 窗口的呈现仍独立缩放。实测 Qt/XCB 在 175% 创建 1680×1120 画面，改成 125% 呈现为 1000×625，但应用共享 Xft 密度仍为 175%。忽略 Xft/DPI 的旧软件可能需要应用自己的字体设置。X11 resize 仍由应用自行布局，不能等同原生 Wayland 的逐窗口密度协议。
+`Xft/DPI` and X11 client density are shared across the X server (initialized from the connecting Windows DPI) while each Windows window still scales presentation independently. For instance, Qt/XCB at 175% renders 1680×1120 and presents as 1000×625 if moved to 125% while keeping shared 175% Xft density; legacy apps ignoring `Xft/DPI` need their own font settings.
 
-所有 X11 窗口共用一个稳定的 RandR 输出，原生 Wayland 的逐窗口输出对 Xwayland 隐藏。调整 MC 等单个窗口的尺寸/呈现 DPI 或关闭游戏，不再创建、移除或缩放整个 X11 会话的显示器；真实 GLFW 回归覆盖缩放后菜单坐标，以及禁用光标的游戏窗口关闭后再次点击启动器。
+All X11 windows share one stable RandR output while per-window native Wayland outputs are hidden from Xwayland—resizing, changing DPI, or closing a game never mutates Java/GLFW's monitor topology. X11 toplevels are placed inside that virtual screen so negative or out-of-bounds coordinates (e.g., HMCL) never clip clicks; full monitor dimensions and work area are reported separately so fullscreen covers the taskbar properly.
 
-X11 顶层窗口在该虚拟屏幕内布局，避免 HMCL 等应用的负坐标或越界位置让按钮点击被 Xwayland 截断。连接时分别传递完整显示器和工作区尺寸，全屏包含任务栏区域；这项修复需更新 Linux 合成器和 Windows 客户端，并重建会话。
+Current X11 limits exclude `PRIMARY` selection, XIM/Windows IME, full EWMH fullscreen/size hints, and automatic Xwayland crash restart (generic XDND is now wired; see [XDND.md](XDND.md)). Crashing or closing an X11 app leaves Wayland windows unaffected, and clean shutdown removes private X sockets and locks.
 
-当前 X11 子集不含 PRIMARY、XDND 文件拖放桥、XIM/Windows IME、完整 EWMH fullscreen/尺寸提示及自动 Xwayland 崩溃重启。崩溃/关闭 X11 应用不会关闭其余 Wayland 窗口；正常退出/SIGINT/SIGTERM 回收私有 X socket 和锁。可以与本版的原生 Wayland、音频和媒体功能共用会话。
+## Data Exchange
 
-## 使用数据交换
+Cross-machine files are always delivered read-only: apps can read and import them, while in-place writes and atomic replacements fail. Copy delivered items via Dolphin or Explorer into a personal folder to edit and save normally. Linux exposes completed transfers via a read-only FUSE view, and Windows protects materialized caches with NTFS DACLs (Wine's attribute mapping fails the copy-permission invariant, so materialized clipboard downloads are rejected and cleaned up on Wine while virtual-file drag-out and Windows → Linux uploads remain usable). See [Read-Only Delivery](FEATURES.md#read-only-delivery-of-cross-machine-files).
 
-跨端文件现统一只读交付；应用可以读取/导入，原位写入及替换会失败。需要保存或正常编辑时，通过 Dolphin/Explorer 复制到自己的目录，新副本正常可写。Linux 通过只读 FUSE 视图交付，Windows 实体缓存用 DACL 保护；Wine 的属性映射不满足副本语义，会明确拒绝该批实体剪贴板下载并清理，虚拟流和 Windows→Linux 上传仍可用。决策与验收见 [只读交付规格](FEATURES.md#跨端文件的只读交付)。
+- Text and PNG images sync automatically across clipboards (12 MiB cap per format); image clipboard data and image files are distinct.
+- Copying files or directories in Windows Explorer uploads and makes them pasteable in Linux apps; Linux `text/uri-list` directory trees download for pasting in Windows Explorer. Negotiated `file_tree` preserves directory hierarchies, empty directories, zero-byte files, and names; older peers fall back to flat files.
+- Dragging files or directories from Windows Explorer onto a remote window uploads the batch first, then negotiates a `Copy` drop with the target app (no pre-upload hover preview yet).
+- Windows apps exposing only `FILEDESCRIPTORW/A` + `FILECONTENTS` (without `CF_HDROP`) also copy or drop into remote windows via a dedicated COM worker reading 64 KiB chunks (supporting `Clone`/`Seek`, sequential streams, unknown-size `Stat`, and known-size `HGLOBAL` up to 12 MiB). Async sources receive completion notifications after Linux commit; synchronous drops wait for completion (cancellable via `Esc`). Linux apps read completed bytes via read-only FUSE (`IStorage` and unknown-size `HGLOBAL` are not supported).
+- Dragging files or directories out of Linux apps to Windows targets that accept virtual files streams bytes on demand as the target reads, supporting async extraction, cancellation, and disconnect cleanup (always `Copy`, preserving Linux originals and clipboard). `CF_HDROP`-only Windows consumers are not yet supported on this drag-out path.
+- Batch caps: 128 top-level items, 512 total entries, 16 directory levels, 8 GiB total payload, 1 GiB per file, 240 UTF-16 units per relative path, 240 UTF-8 bytes / UTF-16 units per name; Windows temp dir + relative path must fit within `MAX_PATH`. `Copy` only—permissions, timestamps, and hard links are not preserved.
+- Symlinks, NTFS reparse points (including junctions and cloud placeholders), special files, non-local URIs, Windows reserved names, ADS, trailing dots/spaces, and case collisions in the same parent directory reject the whole batch—never silently overwriting or renaming. Linux drag-out requires Wayland data-device v3 supporting `Copy` (one outbound drag at a time, 120 s idle timeout).
+- Incomplete staging trees clean up on cancel, error, clipboard replacement, or disconnect. Completed Linux batches publish under `$XDG_RUNTIME_DIR/waybridge-inbox/readonly/tree-<batch>/` or `readonly/<transfer-id>/` (reused IDs across reconnects allocate suffixed dirs to keep old URIs intact). Completed Windows caches live under `%TEMP%\Waybridge-tree-*` or `%TEMP%\Waybridge-*`. Because apps may read lazily, completed caches persist past viewer disconnect (automatic cache GC/quotas are not yet implemented; avoid deleting while apps still read). Files created by native Windows drop targets belong to the user and are never deleted by Waybridge.
 
-- 文本和 PNG 图片在两端自动同步剪贴板，单种格式上限 12 MiB。图片剪贴板与图片文件分别处理。
-- Windows 资源管理器中复制文件或目录，传输完成后可在支持文件粘贴的 Linux 应用里粘贴；Linux 应用提供 `text/uri-list` 时，目录树下载后可粘贴到 Windows 资源管理器。两端会协商 `file_tree` 能力，保留层级、空目录、零字节文件和名称；旧端仍只支持普通文件。
-- 从 Windows 资源管理器拖文件或目录到远端窗口，先上传完整数据，再由合成器向目标应用协商 Copy 拖放。当前不会在上传期间显示远端拖动预览。
-- Windows 应用仅提供 `FILEDESCRIPTORW/A` + `FILECONTENTS`、没有 `CF_HDROP` 路径时，也可复制或拖入远端窗口。独立 COM worker 按文件获取并以 64 KiB 分块读取流；支持 Clone/Seek、顺序流、未知大小流的 Stat，以及最多 12 MiB 的已知大小 HGLOBAL。异步源在 Linux 提交后收到完成通知，同步拖入等完整接收后返回，等待期间 Esc 可取消。Linux 应用通过只读 FUSE 视图读取完整接收并保留的本地文件，尚未提供网络按需读取；IStorage 和未知大小 HGLOBAL 暂不支持。
-- Linux 应用提供标准文件/目录拖放时，可按住左键拖出远端窗口，到支持 Windows 虚拟文件的原生目标释放。文件内容按目标读取请求传输，无需先下载完整文件；支持异步提取、取消以及断线清理，始终使用 Copy，保留 Linux 源文件并保持剪贴板内容。仅接受 CF_HDROP 的目标暂不支持这一拖出路径。
-- 目录批次最多 128 个顶层项、512 个条目、16 层路径、总文件内容 8 GiB，单文件最多 1 GiB；相对路径最多 240 个 UTF-16 单元，单个名称最多 240 UTF-8 字节/UTF-16 单元。Windows 临时目录加完整相对路径还必须小于 MAX_PATH，超限会报错。仅 Copy，不保留权限、时间戳和硬链接关系。
-- 符号链接、NTFS reparse point（含 junction/云占位文件）、特殊文件、非本地 URI、Windows 保留名/ADS/尾点空格及同一父目录下的大小写冲突会拒绝整批，绝不静默覆盖或改名。Linux 拖出要求应用使用 Wayland data-device v3 并支持 Copy；一次一个出站操作，空闲超过 120 秒取消。
-- 未完成的私有目标树会在取消、错误、替换剪贴板或断线时清理。Linux 完整接收批次公开为 `$XDG_RUNTIME_DIR/waybridge-inbox/readonly/tree-<batch>/` 或 `readonly/<transfer-id>/` 下的只读 URI；重连复用编号会生成独立后缀目录，保留旧 URI。Windows 完整缓存保留在 `%TEMP%\Waybridge-tree-*` 或 `%TEMP%\Waybridge-*` 并保护公开内容。应用可能延迟读取，成功后不随查看端断线删除；自动缓存回收和配额尚未实现，不要在消费者仍使用时清理。原生拖出目标自己创建的文件由目标管理，Waybridge 不删除用户目标目录或源文件。
+Individual apps impose their own paste/drop format restrictions; proprietary app-specific formats are not translated cross-platform.
 
-应用对粘贴和拖入的数据类型有自己的限制；私有应用格式不做跨平台转换。
+## Optional UDP/FEC Media Channel
 
-## 可选 UDP/FEC 媒体通道
-
-默认使用 TLS 或 SSH 内的 TCP。显式启用 UDP 时，在 Linux 增加 `--udp-listen <可达监听地址>:49091`；`--udp-mbps 200` 控制含校验片的发送速率上限，范围 1–1000 Mbit/s。它是固定速率节流，尚无自适应拥塞控制；应低于可用带宽。控制中心可直接配置 UDP；低层客户端的 SSH 兼容模式保留隧道和 TCP 启动参数，另设置：
+TCP over TLS or SSH is used by default. To enable UDP explicitly, add `--udp-listen <reachable-bind-addr>:49091` on Linux (`--udp-mbps 200` caps pacing including parity from `1–1000` Mbit/s). Configure UDP directly in the Control Center, or for the low-level SSH client set:
 
 ```powershell
-$env:WAYBRIDGE_UDP_HOST = "<Windows 能直接访问的 Linux 地址>"
-# 可选：NAT/代理暴露的端口与服务端监听端口不同时设置
+$env:WAYBRIDGE_UDP_HOST = "<Linux IP reachable directly from Windows>"
+# Optional if NAT/port-forwarding exposes a different external port:
 $env:WAYBRIDGE_UDP_PORT = "49091"
 .\waybridge-client.exe 127.0.0.1 49090 "<token>"
 ```
 
-SSH `-L` 只转发 TCP，不能承载这个 UDP 通道；可使用局域网或已有 VPN 的地址，需允许该 UDP 端口。握手和媒体密钥仍走受保护的 TLS 或 SSH 控制连接。UDP 每会话、每方向使用独立随机 AES-256-GCM 密钥、唯一计数 nonce、认证分片和重放检查；认证成功前不向 UDP 地址发送画面。
+SSH `-L` forwards TCP only and cannot carry UDP; use a reachable LAN or VPN address with the UDP port allowed. Handshakes and media keys still travel over the protected TLS or SSH control connection. UDP uses fresh per-session, per-direction random AES-256-GCM keys, unique counter nonces, authenticated chunks, and replay checks—never transmitting frames until authenticated.
 
-画面分为 1024-byte 数据片，每 8 片增加一片 XOR 校验，可恢复该组单片丢失；乱序重组后按原顺序送入解码器。其余丢包通过原 TCP 媒体连接补同一帧，保留 H.264/HEVC/AV1/Main10 引用链。每窗口的两帧呈现 credit 保持有效。UDP 不通时继续 TCP，已建立的 UDP 中断时用 TCP 补帧；当前不支持 UDP endpoint 漫游，需重连。协议仍为 v3，未协商的客户端不受影响。
+Frames split into 1024-byte data chunks with 1 XOR parity chunk per 8 data chunks (recovering single-chunk loss per group), reassembling out-of-order packets in original order before decoding. Unrecovered losses repair over the TCP media connection to preserve H.264/HEVC/AV1/Main10 reference chains. Per-window 2-frame presentation credits remain active. Unreachable UDP falls back seamlessly to TCP, and mid-session UDP drops repair via TCP (endpoint roaming requires reconnecting). Wire version stays v3.
 
-当前尚未实现动态码率、Reed–Solomon、多丢包低延迟 IDR 恢复或音频 UDP。全局最多 8 条未确认媒体消息、原始帧体合计最多 64 MiB（单条超大 TCP 帧只允许独占），包括 UDP 和 TCP fallback；补帧优先，不受这个新帧门限阻塞。接收端重组最多 16 条/96 MiB，缺失的头部 TCP 补帧可直接交付并排空后续消息。UDP 仅用于不超过 8 MiB 的帧，服务端修复缓存最多 16 条/32 MiB；超限新帧走 TCP。断线取消会逐包中断慢速发送。传输层按全局消息顺序交付，丢失一帧可能暂时阻塞其他窗口，不能据此保证弱网体验或端到端延迟优于 TCP。
+Dynamic FPS, Reed–Solomon, multi-loss low-latency IDR recovery, and UDP audio are not yet implemented. Global in-flight cap is 8 unacknowledged media messages / 64 MiB raw frame bytes (allowing a single oversized TCP frame exclusively) across UDP and TCP fallback; repairs have priority. Receiver reassembly caps at 16 messages / 96 MiB, letting a missing head frame delivered via TCP repair drain queued successors immediately. UDP handles frames up to 8 MiB with a 16-message / 32 MiB server repair cache; larger frames go over TCP. Disconnects interrupt slow sends per packet. Because delivery is globally ordered across media messages, one lost frame can temporarily stall other windows.
 
-## 可选 CUDA GL 颜色输入
+## Optional CUDA GL Color Input
 
-在同一 NVIDIA GPU 上，可用 `--gpu-input cuda` 显式启用 GL renderbuffer → CUDA
-→ NVENC 输入；默认 `cpu` 保持原路径。实现通过公开 GL framebuffer attachment
-查询取得资源，CUDA kernel 在 GPU 上反预乘并处理方向/奇数尺寸，再交给 FFmpeg
-CUDA RGBA 帧。成功路径不把颜色读回 CPU，也不从 CPU 上传颜色；仍有 GPU 内部
-复制、同步及 NVENC 色彩转换，因此不是整条管线零拷贝。
+On a single NVIDIA GPU, pass `--gpu-input cuda` to feed GL renderbuffer → CUDA → NVENC directly (default `cpu` keeps the standard path). Public GL framebuffer attachment queries fetch the resource, a CUDA kernel un-premultiplies and handles orientation/odd sizes on GPU, and FFmpeg consumes the CUDA RGBA frame—avoiding CPU color readback and upload on the fast path while still involving internal GPU copies, sync, and NVENC color conversion (not end-to-end zero-copy).
 
-透明窗口仍将无损 alpha 以每像素 1 字节读回 CPU 并压为 PNG；完全不透明时只读
-4 字节透明度标志，不回读整张 alpha。GL/CUDA 交接和 alpha 回读目前是同步的。
-PNG、弹出窗口和不支持的 codec/尺寸继续走 CPU。初始化/注册失败保留 CPU 输入；
-GPU 编码失败保留当前帧的 PNG，触发一次新的 CPU 捕获，并以新 epoch 的 CPU
-NVENC 关键帧恢复。每个查看会话/窗口发生失败后不再反复尝试 GPU 路径。
+Transparent windows still read back 1 byte/pixel lossless alpha to CPU for PNG compression; fully opaque windows read back only a 4-byte opacity flag. GL/CUDA handoff and alpha readback are currently synchronous. PNG frames, popups, and unsupported codecs/sizes stay on CPU. Init/registration errors stay on CPU; GPU encode failures preserve the current frame as PNG, trigger a fresh CPU capture, and recover with a new CPU NVENC keyframe epoch without retrying GPU on that window/session.
 
-正常构建仅在 `WAYBRIDGE_CUDA_ROOT`（默认 `/opt/cuda`）存在 CUDA 开发头文件及 GL 开发头文件时
-编入可选 interop；运行时动态加载系统 `libcuda.so.1`，不新增 libcudart/libnvrtc 运行依赖。
-缺失头文件的构建仍可正常运行，指定 `cuda` 时会记录原因并回退。PTX 来自仓库内
-kernel 源码，可用 `bash scripts/build-gpu-kernel.sh` 重新生成；预生成 PTX 需要
-兼容的 NVIDIA 驱动。常规 CUDA 输入处理 RGBA8 SDR；下面的 HDR 模式另有 FP16→P010 路径。同 GPU 限制由 CUDA GL 查询校验。
+Builds compile optional interop only when CUDA and GL development headers exist under `WAYBRIDGE_CUDA_ROOT` (default `/opt/cuda`), loading `libcuda.so.1` dynamically at runtime with no `libcudart`/`libnvrtc` dependency. Builds without CUDA headers work normally and log a fallback reason if `cuda` is requested. PTX is built from repo kernel sources via `bash scripts/build-gpu-kernel.sh` and requires a compatible NVIDIA driver. Regular CUDA input handles RGBA8 SDR; HDR below adds an FP16 → P010 path. Same-GPU affinity is verified via CUDA GL queries.
 
-`python tests/gpu_smoke.py --benchmark` 检查真实 GL/CUDA/NVENC、每像素/alpha 和
-编码错误恢复，并输出 Release CPU/CUDA 对照到 `build/diagnostics/gpu-input-benchmark.json`。
-本机 RTX 5070 Ti 上，颜色输入及编码阶段在 1080p 从约 6.65/9.20 ms（不透明/透明）
-降到 1.67/2.40 ms；1440p 从约 10.80/15.35 ms 降到 2.40/3.37 ms。这些是本机
-合成测试的阶段耗时，不是物理输入到屏幕延迟，也不代表其他设备性能。
+`python tests/gpu_smoke.py --benchmark` tests real GL/CUDA/NVENC, pixel/alpha accuracy, and error recovery, writing Release CPU vs. CUDA stage timings to `build/diagnostics/gpu-input-benchmark.json`. On a local RTX 5070 Ti, color-input + encode dropped from ~6.65 / 9.20 ms (opaque / transparent) to 1.67 / 2.40 ms at 1080p, and from ~10.80 / 15.35 ms to 2.40 / 3.37 ms at 1440p (synthetic stage timings only—not physical input-to-photon latency or universal hardware numbers).
 
-## 实验 scRGB HDR 子集（partial）
+## Experimental scRGB HDR Subset (Partial)
 
-默认仍为 8-bit BT.709 SDR。服务端显式使用
-`--hdr experimental-scrgb --codec hevc-nvenc`（或 `av1-nvenc`）；Windows
-PowerShell 设置 `$env:WAYBRIDGE_HDR="1"` 后运行客户端。此模式要求同一 NVIDIA
-GPU 执行 GL/CUDA/NVENC，自动为 HDR 开启 CUDA 输入；启用 HDR 时 `--codec auto` 也会选择 HEVC。
+Default remains 8-bit BT.709 SDR. Enable explicitly on Linux with `--hdr experimental-scrgb --codec hevc-nvenc` (or `av1-nvenc`) and on Windows PowerShell with `$env:WAYBRIDGE_HDR="1"`. Requires a single NVIDIA GPU for GL/CUDA/NVENC and auto-enables CUDA input for HDR (`--codec auto` also selects HEVC when HDR is enabled).
 
-只有通过 `wp_color_manager_v1.create_windows_scrgb` 明确标记的 Wayland surface
-才进入 HDR。RGB 是线性 Rec.709/scRGB，每单位为 80 nits。surface tree 在真正的
-RGBA16F target 合成；未标记的 SDR 子表面先从 sRGB 转线性再混合。CUDA 反预乘、
-转换 BT.2020/PQ/P010，NVENC 输出 HEVC/AV1 Main10。透明度独立以 16-bit PNG
-存储 **原始 FP16 alpha 位**，没有量化成 8 位；成功路径不回读颜色，透明帧仍回读
-每像素 2 字节 alpha，并保留一张 GPU SDR 备用图。不是全程零拷贝。
+Only Wayland surfaces explicitly tagged via `wp_color_manager_v1.create_windows_scrgb` enter HDR (linear Rec.709/scRGB where 1.0 = 80 nits). Surface trees composite into a real RGBA16F target, converting untagged SDR subsurfaces from sRGB to linear before blending. CUDA un-premultiplies and converts to BT.2020 / PQ / P010 for NVENC HEVC/AV1 Main10. Alpha stores **raw FP16 alpha bits** in a 16-bit PNG without 8-bit quantization; transparent frames read back 2 bytes/pixel alpha and keep a GPU SDR fallback image (not end-to-end zero-copy).
 
-查看端须实际解码 Main10 探针得到 P010 GPU 纹理，验证 P010 plane views、精度和
-FP16/scRGB composition swapchain，才广告 HDR。每个窗口仅在其显示器已处于 HDR
-模式时请求 HDR；窗口移动/显示设置变化会重新检查。P010/PQ shader 转回线性 scRGB
-并以预乘 FP16 交给 DirectComposition。不更改系统 HDR 设置。显示器 SDR、缺解码器、
-GPU/编码错误或不支持的色域/非有限源值都会回退 SDR：线性 Rec.709 按
-`rgb/(1+luminance)` 做 Reinhard 映射后转 sRGB。解码/呈现错误按窗口回退 PNG。
+Clients advertise HDR only after actually decoding a Main10 probe into a P010 GPU texture and verifying P010 plane views, precision, and an FP16/scRGB composition swapchain. Each window requests HDR only while its monitor is already in Windows HDR mode (re-checked on window move and display changes), converting P010/PQ back to premultiplied linear FP16 scRGB for DirectComposition without toggling OS HDR settings. SDR displays, missing decoders, GPU/encode errors, or out-of-range/non-finite source values fall back to SDR via Reinhard tone mapping `rgb / (1 + luminance)` → sRGB; decode/present errors fall back per window to PNG.
 
-这是可验证的首个 HDR 子集，**整体 HDR 仍是 partial**。ICC、任意 parametric
-BT.2020/PQ 描述、广义色域映射、HDR X11 应用和物理 Windows/WoA HDR 显示/MFT
-仍未完成验证。超出 BT.2020 正值 0–10000 nit 的 scRGB 不会被裁剪后冒充正确 HDR。
-一般应用若未明确标记 scRGB，仍按 SDR 处理；SDR 首选/output 描述保持真实。
+**Overall HDR remains partial.** ICC profiles, arbitrary parametric BT.2020/PQ descriptions, general gamut mapping, HDR X11 apps, and physical Windows/WoA HDR display/MFT certification remain incomplete. Values outside positive BT.2020 `0–10000` nits are not silently clipped to masquerade as valid HDR; untagged apps stay SDR.
 
-`waybridge --check-hdr` 离屏测量 RGB10/FP16 和真实 Main10 编解码，不创建
-会话/监听。`waybridge-client.exe --check-hdr` 只读查询显示模式及 FP16 能力；
-`--check-hdr-shaders` 离屏执行实际 P010/PQ/scRGB shader 数值测试。Linux 可运行
-`python tests/hdr_smoke.py`、`python tests/hdr_video_smoke.py`；私有 Wine/Xvfb 数值
-与原始 alpha 检查为 `python tests/hdr_windows_smoke.py`，不代替物理 HDR 显示验收。
-协议 v3 为 HDR 使用 kind7/8 与 `hevc_main10_pq_alpha16` /
-`av1_main10_pq_alpha16` 能力，保留 60-byte 视频 header；kind6 留给 UDP repair。
-测试需要 NumPy、Pillow、CUDA 开发头及真实 NVENC。源码内 vendor Smithay 保留 Xwayland 补丁，并修复同尺寸 SHM 格式切换的纹理缓存。
+`waybridge --check-hdr` runs offscreen RGB10/FP16 and real Main10 codec checks without starting a session. `waybridge-client.exe --check-hdr` queries display modes and FP16 support read-only; `--check-hdr-shaders` runs offscreen P010/PQ/scRGB numerical shader checks. Linux tests: `python tests/hdr_smoke.py`, `python tests/hdr_video_smoke.py`, and Wine/Xvfb numerical + raw-alpha check `python tests/hdr_windows_smoke.py` (does not substitute for physical HDR display testing). Wire protocol uses frame kinds `7`/`8` and `hevc_main10_pq_alpha16` / `av1_main10_pq_alpha16` capabilities (keeping the 60-byte video header; kind `6` is reserved for UDP repair). Tests require NumPy, Pillow, CUDA dev headers, and real NVENC. Vendored Smithay includes both the Xwayland patches and a same-size SHM texture-cache format-transition fix.
 
-## 构建
+## Building
 
-Rust 依赖版本由 `Cargo.lock` 固定。Linux 需要 EGL/GLES、libdrm、Wayland、xkbcommon、FFmpeg（libavcodec/libavutil）开发文件及 pkg-config；使用 NVENC 还需要系统 FFmpeg 的对应 h264_nvenc/hevc_nvenc/av1_nvenc 编码器和 NVIDIA 驱动；构建原生 Windows 客户端需要 MinGW-w64、CMake 和 Ninja。
+Rust dependencies are locked via `Cargo.lock`. Linux build requirements: EGL/GLES, `libdrm`, Wayland, `xkbcommon`, FFmpeg (`libavcodec`/`libavutil`) dev packages, and `pkg-config` (plus FFmpeg `h264_nvenc`/`hevc_nvenc`/`av1_nvenc` and NVIDIA drivers for NVENC). Building the native Windows x64 client from Linux requires MinGW-w64, CMake, and Ninja:
 
 ```bash
 ./scripts/build.sh
 ```
 
-原生 Windows ARM64 客户端使用 LLVM-MinGW 的 `aarch64-w64-mingw32-clang++` 交叉编译，输出目录为 `build/windows-arm64/`，不需要重编 Linux 服务端：
+Cross-compile the native Windows ARM64 client using LLVM-MinGW's `aarch64-w64-mingw32-clang++` into `build/windows-arm64/` without rebuilding Linux:
 
 ```bash
 ./scripts/build-windows-arm64.sh
-# 若工具链不在 PATH 或本机默认位置，指定其根目录：
+# If LLVM-MinGW is not on PATH or the default location:
 LLVM_MINGW_ROOT=/path/to/llvm-mingw ./scripts/build-windows-arm64.sh
 ```
 
-也可在 Windows 上使用 MSVC/CMake 构建 `client/`。客户端使用 Win32、D3D11、DXGI、DirectComposition、GDI+、系统 Media Foundation 和系统剪贴板 API，无 WSL 或 Qt 运行时依赖。
+`client/` can also be built natively on Windows with MSVC + CMake. The client relies solely on Win32, D3D11, DXGI, DirectComposition, GDI+, Media Foundation, and Windows clipboard APIs—no WSL or Qt runtime dependencies.
 
-运行需要 systemd-logind 和可用的用户 D-Bus（dbus-daemon 或 dbus-broker），可用 `systemctl --user start dbus.service` 启动用户总线。管理入口需要 Python 3.11 或更新版本，应用目录需要 GIO；声明式组件生命周期需要 systemd 用户管理器及已安装的 Waybridge target。钱包与文件选择需安装并配置所选 Secret Service/KWallet、`xdg-desktop-portal` 与 GTK 后端；核心不自动选择这些组件。
+Linux runtime requirements: `systemd-logind` and a working user D-Bus bus (`dbus-daemon` or `dbus-broker`, e.g., `systemctl --user start dbus.service`), Python 3.11+ and GIO for session management/app catalog, and a systemd user manager plus installed Waybridge targets for declarative session component lifecycles. Wallets and file pickers require the user's chosen Secret Service/KWallet, `xdg-desktop-portal`, and GTK backend.
 
-按需功能依赖：X11 需要 `Xwayland`，音频需要 `pactl`/`parec` 和可用的 PulseAudio 或 PipeWire-Pulse；SVG 图标需要 `rsvg-convert`。CUDA/HDR 需要兼容 NVIDIA GPU/驱动及构建时 CUDA/GL 开发头；缺少 CUDA 头时仍可构建 CPU/PNG 路径。测试另需 Pillow、wl-clipboard、Wayland scanner、Qt6Widgets、Wine/Xvfb/MinGW；HDR 数值测试需要 NumPy。
+Optional feature dependencies: `Xwayland` for X11 apps; `pactl`/`parec` + PulseAudio or PipeWire-Pulse for audio; `rsvg-convert` for SVG icons; `fuse3`/`fusermount3` + `/dev/fuse` for read-only Linux file delivery; compatible NVIDIA GPU/driver + CUDA/GL dev headers for CUDA/HDR (CPU/PNG builds cleanly without CUDA headers). Tests additionally use Pillow, `wl-clipboard`, `wayland-scanner`, `Qt6Widgets`, Wine/Xvfb/MinGW, and NumPy (for HDR numerical checks).
 
-## 构建后的测试
+## Running Tests
 
-以下命令均在 `waybridge` 目录执行。组合脚本自动使用临时用户总线、模拟 logind 和临时用户数据，避免操作当前桌面的钱包或激活环境。单独运行旧图形回归时使用 `python tests/session_fixture.py python tests/<脚本>.py`；新的 admission 和 desktop-services 测试自带测试环境。
+Run all commands from the repository root. Combined scripts automatically spin up temporary user buses, simulated `logind`, and temporary user directories so they never touch your active desktop wallet or activation environment. When running older graphical tests standalone, wrap them with `python tests/session_fixture.py python tests/<script>.py`; newer admission and desktop-service tests manage their own fixtures.
 
 ```bash
 ./scripts/test.sh
-./scripts/test-m0-m1.sh --with-wine  # M0/M1 完整 Linux/Wine 回归；需 NVIDIA/CUDA/NVENC
+./scripts/test-m0-m1.sh --with-wine  # full M0/M1 Linux/Wine suite; requires NVIDIA/CUDA/NVENC
 python tests/session_integration_smoke.py
 ```
 
-新增配置与桌面集成验证为 `tests/configuration_smoke.py`、`tests/desktop_overrides_smoke.py` 和 `tests/session_lifecycle_smoke.py`。前两项已纳入组合脚本；生命周期测试在组合脚本的模拟总线包装之前，通过单独的 delegated scope 运行临时真实 systemd 用户管理器，验证显示可用期间完成组件启动和停止。
+Configuration and desktop integration tests: `tests/configuration_smoke.py`, `tests/desktop_overrides_smoke.py`, and `tests/session_lifecycle_smoke.py`. The first two run inside the combined suite; `session_lifecycle_smoke.py` launches an isolated temporary real systemd user manager inside a delegated scope before the mocked bus wrapper to verify component start/stop while the display is live.
 
-组合脚本同时启用 X11/音频/UDP/GPU/HDR，验证能力、独立音频认证、PNG-only 回退、Wayland+X11 共存、控制响应及共享退出清理；它不代表所有 14 项功能在一个真实 Windows 会话中完成验收。完整文件整合后的组合脚本、原生文件/IME 和媒体回归已通过，分层结果见 [VALIDATION.md](VALIDATION.md)。
+The combined suite exercises X11, audio, UDP, GPU, and HDR simultaneously—checking capabilities, audio auth, PNG-only fallback, Wayland+X11 coexistence, control responsiveness, and clean shared shutdown—without claiming all features are jointly certified in a single physical Windows session.
 
-按所需功能选择额外测试；每条命令都需其对应依赖。
+Targeted regressions (each requires its corresponding dependencies):
 
-| 范围 | 测试入口（`python tests/<名称>.py`） |
+| Area | Test Entry (`python tests/<name>.py`) |
 |---|---|
-| 原生 Windows 窗口/剪贴板/菜单 | `windows_smoke`，可加 `--csd` / `--terminal` / `--qt` / `--udp` |
-| 光标与图标 | `cursor_smoke`、`windows_cursor_smoke`、`app_icon_smoke`、`window_icon_smoke`、`windows_app_icon_smoke` |
-| 模态/全屏/输入区域 | `window_semantics_smoke`、`windows_semantics_smoke` |
-| IME 与快捷键 | `ime_smoke`、`windows_ime_keys_smoke`、`ghostty_smoke --ime` |
-| 相对鼠标 | `relative_smoke`、`windows_relative_smoke` |
-| 原生拖出/目录/虚拟源 | `drag_out_smoke`、`tree_smoke`、`windows_drag_out_smoke`（可加 `--tree`）、`windows_virtual_smoke` |
-| X11/GLX/剪贴板 | `x11_smoke`、`x11_clipboard_smoke` |
-| 游戏式 X11 缩放/点击、稳定 RandR | `x11_pointer_smoke`（需要 GLFW ≥3.4、GL、xrandr） |
-| Chrome 标签拆分/合并/取消 | `chrome_drag_smoke`、`windows_chrome_smoke`（独立测试 profile） |
-| PCM/WASAPI | `audio_smoke`、`windows_audio_smoke` |
-| 真实 NVENC/缓存/回退 | `hardware_smoke`、`codecs_smoke`、`resize_smoke`、`windows_codecs_smoke` |
-| CUDA 与故障恢复 | `gpu_window_lifecycle_smoke`、`gpu_smoke --binary target/debug/waybridge`；Release 对照使用 `--benchmark` |
-| UDP 故障/所有 codec/全局流控 | `windows_udp_smoke`、`udp_flow_smoke` |
-| HDR 数值/视频/Windows shader | `hdr_smoke`、`hdr_video_smoke`、`hdr_windows_smoke`、`hdr_preflight` |
+| Native Windows windows / clipboard / menus | `windows_smoke` (optional `--csd` / `--terminal` / `--qt` / `--udp`) |
+| Cursors & icons | `cursor_smoke`, `windows_cursor_smoke`, `app_icon_smoke`, `window_icon_smoke`, `windows_app_icon_smoke` |
+| Modality / fullscreen / input regions | `window_semantics_smoke`, `windows_semantics_smoke` |
+| IME & shortcuts | `ime_smoke`, `windows_ime_keys_smoke`, `ghostty_smoke --ime` |
+| Relative mouse | `relative_smoke`, `windows_relative_smoke` |
+| Native drag-out / trees / virtual files | `drag_out_smoke`, `tree_smoke`, `windows_drag_out_smoke` (`--tree`), `windows_virtual_smoke` |
+| X11 / GLX / clipboard | `x11_smoke`, `x11_clipboard_smoke` |
+| Gaming X11 scale / click & stable RandR | `x11_pointer_smoke` (requires GLFW ≥ 3.4, GL, `xrandr`) |
+| Chrome tab tear-off / merge / cancel | `chrome_drag_smoke`, `windows_chrome_smoke` (isolated test profile) |
+| PCM / WASAPI audio | `audio_smoke`, `windows_audio_smoke` |
+| Real NVENC / caches / fallback | `hardware_smoke`, `codecs_smoke`, `resize_smoke`, `windows_codecs_smoke` |
+| CUDA & fault recovery | `gpu_window_lifecycle_smoke`, `gpu_smoke --binary target/debug/waybridge` (`--benchmark` for Release comparison) |
+| UDP faults / all codecs / global flow control | `windows_udp_smoke`, `udp_flow_smoke` |
+| HDR numeric / video / Windows shaders | `hdr_smoke`, `hdr_video_smoke`, `hdr_windows_smoke`, `hdr_preflight` |
 
-Wine GUI 测试使用 GDI 备用呈现，不能据此验收真实 Windows GPU/透明显示。HDR 的离屏软件 D3D11 数值测试只验证 shader/WIC，不证明物理 HDR。测试输出位于各工作目录的 `build/tests/` 和 `build/diagnostics/`，不是随仓库提交的固定产物。
+Wine GUI tests use the GDI fallback path and do not certify physical Windows GPU/alpha rendering; offscreen software D3D11 HDR tests verify shaders/WIC only. Test logs write under `build/tests/` and `build/diagnostics/` and are Git-ignored.
 
-## Windows 实机检查与延迟日志
+## On-Device Windows Checks and Latency Logs
 
-先运行 `waybridge-client.exe --check-codecs`。正常 GPU 呈现日志包含 `D3D11/DirectComposition presentation active`，视频解码日志标明具体 codec；`GDI fallback` 不支持逐像素透明。HDR 另用 `--check-hdr` 查询当前显示/能力，并在实际 HDR 显示器上检查 Main10、透明度及切回 SDR。程序不会替你启用系统 HDR。
+Run `waybridge-client.exe --check-codecs` first. Normal GPU presentation logs `D3D11/DirectComposition presentation active` along with the active video decoder (`GDI fallback` lacks per-pixel alpha). For HDR, run `--check-hdr` to inspect current display capabilities and verify Main10, alpha, and SDR fallback on an actual HDR display (Waybridge never toggles OS HDR).
 
-请重点验收 175% DPI、Ghostty 越界菜单、真实微软拼音候选/选词/焦点切换、Explorer 双向目录和拖出、Outlook/压缩软件虚拟源、锁定后紧急解锁、Windows 新 codec 及多显示器切换。Linux→Windows 拖出始终 Copy，目标必须接受虚拟文件；先用小文件、空目录和 Unicode 名称核对哈希与保留源文件。
+Key physical verification targets: 175% DPI, Ghostty overflowing menus, real Microsoft Pinyin candidates/selection/focus switches, bidirectional Explorer directories and drag-out, Outlook/archiver virtual file sources, pointer lock + emergency unlock, new Windows codecs, and multi-monitor moves. Linux → Windows drag-out is always `Copy` and requires virtual-file-capable targets; validate small files, empty directories, and Unicode names with hash checks first.
 
-Linux：
+Linux:
 
 ```bash
 ./target/release/waybridge --stats --codec auto -- ghostty
 ```
 
-Windows PowerShell：
+Windows PowerShell:
 
 ```powershell
 $env:WAYBRIDGE_STATS = "1"
 .\waybridge-client.exe 127.0.0.1 49090 "<token>"
 ```
 
-Linux 记录合成、回读、编码排队、转换、编码、发送及呈现确认往返；Windows 记录解码排队/处理、UI 排队、呈现提交及控制 RTT。各端使用自身单调时钟；`present` 不含显示器扫描输出，`send` 只是 socket 写入，`display_roundtrip` 包含往返，均不等于物理输入到显示延迟。尺寸切换另有 `encoder_init`、`encoder_reuse`、`resize_first_encoded`、`resize_first_sent`、`decoder_create`、`decoder_reuse` 和 `resize_to_present`。
+Linux logs composite, readback, encode queue, convert, encode, send, and presentation-ACK round-trip timings; Windows logs decode queue/work, UI queue, present submit, and control RTT. Each side uses its own monotonic clock (`present` excludes display scanout, `send` is socket write only, `display_roundtrip` includes round-trip—none equal physical input-to-photon latency). Resizes additionally log `encoder_init`, `encoder_reuse`, `resize_first_encoded`, `resize_first_sent`, `decoder_create`, `decoder_reuse`, and `resize_to_present`.
 
-开发诊断变量：`WAYBRIDGE_DPI=168` 强制 175%，`WAYBRIDGE_GDI=1` 强制备用呈现，`WAYBRIDGE_PNG=1` 禁用视频能力协商；清除变量恢复自动选择。新旧客户端、编译配置、窗口尺寸及网络路径应在性能对照时保持一致；当前没有输入到光子的测量或相对 Moonlight 的性能结论。
+Diagnostic environment overrides: `WAYBRIDGE_DPI=168` (force 175%), `WAYBRIDGE_GDI=1` (force GDI fallback), `WAYBRIDGE_PNG=1` (disable video negotiation); unset to restore defaults. Keep builds, window sizes, and network paths identical across A/B comparisons; no input-to-photon benchmarks or Moonlight performance claims are made here.
 
-## 当前限制
+## Current Limitations
 
-- 每个视频顶层窗口使用 NVENC 会话，尺寸/并发受硬件与驱动限制；申请失败回退 PNG。视频一般限制在 48×48–4096×2304，驱动可能拒绝更小尺寸；更大窗口走 PNG。SDR 视频是 8-bit 4:2:0，彩色文字可能不如 PNG 清晰；无 4:4:4。
-- CUDA/HDR 需要兼容的同一 NVIDIA GPU；透明 alpha、同步和 GPU 内复制仍存在。HDR 仅显式 Wayland scRGB，ICC、通用 parametric 色彩管理、HDR X11 和物理 Main10/HDR 验收未完成。
-- IME 仅 text-input-v3，不含 XIM、周边文本查询/重转换。X11 还缺 PRIMARY、XDND、完整 EWMH 及自动崩溃重启；忽略 Xft 的程序需自己的密度设置。
-- 指针锁定和输入区域为有限子集；未支持通用跨进程透明点穿、KDE 模糊或 confined-pointer。
-- 文件只 Copy，不保留权限/时间戳/硬链接，无断点续传、FUSE 或 IStorage。Explorer/Outlook/压缩软件与不响应 COM 取消的源仍需实机兼容性验证。
-- 音频无 Opus、麦克风、严格音画同步和设备热切换；UDP 为固定节流与全局有序流，无自适应拥塞控制或 endpoint 漫游，弱网可能跨窗口阻塞。
-- 原始 v3 TCP 需经内建 TLS 入口或外部 SSH 等受保护传输；与 Sunshine/Moonlight 线协议不兼容。TLS 入口重启保留会话，合成器崩溃后的应用状态恢复未实现；SIGKILL 无法执行资源清理。
+- Each video toplevel consumes an NVENC session subject to GPU/driver concurrency and size caps (typically `48×48–4096×2304`, with larger or rejected windows falling back to PNG). SDR video is 8-bit 4:2:0 (no 4:4:4), so colored text may be less crisp than PNG.
+- CUDA/HDR requires a single compatible NVIDIA GPU and still involves alpha readback, sync, and GPU-internal copies. HDR covers explicit Wayland scRGB only; ICC, generic parametric color management, HDR X11, and physical Main10/HDR certification remain incomplete.
+- IME supports `text-input-v3` only (no XIM, surrounding text, or reconversion). X11 lacks `PRIMARY`, full EWMH, and automatic crash restart; apps ignoring `Xft/DPI` need their own scaling settings.
+- Pointer lock and input regions are scoped subsets (no cross-process click-through, KDE blur, or `confined-pointer`).
+- Cross-machine files are `Copy`-only without preserving permissions, timestamps, or hard links, and without resume, on-demand network FUSE, or `IStorage`; Explorer, Outlook, archivers, and COM sources ignoring cancellation still need broader physical testing.
+- Audio lacks Opus, strict A/V sync, and output hot-switching; UDP uses global media ordering without endpoint roaming, so packet loss on poor links can briefly stall other windows.
+- Raw v3 TCP requires the built-in TLS entry point, SSH, or an equivalent protected transport and is incompatible with Sunshine/Moonlight wire protocols. TLS entry restarts preserve live sessions, whereas surviving a compositor crash is not implemented and `SIGKILL` skips cleanup.
 
-普通 SHM、DMA-BUF 和可选 Xwayland 已接通；大型应用、驱动、多 GPU 与物理 Windows 组合仍需逐项测试，不能保证“All 应用”。
+SHM, DMA-BUF, and optional Xwayland are wired, but complex apps, drivers, multi-GPU setups, and physical Windows environments still require per-combination testing rather than promising universal compatibility.
 
-窗口激活、托盘操作和拖放的当前支持边界见 [DESKTOP_INTERACTIONS.md](DESKTOP_INTERACTIONS.md)。
+For current window activation, tray, and drag-and-drop boundaries, see [DESKTOP_INTERACTIONS.md](DESKTOP_INTERACTIONS.md).

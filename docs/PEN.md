@@ -7,7 +7,7 @@ move/resize. It does not complete the professional-input milestone.
 
 ## Enable and calibrate
 
-In the control center's input settings, enable **压感手写笔（实验）**. Settings
+In the control center's input settings, enable **Pressure-sensitive pen (experimental)**. Settings
 are saved per connection:
 
 | Field | Default | Meaning |
@@ -15,7 +15,7 @@ are saved per connection:
 | `pen` | `false` | Enable native pen forwarding. |
 | `pen_pressure_gamma` | `1` | Pressure curve; finite values from `0.25` to `4`. |
 
-**保存设置** persists the choice; **应用到当前连接** also updates the active
+**Save settings** persists the choice; **Apply to current connection** also updates the active
 worker/session. Gamma `1` is linear; smaller values strengthen light pressure,
 larger values require more force. The curve changes valid pressure samples only.
 The low-level viewer also accepts `--pen`; no environment switch is required.

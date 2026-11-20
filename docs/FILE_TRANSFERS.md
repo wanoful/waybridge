@@ -1,23 +1,23 @@
-# 文件传输
+# File Transfers
 
-控制中心的文件抽屉显示上传、下载和从 Linux 拖出的文件传输。两端协商独立文件通道后，可在「共享与权限」设置限速，再用「应用到当前连接」即时生效。默认值 0 表示不限速，限速值分别作用于两个方向。进度按文件字节计算，限速计算线上数据块的大小。
+The Control Center's file drawer displays uploads, downloads, and files dragged out from Linux. Once both endpoints negotiate the dedicated file channel, you can set a bandwidth limit under **Sharing & Permissions** and click **Apply to current connection** for immediate effect. The default value `0` means unlimited, and the rate limit applies independently to each direction. Progress is measured in file bytes, while rate limiting accounts for on-the-wire chunk sizes.
 
-通过文件抽屉发送文件或目录、复制文件、向串流窗口拖入文件都使用同一个上传队列。Linux 文件剪贴板同步后可直接粘贴，也可以从文件抽屉打开接收目录。跨端交付保留现有只读机制，可以复制到目标目录后编辑。
+Sending files or directories from the file drawer, copying files via clipboard, and dropping files onto streamed windows all share the same upload queue. Synced Linux file clipboards can be pasted directly, or you can open the receiving directory from the file drawer. Cross-machine delivery preserves the existing read-only mechanism so you can copy files to a destination directory before editing.
 
-- 启动读取后，传输行显示字节进度和取消操作。已完成的数据可继续使用。
-- 提交前可取消后续文件读写。暂存内容会清理，旧剪贴板及窗口目标保护仍生效。
-- Linux 文件拖出的延迟读取按目标所需范围发送数据。进度表示已交付的数据量，完成状态由原生拖放结果确定。
-- 独立数据通道中断时，未完成的传输停止。控制、视频、声音和剪贴板文字继续使用各自通道，重新连接后可再次传输。
+- Once reading starts, each transfer row shows byte progress and a cancel action. Already-completed transfers remain usable.
+- Before commit, cancellation aborts remaining file reads and writes. Staged data is cleaned up, and stale clipboard and window-target protections remain in effect.
+- Lazy reads for Linux file drag-out transmit only the ranges requested by the target. Progress reflects delivered bytes, while final completion is determined by the native drag-and-drop outcome.
+- If the dedicated file data channel drops, in-flight transfers stop. Control, video, audio, and clipboard text continue on their own channels, and transfers can be restarted after reconnecting.
 
-## 文件数据通道
+## File Data Channel
 
-带 `file_tree` 能力的客户端可在 hello 中声明 `file_channel_v1`。两端确认能力后，客户端使用与现有控制连接相同的 TLS 入口和配对信息，通过 `channel: "files"`、会话令牌和本次连接的 `media_key` 打开一个双向通道。Linux 校验活动连接身份和唯一附着，返回 `files_ready`。已协商的连接始终经此通道传输文件数据。
+A client with the `file_tree` capability can advertise `file_channel_v1` in its `hello`. Once both sides confirm support, the client opens a bidirectional channel through the same TLS entry point and pairing credentials as the control connection, sending `channel: "files"`, the session token, and the active connection's `media_key`. Linux verifies active connection identity and single attachment, then replies with `files_ready`. Negotiated connections always transfer file bytes over this channel.
 
-上传 manifest、接纳结果、提交和取消留在有序控制通道。数据块、每文件结束和文件数据栅栏在文件通道传输。磁盘工作线程受理该栅栏后，在控制通道返回数据处理完成确认。Windows 收到该确认后提交，使剪贴板代次和窗口状态检查先于发布。Linux 输出的文件剪贴板流以及 OLE 延迟文件读取的返回数据走文件通道。拖放的报价、目标、读取请求和终结留在控制通道。旧端沿用已有文件消息路径。
+Upload manifests, admission results, commits, and cancellations remain on the ordered control channel. Data chunks, per-file EOF markers, and file-data fences travel on the file channel. Once the disk worker processes a fence, it sends a data-processing acknowledgement on the control channel. Windows commits only after receiving that acknowledgement, ensuring clipboard generation and window-state checks precede publication. Outbound Linux file clipboard streams and OLE lazy file-read responses also use the file channel, while drag-and-drop offers, targets, read requests, and finalization remain on the control channel. Older endpoints fall back to the legacy file message path.
 
-文件收发队列有独立字节上限，服务器上传队列为控制侧文件操作预留容量。文件传输线程可以等待磁盘或网络，输入事件和视频发送无需等待文件工作。文件内容仍遵循现有树 manifest 验证、路径约束和对端只读交付。中断的批次需要重新发送。
+Send and receive file queues enforce independent byte caps, and the server upload queue reserves capacity for control-side file operations. File transfer threads may block on disk or network I/O without stalling input events or video transmission. File contents still enforce existing tree-manifest validation, path constraints, and read-only delivery on the receiving side. Interrupted batches must be resent.
 
-## 验证
+## Verification
 
 ```sh
 python3 tests/session_fixture.py python3 tests/tree_smoke.py --file-channel
@@ -25,4 +25,4 @@ python3 tests/session_fixture.py python3 tests/tree_smoke.py
 python3 tests/session_fixture.py python3 tests/gui_native_smoke.py
 ```
 
-树协议回归覆盖文件传输和拖放、文件通道身份校验、限速期间的控制消息响应及独立通道断开后的清理。Windows Worker 探针检查真实发送、传输进度、取消和 Linux 会话保留。
+The tree protocol regressions cover file transfers and drag-and-drop, file-channel authentication checks, control-message responsiveness under rate limiting, and cleanup after an independent channel disconnect. The Windows worker probe verifies real transmission, transfer progress, cancellation, and Linux session preservation.

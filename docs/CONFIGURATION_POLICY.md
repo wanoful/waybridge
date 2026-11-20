@@ -1,96 +1,96 @@
-# 配置归属与桌面集成决策
+# Configuration Ownership and Desktop Integration Policy
 
-决策日期：2026-11-14。状态：首版配置、desktop 覆写与标准会话集成已实施。本文补充 [会话策略](SESSION_POLICY.md)，记录职责边界；具体语法与操作见 [配置与应用启动](CONFIGURATION.md)、[桌面组件](INTEGRATION.md)，验收范围见 [验证记录](VALIDATION.md)。
+Decision date: 2026-11-14. Status: initial primary configuration, desktop overrides, and standard session integration are implemented. This document complements [Session Policy](SESSION_POLICY.md) by defining responsibility boundaries; see [Configuration and Application Launching](CONFIGURATION.md) and [Desktop Components](INTEGRATION.md) for exact syntax and operations.
 
-## 职责边界
+## Responsibility Boundaries
 
-Waybridge 负责合成、远程窗口、输入、媒体，以及可靠的图形会话入口和通用应用启动行为。会话环境发布、就绪和退出顺序属于项目责任；钱包、通知、认证代理等外部组件的选择由用户或可选集成配置决定。
+Waybridge owns compositing, remote windows, input, media, a reliable graphical session entry point, and generic application launching. Publishing the session environment, readiness, and shutdown ordering belong to the project; choosing external components such as wallets, notification providers, and authentication agents belongs to the user or optional integration packages.
 
-- 使用标准用户 D-Bus 和用户原有数据，不按已安装的软件猜测钱包或浏览器密码后端。
-- 通过 systemd 用户 unit、target 和声明的依赖接入服务，不在核心建立按 KWallet、GNOME Keyring 等名称区分的服务管理框架。
-- 使用 `.desktop`、D-Bus、Portal 等既有契约。需要合成器配合的能力，例如 Waybridge 的 ScreenCast 后端，仍由项目实现。
-- 不建立按 Chrome、Steam、HMCL 等程序名称自动修改行为的核心兼容引擎；用户显式的启动定制使用下文的通用机制。
-- 项目可维护推荐组件组合、unit/drop-in 示例和应用配置说明，不自动接管用户桌面配置。
-- 单向创建检查和共享用户数据的决策保持不变，启动后的其他 DM 登录仍不拦截。
+- Use the standard user D-Bus bus and the user's existing data; never guess a wallet or browser password backend based on installed packages.
+- Integrate services through standard systemd user units, targets, and declared dependencies rather than building a core service-management framework keyed on names like KWallet or GNOME Keyring.
+- Build on standard contracts (`.desktop`, D-Bus, Portals). Capabilities requiring compositor cooperation—such as a Waybridge ScreenCast backend—remain project responsibilities.
+- Do not build a core compatibility engine that alters behavior automatically by application name (Chrome, Steam, HMCL, etc.); explicit user launch customization uses the generic override mechanism below.
+- The project may maintain recommended component combinations, unit/drop-in examples, and app setup guides without silently taking over user desktop configs.
+- One-way creation admission checks and shared user data remain unchanged; logins via other display managers after startup are not intercepted.
 
-会话结束应先处理归属当前会话的图形服务，再销毁显示并撤销环境。用户总线、持久数据以及用户自行保留的后台任务按各自生命周期处理，不扫描或强杀所有同 UID 进程。服务存在不等于它已经连接当前显示；此类状态需要诊断，而不是按程序名自动修复。
+Session shutdown stops graphical services explicitly bound to the session before tearing down the display and revoking the environment. The user bus, persistent data, and user-managed background tasks follow their own lifecycles; Waybridge never scans or force-kills all same-UID processes. A service existing on the bus does not prove it is connected to the current display—that state is surfaced via diagnostics rather than silently patched by process name.
 
-## 配置所有权与位置
+## Configuration Ownership and Locations
 
-实现时尊重有效的 XDG 环境变量，不整体替换应用的 HOME 或 XDG 数据路径。
+Implementations respect valid XDG environment variables and never blanket-replace an application's `HOME` or XDG data paths.
 
-| 内容 | 建议位置 | 所有者 |
+| Content | Recommended Location | Owner |
 |---|---|---|
-| Linux 服务、会话默认值、资源限制 | `$XDG_CONFIG_HOME/waybridge/config.toml` | Waybridge 用户配置 |
-| Waybridge 专用应用启动追加/覆写 | `$XDG_CONFIG_HOME/waybridge/desktop-overrides/`，按完整 desktop ID 区分 | Waybridge 用户配置 |
-| Windows 连接、画质及设备偏好 | 现有 `%LOCALAPPDATA%\Waybridge\profiles.json` | Windows 控制中心 |
-| Waybridge 服务和会话生命周期 | 标准 systemd 用户 unit、target 及用户 drop-in | systemd；包提供默认，用户提供覆盖 |
-| Portal 默认后端选择 | `/usr/share/xdg-desktop-portal/waybridge-portals.conf` | 可选集成包 |
-| 用户 Portal 覆盖 | `$XDG_CONFIG_HOME/xdg-desktop-portal/waybridge-portals.conf` | 用户，遵循 Portal 原生规则 |
-| 全桌面通用的应用配置和 desktop 覆盖 | 应用原生配置、`$XDG_DATA_HOME/applications/` | 用户及对应应用 |
-| 钱包、浏览器等持久数据 | 各应用原有位置 | 对应应用 |
-| 配对身份、信任记录、日志等持久状态 | `$XDG_STATE_HOME/waybridge/` | Waybridge；身份材料单独限制权限 |
-| 可重建缓存 | `$XDG_CACHE_HOME/waybridge/` | Waybridge，可重建 |
-| socket、锁、会话描述及派生启动文件 | `$XDG_RUNTIME_DIR/waybridge/` | Waybridge 运行期资源 |
+| Linux service, session defaults, resource limits | `$XDG_CONFIG_HOME/waybridge/config.toml` | Waybridge user config |
+| Waybridge-specific app launch appends/overrides | `$XDG_CONFIG_HOME/waybridge/desktop-overrides/`, keyed by full desktop ID | Waybridge user config |
+| Windows connections, quality, and device preferences | `%LOCALAPPDATA%\Waybridge\profiles.json` | Windows Control Center |
+| Waybridge service and session lifecycle | Standard systemd user units, targets, and user drop-ins | systemd (package defaults, user overrides) |
+| Default Portal backend selection | `/usr/share/xdg-desktop-portal/waybridge-portals.conf` | Optional integration package |
+| User Portal overrides | `$XDG_CONFIG_HOME/xdg-desktop-portal/waybridge-portals.conf` | User (native Portal precedence) |
+| Cross-desktop app configs and desktop overrides | Native app configs, `$XDG_DATA_HOME/applications/` | User and respective apps |
+| Persistent wallet, browser, and app data | Native application paths | Respective apps |
+| Pairing identity, trust store, persistent logs | `$XDG_STATE_HOME/waybridge/` | Waybridge (restricted permissions on key material) |
+| Rebuildable caches | `$XDG_CACHE_HOME/waybridge/` | Waybridge (rebuildable) |
+| Sockets, locks, session descriptors, derived launch files | `$XDG_RUNTIME_DIR/waybridge/` | Waybridge runtime state |
 
-用户文件和第三方文件不因 Waybridge 启动或升级而被改写。凭据、私钥、钱包内容不进入普通配置导出；Windows 凭据继续使用凭据管理器。
+User and third-party files are never modified by starting or upgrading Waybridge. Credentials, private keys, and wallet contents are excluded from normal config exports; Windows tokens stay in Windows Credential Manager.
 
-## Waybridge 自身配置
+## Waybridge Core Configuration
 
-- 首版采用 TOML，一份用户主配置，不引入隐式脚本执行、工作目录自动发现或复杂 include 体系。
-- 优先级为：内置默认值 → 用户配置文件 → 显式启动参数。`--config` 指定文件时替代默认用户文件位置，不再叠加隐藏配置层。
-- Windows 保存客户端偏好，Linux 保存服务端设置和允许范围。客户端只请求允许动态调整的项目，服务端返回生效值及限制或回退原因，不通过请求改写 Linux 配置文件。
-- 临时运行时修改不自动持久化；保存为默认值必须是明确操作。
-- 每项设置标明立即生效、下一会话生效或需要重启服务。无效字段和取值明确报错，不静默退回另一套行为。
-- 会话层管理显示和激活所需变量；工具包偏好、应用参数等不因核心默认选择而一并导入用户全局环境。用户显式的环境覆盖应注明作用范围。
+- Uses TOML with a single primary user configuration file—no implicit script execution, working-directory auto-discovery, or complex include trees.
+- Precedence is: built-in defaults → user config file → explicit CLI arguments. Passing `--config` replaces the default user file location without stacking hidden layers.
+- Windows stores client preferences; Linux stores server defaults and limits. Clients request only dynamically adjustable settings; the server replies with effective values and any constraint or fallback reason without rewriting Linux config files.
+- Temporary runtime changes do not persist automatically; saving defaults is always an explicit action.
+- Every setting documents whether it applies immediately, on the next session, or on service restart. Invalid fields and values produce explicit errors rather than silently falling back to unrelated behavior.
+- The session layer manages display and activation variables only; toolkit preferences and app flags are not injected globally by core defaults. Explicit user environment overrides state their scope.
 
-## Waybridge 专用 desktop 追加与覆写
+## Waybridge-Specific Desktop Appends and Overrides
 
-确认提供这一能力，作用范围仅限通过 Waybridge 的桌面应用启动入口，不改变本地 KDE、niri 等桌面的同名应用启动行为。
+This capability applies exclusively to desktop launches initiated through Waybridge and never alters how the same application launches on local KDE, niri, or other desktops.
 
-这是用户显式提供的通用启动配置。例如，用户可以为自己的 Chrome desktop ID 增加密码后端参数，但核心不会识别 Chrome 并猜测应添加什么参数。
+It is an explicit, generic user launch mechanism: for example, a user may add a password-backend flag for their Chrome desktop ID, while core Waybridge never inspects for Chrome or guesses flags automatically.
 
-### 查找与覆盖顺序
+### Resolution and Override Order
 
-1. 按标准应用目录和用户覆盖规则解析原始 `.desktop`，以完整 desktop ID 作为匹配键，不按可执行文件名或显示名称匹配。
-2. 应用该 ID 的 Waybridge 专用追加/覆写，得到仅供当前启动使用的有效视图。
-3. 交给通用启动器及 GIO 等标准实现处理，保留字段转义、文件/URI 展开和 desktop action 语义。
+1. Resolve the original `.desktop` file using standard application directories and user overrides, matching strictly by full desktop ID—never by executable name or display name.
+2. Apply Waybridge-specific appends/overrides for that ID to produce an effective view scoped solely to this launch.
+3. Hand off to the generic launcher and standard GIO implementation, preserving quoting, escaping, file/URI expansion, and desktop action semantics.
 
-原文件和 `$XDG_DATA_HOME/applications/` 中的用户文件均保持不变。派生文件如有需要放在运行目录，记录原始 ID、来源和生效配置；不能因临时文件命名破坏应用身份和激活语义。
+Original files and user overrides in `$XDG_DATA_HOME/applications/` remain untouched. Any derived files live in the runtime directory, recording the original ID, source, and effective settings without breaking app identity or activation semantics via temporary filenames.
 
-### 行为约束
+### Behavioral Constraints
 
-- 区分字段替换与参数追加，允许用户显式定制启动命令、工作目录、终端行为、显示元数据，以及环境变量的设置和取消。
-- 额外参数采用字面参数数组，插入位置、`--` 边界以及 `%f/%F/%u/%U` 等字段展开的先后必须明确，不通过 shell 字符串拼接实现。
-- 默认启动动作与具名 desktop action 分别处理，不把一个动作的覆盖隐式传播到其他动作。
-- 提供取消/删除覆盖值的表达方式，不能用空字符串统一代替未设置。
-- 替换 `Exec` 时仍按 Desktop Entry 规则解析；只有用户显式使用 shell 命令时才具有对应 shell 语义。
-- `DBusActivatable=true` 与进程参数、工作目录或环境覆写可能存在语义冲突。不能静默忽略覆写或静默关闭 D-Bus 激活；需要校验，并让用户显式选择保持标准激活或采用 `Exec` 启动。
-- 请求交给已有应用实例时，不承诺覆写能改变该实例的环境、目录或窗口。诊断区分新进程启动与请求转交。
-- 直接 argv 启动保持显式命令语义，不根据可执行程序名称自动套用 desktop 覆写。
+- Separate field replacement from argument appending, supporting explicit customization of command, working directory, terminal flag, display metadata, and environment set/unset.
+- Extra arguments use a literal argument array with deterministic placement relative to `--` and `%f`/`%F`/`%u`/`%U` field expansions, never shell string concatenation.
+- The default action and named desktop actions are configured independently without implicit inheritance across actions.
+- Clearing or removing inherited values uses an explicit mechanism rather than overloading empty strings.
+- Replacing `Exec` still follows Desktop Entry parsing rules; shell semantics apply only when the user explicitly invokes a shell.
+- `DBusActivatable=true` can conflict with process argument, working-directory, or environment overrides. Waybridge neither silently drops overrides nor silently disables D-Bus activation; it validates and requires the user to choose standard activation or explicit `exec` launch.
+- When a request is forwarded to an already running instance, overrides cannot be guaranteed to alter that instance's environment, directory, or windows. Diagnostics distinguish spawning a new process from forwarding a request.
+- Direct `argv` launches preserve explicit command semantics and never auto-apply desktop overrides by executable name.
 
-通用工作目录规则：桌面应用采用有效覆写后的 `Path`，未指定时默认用户 HOME；直接命令采用显式 `cwd`，未指定时默认 HOME；应用终端内的子程序正常继承 shell 当前目录。
+Generic working-directory rules: desktop applications use their effective `Path` (defaulting to `HOME`); direct commands use explicit `cwd` (defaulting to `HOME`); child processes launched inside a terminal inherit the shell's current working directory.
 
-首版使用 `<desktop ID>.toml`、`[default]` 与 `[actions."ActionID"]`，字面参数插在可执行 token 后、原有参数前。精确 schema 和示例见 [配置与应用启动](CONFIGURATION.md)。
+The initial format uses `<desktop-id>.toml`, `[default]`, and `[actions."ActionID"]`, inserting literal extra arguments after the executable token and before original arguments. See [Configuration and Application Launching](CONFIGURATION.md) for the exact schema and examples.
 
-## 标准配置与推荐组合
+## Standard Configs and Recommended Combinations
 
-项目可在仓库 `integration/` 集中维护 unit、target、Portal 默认配置和接入示例；安装后由对应标准组件读取，不新增统一配置同步守护进程。
+The repository maintains systemd units, targets, default Portal configs, and integration examples under `integration/`; once installed, standard components read them directly without any unified config-sync daemon.
 
-- 包提供的文件由包更新，用户覆盖始终归用户所有。
-- 推荐配置通过明确安装/启用步骤接入，不在每次启动时重新生成或覆盖用户文件。
-- 第三方配置保留原格式和覆盖规则：systemd drop-in、标准 desktop 覆盖和 Portal 配置不套用同一个合并算法。
-- 钱包/provider 的选择以及应用数据迁移留在显式用户配置和组件工具中，不自动修改或合并钱包。
-- 专用配置优先使用 Waybridge 独立命名空间，避免无意改变其他桌面。
+- Package-provided files are updated by packages; user overrides always belong to the user.
+- Recommended configs are installed/enabled via explicit steps, never regenerated or overwritten on every startup.
+- Third-party formats retain their native schemas and override semantics (systemd drop-ins, standard desktop overrides, and Portal configs are not forced through one merge engine).
+- Wallet/provider choice and data migration stay in explicit user configs and native tools; Waybridge never merges wallet files automatically.
+- Waybridge-specific configs live in Waybridge's own namespace to avoid unintended side effects on other desktops.
 
-## 诊断、升级与验收
+## Diagnostics, Upgrades, and Verification
 
-提供配置检查、生效值和来源查询、desktop 有效启动方案查询，以及标准桌面接口检查。显示实际目录、启动方式和配置来源；敏感字段脱敏，不导出钱包或登录数据。检查工具主要报告问题，不自动重写第三方配置。
+Waybridge provides config validation, effective-value/source inspection, desktop launch-plan previews, and standard desktop interface checks—showing real paths, launch modes, and config sources while redacting secrets and never exporting wallet or login data. Diagnostic tools report issues rather than rewriting third-party configs.
 
-升级只更新包拥有的默认文件；用户配置需要迁移时显式报告变化，不静默覆盖。旧隔离应用数据继续按 [会话策略](SESSION_POLICY.md) 保留。
+Upgrades update only package-owned defaults; if user config migration is ever needed, changes are reported explicitly rather than silently overwritten. Legacy isolated application data remains preserved per [Session Policy](SESSION_POLICY.md).
 
-M1 收尾覆盖：默认和覆写后的工作目录、参数/字段展开与 shell 边界、D-Bus 激活冲突、不同动作的覆盖、环境变量取消、用户文件不被修改、非 Waybridge 启动不受影响，以及图形服务随声明的会话依赖正常结束。实际 systemd 用户会话集成需要独立验证，不能仅依靠模拟 D-Bus/logind 的结果。
+M1 sign-off covers default and overridden working directories, argument/field expansion and shell boundaries, D-Bus activation conflicts, independent action overrides, environment unsetting, immutability of user files, isolation from non-Waybridge launches, and clean shutdown of graphical services bound to the session target. Real systemd user-session integration is verified independently rather than relying solely on mocked D-Bus/`logind` fixtures.
 
-当前核心已移除硬编码钱包激活和动态 Portal 配置；标准 target、静态 Portal 选择及用户组件声明位于 `integration/`。主配置、检查和来源查询由共享配置模块实现，desktop 启动助手复用 GIO；这些实现不扩大后续里程碑的功能支持范围。
+Core code no longer contains hardcoded wallet activation or dynamic Portal config generation; standard targets, static Portal selection, and user-component examples reside in `integration/`. The shared config crate handles main config checks and source queries, and the desktop launch helper builds on GIO; these implementations do not expand milestone feature claims beyond their verified scope.
 
-参考：[XDG 目录](https://specifications.freedesktop.org/basedir/latest/)、[Desktop Entry](https://specifications.freedesktop.org/desktop-entry/latest/)、[Portal 配置](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html)、[systemd unit](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)。
+References: [XDG Base Directory](https://specifications.freedesktop.org/basedir/latest/), [Desktop Entry](https://specifications.freedesktop.org/desktop-entry/latest/), [Portal Configuration](https://flatpak.github.io/xdg-desktop-portal/docs/portals.conf.html), [systemd.unit](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html).
