@@ -19,9 +19,10 @@ const EV_UINPUT: u16 = 0x101;
 const FF_RUMBLE: u16 = 0x50;
 const FF_GAIN: u16 = 0x60;
 const BUTTON_MASK: u16 = 0xf3ff;
+const GUIDE_BUTTON: u16 = 0x0400;
 const MAX_EFFECTS: usize = 16;
 const RECONNECT_GRACE: Duration = Duration::from_secs(5);
-const BUTTONS: [(u16, u16); 10] = [
+const BUTTONS: [(u16, u16); 11] = [
     (0x1000, 0x130), // A / south
     (0x2000, 0x131), // B / east
     (0x4000, 0x133), // X / west
@@ -29,7 +30,8 @@ const BUTTONS: [(u16, u16); 10] = [
     (0x0100, 0x136),
     (0x0200, 0x137), // shoulders
     (0x0020, 0x13a),
-    (0x0010, 0x13b), // back / start
+    (0x0010, 0x13b),       // back / start
+    (GUIDE_BUTTON, 0x13c), // Guide / BTN_MODE
     (0x0040, 0x13d),
     (0x0080, 0x13e), // thumb buttons
 ];
@@ -101,9 +103,14 @@ struct Sample {
 }
 impl Sample {
     fn parse(value: &Value) -> Option<Self> {
-        let buttons = u16::try_from(value["buttons"].as_u64()?).ok()?;
+        let mut buttons = u16::try_from(value["buttons"].as_u64()?).ok()?;
         if buttons & !BUTTON_MASK != 0 {
             return None;
+        }
+        if let Some(guide) = value.get("guide") {
+            if guide.as_bool()? {
+                buttons |= GUIDE_BUTTON;
+            }
         }
         let mut axes = [0; 8];
         for (i, field) in ["lx", "ly", "rx", "ry", "lt", "rt"].into_iter().enumerate() {
@@ -236,7 +243,7 @@ impl Device {
         })
     }
     fn write(&mut self, sample: Sample) -> io::Result<()> {
-        let mut events = Vec::with_capacity(19);
+        let mut events = Vec::with_capacity(BUTTONS.len() + AXES.len() + 1);
         for (mask, code) in BUTTONS {
             events.push(event(EV_KEY, code, i32::from(sample.buttons & mask != 0)));
         }
@@ -762,6 +769,14 @@ mod tests {
         let valid = input(1, 1, 1);
         let sample = Sample::parse(&valid).unwrap();
         assert_eq!(sample.axes, [12345, 32767, -30000, -32767, 123, 255, 0, -1]);
+        let mut guide = valid.clone();
+        guide["guide"] = json!(true);
+        assert_eq!(
+            Sample::parse(&guide).unwrap().buttons,
+            sample.buttons | GUIDE_BUTTON
+        );
+        guide["guide"] = json!(false);
+        assert_eq!(Sample::parse(&guide).unwrap(), sample);
         for (field, bad) in [
             ("lx", json!(32768)),
             ("ly", json!(-32769)),
@@ -769,6 +784,7 @@ mod tests {
             ("lt", json!(-1)),
             ("buttons", json!(0x0400)),
             ("buttons", json!(1.5)),
+            ("guide", json!(1)),
         ] {
             let mut malformed = valid.clone();
             malformed[field] = bad;
@@ -1002,11 +1018,12 @@ mod tests {
         assert!(phys.starts_with(&format!("waybridge/{}/", std::process::id())));
         device.write(Sample::default()).unwrap();
         drain(&mut reader);
-        device
-            .write(Sample::parse(&input(generation, 41, 2)).unwrap())
-            .unwrap();
+        let mut pressed = input(generation, 41, 2);
+        pressed["guide"] = json!(true);
+        device.write(Sample::parse(&pressed).unwrap()).unwrap();
         let seen = drain(&mut reader);
         assert!(seen.contains(&(EV_KEY, 0x130, 1)));
+        assert!(seen.contains(&(EV_KEY, 0x13c, 1)));
         assert!(seen.contains(&(EV_ABS, 0, 12345)));
         assert!(seen.contains(&(EV_ABS, 1, 32767)));
         assert!(seen.contains(&(EV_ABS, 17, -1)));

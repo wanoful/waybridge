@@ -1,10 +1,12 @@
 // Exercise the production adapter with SDL virtual controllers and motor callbacks.
 #include "gamepad.h"
+#include <SDL3/SDL_hints.h>
 #include <cstdlib>
 #include <iostream>
 #include <vector>
 
 using Json = nlohmann::json;
+static constexpr Uint16 FixtureVendor = 0xfffe, FixtureProduct = 0x5742;
 
 static void check(bool condition, const char *failure) {
   if (!condition) {
@@ -41,6 +43,8 @@ struct FixturePad {
     desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
     desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
     desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    desc.vendor_id = FixtureVendor;
+    desc.product_id = FixtureProduct;
     desc.name = name;
     desc.userdata = this;
     desc.Update = update;
@@ -92,6 +96,8 @@ int main() {
 
   // Attach only private devices in this process. SDL handles discovery,
   // normalization and feedback just as in production.
+  check(SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT, "0xfffe/0x5742"),
+        "could not isolate the virtual controller fixture");
   check(SDL_InitSubSystem(SDL_INIT_GAMEPAD), "could not initialize SDL in the fixture");
   Motors firstMotors, secondMotors, replacementMotors;
   FixturePad a, b, c, d, overflow, replacement;
@@ -112,7 +118,8 @@ int main() {
         latest(4).empty() && !latest(3).empty(), "SDL slots or four-device limit wrong");
   check(latest(0)["buttons"] == (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_DPAD_UP) &&
         latest(0)["ly"] == 32767 && latest(0)["lt"] == 255 && latest(0)["rt"] == 0 &&
-        latest(1)["buttons"] == XINPUT_GAMEPAD_B, "SDL button, stick or trigger mapping wrong");
+        latest(1)["buttons"] == XINPUT_GAMEPAD_B,
+        ("SDL button, stick or trigger mapping wrong: " + latest(0).dump() + " " + latest(1).dump()).c_str());
   auto aInc = latest(0)["device_generation"].get<uint64_t>();
   auto bInc = latest(1)["device_generation"].get<uint64_t>();
   auto cInc = latest(2)["device_generation"].get<uint64_t>();
@@ -122,6 +129,15 @@ int main() {
   check(messages.size() == before, "poll exceeded 125 Hz");
   pad.poll(now += 8);
   check(latest(1)["sequence"] == 2 && latest(0)["sequence"] == 1, "SDL changes lost or rebroadcast in other slots");
+  b.button(SDL_GAMEPAD_BUTTON_GUIDE, true);
+  pad.poll(now += 8);
+  check(latest(1)["guide"] == true && latest(1)["buttons"] == (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_Y),
+        "Guide press changed the legacy XInput button mask");
+  b.button(SDL_GAMEPAD_BUTTON_GUIDE, false);
+  // SDL holds a Guide press for at least 250 ms before reporting its release.
+  Sleep(260);
+  pad.poll(now += 8);
+  check(latest(1)["guide"] == false, "Guide release was lost");
   check(pad.status()["rumble_supported"] == true, "SDL rumble capability missing");
   pad.feedback(haptic(1, 2, cInc));
   pad.feedback(haptic(9, 0, aInc));
@@ -211,18 +227,15 @@ int main() {
         "disable did not clear active input and local inventory");
   pad.disconnect();
   c.detach(); replacement.detach();
+  messages.clear();
+  pad.configure(true, true, true, 15);
+  pad.poll(now += 500);
+  check(pad.status()["gamepad_backend"] == "SDL3" && pad.status()["gamepad_local_count"] == 0 &&
+        pad.status()["rumble_supported"] == false && latest(0).empty(),
+        "empty SDL inventory reported a gamepad");
+  pad.disconnect();
   SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
   check(SDL_WasInit(SDL_INIT_GAMEPAD) == 0, "SDL gamepad subsystem leaked a reference");
 
-  XboxBluetoothGamepad::Report legacyReport = {1, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
-      0xff, 0x03, 0x00, 0x02, 2, 0x49, 0x2c, 0x00};
-  XINPUT_GAMEPAD legacyState{};
-  check(XboxBluetoothGamepad::decode(legacyReport, legacyState) && legacyState.sThumbLX == 32767 &&
-        legacyState.sThumbLY == 32767 && legacyState.bLeftTrigger == 255 && legacyState.bRightTrigger == 128 &&
-        legacyState.wButtons == (XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_A |
-            XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_BACK |
-            XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_LEFT_THUMB), "temporary Xbox fallback report regressed");
-  legacyReport[0] = 4;
-  check(!XboxBluetoothGamepad::decode(legacyReport, legacyState), "temporary fallback accepted a battery report");
   std::cout << "PASS: SDL virtual pads, four slots and hotplug, buttons/axes/triggers, lease and deadzone, exact rumble/stop and stale feedback, bounded same-slot reconnect\n";
 }

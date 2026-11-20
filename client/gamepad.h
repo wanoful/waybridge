@@ -4,7 +4,6 @@
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_init.h>
 #include "third_party/json.hpp"
-#include "xbox_bluetooth.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -22,6 +21,7 @@ public:
 
 private:
   static constexpr ULONGLONG ReconnectGraceMs = 5000;
+  static constexpr WORD GuideButton = 0x0400;
   struct Slot {
     SDL_JoystickID instance = 0;
     SDL_Gamepad *controller = nullptr;
@@ -35,8 +35,6 @@ private:
   std::function<void(const Json &)> emit;
   std::function<std::string(SDL_JoystickID)> deviceIdentity;
   std::array<Slot, 4> slots{};
-  XboxBluetoothGamepad bluetooth;
-  std::wstring bluetoothPath;
   bool initialized = false, negotiated = false, requested = false, rumble = true;
   bool reconnect = false;
   bool serverSupported = false, leaseEnabled = false, haveState = false;
@@ -51,7 +49,7 @@ private:
   void send(const Json &message) {
     if (emit) emit(message);
   }
-  bool supported() const { return !requested || initialized || !bluetoothPath.empty(); }
+  bool supported() const { return !requested || initialized; }
   bool active() const {
     return negotiated && requested && supported() && serverSupported && leaseEnabled && focusId &&
            leaseId == focusId && generation;
@@ -61,7 +59,8 @@ private:
     auto &device = slots[slot];
     Json value = {{"type", "gamepad"}, {"generation", generation}, {"id", leaseId}, {"slot", slot},
           {"device_generation", device.incarnation}, {"sequence", ++device.sequence},
-          {"connected", connected}, {"buttons", sample.wButtons}, {"lx", sample.sThumbLX},
+          {"connected", connected}, {"buttons", sample.wButtons & ~GuideButton},
+          {"guide", (sample.wButtons & GuideButton) != 0}, {"lx", sample.sThumbLX},
           {"ly", sample.sThumbLY}, {"rx", sample.sThumbRX}, {"ry", sample.sThumbRY},
           {"lt", sample.bLeftTrigger}, {"rt", sample.bRightTrigger}};
     if (suspended) value["suspended"] = true;
@@ -88,9 +87,9 @@ private:
     device.sequence = 0;
     device.reconnectUntil = 0;
   }
-  void detachPhysical(size_t slot, ULONGLONG now, bool keepDevice = true) {
+  void detachPhysical(size_t slot, ULONGLONG now) {
     auto &device = slots[slot];
-    if (keepDevice && reconnect && device.sent && generation && !device.identity.empty()) {
+    if (reconnect && device.sent && generation && !device.identity.empty()) {
       closeController(device);
       device.rumbleCapable = false;
       if (!device.reconnectUntil) {
@@ -110,11 +109,7 @@ private:
     SDL_GUIDToString(SDL_GetGamepadGUIDForID(id), guid, sizeof(guid));
     return std::string(guid) + ":" + path;
   }
-  static std::string hidIdentity(const std::wstring &path) {
-    return "HID:" + std::string(reinterpret_cast<const char *>(path.data()), path.size() * sizeof(wchar_t));
-  }
   void pauseInput() {
-    bluetooth.close();
     for (auto &device : slots) {
       closeController(device);
       device.needSnapshot = true;
@@ -122,13 +117,11 @@ private:
     nextPoll = 0;
   }
   void stopDiscovery(bool notify) {
-    bluetooth.close();
     for (size_t i = 0; i < slots.size(); ++i) {
       closeSlot(i, notify);
       slots[i].instance = 0;
       slots[i].identity.clear();
     }
-    bluetoothPath.clear();
     if (initialized) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     initialized = false;
     nextPoll = nextInventory = 0;
@@ -138,12 +131,12 @@ private:
   void refreshDevices(ULONGLONG now) {
     int count = 0;
     std::unique_ptr<SDL_JoystickID, decltype(&SDL_free)> instances(
-        initialized ? SDL_GetGamepads(&count) : nullptr, SDL_free);
-    if (initialized && !instances) {
+        SDL_GetGamepads(&count), SDL_free);
+    if (!instances) {
       localError = "Could not enumerate SDL controllers: " + std::string(SDL_GetError());
       return;
     }
-    if (initialized) localError.clear();
+    localError.clear();
     const auto *first = instances.get();
     for (size_t i = 0; i < slots.size(); ++i) {
       auto &device = slots[i];
@@ -151,20 +144,7 @@ private:
         detachPhysical(i, now);
       }
     }
-    // Keep the existing single-device fallback until SDL can be checked with
-    // the affected physical controller. Never enumerate it alongside SDL pads.
-    auto path = count == 0 ? XboxBluetoothGamepad::find() : std::wstring{};
-    if (path != bluetoothPath) {
-      bluetooth.close();
-      if (!bluetoothPath.empty()) detachPhysical(0, now, count == 0);
-      if (!path.empty()) {
-        auto key = hidIdentity(path);
-        if (slots[0].identity != key) closeSlot(0, true);
-        slots[0].identity = std::move(key);
-      }
-      bluetoothPath = std::move(path);
-    }
-    localCount = count > 0 ? std::min(count, int(slots.size())) : (!bluetoothPath.empty() ? 1 : 0);
+    localCount = std::min(count, int(slots.size()));
     for (int n = 0; n < count; ++n) {
       const auto id = first[n];
       if (std::any_of(slots.begin(), slots.end(), [&](const Slot &s) { return s.instance == id; })) continue;
@@ -187,6 +167,7 @@ private:
       {SDL_GAMEPAD_BUTTON_SOUTH, XINPUT_GAMEPAD_A}, {SDL_GAMEPAD_BUTTON_EAST, XINPUT_GAMEPAD_B},
       {SDL_GAMEPAD_BUTTON_WEST, XINPUT_GAMEPAD_X}, {SDL_GAMEPAD_BUTTON_NORTH, XINPUT_GAMEPAD_Y},
       {SDL_GAMEPAD_BUTTON_BACK, XINPUT_GAMEPAD_BACK}, {SDL_GAMEPAD_BUTTON_START, XINPUT_GAMEPAD_START},
+      {SDL_GAMEPAD_BUTTON_GUIDE, GuideButton},
       {SDL_GAMEPAD_BUTTON_LEFT_STICK, XINPUT_GAMEPAD_LEFT_THUMB},
       {SDL_GAMEPAD_BUTTON_RIGHT_STICK, XINPUT_GAMEPAD_RIGHT_THUMB},
       {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER},
@@ -331,39 +312,25 @@ public:
     }
   }
   void poll(ULONGLONG now = GetTickCount64()) {
-    if (!negotiated || !requested) return;
+    if (!initialized) return;
     for (size_t slot=0;slot<slots.size();++slot) {
       auto &device=slots[slot];
       if (device.motorOwned && now >= device.motorDeadline) stopMotor(device);
       if (device.reconnectUntil && now >= device.reconnectUntil) {
         closeSlot(slot, true);
-        if (!device.instance && (slot != 0 || bluetoothPath.empty())) device.identity.clear();
+        if (!device.instance) device.identity.clear();
       }
     }
     const bool inventoryDue = now >= nextInventory;
     const bool sampleDue = active() && now >= nextPoll;
     if (!sampleDue && !inventoryDue) return;
-    if (initialized) SDL_UpdateGamepads();
+    SDL_UpdateGamepads();
     if (inventoryDue) {
       nextInventory = now + 500;
       refreshDevices(now);
     }
     if (!active() || now < nextPoll) return;
     nextPoll = now + 8;
-    if (!bluetoothPath.empty()) {
-      auto &device = slots[0];
-      if (now < device.retryAfter) return;
-      XINPUT_GAMEPAD state{};
-      if (bluetooth.read(bluetoothPath, state)) {
-        localError.clear();
-        forward(0, state);
-      } else {
-        detachPhysical(0, now);
-        device.retryAfter = now + 500;
-        localError = "Could not read input from the Bluetooth Xbox controller";
-      }
-      return;
-    }
     bool opened = false;
     for (size_t i = 0; i < slots.size(); ++i) {
       auto &device = slots[i];
@@ -393,7 +360,7 @@ public:
   }
   static XINPUT_GAMEPAD filtered(XINPUT_GAMEPAD sample, int percent) {
     percent = std::clamp(percent, 0, 50);
-    sample.wButtons &= 0xf3ff;
+    sample.wButtons &= 0xf3ff | GuideButton;
     stick(sample.sThumbLX, sample.sThumbLY, percent);
     stick(sample.sThumbRX, sample.sThumbRY, percent);
     sample.bLeftTrigger = trigger(sample.bLeftTrigger, percent);
@@ -407,7 +374,7 @@ public:
             {"gamepad_local_count", localCount < 0 ? Json(nullptr) : Json(localCount)},
             {"gamepad_devices", serverDevices}, {"rumble_supported", negotiated && serverSupported && motors},
             {"gamepad_error", serverError.empty() ? localError : serverError},
-            {"gamepad_backend", bluetoothPath.empty() ? "SDL3" : "Xbox Bluetooth HID"}};
+            {"gamepad_backend", "SDL3"}};
   }
   void disconnect() {
     stopDiscovery(true);

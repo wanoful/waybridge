@@ -1,6 +1,6 @@
 # Gamepads (Experimental)
 
-Updated: 2026-11-18. Windows discovers physical gamepads via SDL3 Gamepad and forwards them over the authenticated connection as session-owned Linux `uinput` virtual controllers. Disabled by default. When enabled, the local device count can be displayed in the background, while devices are only opened and forwarded once a foreground remote window holds the input lease.
+Updated: 2026-11-21. Windows discovers physical gamepads via SDL3 Gamepad and forwards them over the authenticated connection as session-owned Linux `uinput` virtual controllers. Disabled by default. When enabled, the local device count can be displayed in the background, while devices are only opened and forwarded once a foreground remote window holds the input lease.
 
 ## GUI and Configuration
 
@@ -18,7 +18,9 @@ Sticks use a radial deadzone and rescale the remaining range; triggers apply the
 
 ## Input, Focus, and Rumble
 
-SDL3 handles device discovery, standard button mapping, and dual-motor rumble on supported controllers. Up to four slots are assigned by SDL instance ID so plugging or unplugging one controller does not reorder other connected slots. When SDL sees no devices, a single-device Bluetooth HID fallback for Xbox Series (`045e:0b13`) is temporarily retained pending SDL verification on that physical controller; this fallback does not support rumble. Active input polling is capped at 125 Hz, and the device list refreshes every 500 ms. Actual cadence is subject to UI timers and OS scheduling.
+SDL3 handles device discovery, standard button mapping, and dual-motor rumble on supported USB and Bluetooth controllers. Up to four slots are assigned by SDL instance ID so plugging or unplugging one controller does not reorder other connected slots. Active input polling is capped at 125 Hz, and the device list refreshes every 500 ms. Actual cadence is subject to UI timers and OS scheduling.
+
+Guide (the Xbox logo button) is forwarded as Linux `BTN_MODE` when the Windows input backend reports it. To prevent the local overlay from opening on a short press, turn off **Allow your controller to open Game Bar** in **Windows Settings → Gaming → Game Bar**. In Windows Xbox full-screen experience, Windows reserves the physical Guide button and provides **View + Menu** as an alternative. [Microsoft full-screen experience guidance](https://learn.microsoft.com/en-us/gaming/gdk/docs/gdk-dev/pc-dev/handheld/handheld-launchers#game-overlays-and-guide-button)
 
 The Windows build downloads and verifies a pinned [SDL3 release](https://github.com/libsdl-org/SDL/releases/tag/release-3.4.20) and links the gamepad library statically into the worker. Portable packages include the SDL license.
 
@@ -26,7 +28,7 @@ A lease is granted only when a local foreground remote window, server-side focus
 
 Linux exposes a standard Xbox 360 BTN/ABS/HAT layout with inverted stick Y axes per `evdev` conventions. Game `FF_RUMBLE` uploads, plays, stops, and finite-duration expirations are routed back over the active lease to the originating Windows slot; feedback from an old incarnation cannot affect a reconnected device. Continuous rumble is refreshed every 250 ms with a 750 ms feedback lease, checked and zeroed on the client poll loop (not a hard real-time deadline independent of UI scheduling).
 
-When `gamepad_reconnect_v1` is negotiated, a brief disconnect of a controller with a recognizable device path zeroes inputs immediately and preserves its virtual slot for up to 5 seconds. SDL devices match returning hardware by SDL path and GUID; the Bluetooth HID fallback uses its device path. If the same device returns in time, games keep using the existing `evdev` handle while input and rumble switch to the new device incarnation. Unrecognized unplugs or expired grace windows destroy the virtual device. Read-only mode, disabling forwarding, or disconnecting destroys all corresponding virtual devices. Virtual devices are created and destroyed with the session lifecycle, though kernel input nodes remain visible system-wide.
+When `gamepad_reconnect_v1` is negotiated, a brief disconnect of a controller with a recognizable device path zeroes inputs immediately and preserves its virtual slot for up to 5 seconds. The client matches returning hardware by SDL path and GUID. If the same device returns in time, games keep using the existing `evdev` handle while input and rumble switch to the new device incarnation. Unrecognized unplugs or expired grace windows destroy the virtual device. Read-only mode, disabling forwarding, or disconnecting destroys all corresponding virtual devices. Virtual devices are created and destroyed with the session lifecycle, though kernel input nodes remain visible system-wide.
 
 ## Backend and Verification
 
@@ -46,4 +48,4 @@ The real Linux tests operate exclusively on temporary virtual devices verified b
 
 End-to-end compositor-to-`evdev` tests verify default-off behavior, bidirectional focus matching, buttons/axes/HATs, rejection of invalid/stale/duplicate input, zeroing and recovery on focus switches on the same `evdev` node, unplug while unfocused, and read-only/disable/disconnect cleanup—reading only temporary nodes verified by compositor PID, name, `phys`, and `sysname`.
 
-Input forwarding with a physical Xbox Bluetooth controller has been confirmed by users. Player ordering in real SDL/Steam games, Bluetooth reconnects, and physical rumble still require dedicated on-device verification. Windows x64 WinUI settings save, reload, and status reporting pass via private provider tests.
+Discovery, input, rumble, and reconnect were verified with a physical Xbox Bluetooth controller using the SDL3-only client. Player ordering in SDL and Steam games still needs on-device verification. Windows x64 WinUI settings save, reload, and status reporting pass via private provider tests.

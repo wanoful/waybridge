@@ -929,6 +929,8 @@ server focus. `gamepad_state` grants `id` and `generation`, plus `supported`,
 `requested`, `enabled`, `devices`, `rumble_supported` and `error`. `gamepad`
 snapshots bind `id`, `generation`, `slot` (0–3), `device_generation`,
 `sequence`, `connected`, `buttons`, signed `lx/ly/rx/ry` and byte `lt/rt`.
+Optional boolean `guide` carries the Xbox Guide button as Linux `BTN_MODE`.
+Omission means released. The existing `buttons` mask remains unchanged.
 `device_generation` identifies a physical attachment and `sequence` increases
 for its lifetime. A focus change neutralizes the existing virtual devices.
 Connected snapshots require the current focus lease. A `connected:false`
