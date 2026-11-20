@@ -64,9 +64,21 @@ def main():
                 raise AssertionError("Expected native IPC event missing")
             settings = dict(codec="png", fps=60, bitrate=30000, audio=False, files=True,
                             badge_png=base64.b64encode((ROOT/"assets/branding/waybridge-badge.png").read_bytes()).decode())
-            send(type="start", version=1, host="127.0.0.1", port=session["port"], token=session["token"], settings=settings)
+            def appearance_is(value):
+                result = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.impl.portal.desktop.waybridge",
+                                         "--object-path", "/org/freedesktop/portal/desktop", "--method",
+                                         "org.freedesktop.impl.portal.Settings.Read", "org.freedesktop.appearance", "color-scheme"],
+                                        capture_output=True, text=True, timeout=3)
+                return f"uint32 {value}>" in result.stdout
+
+            send(type="start", version=1, host="127.0.0.1", port=session["port"], token=session["token"],
+                 settings=settings, appearance="dark")
             connected = until(lambda e: e["type"] == "connected")
             assert "token" not in connected and "media_key" not in connected
+            wait(lambda: appearance_is(1))
+            send(type="appearance", color_scheme="light")
+            wait(lambda: appearance_is(2))
+            print("PASS: Windows worker forwards initial appearance and live theme changes over the viewer protocol")
             status = until(lambda e: e["type"] == "status" and e["windows"])
             assert status["windows"][0]["codec"] == "PNG" and status["tcp_bytes"] > 0
             settings.update(fps=30, bitrate=12000, read_only=True, clipboard="off", dpi=144, badge_png="")

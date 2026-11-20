@@ -195,6 +195,7 @@ internal sealed partial class MainWindow : Window
             args.Handled = true;
         };
         Content = root;
+        root.ActualThemeChanged += (sender, args) => _ = GuardAsync(SyncAppearanceAsync);
         UpdateMode();
         root.Loaded += async (_, _) => await GuardAsync(() => initialization ??= InitializeAsync(refreshCatalog: true));
     }
@@ -609,6 +610,7 @@ internal sealed partial class MainWindow : Window
     {
         string credential = secrets.Read(profile.Id) ?? throw new InvalidOperationException(Tr("Pair this device again"));
         notice.IsOpen = false;
+        await SyncAppearanceAsync();
         liveSettings = SettingsWithLauncherPolicies(profile.Settings);
         desktopNotifications.SharingChanged(profile.Settings.Notifications);
         var connection = controller.ConnectAsync(profile with { Settings = liveSettings }, credential);

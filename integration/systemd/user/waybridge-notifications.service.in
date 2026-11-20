@@ -6,8 +6,7 @@ Conflicts=waybridge-session-shutdown.target
 Before=waybridge-session-shutdown.target
 
 [Service]
-Type=dbus
-BusName=org.freedesktop.Notifications
+Type=exec
 ExecStart="@COMPOSITOR_BINARY@" --notification-provider
 Restart=no
 TimeoutStopSec=5

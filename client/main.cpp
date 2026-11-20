@@ -11,6 +11,7 @@
 #include <wincrypt.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <dwmapi.h>
 // clang-format on
 
 #include "presentation.h"
@@ -66,6 +67,8 @@ bool hostedReadOnly = false, hostedIme = true, hostedFiles = true, hostedImages 
 std::string hostedClipboard = "both";
 uint64_t hostedFileRate = 0;
 bool streamConfigNegotiated = false;
+bool appearanceNegotiated = false;
+std::string appAppearance;
 bool appStreamModesNegotiated = false;
 bool hostedTouch = false, touchNegotiated = false, touchSettingsNegotiated = false, touchInteractionNegotiated = false;
 bool hostedPen = false, penNegotiated = false, penSettingsNegotiated = false, penDragNegotiated = false;
@@ -96,6 +99,14 @@ uint64_t streamRequest = 0;
 void applyHostedSettings(const Json &settings, bool live);
 void sendStreamConfiguration();
 void sendJson(const Json &value);
+void applyAppearance(const std::string &scheme, bool live);
+
+void applyWindowAppearance(HWND hwnd) {
+  if (appAppearance.empty()) return;
+  BOOL dark = appAppearance == "dark";
+  // Use the native caption so Windows still handles window gestures and Snap.
+  DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+}
 RemoteNotifications remoteNotifications([](Json message) { hostControl.emit(std::move(message)); },
                                       [](Json message) { sendJson(message); });
 NativeTouch nativeTouch([](const Json &message) { sendJson(message); });
@@ -3625,6 +3636,7 @@ void dispatchNetwork() {
       {
         FileTree::supported = std::find(m["features"].begin(), m["features"].end(), "file_tree") != m["features"].end();
         streamConfigNegotiated = std::find(m["features"].begin(),m["features"].end(),"stream_config_v1") != m["features"].end();
+        appearanceNegotiated = std::find(m["features"].begin(), m["features"].end(), "appearance_v1") != m["features"].end();
         appStreamModesNegotiated = std::find(m["features"].begin(), m["features"].end(), "app_stream_modes_v1") != m["features"].end();
       }
       if (m.value("split_media", false))
@@ -3793,6 +3805,7 @@ void dispatchNetwork() {
             GetModuleHandleW(nullptr), w.get());
         if (!hwnd)
           continue;
+        applyWindowAppearance(hwnd);
         w->dpi = effectiveDpi(hwnd);
         w->presentation = std::make_unique<Presentation>();
         if (!w->presentation->initialize(hwnd, &mediaBudget, id)) {
@@ -4048,6 +4061,17 @@ void dispatchNetwork() {
     PostMessageW(controller, StartWindowDragMove, 0, 0);
   updateIme();
 }
+void applyAppearance(const std::string &scheme, bool live) {
+  if (scheme != "light" && scheme != "dark") return;
+  if (appAppearance == scheme) return;
+  appAppearance = scheme;
+  if (live) {
+    for (const auto &[id, window] : windows)
+      if (!window->popup) applyWindowAppearance(window->hwnd);
+    if (appearanceNegotiated) sendJson({{"type", "appearance"}, {"color_scheme", scheme}});
+  }
+}
+
 void sendStreamConfiguration() {
   if (!hostControl.active()) return;
   if (!streamConfigNegotiated) {
@@ -4258,6 +4282,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
           else if (type=="activation_launch") sendJson(request);
           else if (remoteNotifications.command(request)) {}
           else if (type=="settings") applyHostedSettings(request.at("settings"),true);
+          else if (type=="appearance") applyAppearance(request.value("color_scheme", ""), true);
           else if (type=="language") remoteTray.setChinese(request.value("language", "en") == "zh-Hans");
           else if (type=="tray_action") {
             if (!(request.value("epoch",uint64_t(0)) && request.value("generation",uint64_t(0)) && remoteTray.request(request.value("id",std::string()),request.value("action",std::string()),request.value("epoch",uint64_t(0)),request.value("generation",uint64_t(0)))))
@@ -4422,6 +4447,7 @@ int wmain(int argc, wchar_t **argv) {
       } bootstrapOle;
       if (FAILED(bootstrapOle.result)) throw std::runtime_error("Cannot initialize custom icon decoder");
       applyHostedSettings(start.value("settings",Json::object()),false);
+      applyAppearance(start.value("appearance", ""), false);
       remoteTray.setChinese(start.value("language", "en") == "zh-Hans");
       clientStats.enabled=true;
       SetEnvironmentVariableW(L"WAYBRIDGE_IME_TRACE",nullptr);
@@ -4632,6 +4658,7 @@ int wmain(int argc, wchar_t **argv) {
     codecs.push_back(VideoDecoder::capability(kind));
   sendJson({{"type", "hello"},
             {"version", 3},
+            {"color_scheme", appAppearance},
             {"split_media", true},
             {"audio_pcm", audioSupported},
             {"microphone_v1", true},

@@ -49,4 +49,11 @@ internal sealed partial class MainWindow
         root.RequestedTheme = content;
         if (AppWindowTitleBar.IsCustomizationSupported()) AppWindow.TitleBar.PreferredTheme = titleBar;
     }
+
+    private Task SyncAppearanceAsync() => controller.SetAppearanceAsync(launcherPreferences.Theme switch
+    {
+        "light" => "light",
+        "dark" => "dark",
+        _ => root.ActualTheme == ElementTheme.Dark ? "dark" : "light"
+    });
 }

@@ -15,6 +15,7 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
     private volatile ConnectionProfile? active;
     private volatile Connection? connection;
     private volatile string? currentSession;
+    private volatile string appearance = "default";
     private volatile Func<string> statusText = static () => Tr("Disconnected");
 
     public bool Connected => connection is not null;
@@ -102,10 +103,11 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
                     if (settings.Udp && string.IsNullOrWhiteSpace(settings.UdpHost))
                         settings = settings with { UdpHost = profile.Address };
 
+                    string initialAppearance = appearance;
                     string initialLanguage = Localization.Language;
                     await using var worker = await EngineChannel.StartAsync(enginePath, profile.Address, profile.Port,
                         sessionToken, settings, message => Message?.Invoke(message), WriteLog, token,
-                        transport: server.Transport(session), sourceId: profile.Id.ToString("N"),
+                        transport: server.Transport(session), sourceId: profile.Id.ToString("N"), appearance: initialAppearance,
                         language: initialLanguage);
                     using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(token);
                     token.ThrowIfCancellationRequested();
@@ -113,6 +115,7 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
                     connection = current;
                     try
                     {
+                        if (appearance != initialAppearance) await SendAppearanceAsync(current);
                         if (Localization.Language != initialLanguage) await UpdateLanguageAsync();
                         hadConnection = true;
                         attempt = 0;
@@ -279,6 +282,16 @@ public sealed class SessionController(string enginePath) : IAsyncDisposable
         var current = RequireConnection();
         return current.Worker.SendAsync(request, current.Closed);
     }
+
+    public Task SetAppearanceAsync(string scheme)
+    {
+        if (appearance == scheme) return Task.CompletedTask;
+        appearance = scheme;
+        return connection is { } current ? SendAppearanceAsync(current) : Task.CompletedTask;
+    }
+
+    private Task SendAppearanceAsync(Connection current) =>
+        current.Worker.SendAsync(new { type = "appearance", color_scheme = appearance }, current.Closed);
 
     public async Task UpdateLanguageAsync()
     {

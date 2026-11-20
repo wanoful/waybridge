@@ -2,6 +2,7 @@
 //! opt-in virtual gamepads are owned by its authenticated input lifetime.
 mod activation;
 mod app_icon;
+mod appearance;
 mod audio;
 mod microphone;
 mod capture;
@@ -326,6 +327,7 @@ pub(crate) struct OutboundDrag {
 }
 
 struct App {
+    appearance: Option<appearance::Bridge>,
     color_programs: Option<color::Programs>,
     _color_manager: Option<GlobalId>,
     gpu_device: Option<Rc<waybridge_codec::GpuDevice>>,
@@ -1137,6 +1139,13 @@ impl App {
                 }
             }
             "stream_config" => self.stream_config(&value),
+            "appearance" if self.peer.is_some() => {
+                if let (Some(appearance), Some(scheme)) =
+                    (&self.appearance, value["color_scheme"].as_str())
+                {
+                    appearance.update(scheme);
+                }
+            }
             "file_drop_out_enabled" => {
                 self.drag_enabled = value["enabled"].as_bool().unwrap_or(false);
                 if !self.drag_enabled {
@@ -1200,6 +1209,11 @@ impl App {
             }
             "ping" => self.control(json!({"type":"pong","nonce":value["nonce"]})),
             "hello" => {
+                if let (Some(appearance), Some(scheme)) =
+                    (&self.appearance, value["color_scheme"].as_str())
+                {
+                    appearance.update(scheme);
+                }
                 if let Some(enabled) = value["data_drag_v1"].as_bool() {
                     let enabled =
                         enabled && self.peer.as_ref().is_some_and(|p| p.data_drag_enabled());
@@ -2902,6 +2916,7 @@ fn main() -> Result<()> {
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
     let mut app = App {
+        appearance: None,
         _color_manager: color_programs
             .as_ref()
             .map(|_| color_management::register(&dh)),
@@ -3022,6 +3037,10 @@ fn main() -> Result<()> {
         &args.listen,
         &token_path,
     )?;
+    match appearance::Bridge::start(application_session.bus_address()) {
+        Ok(appearance) => app.appearance = Some(appearance),
+        Err(error) => tracing::warn!(%error, "Waybridge Settings portal backend unavailable"),
+    }
     let mut notifications = desktop_notifications::Bridge::new(
         application_session.service_runtime(),
         application_session.service_bus_address(),

@@ -872,6 +872,7 @@ pub fn listen(
                     "touchpad_v1",
                     "toplevel_drag_v1",
                     "stream_config_v1",
+                    "appearance_v1",
                     "app_stream_modes_v1",
                     "notifications_v1",
                     "tray_v1",

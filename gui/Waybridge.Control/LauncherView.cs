@@ -720,7 +720,11 @@ internal sealed partial class MainWindow
             if (loading) return;
             launcherPreferences.Theme = theme.SelectedIndex switch { 1 => "light", 2 => "dark", _ => "system" };
             ApplyLauncherTheme();
-            await GuardAsync(SaveLauncherPreferencesAsync);
+            await GuardAsync(async () =>
+            {
+                await SaveLauncherPreferencesAsync();
+                await SyncAppearanceAsync();
+            });
         };
         language.SelectionChanged += async (_, _) =>
         {

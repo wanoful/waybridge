@@ -77,7 +77,7 @@ public sealed class EngineChannel : IAsyncDisposable
     public static async Task<EngineChannel> StartAsync(string executable, string host, int port, string token,
         ClientSettings settings, Action<JsonElement> message, Action<string> log,
         CancellationToken cancellationToken, IReadOnlyList<string>? prefixArguments = null, DirectTransport? transport = null,
-        string sourceId = "", string? language = null)
+        string sourceId = "", string appearance = "default", string? language = null)
     {
         if (token.Length is < 16 or > 4096 || token.Any(char.IsWhiteSpace)) throw new ArgumentException(Tr("Enter a valid session token"));
         string name = "waybridge-" + Guid.NewGuid().ToString("N");
@@ -102,7 +102,7 @@ public sealed class EngineChannel : IAsyncDisposable
             await connected;
             channel = new EngineChannel(pipe, process, token, transport?.ClientToken ?? "");
             channel.Message += message; channel.Log += log;
-            await channel.SendAsync(new { type = "start", version = 1, host, port, token, settings, transport, source_id = sourceId, language = language ?? Localization.Language }, timeout.Token);
+            await channel.SendAsync(new { type = "start", version = 1, host, port, token, settings, transport, source_id = sourceId, appearance, language = language ?? Localization.Language }, timeout.Token);
             var engineReady = channel.ready.Task;
             if (await Task.WhenAny(engineReady, exited) == exited)
             {
