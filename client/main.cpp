@@ -3431,26 +3431,36 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
   case WM_LBUTTONDOWN:
   case WM_RBUTTONDOWN:
   case WM_MBUTTONDOWN:
+  case WM_XBUTTONDOWN:
   case WM_LBUTTONUP:
   case WM_RBUTTONUP:
-  case WM_MBUTTONUP: {
+  case WM_MBUTTONUP:
+  case WM_XBUTTONUP: {
+    const bool sideButton = message == WM_XBUTTONDOWN || message == WM_XBUTTONUP;
+    const int extraButton = GET_XBUTTON_WPARAM(wp);
+    if (sideButton && extraButton != XBUTTON1 && extraButton != XBUTTON2)
+      break;
+    const LRESULT handled = sideButton ? TRUE : 0;
     if (windowDrag.active) {
       if (message == WM_LBUTTONUP) sendWindowDragMotion(true);
-      return 0;
+      return handled;
     }
     if (FileDrag::ownsInput()) {
       if (message == WM_LBUTTONUP) {
         FileDrag::releasedBeforeStart();
         updateIme();
       }
-      return 0;
+      return handled;
     }
-    bool down = message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN;
+    const bool down = message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN ||
+                      message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN;
     if ((down || GetCapture() != hwnd) &&
-        inResizePreviewFill(w, {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)})) return 0;
+        inResizePreviewFill(w, {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)})) return handled;
     uint32_t button = (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)   ? 0x110
                       : (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) ? 0x111
                                                                                : 0x112;
+    if (sideButton)
+      button = extraButton == XBUTTON1 ? 0x113 : 0x114;  // BTN_SIDE / BTN_EXTRA
     if (message == WM_LBUTTONDOWN) {
       w->movePress = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       ClientToScreen(hwnd, &w->movePress);
@@ -3466,11 +3476,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         SetFocus(hwnd);
       if (!grabbedRoot && !relativeInput.active())
         SetCapture(hwnd);
-    } else if (!grabbedRoot && !relativeInput.active())
-      ReleaseCapture();
+    } else {
+      constexpr int mouseButtons = MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2;
+      if (!grabbedRoot && !relativeInput.active() && !(GET_KEYSTATE_WPARAM(wp) & mouseButtons))
+        ReleaseCapture();
+    }
     pointer(w, lp);
     sendJson({{"type", "button"}, {"id", w->id}, {"button", button}, {"down", down}});
-    return 0;
+    return handled;
   }
   case WM_MOUSEWHEEL:
   case WM_MOUSEHWHEEL: {

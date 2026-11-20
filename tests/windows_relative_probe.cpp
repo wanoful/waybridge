@@ -3,12 +3,17 @@
 #include <string>
 #include <iostream>
 static HWND target = nullptr;
+static HWND other = nullptr;
 static BOOL CALLBACK find(HWND hwnd, LPARAM) {
   wchar_t title[256]{}, klass[128]{};
   GetWindowTextW(hwnd, title, 256);
   GetClassNameW(hwnd, klass, 128);
-  if (std::wstring(klass) == L"WaybridgeRemote" && std::wstring(title) == L"Relative fixture lock")
-    target = hwnd;
+  if (std::wstring(klass) == L"WaybridgeRemote") {
+    if (std::wstring(title) == L"Relative fixture lock")
+      target = hwnd;
+    else if (std::wstring(title) == L"Relative fixture other")
+      other = hwnd;
+  }
   return TRUE;
 }
 static void key(WORD code, bool down) {
@@ -38,11 +43,24 @@ int wmain(int argc, wchar_t **argv) {
     INPUT input{}; input.type = INPUT_MOUSE; input.mi.dx = 17; input.mi.dy = -9;
     input.mi.dwFlags = MOUSEEVENTF_MOVE;
     if (SendInput(1, &input, sizeof(input)) != 1) return 3;
+  } else if (action == L"side-buttons") {
+    INPUT inputs[4]{};
+    for (int i = 0; i < 4; ++i) {
+      inputs[i].type = INPUT_MOUSE;
+      inputs[i].mi.dwFlags = i % 2 == 0 ? MOUSEEVENTF_XDOWN : MOUSEEVENTF_XUP;
+      inputs[i].mi.mouseData = i < 2 ? XBUTTON1 : XBUTTON2;
+    }
+    if (SendInput(4, inputs, sizeof(INPUT)) != 4) return 3;
   } else if (action == L"emergency") {
     key(VK_CONTROL, true); key(VK_MENU, true); key(VK_SHIFT, true); key(VK_F12, true);
     key(VK_F12, false); key(VK_SHIFT, false); key(VK_MENU, false); key(VK_CONTROL, false);
   } else if (action == L"blur") {
-    PostMessageW(target, WM_KILLFOCUS, 0, 0);
+    if (!other) return 5;
+    SetForegroundWindow(other);
+    SetWindowPos(other, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    for (int attempt = 0; attempt < 20 && GetForegroundWindow() != other; ++attempt)
+      Sleep(10);
+    if (GetForegroundWindow() != other) return 5;
   } else if (action == L"close") {
     PostMessageW(target, WM_CLOSE, 0, 0);
   } else if (action == L"state") {

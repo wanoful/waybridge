@@ -62,6 +62,18 @@ def main():
             wait_for(lambda: locked_count() > previous)
             wait_for(lambda: state() == (1, 1, 0))
 
+        def side_buttons():
+            def received():
+                return [line for line in app_text().splitlines()
+                        if line.startswith(("BUTTON 275 ", "BUTTON 276 "))]
+
+            previous = len(received())
+            probe("side-buttons")
+            wait_for(lambda: len(received()) >= previous + 4)
+            assert received()[previous:] == [
+                "BUTTON 275 1", "BUTTON 275 0", "BUTTON 276 1", "BUTTON 276 0"
+            ], app_text()
+
         try:
             subprocess.run(["wineboot", "-u"], env=wine_env, stdout=log, stderr=log, check=True, timeout=60)
             host = subprocess.Popen([str(ROOT / "target/debug/waybridge"), "--codec", "png", "--socket", "windows-relative-0", "--listen", f"127.0.0.1:{port}", "--token-file", str(token_path)], env=env, stdout=log, stderr=log)
@@ -85,10 +97,13 @@ def main():
             motion_before = app_text().count("MOTION ")
             probe("motion")
             wait_for(lambda: "REL " in app_text())
+            side_buttons()
             assert app_text().count("MOTION ") == motion_before, app_text()
+            assert state() == (1, 1, 0)
             probe("emergency")
             wait_for(lambda: app_text().count("UNLOCKED\n") >= 1)
             wait_for(lambda: state() == (1280, 1024, 1))
+            side_buttons()
             # Explicit focus loss is also the required gesture to rearm a persistent lock.
             probe("blur")
             focus_lock()
@@ -114,7 +129,7 @@ def main():
             wait_for(lambda: client.poll() is not None)
             # The viewer must restore the desktop even when the compositor disappears.
             wait_for(lambda: state() == (1280, 1024, 1))
-            print("PASS: full PE viewer in private Wine/Xvfb: native handshake, hidden one-pixel clip, synthetic Raw Input reaches real Wayland relative-pointer without absolute motion, remote cursor updates remain hidden while locked, emergency/focus/close/server-destruction/disconnect cleanup. Physical Windows mouse and ARM64 runtime remain unverified.")
+            print("PASS: full PE viewer in private Wine/Xvfb: native handshake, hidden one-pixel clip, synthetic Raw Input reaches real Wayland relative-pointer without absolute motion, both side buttons reach Wayland with and without pointer lock, remote cursor updates remain hidden while locked, emergency/focus/close/server-destruction/disconnect cleanup. Physical Windows mouse and ARM64 runtime remain unverified.")
         finally:
             for process in reversed(processes):
                 if process.poll() is None:
