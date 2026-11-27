@@ -524,6 +524,79 @@ try
     }
     Console.WriteLine("PASS: Control Center local IPC ensure_connected and disconnect broadcast");
 
+    var defaultMediaProfile = new ConnectionProfile { Name = "Media Box", Host = "10.0.0.5" };
+    Check(defaultMediaProfile.Settings.MediaControls, "media controls must default to enabled");
+    var disabledMediaJson = JsonSerializer.Serialize(defaultMediaProfile with { Settings = defaultMediaProfile.Settings with { MediaControls = false } }, ProfileStore.Json);
+    Check(disabledMediaJson.Contains("\"media_controls\": false", StringComparison.Ordinal), "media_controls must serialize in snake_case");
+    var reloadedMedia = JsonSerializer.Deserialize<ConnectionProfile>(disabledMediaJson, ProfileStore.Json)!;
+    Check(!reloadedMedia.Settings.MediaControls, "media_controls false must round-trip");
+
+    using (var stateDoc = JsonDocument.Parse("""
+        {
+          "type": "media_state",
+          "epoch": 3,
+          "player": "org.mpris.MediaPlayer2.chromium.instance42",
+          "generation": 7,
+          "identity": "Chromium",
+          "desktop_entry": "chromium",
+          "status": "Playing",
+          "title": "Test Song",
+          "artists": ["Artist One", "Artist Two"],
+          "album": "Test Album",
+          "album_artists": [],
+          "track_id": "/org/mpris/MediaPlayer2/Track/1",
+          "length_us": 180000000,
+          "position_us": 30000000,
+          "rate": 1.0,
+          "can_control": true,
+          "can_play": true,
+          "can_pause": true,
+          "can_go_next": true,
+          "can_go_previous": false,
+          "can_seek": true,
+          "art_revision": 4,
+          "read_only": false
+        }
+        """))
+    {
+        Check(MediaControlsModel.TryParseState(stateDoc.RootElement, out var state) && state is not null, "valid media_state must parse");
+        Check(state!.DisplayTitle == "Test Song" && state.DisplayArtist == "Artist One, Artist Two" && state.DisplayAlbum == "Test Album", "metadata display mapping failed");
+        Check(state.EffectiveCanPlay && state.EffectiveCanPause && state.EffectiveCanNext && !state.EffectiveCanPrevious && state.EffectiveCanSeek, "capability flags mismatch");
+        var pauseCmd = MediaControlsModel.BuildActionCommand(state, "pause");
+        Check(pauseCmd is not null && (string?)pauseCmd["action"] == "pause" && (ulong?)pauseCmd["epoch"] == 3 && (ulong?)pauseCmd["generation"] == 7, "pause command invalid");
+        Check(MediaControlsModel.BuildActionCommand(state, "previous") is null, "disabled previous action must be blocked");
+        var seekCmd = MediaControlsModel.BuildSeekCommand(state, 999_000_000);
+        Check(seekCmd is not null && (long?)seekCmd["position_us"] == 180_000_000 && (string?)seekCmd["track_id"] == "/org/mpris/MediaPlayer2/Track/1", "seek command must clamp to length");
+        var readOnlyState = state with { ReadOnly = true };
+        Check(!readOnlyState.EffectiveCanPlay && !readOnlyState.EffectiveCanSeek &&
+            MediaControlsModel.BuildActionCommand(readOnlyState, "pause") is null &&
+            MediaControlsModel.BuildSeekCommand(readOnlyState, 10_000_000) is null, "read_only must disable all media controls");
+
+        byte[] pngHeader = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13];
+        using var artDoc = JsonDocument.Parse(JsonSerializer.Serialize(new
+        {
+            type = "media_art", epoch = 3, player = state.Player, generation = 7, revision = 4,
+            mime = "image/png", data = Convert.ToBase64String(pngHeader)
+        }));
+        Check(MediaControlsModel.TryParseArt(artDoc.RootElement, state, out var artBytes, out var artMime, out var artRev) &&
+            artMime == "image/png" && artRev == 4 && artBytes.SequenceEqual(pngHeader), "valid PNG media_art must parse");
+
+        using var wrongRevArt = JsonDocument.Parse(JsonSerializer.Serialize(new
+        {
+            type = "media_art", epoch = 3, player = state.Player, generation = 7, revision = 5,
+            mime = "image/png", data = Convert.ToBase64String(pngHeader)
+        }));
+        Check(!MediaControlsModel.TryParseArt(wrongRevArt.RootElement, state, out _, out _, out _), "stale revision media_art must be rejected");
+
+        using var wrongMimeArt = JsonDocument.Parse(JsonSerializer.Serialize(new
+        {
+            type = "media_art", epoch = 3, player = state.Player, generation = 7, revision = 4,
+            mime = "image/jpeg", data = Convert.ToBase64String(pngHeader)
+        }));
+        Check(!MediaControlsModel.TryParseArt(wrongMimeArt.RootElement, state, out _, out _, out _), "mismatched magic bytes must be rejected");
+    }
+    Console.WriteLine("PASS: remote media controls model, settings, artwork validation, and read-only gating");
+
 
 }
 finally { Directory.Delete(directory, true); }

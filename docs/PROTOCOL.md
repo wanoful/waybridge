@@ -758,6 +758,46 @@ Dismissed event; disappearance is checked with GetAllAsync every two seconds,
 with a further two-second activation grace period before sending dismissal.
 Expiry/application close and disconnect cleanup do not depend on that polling.
 
+## System media controls (`media_controls_v1`)
+
+Both v3 hellos negotiate the boolean `media_controls_v1`. The hosted Windows
+worker initially sends `media_controls_enabled:false`; forwarding opens only
+after the Control Center acquires Windows System Media Transport Controls
+(`SystemMediaTransportControlsInterop.GetForWindow`) for its window and sends
+`media_controls_available {available:true}` over the private host pipe.
+Standalone workers do not negotiate this capability. `media_controls_enabled
+{enabled}` toggles live forwarding; the per-profile setting `media_controls`
+defaults to true.
+
+On Linux, a dedicated bounded worker thread watches `org.mpris.MediaPlayer2.*`
+names on the session D-Bus (up to 16 players) and selects one active player by
+playback status (`Playing` > `Paused` > `Stopped`), most recent activity, and
+bus name. Empty stopped shells are ignored. The server emits:
+
+- `media_state {epoch,player,generation,identity,desktop_entry,status,title,
+  artists,album,album_artists,track_id,length_us,position_us?,rate,can_control,
+  can_play,can_pause,can_go_next,can_go_previous,can_seek,art_revision}`: sent
+  when structural metadata/capabilities change or when playback position drifts
+  more than 1.5 seconds from the extrapolated timeline (catching seeks without
+  periodic timer spam).
+- `media_art {epoch,player,generation,revision,mime,data}`: sent on a latest-only
+  control slot whenever `art_revision` changes. Only local regular `file://`
+  images, bounded `data:image/*;base64` URIs, or the player's desktop app icon
+  are read—never arbitrary remote `http(s)://` URLs. PNG artwork is decoded and
+  resized to at most 256×256 (<= 192 KiB); JPEG and WebP are magic-checked and
+  bounded to <= 256 KiB, then safely decoded and normalized with WIC on Windows.
+- `media_reset {epoch}`: clears Windows SMTC when no active player remains,
+  forwarding is disabled, or the connection closes.
+
+The Control Center sends `media_control {epoch,player,generation,action,
+track_id?,position_us?}` with `action` in `play`, `pause`, `play_pause`, `stop`,
+`next`, `previous`, or `set_position`. Both the native Windows worker and the
+Linux MPRIS2 worker verify current connection `epoch`, player bus name and
+`generation` (bumped when `GetNameOwner` changes), `CanControl` and per-action
+player capability flags, track identity/bounds for `set_position`, and read-only
+mode. Read-only mode continues showing playback metadata while disabling all
+SMTC control buttons and blocking `media_control` at both boundaries.
+
 ## Generic drag visual (`data_drag_v1`)
 
 A client can provide a standard `wl_surface` icon to `wl_data_device.start_drag`.

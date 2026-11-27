@@ -62,6 +62,7 @@ struct Queue {
     drag_visual: Option<Vec<u8>>,
     icons: BTreeMap<u32, Vec<u8>>,
     tray_icons: BTreeMap<String, Vec<u8>>,
+    media_art: Option<Vec<u8>>,
     frames: BTreeMap<u32, VecDeque<QueuedFrame>>,
     png_only: BTreeSet<u32>,
     active_codec: BTreeMap<u32, waybridge_codec::Codec>,
@@ -130,6 +131,8 @@ pub struct Peer {
     window_icon_v1: bool,
     notifications_v1: bool,
     notifications_initial: bool,
+    media_controls_v1: bool,
+    media_controls_initial: bool,
     window_semantics_v1: bool,
     activation_v1: bool,
     tray_v1: bool,
@@ -155,6 +158,28 @@ impl Peer {
     }
     pub fn notifications_initial(&self) -> bool {
         self.notifications_v1 && self.notifications_initial
+    }
+    pub fn media_controls_enabled(&self) -> bool {
+        self.media_controls_v1
+    }
+    pub fn media_controls_initial(&self) -> bool {
+        self.media_controls_v1 && self.media_controls_initial
+    }
+    pub fn media_art(&self, message: Value) -> bool {
+        if !self.media_controls_v1 {
+            return false;
+        }
+        let bytes = serde_json::to_vec(&message).unwrap();
+        if bytes.len() > 384 * 1024 {
+            return false;
+        }
+        let mut q = self.queue.lock().unwrap();
+        if q.closed {
+            return false;
+        }
+        q.media_art = Some(bytes);
+        self.wake.notify_all();
+        true
     }
     pub fn audio_frame(&self, frame: Vec<u8>) {
         if !self.audio_attached.load(Ordering::Relaxed) {
@@ -605,7 +630,8 @@ impl Peer {
                             || q.cursor.is_some()
                             || q.drag_visual.is_some()
                             || !q.icons.is_empty()
-                            || !q.tray_icons.is_empty()))
+                            || !q.tray_icons.is_empty()
+                            || q.media_art.is_some()))
                         || (frames_allowed && (!q.repairs.is_empty() || frame_ready));
                     if q.closed || ready {
                         break;
@@ -634,6 +660,8 @@ impl Peer {
                     (protocol::JSON, q.icons.pop_first().unwrap().1, None)
                 } else if !media && !q.tray_icons.is_empty() {
                     (protocol::JSON, q.tray_icons.pop_first().unwrap().1, None)
+                } else if !media && q.media_art.is_some() {
+                    (protocol::JSON, q.media_art.take().unwrap(), None)
                 } else if frames_allowed && !q.frames.is_empty() {
                     let id = q.next_frame().unwrap().0;
                     q.last_frame_id = id;
@@ -918,6 +946,10 @@ pub fn listen(
                     window_icon_v1: hello["window_icon_v1"].as_bool().unwrap_or(false),
                     notifications_v1: hello["notifications_v1"].as_bool().unwrap_or(false),
                     notifications_initial: hello["notifications_enabled"].as_bool().unwrap_or(true),
+                    media_controls_v1: hello["media_controls_v1"].as_bool().unwrap_or(false),
+                    media_controls_initial: hello["media_controls_enabled"]
+                        .as_bool()
+                        .unwrap_or(true),
                     window_semantics_v1: hello["window_semantics_v1"].as_bool().unwrap_or(false),
                     activation_v1: hello["activation_v1"].as_bool().unwrap_or(false),
                     tray_v1: hello["tray_v1"].as_bool().unwrap_or(false),
@@ -984,12 +1016,13 @@ pub fn listen(
                     "appearance_v1",
                     "app_stream_modes_v1",
                     "notifications_v1",
+                    "media_controls_v1",
                     "tray_v1",
                     "data_drag_v1",
                     "data_drag_result_v1",
                     "activation_v1",
                 ];
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media,"file_channel_v1":peer.has_file_lane(), "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1,"notifications_v1":peer.notifications_v1,"tray_v1":peer.tray_v1,"pen_v1":hello["pen_v1"] == true,"pen_settings_v1":hello["pen_v1"] == true,"pen_drag_v1":hello["pen_v1"] == true && hello["pen_drag_v1"] == true,"gamepad_v1":hello["gamepad_v1"] == true,"gamepad_settings_v1":hello["gamepad_v1"] == true,"gamepad_reconnect_v1":hello["gamepad_v1"] == true && hello["gamepad_reconnect_v1"] == true,"touch_v1":hello["touch_v1"] == true, "touch_settings_v1":hello["touch_v1"] == true,"touch_interaction_v1":hello["touch_v1"] == true && hello["touch_interaction_v1"] == true,"touchpad_v1":hello["touchpad_v1"] == true,"data_drag_v1":peer.data_drag_v1,"data_drag_result_v1":peer.data_drag_v1,"activation_v1":peer.activation_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_codec == Some(audio::Codec::Pcm), "audio_opus_v1":peer.audio_codec == Some(audio::Codec::Opus), "microphone_v1":peer.microphone.is_some(), "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":features}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media,"file_channel_v1":peer.has_file_lane(), "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1,"notifications_v1":peer.notifications_v1,"media_controls_v1":peer.media_controls_v1,"tray_v1":peer.tray_v1,"pen_v1":hello["pen_v1"] == true,"pen_settings_v1":hello["pen_v1"] == true,"pen_drag_v1":hello["pen_v1"] == true && hello["pen_drag_v1"] == true,"gamepad_v1":hello["gamepad_v1"] == true,"gamepad_settings_v1":hello["gamepad_v1"] == true,"gamepad_reconnect_v1":hello["gamepad_v1"] == true && hello["gamepad_reconnect_v1"] == true,"touch_v1":hello["touch_v1"] == true, "touch_settings_v1":hello["touch_v1"] == true,"touch_interaction_v1":hello["touch_v1"] == true && hello["touch_interaction_v1"] == true,"touchpad_v1":hello["touchpad_v1"] == true,"data_drag_v1":peer.data_drag_v1,"data_drag_result_v1":peer.data_drag_v1,"activation_v1":peer.activation_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_codec == Some(audio::Codec::Pcm), "audio_opus_v1":peer.audio_codec == Some(audio::Codec::Opus), "microphone_v1":peer.microphone.is_some(), "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":features}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

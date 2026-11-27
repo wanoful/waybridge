@@ -42,6 +42,7 @@
 #include "native_transport.h"
 #include "microphone.h"
 #include "host_control.h"
+#include "remote_media.h"
 #include "remote_notifications.h"
 #include "ordered_sender.h"
 #include "rich_clipboard.h"
@@ -112,6 +113,8 @@ void applyWindowAppearance(HWND hwnd) {
 }
 RemoteNotifications remoteNotifications([](Json message) { hostControl.emit(std::move(message)); },
                                       [](Json message) { sendJson(message); });
+RemoteMedia remoteMedia([](Json message) { hostControl.emit(std::move(message)); },
+                        [](Json message) { sendJson(message); });
 NativeTouch nativeTouch([](const Json &message) { sendJson(message); });
 NativeTouchpad nativeTouchpad([](const Json &message) { sendJson(message); });
 bool touchpadNegotiated = false;
@@ -3732,7 +3735,7 @@ void dispatchNetwork() {
                          type == "tree_done")) || (!hostedFiles && type=="drag_offer" && !m.value("text",Json()).is_string())) continue;
     if(type=="drag_offer" && m.value("text",Json()).is_string() && !hostedDragText){sendJson({{"type","drag_result"},{"drag",m.value("drag",uint64_t(0))},{"success",false}});continue;}
     if (FileTree::receive(m) || FileDrag::control(m, controller, sourceWindow)) continue;
-    if (TextDrag::control(m) || remoteNotifications.receive(m)) continue;
+    if (TextDrag::control(m) || remoteNotifications.receive(m) || remoteMedia.receive(m)) continue;
     if (type.rfind("tray_",0)==0) {
       if (!iconDecoder) iconDecoder=std::make_unique<ImageDecoder>();
       if (remoteTray.receive(m,*iconDecoder)) continue;
@@ -3794,6 +3797,7 @@ void dispatchNetwork() {
                         {"activation_v1",nativeActivation.enabled()},
                         {"hardware_codecs",supportedVideoKinds},{"stream_config",streamConfigNegotiated}});
       remoteNotifications.hello(m);
+      remoteMedia.hello(m);
       if (hostControl.active()) sendStreamConfiguration();
       updateMicrophonePermission();
     } else if (type == "microphone_state") {
@@ -4313,12 +4317,14 @@ void applyHostedSettings(const Json &settings, bool live) {
   touchApplicationModes = std::move(nextTouchModes);
   hostedSettings=settings;
   remoteNotifications.settings(settings.value("notifications",true));
+  remoteMedia.settings(settings.value("media_controls",true));
   remoteTray.configure(trayNegotiated,settings.value("tray",true),settings.value("read_only",false));
   remoteTray.repaint();
   hostedReadOnly=settings.value("read_only",false); hostedIme=settings.value("ime",true);
   hostedMicrophone = settings.value("microphone", false);
   if (!hostedMicrophone || hostedReadOnly) microphoneForwarder.configure(std::nullopt);
   remoteNotifications.inputReadOnly(hostedReadOnly);
+  remoteMedia.inputReadOnly(hostedReadOnly);
   hostedDragText=settings.value("drag_text",true);
   hostedFiles=settings.value("files",true); hostedImages=settings.value("clipboard_images",true);
   hostedFileRate=settings.value("file_rate_kib",uint64_t(0));
@@ -4419,6 +4425,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
           }
           else if (type=="activation_launch") sendJson(request);
           else if (remoteNotifications.command(request)) {}
+          else if (remoteMedia.command(request)) {}
           else if (type=="settings") applyHostedSettings(request.at("settings"),true);
           else if (type=="appearance") applyAppearance(request.value("color_scheme", ""), true);
           else if (type=="language") remoteTray.setChinese(request.value("language", "en") == "zh-Hans");
@@ -4540,6 +4547,7 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
       TextDrag::reset();
       dragVisual.reset();
       remoteTray.clear();
+      remoteMedia.reset();
       windowDrag.cancelled = true;
       endWindowDrag();
       releasePointer(false);
@@ -4820,6 +4828,8 @@ int wmain(int argc, wchar_t **argv) {
             {"data_drag_v1", true},
             {"notifications_v1", hostControl.active()},
             {"notifications_enabled", false},
+            {"media_controls_v1", hostControl.active()},
+            {"media_controls_enabled", false},
             {"pen_v1", true}, {"pen_drag_v1", true}, {"pen_enabled",hostedPen},
             {"gamepad_v1", true}, {"gamepad_reconnect_v1",true}, {"gamepad_enabled",hostedGamepads},
             {"touch_v1", true},
@@ -4851,6 +4861,7 @@ int wmain(int argc, wchar_t **argv) {
   presentationWake.stop();
   pendingPresentations.clear();
   remoteTray.clear();
+  remoteMedia.reset();
   windowDrag.cancelled = true;
   endWindowDrag();
   releasePointer(false);

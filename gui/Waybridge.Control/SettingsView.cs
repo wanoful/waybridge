@@ -71,6 +71,7 @@ internal sealed partial class MainWindow
 
     private UIElement DesktopPage() => SettingsPage(L("Desktop integration"),
         Row(L("Desktop notifications"), L("Applies immediately. Linux app notifications follow Windows notification settings."), notifications),
+        Row(L("System media controls"), L("Applies immediately. Shows Linux media playback info and controls in Windows Quick Settings and media keys."), mediaControls),
         Row(L("Remote app tray icons"), L("Applies immediately. Shows remote app tray icons in the Windows notification area."), remoteTray),
         Row(L("Sync profile to Windows Terminal"), L("Adds this workstation to Windows Terminal via a JSON fragment. Save settings to apply."), windowsTerminalProfile),
         BadgeEditor(), SettingsActions(includeApply: true));

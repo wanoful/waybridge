@@ -228,13 +228,13 @@ Distinguishes current capabilities from remaining targets:
 | Background app entries | SNI-based background list, restore, and app menus landed (non-SNI processes excluded) | M2: Track manageable apps and tray/window relationships; surface running background apps with native activate and quit |
 | Taskbar grouping & activation | Per-profile/app `AppUserModelID` landed; full Shell matrix pending | M2: Complete app identity mapping, window restoration, and grouping; verify multi-instance and modal relationships |
 | Files / URIs & login callbacks | GIO launches, partial file pickers, and read-only cross-machine delivery + writable user copies landed | M2: Keep native open/save, expand app compatibility, verify URIs/login callbacks; explicit "Open in Windows" without hijacking global defaults |
-| Global shortcuts & media keys | Basic keyboard routing exists; full config and backends missing | M2 defines local/remote shortcut rules; GlobalShortcuts Portal and MPRIS media control tracked as optional subsets |
+| Global shortcuts & media controls | Linux MPRIS2 ↔ Windows SMTC playback metadata, artwork, timeline, and media-key controls landed (`media_controls_v1`); global shortcuts portal remains open | M2 defines local/remote shortcut rules; GlobalShortcuts Portal remains an optional subset |
 | Lock, sleep & resume | Full handling and test matrix pending | M2 adds input release, session preservation, and reconnect across Windows power/lock transitions; M3/M4 extend to new peripherals |
 | Auth & dev-tool interactions | Wallets wired; other auth paths not assumed | Verify polkit and SSH/GPG agent prompts individually using standard user configuration |
 
 Trays prioritize [StatusNotifierItem](https://specifications.freedesktop.org/status-notifier-item/latest-single/) with [X11 System Tray](https://specifications.freedesktop.org/systemtray/latest-single/) (XEmbed) tracked separately; items offering only `ContextMenu` without exportable menus verify Linux-window fallback rather than assuming native Windows menus for every app. Shared user buses respect existing tray watchers and [notification service](https://specifications.freedesktop.org/notification/latest-single/) owners without hijacking or snooping.
 
-Theme/font sync, autostart/launch bundles, MPRIS, global menus, and auto-updates remain separate candidates rather than v1 commitments.
+Theme/font sync, autostart/launch bundles, global menus, and auto-updates remain separate candidates rather than v1 commitments.
 
 ### Default Sharing Behavior
 

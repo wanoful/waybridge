@@ -11,6 +11,7 @@ mod color_management;
 mod cursor;
 mod data_drop;
 mod data_offer;
+mod desktop_media;
 mod desktop_notifications;
 mod desktop_tray;
 mod dnd_lifecycle;
@@ -347,6 +348,7 @@ struct App {
     icons: app_icon::Icons,
     _toplevel_icons: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
     tray: Option<desktop_tray::Tray>,
+    media: Option<desktop_media::Media>,
     relative: relative_input::RelativeInput,
     touch: touch::Touch,
     touchpad: touchpad::Touchpad,
@@ -1140,6 +1142,29 @@ impl App {
             "tray_refresh" if self.peer.as_ref().is_some_and(|p| p.tray_enabled()) => {
                 if let Some(tray) = &self.tray {
                     tray.set_peer(self.peer.clone());
+                }
+            }
+            "media_controls_enabled" => {
+                if let Some(media) = &self.media {
+                    media.set_enabled(
+                        self.peer.clone(),
+                        value["enabled"] == true
+                            && self
+                                .peer
+                                .as_ref()
+                                .is_some_and(|p| p.media_controls_enabled()),
+                    );
+                }
+            }
+            "media_control" if !self.read_only => {
+                if let Some(peer) = self
+                    .peer
+                    .as_ref()
+                    .filter(|p| p.media_controls_enabled() && !p.is_closed())
+                {
+                    if let Some(media) = &self.media {
+                        media.control(peer.clone(), value);
+                    }
                 }
             }
             "stream_config" => self.stream_config(&value),
@@ -2945,6 +2970,7 @@ fn main() -> Result<()> {
             manager
         },
         tray: None,
+        media: None,
         _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<App>(&dh),
         relative: relative_input::RelativeInput::default(),
         touch: touch::Touch::default(),
@@ -3052,6 +3078,9 @@ fn main() -> Result<()> {
         application_session.bus_address().to_owned(),
         app.events.clone(),
     ));
+    app.media = Some(desktop_media::Media::new(
+        application_session.bus_address().to_owned(),
+    ));
     // Service shutdown must run for application-launch and event-loop errors too.
     // Keep the display alive and dispatchable until owned components have stopped.
     let run_result = (|| -> Result<()> {
@@ -3111,6 +3140,9 @@ fn main() -> Result<()> {
                         }
                         if let Some(tray) = &app.tray {
                             tray.set_peer(Some(peer.clone()));
+                        }
+                        if let Some(media) = &app.media {
+                            media.set_peer(Some(peer.clone()), peer.media_controls_initial());
                         }
                         app.read_only = false;
                         app.pen_available(false);
@@ -3277,6 +3309,9 @@ fn main() -> Result<()> {
                         notifications.connection(false);
                         if let Some(tray) = &app.tray {
                             tray.set_peer(None);
+                        }
+                        if let Some(media) = &app.media {
+                            media.set_peer(None, false);
                         }
                         app.cancel_window_drag();
                         app.poll_window_drag();

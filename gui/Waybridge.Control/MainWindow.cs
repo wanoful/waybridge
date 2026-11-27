@@ -32,6 +32,7 @@ internal sealed partial class MainWindow : Window
     private readonly WindowsCredentialStore secrets = new();
     private readonly SessionController controller;
     private readonly DesktopNotifications desktopNotifications;
+    private readonly DesktopMediaControls desktopMediaControls;
     private readonly TrayIcon tray;
     private readonly ObservableCollection<ConnectionProfile> profiles = [];
     private readonly ComboBox profilePicker = L("Select workstation").Bind(new ComboBox { DisplayMemberPath = "Name", MinWidth = 156, MaxWidth = 320, HorizontalAlignment = HorizontalAlignment.Stretch }, ComboBox.PlaceholderTextProperty);
@@ -42,6 +43,7 @@ internal sealed partial class MainWindow : Window
     private readonly NumberBox remotePort = Number(49092, 1, 65535);
     private readonly ToggleSwitch reconnect = Toggle(true), audio = Toggle(true), files = Toggle(true), dragText = Toggle(true), images = Toggle(true), readOnly = Toggle(false), ime = Toggle(true), udp = Toggle(false), hdr = Toggle(false);
     private readonly ToggleSwitch notifications = Toggle(true);
+    private readonly ToggleSwitch mediaControls = Toggle(true);
     private readonly ToggleSwitch touch = Toggle(false);
     private readonly TextBlock touchStatus = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12 };
     private Guid? touchStatusProfile;
@@ -120,6 +122,7 @@ internal sealed partial class MainWindow : Window
         store = new(directory);
         controller = new(Path.Combine(AppContext.BaseDirectory, "waybridge-client.exe"));
         desktopNotifications = new(request => controller.SendEngineAsync(request), message => UI(() => Inform(message)));
+        desktopMediaControls = new(hwnd, DispatcherQueue, request => controller.SendEngineAsync(request), message => UI(() => Inform(message)));
         controller.Status += _ => UI(() => status.Text = controller.CurrentStatus);
         controller.ConnectionChanged += connected =>
         {
@@ -127,6 +130,7 @@ internal sealed partial class MainWindow : Window
             UI(() =>
             {
                 desktopNotifications.ConnectionChanged(connected);
+                desktopMediaControls.ConnectionChanged(connected);
                 TouchConnectionChanged(connected);
                 if (!connected)
                 {
@@ -141,6 +145,7 @@ internal sealed partial class MainWindow : Window
         controller.Message += message =>
         {
             if (desktopNotifications.Receive(message)) return;
+            if (desktopMediaControls.Receive(message)) return;
             var profileId = controller.ActiveProfileId;
             string? sessionName = controller.CurrentSession;
             UI(() =>
@@ -553,6 +558,8 @@ internal sealed partial class MainWindow : Window
         gamepads.IsOn = settings.Gamepads; gamepadRumble.IsOn = settings.GamepadRumble; gamepadDeadzone.Value = settings.GamepadDeadzone;
         notifications.IsOn = settings.Notifications;
         desktopNotifications.SharingChanged(settings.Notifications);
+        mediaControls.IsOn = settings.MediaControls;
+        desktopMediaControls.SharingChanged(settings.MediaControls);
         loading = false; UpdateMode(); UpdateTouchStatus(); UpdateInputDeviceStatus();
         if (changedProfile) FilterApplications();
     }
@@ -572,7 +579,7 @@ internal sealed partial class MainWindow : Window
             FileRateKib = checked((int)fileRate.Value),
             Pen = pen.IsOn, PenPressureGamma = penPressureGamma.Value,
             Gamepads = gamepads.IsOn, GamepadRumble = gamepadRumble.IsOn, GamepadDeadzone = checked((int)gamepadDeadzone.Value),
-            Notifications = notifications.IsOn, Tray = remoteTray.IsOn,
+            Notifications = notifications.IsOn, MediaControls = mediaControls.IsOn, Tray = remoteTray.IsOn,
             WindowsTerminalProfile = windowsTerminalProfile.IsOn,
             TouchModes = new(touchModes, StringComparer.Ordinal)
         };
@@ -630,6 +637,7 @@ internal sealed partial class MainWindow : Window
         await SyncAppearanceAsync();
         liveSettings = SettingsWithLauncherPolicies(profile.Settings);
         desktopNotifications.SharingChanged(profile.Settings.Notifications);
+        desktopMediaControls.SharingChanged(profile.Settings.MediaControls);
         var connection = controller.ConnectAsync(profile with { Settings = liveSettings }, credential);
         UpdateMode();
         await connection;
@@ -650,6 +658,7 @@ internal sealed partial class MainWindow : Window
         await controller.ApplyAsync(requested, expectedProfileId: profile.Id);
         liveSettings = requested;
         desktopNotifications.SharingChanged(profile.Settings.Notifications);
+        desktopMediaControls.SharingChanged(profile.Settings.MediaControls);
         await StoreProfileAsync(profile);
     });
     private async Task RunOperationAsync(Func<Task> operation, bool canCancelConnect = false)
@@ -887,6 +896,7 @@ internal sealed partial class MainWindow : Window
     private void Receive(JsonElement message)
     {
         if (desktopNotifications.Receive(message)) return;
+        if (desktopMediaControls.Receive(message)) return;
         string? type = message.GetProperty("type").GetString();
         if (type is "status" or "local_settings_applied") ReceiveTouchStatus(message);
         if (type is "status" or "local_settings_applied") ReceiveMicrophoneStatus(message);
@@ -1045,6 +1055,7 @@ internal sealed partial class MainWindow : Window
             {
                 quitting = true; activeDialog?.Hide(); InvalidateCatalog();
                 if (controlIpc is not null) await controlIpc.DisposeAsync();
+                await desktopMediaControls.DisposeAsync();
                 await desktopNotifications.DisposeAsync(); await controller.DisposeAsync(); tray.Dispose();
                 Close(); Application.Current.Exit();
             }

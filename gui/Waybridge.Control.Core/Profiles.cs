@@ -35,6 +35,7 @@ public sealed record ClientSettings
     public bool DragText { get; set; } = true;
     public string BadgePng { get; set; } = "";
     public bool Notifications { get; set; } = true;
+    public bool MediaControls { get; set; } = true;
     public bool Tray { get; set; } = true;
     public bool WindowsTerminalProfile { get; set; }
     public int Volume { get; set; } = 100;
