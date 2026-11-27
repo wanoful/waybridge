@@ -1,5 +1,9 @@
 //! Optional authenticated, paced UDP media with 8+1 XOR shards and TCP repair.
-use crate::{metrics, protocol};
+use crate::{
+    metrics, protocol,
+    udp_batch::{batch_len, send_batch},
+    udp_fec::{ReedSolomon, RS_GROUP},
+};
 #[path = "udp_pacing.rs"]
 mod pacing;
 use anyhow::Result;
@@ -11,7 +15,7 @@ use ring::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     net::{SocketAddr, TcpStream, UdpSocket},
     sync::{
@@ -28,6 +32,8 @@ const MAX_FRAME: usize = 8 * 1024 * 1024;
 const MAX_CACHE: usize = 32 * 1024 * 1024;
 const ENDPOINT_LIFETIME: Duration = Duration::from_secs(3);
 const REPAIR_FEEDBACK_GRACE: Duration = Duration::from_millis(20);
+const WINDOW_DEADLINE: Duration = Duration::from_millis(200);
+const BLACKHOLE_FALLBACK: Duration = Duration::from_secs(1);
 pub const REPAIR: u8 = 6;
 
 fn key(bytes: &[u8]) -> aead::LessSafeKey {
@@ -44,12 +50,45 @@ fn header(session: u64, counter: u64) -> Vec<u8> {
     out.extend(counter.to_be_bytes());
     out
 }
-pub fn repair(message: u64, kind: u8, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(9 + body.len());
+#[cfg(test)]
+fn repair(message: u64, kind: u8, body: &[u8]) -> Vec<u8> {
+    repair_packet(message, kind, None, body)
+}
+fn repair_packet(message: u64, kind: u8, route: Option<Route>, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + route.map_or(0, |_| 12) + body.len());
     out.extend(message.to_be_bytes());
-    out.push(kind);
+    out.push(kind | route.map_or(0, Route::flags));
+    if let Some(route) = route {
+        route.write_to(&mut out);
+    }
     out.extend(body);
     out
+}
+
+#[derive(Clone, Copy)]
+struct Route {
+    window: u32,
+    predecessor: u64,
+    independent: bool,
+}
+
+impl Route {
+    fn flags(self) -> u8 {
+        if self.independent {
+            0x80
+        } else {
+            0
+        }
+    }
+
+    fn write_to(self, bytes: &mut Vec<u8>) {
+        bytes.extend(self.window.to_be_bytes());
+        bytes.extend(self.predecessor.to_be_bytes());
+    }
+}
+
+pub(crate) fn independent(kind: u8, body: &[u8]) -> bool {
+    kind == protocol::FRAME || body.get(48..52) == Some(&[0, 0, 0, 1])
 }
 struct Cached {
     kind: u8,
@@ -61,6 +100,7 @@ struct Pending {
     data_boundary: Option<Instant>,
     udp: bool,
     repaired: bool,
+    route: Option<Route>,
 }
 #[derive(Default)]
 struct Cache {
@@ -69,11 +109,27 @@ struct Cache {
     frames: BTreeMap<u64, Cached>,
     pending: BTreeMap<u64, Pending>,
     pending_bytes: usize,
+    window_last: BTreeMap<u32, u64>,
+    last_udp_delivery: Option<Instant>,
+    tcp_until: Option<Instant>,
 }
 impl Cache {
     fn can_send(&self, size: usize) -> bool {
         self.pending.len() < 8
             && (self.pending.is_empty() || self.pending_bytes + size <= 64 * 1024 * 1024)
+    }
+
+    fn release(&mut self, messages: Vec<u64>) {
+        for message in messages {
+            if let Some(pending) = self.pending.remove(&message) {
+                self.pending_bytes -= pending.bytes;
+            }
+            if let Some(frame) = self.frames.remove(&message) {
+                self.bytes -= frame.body.len();
+            }
+        }
+        metrics::gauge("udp_pending_messages", self.pending.len());
+        metrics::gauge("udp_pending_bytes", self.pending_bytes);
     }
 }
 pub struct Transport {
@@ -82,6 +138,8 @@ pub struct Transport {
     tx: aead::LessSafeKey,
     rx: aead::LessSafeKey,
     offer: Value,
+    per_window: bool,
+    reed_solomon: bool,
     endpoint: Mutex<Option<(SocketAddr, Instant, u64)>>,
     counter: Mutex<u64>,
     cache: Mutex<Cache>,
@@ -115,18 +173,25 @@ impl Hub {
             mbps,
         }))
     }
-    pub fn session(&self) -> Result<Arc<Transport>> {
+    pub fn session(&self, per_window: bool, reed_solomon: bool) -> Result<Arc<Transport>> {
         let mut random = [0; 72];
         SystemRandom::new()
             .fill(&mut random)
             .map_err(|_| io::Error::other("UDP key generation"))?;
         let id = u64::from_be_bytes(random[..8].try_into().unwrap());
+        let reed_solomon = per_window && reed_solomon;
+        let mut offer = json!({"version":if per_window {2} else {1},"session":id.to_string(),"port":self.socket.local_addr()?.port(),"tx_key":STANDARD.encode(&random[8..40]),"rx_key":STANDARD.encode(&random[40..]),"chunk":CHUNK,"group":if reed_solomon {RS_GROUP} else {GROUP}});
+        if per_window {
+            offer["fec"] = json!(if reed_solomon { "rs" } else { "xor" });
+        }
         let session = Arc::new(Transport {
             socket: self.socket.clone(),
             session: id,
             tx: key(&random[8..40]),
             rx: key(&random[40..]),
-            offer: json!({"version":1,"session":id.to_string(),"port":self.socket.local_addr()?.port(),"tx_key":STANDARD.encode(&random[8..40]),"rx_key":STANDARD.encode(&random[40..]),"chunk":CHUNK,"group":GROUP}),
+            offer,
+            per_window,
+            reed_solomon,
             endpoint: Mutex::new(None),
             counter: Mutex::new(0),
             cache: Mutex::new(Cache::default()),
@@ -193,6 +258,67 @@ impl Transport {
     pub fn ready(&self) -> bool {
         self.endpoint.lock().unwrap().is_some()
     }
+    pub fn per_window(&self) -> bool {
+        self.per_window
+    }
+    pub fn forget_window(&self, window: u32) {
+        if !self.per_window {
+            return;
+        }
+        let mut cache = self.cache.lock().unwrap();
+        cache.window_last.remove(&window);
+        let expired = cache
+            .pending
+            .iter()
+            .filter(|(_, p)| p.route.is_some_and(|r| r.window == window))
+            .map(|(&message, _)| message)
+            .collect();
+        cache.release(expired);
+    }
+    pub fn repair_pending(&self, message: u64) -> bool {
+        !self.per_window || self.cache.lock().unwrap().pending.contains_key(&message)
+    }
+    /// Age is measured after the last data shard is submitted. A large frame
+    /// deliberately paced over a slow link is not a network loss.
+    pub fn expire_windows(&self, now: Instant) -> (BTreeSet<u32>, Option<Instant>) {
+        let mut cache = self.cache.lock().unwrap();
+        let mut expired = BTreeSet::new();
+        let mut next = None;
+        for pending in cache.pending.values() {
+            if let Some(deadline) = pending
+                .route
+                .and(pending.data_boundary)
+                .filter(|_| pending.udp)
+                .map(|sent| sent + WINDOW_DEADLINE)
+            {
+                if deadline <= now {
+                    expired.insert(pending.route.unwrap().window);
+                } else {
+                    next = Some(next.map_or(deadline, |previous: Instant| previous.min(deadline)));
+                }
+            }
+        }
+        if !expired.is_empty() {
+            if cache.last_udp_delivery.is_none_or(|ack| {
+                now.checked_duration_since(ack)
+                    .is_some_and(|age| age >= WINDOW_DEADLINE)
+            }) {
+                // Keepalives can still reach us when downstream UDP is
+                // blackholed. Resume with current frames through TCP and
+                // periodically probe UDP again.
+                cache.tcp_until = Some(now + BLACKHOLE_FALLBACK);
+                metrics::increment("udp_blackhole_tcp_fallback");
+            }
+            let messages = cache
+                .pending
+                .iter()
+                .filter(|(_, p)| p.route.is_some_and(|r| expired.contains(&r.window)))
+                .map(|(&message, _)| message)
+                .collect();
+            cache.release(messages);
+        }
+        (expired, next)
+    }
     pub fn live_pacing_kbps(&self) -> Option<u64> {
         if self.cancelled.load(Ordering::Relaxed)
             || !self
@@ -200,6 +326,12 @@ impl Transport {
                 .lock()
                 .unwrap()
                 .is_some_and(|(_, seen, _)| seen.elapsed() < ENDPOINT_LIFETIME)
+            || self
+                .cache
+                .lock()
+                .unwrap()
+                .tcp_until
+                .is_some_and(|until| Instant::now() < until)
         {
             return None;
         }
@@ -238,20 +370,17 @@ impl Transport {
                 .data_boundary
                 .filter(|sent| acked.udp && !acked.repaired && *sent <= now)
                 .map(|sent| now.duration_since(sent));
-            let pending: Vec<_> = c.pending.range(..=message).map(|(n, _)| *n).collect();
-            for n in pending {
-                if let Some(pending) = c.pending.remove(&n) {
-                    c.pending_bytes -= pending.bytes;
-                }
+            let window = acked.route.map(|route| route.window);
+            if window.is_some() && sample.is_some() {
+                c.last_udp_delivery = Some(now);
             }
-            let done: Vec<_> = c.frames.range(..=message).map(|(n, _)| *n).collect();
-            for n in done {
-                if let Some(v) = c.frames.remove(&n) {
-                    c.bytes -= v.body.len();
-                }
-            }
-            metrics::gauge("udp_pending_messages", c.pending.len());
-            metrics::gauge("udp_pending_bytes", c.pending_bytes);
+            let done = c
+                .pending
+                .range(..=message)
+                .filter(|(_, p)| window.is_none() || p.route.map(|r| r.window) == window)
+                .map(|(&n, _)| n)
+                .collect();
+            c.release(done);
             sample
         };
         if let Some(delivery) = sample {
@@ -269,18 +398,31 @@ impl Transport {
         }
         let (repair, udp_age) = {
             let mut c = self.cache.lock().unwrap();
+            let p = c.pending.get(&message)?;
+            let route = p.route;
+            let udp_age = p
+                .data_boundary
+                .filter(|_| p.udp && !p.repaired)
+                .and_then(|sent| now.checked_duration_since(sent));
+            if route.is_some() {
+                let age = udp_age?;
+                // A large TCP resend can occupy the shared socket after its
+                // presentation deadline. Leave that window to a fresh frame.
+                let limit = (self.pacing.lock().unwrap().kbps() * 3).min(64 * 1024) as usize;
+                if age < REPAIR_FEEDBACK_GRACE
+                    || age >= WINDOW_DEADLINE - Duration::from_millis(40)
+                    || p.bytes > limit
+                {
+                    return None;
+                }
+            }
             let v = c.frames.get_mut(&message)?;
             if now.duration_since(v.retry) < Duration::from_millis(50) {
                 return None;
             }
             v.retry = now;
-            let repair = repair(message, v.kind, &v.body);
-            let pending = c.pending.get_mut(&message)?;
-            let udp_age = pending
-                .data_boundary
-                .filter(|_| pending.udp && !pending.repaired)
-                .and_then(|sent| now.checked_duration_since(sent));
-            pending.repaired = true;
+            let repair = repair_packet(message, v.kind, route, &v.body);
+            c.pending.get_mut(&message)?.repaired = true;
             (repair, udp_age)
         };
         metrics::increment("udp_tcp_repair_requests");
@@ -305,7 +447,7 @@ impl Transport {
             .unwrap()
             .map(|(a, t, _)| (a, t.elapsed() < ENDPOINT_LIFETIME))
             .unwrap();
-        let (message, use_udp) = {
+        let (message, use_udp, route) = {
             let mut c = self.cache.lock().unwrap();
             if !c.can_send(body.len()) {
                 return Err(io::Error::new(
@@ -318,7 +460,16 @@ impl Transport {
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("UDP message sequence exhausted"))?;
             let message = c.next;
+            let route = self.per_window.then(|| {
+                let window = u32::from_be_bytes(body[..4].try_into().unwrap());
+                Route {
+                    window,
+                    predecessor: c.window_last.insert(window, message).unwrap_or(0),
+                    independent: independent(kind, body),
+                }
+            });
             let use_udp = alive
+                && c.tcp_until.is_none_or(|until| Instant::now() >= until)
                 && !body.is_empty()
                 && body.len() <= MAX_FRAME
                 && c.frames.len() < 16
@@ -330,6 +481,7 @@ impl Transport {
                     data_boundary: None,
                     udp: use_udp,
                     repaired: false,
+                    route,
                 },
             );
             c.pending_bytes += body.len();
@@ -346,82 +498,128 @@ impl Transport {
                     },
                 );
             }
-            (message, use_udp)
+            (message, use_udp, route)
         };
         if !use_udp {
             self.check_cancelled()?;
-            protocol::write_packet(tcp, REPAIR, &repair(message, kind, body))?;
+            protocol::write_packet(tcp, REPAIR, &repair_packet(message, kind, route, body))?;
             self.delivery_boundary(message, false);
             return Ok(());
         }
         let count = body.len().div_ceil(CHUNK);
-        let send = |typ: u8, index: usize, payload: &[u8]| -> io::Result<()> {
-            self.check_cancelled()?;
-            let mut plain = Vec::with_capacity(20 + payload.len());
-            plain.extend([typ, kind]);
-            plain.extend((index as u16).to_be_bytes());
-            plain.extend((count as u16).to_be_bytes());
-            plain.extend([0, 0]);
-            plain.extend((body.len() as u32).to_be_bytes());
-            plain.extend(message.to_be_bytes());
-            plain.extend(payload);
-            let counter = {
-                let mut c = self.counter.lock().unwrap();
-                *c = c
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("UDP nonce exhausted"))?;
-                *c
+        let ip_overhead = if address.is_ipv4() { 28 } else { 48 };
+        let rate = self.pacing.lock().unwrap().kbps().min(u32::MAX as u64) as u32;
+        let header_bytes = if route.is_some() { 32 } else { 20 };
+        let batch_capacity = batch_len(rate, 36 + header_bytes + CHUNK + ip_overhead);
+        let mut batch = Vec::with_capacity(batch_capacity);
+        let mut final_data = false;
+        let flush = |datagrams: &mut Vec<Vec<u8>>, final_data: bool| -> io::Result<()> {
+            if datagrams.is_empty() {
+                return Ok(());
+            }
+            // Account for every authenticated datagram and wait until all
+            // their pacing slots have elapsed before handing the batch over.
+            // The maximum batch spans roughly one millisecond of airtime.
+            let last_slot = {
+                let mut pacing = self.pacing.lock().unwrap();
+                let now = Instant::now();
+                datagrams
+                    .iter()
+                    .fold(now, |_, wire| pacing.reserve(now, wire.len() + ip_overhead))
             };
-            let mut wire = header(self.session, counter);
-            self.tx
-                .seal_in_place_append_tag(nonce(counter), aead::Aad::from(&wire), &mut plain)
-                .map_err(|_| io::Error::other("UDP encrypt"))?;
-            wire.extend(plain);
-            // Include UDP and the base IP header; link/VPN encapsulation is
-            // outside this socket's accounting.
-            let wire_bytes = wire.len() + if address.is_ipv4() { 28 } else { 48 };
-            let slot = self
-                .pacing
-                .lock()
-                .unwrap()
-                .reserve(Instant::now(), wire_bytes);
-            if let Some(delay) = slot.checked_duration_since(Instant::now()) {
+            if let Some(delay) = last_slot.checked_duration_since(Instant::now()) {
                 thread::sleep(delay);
             }
             self.check_cancelled()?;
-            if typ == 1 && index + 1 == count {
-                // A healthy low-RTT receiver can ACK the final DATA before
-                // trailing parity is sent. Publish the sample boundary before
-                // exposing that DATA, or every such ACK can miss training.
+            if final_data {
+                // Record completion before the final DATA is visible to a
+                // low-RTT receiver, even when parity is in that same batch.
                 self.delivery_boundary(message, true);
             }
-            self.socket.send_to(&wire, address)?;
+            send_batch(&self.socket, address, datagrams)?;
+            if datagrams.len() > 1 {
+                metrics::increment("udp_send_batches");
+                metrics::gauge("udp_send_batch_packets", datagrams.len());
+            }
+            datagrams.clear();
             Ok(())
         };
-        for first in (0..count).step_by(GROUP) {
-            let mut parity = [0u8; CHUNK];
-            for index in first..(first + GROUP).min(count) {
-                let block = &body[index * CHUNK..((index + 1) * CHUNK).min(body.len())];
-                for (a, b) in parity.iter_mut().zip(block) {
-                    *a ^= b;
-                }
-                if send(1, index, block).is_err() {
-                    self.check_cancelled()?;
-                    // Disable UDP training before TCP can expose this repair.
-                    self.delivery_boundary(message, false);
-                    protocol::write_packet(tcp, REPAIR, &repair(message, kind, body))?;
-                    metrics::increment("udp_tcp_send_fallback");
-                    return Ok(());
-                }
-            }
-            if send(2, first, &parity).is_err() {
+        let mut stage =
+            |typ: u8, index: usize, parity_number: u8, payload: &[u8]| -> io::Result<()> {
                 self.check_cancelled()?;
-                // Disable UDP training before TCP can expose this repair.
-                self.delivery_boundary(message, false);
-                protocol::write_packet(tcp, REPAIR, &repair(message, kind, body))?;
-                metrics::increment("udp_tcp_send_fallback");
-                return Ok(());
+                let mut plain = Vec::with_capacity(header_bytes + payload.len());
+                plain.extend([typ, kind | route.map_or(0, Route::flags)]);
+                plain.extend((index as u16).to_be_bytes());
+                plain.extend((count as u16).to_be_bytes());
+                plain.extend([parity_number, 0]);
+                plain.extend((body.len() as u32).to_be_bytes());
+                plain.extend(message.to_be_bytes());
+                if let Some(route) = route {
+                    route.write_to(&mut plain);
+                }
+                plain.extend(payload);
+                let counter = {
+                    let mut c = self.counter.lock().unwrap();
+                    *c = c
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("UDP nonce exhausted"))?;
+                    *c
+                };
+                let mut wire = header(self.session, counter);
+                self.tx
+                    .seal_in_place_append_tag(nonce(counter), aead::Aad::from(&wire), &mut plain)
+                    .map_err(|_| io::Error::other("UDP encrypt"))?;
+                wire.extend(plain);
+                batch.push(wire);
+                final_data |= typ == 1 && index + 1 == count;
+                if batch.len() >= batch_capacity {
+                    flush(&mut batch, final_data)?;
+                    final_data = false;
+                }
+                Ok(())
+            };
+        let mut send_media = || -> io::Result<()> {
+            let mut rs = self.reed_solomon.then(ReedSolomon::new).transpose()?;
+            let group = if self.reed_solomon { RS_GROUP } else { GROUP };
+            for first in (0..count).step_by(group) {
+                let end = (first + group).min(count);
+                let block =
+                    |index: usize| &body[index * CHUNK..((index + 1) * CHUNK).min(body.len())];
+                for index in first..end {
+                    stage(1, index, 0, block(index))?;
+                }
+                if let Some(rs) = &mut rs {
+                    let parity = rs.encode((first..end).map(block))?;
+                    // The final short group uses one shard per eight data
+                    // shards, with the same total redundancy as XOR.
+                    for (number, shard) in parity
+                        .iter()
+                        .take((end - first).div_ceil(GROUP))
+                        .enumerate()
+                    {
+                        stage(2, first, number as u8, shard)?;
+                    }
+                } else {
+                    let mut parity = [0u8; CHUNK];
+                    for index in first..end {
+                        for (a, b) in parity.iter_mut().zip(block(index)) {
+                            *a ^= b;
+                        }
+                    }
+                    stage(2, first, 0, &parity)?;
+                }
             }
+            Ok(())
+        };
+        if send_media()
+            .and_then(|()| flush(&mut batch, final_data))
+            .is_err()
+        {
+            self.check_cancelled()?;
+            // Disable UDP training before TCP can expose this repair.
+            self.delivery_boundary(message, false);
+            protocol::write_packet(tcp, REPAIR, &repair_packet(message, kind, route, body))?;
+            metrics::increment("udp_tcp_send_fallback");
         }
         Ok(())
     }
@@ -437,6 +635,8 @@ mod tests {
             tx: key(&[1; 32]),
             rx: key(&[2; 32]),
             offer: Value::Null,
+            per_window: false,
+            reed_solomon: false,
             endpoint: Mutex::new(None),
             counter: Mutex::new(0),
             cache: Mutex::new(Cache::default()),
@@ -509,6 +709,7 @@ mod tests {
                     data_boundary: Some(Instant::now() - Duration::from_millis(20)),
                     udp: true,
                     repaired: false,
+                    route: None,
                 },
             );
             cache.pending_bytes += 4;
@@ -526,6 +727,7 @@ mod tests {
                 data_boundary: None,
                 udp: true,
                 repaired: false,
+                route: None,
             },
         );
         cache.pending_bytes += 4;
@@ -568,6 +770,7 @@ mod tests {
                     }),
                     udp: true,
                     repaired: false,
+                    route: None,
                 },
             );
             cache.pending_bytes += 4;
@@ -592,6 +795,7 @@ mod tests {
                     data_boundary: Some(now - age),
                     udp: true,
                     repaired: false,
+                    route: None,
                 },
             );
             cache.pending_bytes += 1;
@@ -667,10 +871,65 @@ mod tests {
     #[test]
     fn keys_and_sessions_are_fresh() {
         let hub = Hub::new("127.0.0.1:0", 200).unwrap();
-        let a = hub.session().unwrap();
-        let b = hub.session().unwrap();
+        let a = hub.session(false, false).unwrap();
+        let b = hub.session(false, false).unwrap();
         assert_ne!(a.offer()["session"], b.offer()["session"]);
         assert_ne!(a.offer()["tx_key"], b.offer()["tx_key"]);
         assert_ne!(a.offer()["rx_key"], a.offer()["tx_key"]);
+    }
+
+    #[test]
+    fn window_feedback_leaves_other_streams_and_expires_unseen_frame() {
+        let mut transport = transport();
+        transport.per_window = true;
+        let now = Instant::now();
+        let mut cache = transport.cache.lock().unwrap();
+        for (message, window, age) in [
+            (1, 4, WINDOW_DEADLINE),
+            (2, 5, Duration::ZERO),
+            (3, 4, Duration::ZERO),
+            (4, 6, Duration::ZERO),
+            (5, 5, Duration::ZERO),
+        ] {
+            cache.pending.insert(
+                message,
+                Pending {
+                    bytes: 36,
+                    data_boundary: Some(now - age),
+                    udp: true,
+                    repaired: false,
+                    route: Some(Route {
+                        window,
+                        predecessor: 0,
+                        independent: true,
+                    }),
+                },
+            );
+            cache.pending_bytes += 36;
+            cache.frames.insert(
+                message,
+                Cached {
+                    kind: 1,
+                    body: vec![0; 36],
+                    retry: now,
+                },
+            );
+            cache.bytes += 36;
+        }
+        drop(cache);
+        transport.ack(5);
+        {
+            let cache = transport.cache.lock().unwrap();
+            assert_eq!(cache.pending.keys().copied().collect::<Vec<_>>(), [1, 3, 4]);
+            assert_eq!(cache.pending_bytes, 3 * 36);
+        }
+        let (expired, next) = transport.expire_windows(now);
+        assert_eq!(expired, BTreeSet::from([4]));
+        assert_eq!(next, Some(now + WINDOW_DEADLINE));
+        let cache = transport.cache.lock().unwrap();
+        assert_eq!(cache.pending.keys().copied().collect::<Vec<_>>(), [4]);
+        assert_eq!(cache.frames.keys().copied().collect::<Vec<_>>(), [4]);
+        assert_eq!(cache.bytes, 36);
+        assert_eq!(cache.pending_bytes, 36);
     }
 }

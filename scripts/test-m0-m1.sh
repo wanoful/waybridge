@@ -28,6 +28,8 @@ python3 tests/session_launch_policy_smoke.py
 python3 tests/desktop_overrides_smoke.py
 python3 service/tests/direct_service_smoke.py --compositor target/debug/waybridge
 python3 service/tests/app_icons_smoke.py
+dotnet build gui/Waybridge.Cli/Waybridge.Cli.csproj -c Release
+python3 service/tests/shell_smoke.py
 dotnet run --project gui/Waybridge.Control.Tests -c Release
 python3 tests/gui_direct_smoke.py
 python3 tests/gui_codec_smoke.py

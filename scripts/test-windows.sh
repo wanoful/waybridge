@@ -27,7 +27,13 @@ build/tests/ordered-sender-probe
 c++ -std=c++17 -Wall -Wextra -Werror -pthread tests/windows_media_budget_probe.cpp -o build/tests/windows-media-budget-probe
 build/tests/windows-media-budget-probe
 python3 tests/windows_tls_smoke.py
+c++ -std=c++17 -Wall -Wextra -Werror tests/audio_playout_probe.cpp -o build/tests/audio-playout-probe
+build/tests/audio-playout-probe
+c++ -std=c++17 -Wall -Wextra -Werror tests/presentation_cadence_probe.cpp -o build/tests/presentation-cadence-probe
+build/tests/presentation-cadence-probe
 python3 tests/udp_adaptive_smoke.py
+python3 tests/udp_flow_smoke.py
+xvfb-run -a python3 tests/udp_fec_smoke.py
 python3 tests/windows_direct_smoke.py
 python3 tests/gui_native_smoke.py
 python3 tests/windows_data_drag_smoke.py

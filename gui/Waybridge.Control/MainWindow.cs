@@ -429,9 +429,16 @@ internal sealed partial class MainWindow : Window
     {
         var content = new StackPanel { Spacing = 10, Children = { Heading(L("Diagnostics")), Card(Column(Heading(L("Current video path"), 17), diagnosticMediaPath), new Thickness(15)) } };
         foreach (var (key, label) in new[] { ("rtt", L("Network round-trip time")), ("rate", L("TCP receive rate")), ("updates", L("Window presentation updates (total)")),
-            ("decode_queue",L("Decoder queue time")), ("decode",L("Video decode time")), ("ui_queue",L("UI queue time")), ("present",L("Presentation submission")) })
+            ("decode_queue",L("Decoder queue time")), ("decode",L("Video decode time")), ("ui_queue",L("UI queue time")), ("present",L("Presentation submission")),
+            ("foreground_present_interval", L("Foreground frame submission interval")),
+            ("background_present_interval", L("Background frame submission interval")) })
         { var value = Text(Tr("Waiting for capture")); metrics[key] = value; content.Children.Add(Row(label, "", value)); }
         content.Children.Add(Text(L("Round-trip time, queues, decoding, and presentation are measured individually. They do not include total input-to-display latency."), 12));
+        foreach (var (key, label) in new[] { ("audio_output", L("Audio output")),
+            ("audio_arrival", L("Audio packet interval")), ("audio_buffer", L("Buffered audio")),
+            ("audio_gaps", L("Audio blocks skipped")), ("audio_underruns", L("Audio playback underruns")),
+            ("audio_discarded", L("Discarded playback audio")) })
+        { var value = Text(Tr("Waiting for capture")); metrics[key] = value; content.Children.Add(Row(label, "", value)); }
         var export = Button(L("Export diagnostics")); export.Click += async (_, _) => await GuardAsync(async () =>
         {
             var picker = new FileSavePicker { SuggestedFileName = "waybridge-diagnostics" };
@@ -924,7 +931,10 @@ internal sealed partial class MainWindow : Window
         else if (type == "timings")
         {
             var stages = message.GetProperty("stages");
-            foreach (var pair in new[] { ("control_rtt","rtt"), ("decode_queue","decode_queue"), ("ui_queue","ui_queue"), ("present","present") })
+            foreach (var pair in new[] { ("control_rtt","rtt"), ("decode_queue","decode_queue"), ("ui_queue","ui_queue"),
+                ("present","present"), ("audio_arrival","audio_arrival"),
+                ("foreground_present_interval","foreground_present_interval"),
+                ("background_present_interval","background_present_interval") })
                 if (stages.TryGetProperty(pair.Item1, out var value)) metrics[pair.Item2].Text = Tr("{0:F2} ms average / {1:F2} ms maximum", value.GetProperty("avg_ms").GetDouble(), value.GetProperty("max_ms").GetDouble());
             if (stages.TryGetProperty("control_rtt", out var rtt)) quickRtt.Text = $"{rtt.GetProperty("avg_ms").GetDouble():0.#} ms";
             foreach (var stage in stages.EnumerateObject())
@@ -940,6 +950,16 @@ internal sealed partial class MainWindow : Window
                 metrics["updates"].Text = Tr("{0:F1} updates/sec", (updates-lastUpdates)*1000.0/(tick-lastTick));
             }
             lastTick = tick; lastBytes = bytes; lastUpdates = updates;
+            if (message.TryGetProperty("audio_playback", out var playback))
+            {
+                var outputCodec = playback.GetProperty("codec").GetString() == "opus" ? "Opus" : "PCM";
+                var active = playback.GetProperty("device_active").GetBoolean();
+                metrics["audio_output"].Text = $"{outputCodec} · {(active ? Tr("Output active") : Tr("Output unavailable"))}";
+                metrics["audio_buffer"].Text = $"{playback.GetProperty("buffered_ms").GetDouble():0.#} ms";
+                metrics["audio_gaps"].Text = playback.GetProperty("sequence_gaps").GetUInt64().ToString();
+                metrics["audio_underruns"].Text = playback.GetProperty("underruns").GetUInt64().ToString();
+                metrics["audio_discarded"].Text = $"{playback.GetProperty("discarded_ms").GetDouble():0.#} ms";
+            }
             if (message.TryGetProperty("background", out var background)) UpdateBackground(background);
             if (controller.ActiveProfileId == selected.Id) touchApplicationNames.Clear();
             var windows = new List<RemoteWindow>();

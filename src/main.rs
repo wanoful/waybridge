@@ -4,7 +4,6 @@ mod activation;
 mod app_icon;
 mod appearance;
 mod audio;
-mod microphone;
 mod capture;
 mod clipboard_formats;
 mod color;
@@ -17,14 +16,15 @@ mod desktop_tray;
 mod dnd_lifecycle;
 mod drag;
 mod drag_visual;
-mod file_tree;
 mod file_transport;
+mod file_tree;
 mod gamepad;
 mod ime;
 mod input_focus;
 mod launch;
 mod media_budget;
 mod metrics;
+mod microphone;
 mod network;
 mod pen;
 mod protocol;
@@ -40,6 +40,8 @@ mod touchpad;
 mod transfer;
 mod transfer_worker;
 mod udp;
+mod udp_batch;
+mod udp_fec;
 mod video;
 mod window_icon;
 mod window_semantics;
@@ -1111,7 +1113,9 @@ impl App {
         match value["type"].as_str().unwrap_or("") {
             "microphone_enabled" => {
                 if let (Some(peer), Some(request), Some(enabled)) = (
-                    &self.peer, value["request_id"].as_u64(), value["enabled"].as_bool(),
+                    &self.peer,
+                    value["request_id"].as_u64(),
+                    value["enabled"].as_bool(),
                 ) {
                     peer.configure_microphone(request, enabled);
                 }
@@ -1554,18 +1558,10 @@ impl App {
                 self.clipboard = contents.clone();
                 self.x11.clipboard_generation = None;
                 if let Some(wm) = self.x11.wm.as_mut() {
-                    let _ = wm.new_selection(
-                        SelectionTarget::Clipboard,
-                        Some(types.clone()),
-                    );
+                    let _ = wm.new_selection(SelectionTarget::Clipboard, Some(types.clone()));
                 }
                 let seat = self.seat.clone();
-                set_data_device_selection(
-                    &self.dh,
-                    &seat,
-                    types,
-                    Arc::new(contents),
-                );
+                set_data_device_selection(&self.dh, &seat, types, Arc::new(contents));
             }
             "refresh" => {
                 for window in &mut self.windows {
@@ -1600,8 +1596,10 @@ impl App {
                 };
                 if peer.has_file_lane() {
                     match value["type"].as_str() {
-                        Some("tree_upload_chunk" | "tree_upload_end"
-                            | "upload_begin" | "upload_chunk" | "upload_end" | "upload_commit") => return,
+                        Some(
+                            "tree_upload_chunk" | "tree_upload_end" | "upload_begin"
+                            | "upload_chunk" | "upload_end" | "upload_commit",
+                        ) => return,
                         Some("tree_upload_cancel") => {
                             if let Some(batch) = value["batch"].as_u64() {
                                 peer.cancel_file_upload(batch);
@@ -2842,7 +2840,9 @@ fn main() -> Result<()> {
                 && gpu_device.is_some()
                 && video_codec.is_some_and(|c| c.hdr_variant().is_some()),
             audio: audio.is_some(),
-            microphone: audio.as_ref().map_or_else(std::sync::Weak::new, audio::Session::microphone),
+            microphone: audio
+                .as_ref()
+                .map_or_else(std::sync::Weak::new, audio::Session::microphone),
             udp,
             file_ingress: file_ingress.clone(),
         },
@@ -2911,7 +2911,10 @@ fn main() -> Result<()> {
     );
     output.set_preferred(mode);
     let transfers = transfer_worker::Worker::new(
-        PathBuf::from(&runtime).join("waybridge-inbox"), tx.clone(), file_ingress)?;
+        PathBuf::from(&runtime).join("waybridge-inbox"),
+        tx.clone(),
+        file_ingress,
+    )?;
     let fractional_scale = FractionalScaleManagerState::new::<App>(&dh);
     let viewporter = ViewporterState::new::<App>(&dh);
     let outputs = OutputManagerState::new_with_xdg_output::<App>(&dh);
@@ -3198,7 +3201,11 @@ fn main() -> Result<()> {
                         }
                         let value = &completed.message;
                         let tree = value["type"] == "tree_upload_commit";
-                        if tree && !completed.peer.file_upload_current(value["batch"].as_u64().unwrap_or(0)) {
+                        if tree
+                            && !completed
+                                .peer
+                                .file_upload_current(value["batch"].as_u64().unwrap_or(0))
+                        {
                             continue;
                         }
                         let dropped = value["drop"].as_bool() == Some(true);

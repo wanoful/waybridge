@@ -98,8 +98,8 @@ class Crypto:
 
 
 class DelayProxy:
-    """Delay the first control NACK by 600 ms, preserving TCP bytes and ordering."""
-    def __init__(self, address):
+    """Delay the first control NACK, preserving TCP bytes and ordering."""
+    def __init__(self, address, wait_for_credit=None):
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen()
@@ -109,6 +109,9 @@ class DelayProxy:
         self.offer_ready = threading.Event()
         self.offer = None
         self.retry_started = None
+        self.retry_released = None
+        self.wait_for_credit = wait_for_credit
+        self.tcp_media = []
         self.sockets = []
         self.workers = []
         self.errors = []
@@ -139,6 +142,8 @@ class DelayProxy:
         try:
             while not self.closed.is_set():
                 body = read_packet(source)
+                if not upstream and body[0] == 6:
+                    self.tcp_media.append(int.from_bytes(body[1:9], "big"))
                 if body[0] == 0:
                     value = json.loads(body[1:])
                     if not upstream and isinstance(value.get("udp_fec_v1"), dict):
@@ -146,7 +151,12 @@ class DelayProxy:
                         self.offer_ready.set()
                     if upstream and value.get("type") == "udp_retry" and self.retry_started is None:
                         self.retry_started = time.monotonic()
-                        self.closed.wait(0.6)
+                        if self.wait_for_credit is None:
+                            self.closed.wait(0.6)
+                        else:
+                            wait(self.wait_for_credit, seconds=4)
+                            self.closed.wait(0.1)
+                        self.retry_released = time.monotonic()
                 target.sendall(struct.pack(">I", len(body)) + body)
         except (EOFError, OSError):
             pass
@@ -184,9 +194,13 @@ class LossProxy:
         self.closed = threading.Event()
         self.events = []
         self.dropped = 0
+        self.lost_window = None
         self.errors = []
         self.thread = threading.Thread(target=self.run, args=(server, control, crypto))
         self.thread.start()
+
+    def should_drop(self, plaintext, message):
+        return message == 1
 
     def run(self, server, control, crypto):
         client = None
@@ -209,8 +223,10 @@ class LossProxy:
                                      packet[:20], packet[20:])
                 message = int.from_bytes(plain[12:20], "big")
                 self.events.append((time.monotonic(), message))
-                if message == 1:
+                if self.should_drop(plain, message):
                     self.dropped += 1
+                    if control.offer["version"] == 2:
+                        self.lost_window = int.from_bytes(plain[20:24], "big")
                 else:
                     self.stream.sendto(packet, client)
         except Exception as error:
@@ -224,7 +240,7 @@ class LossProxy:
 
 
 @contextmanager
-def server(mbps, log):
+def server(mbps, log, codec="png"):
     with tempfile.TemporaryDirectory(prefix="waybridge-udp-flow-") as directory:
         runtime = Path(directory)
         environment = {**os.environ, "XDG_RUNTIME_DIR": directory, "WAYLAND_DISPLAY": "flow-0"}
@@ -239,7 +255,7 @@ def server(mbps, log):
         process = subprocess.Popen([
             str(ROOT / "target/debug/waybridge"), "--listen", f"127.0.0.1:{tcp_port}",
             "--udp-listen", f"127.0.0.1:{udp_port}", "--udp-mbps", str(mbps),
-            "--socket", "flow-0", "--token-file", str(token_path), "--codec", "png",
+            "--socket", "flow-0", "--token-file", str(token_path), "--codec", codec,
         ], env=environment, stdout=log, stderr=log)
         try:
             wait(lambda: process.poll() is not None or (runtime / "flow-0").exists())
@@ -249,14 +265,16 @@ def server(mbps, log):
             stop(process)
 
 
-def head_repair(wine):
+def receiver_repairs(wine):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as endpoint:
         endpoint.bind(("127.0.0.1", 0))
-        result = subprocess.run(["wine", str(PROBE), "head", str(endpoint.getsockname()[1])],
-                                env=wine, capture_output=True, text=True, timeout=20)
-    assert result.returncode == 0, (result.stdout, result.stderr)
-    assert "delivered messages 1..17 in order" in result.stdout, result.stdout
-    print(result.stdout.strip(), flush=True)
+        for mode, marker in [("head", "delivered messages 1..17 in order"),
+                             ("window", "independent windows, reference ordering and stale repair rejection")]:
+            result = subprocess.run(["wine", str(PROBE), mode, str(endpoint.getsockname()[1])],
+                                    env=wine, capture_output=True, text=True, timeout=20)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert marker in result.stdout, result.stdout
+            print(result.stdout.strip(), flush=True)
 
 
 def twenty_windows(wine, crypto, log):
@@ -273,7 +291,10 @@ def twenty_windows(wine, crypto, log):
                                                       env=environment, stdout=output, stderr=output))
             wait(lambda: all("CONFIGURE 2 " in path.read_text() for path, _ in app_logs))
             assert all(app.poll() is None for app in applications)
-            relay = DelayProxy(("127.0.0.1", tcp_port))
+            def credit_window_full():
+                return loss is not None and {message for _, message in loss.events} >= set(range(1, 9))
+
+            relay = DelayProxy(("127.0.0.1", tcp_port), wait_for_credit=credit_window_full)
             loss = LossProxy(("127.0.0.1", udp_port), relay, crypto)
             path = BUILD / "udp-flow-twenty.bin"
             result = subprocess.run([
@@ -282,8 +303,8 @@ def twenty_windows(wine, crypto, log):
                 capture_output=True, text=True, timeout=45)
             assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
             assert not relay.errors and not loss.errors, (relay.errors, loss.errors)
-            assert relay.retry_started is not None and loss.dropped > 0
-            pending = {message for when, message in loss.events if when < relay.retry_started + 0.5}
+            assert relay.retry_released is not None and loss.dropped > 0
+            pending = {message for when, message in loss.events if when < relay.retry_released}
             assert pending == set(range(1, 9)), pending
             data = path.read_bytes()
             sequences = {}
@@ -304,7 +325,7 @@ def twenty_windows(wine, crypto, log):
                 data = data[4 + size:]
             assert len(sequences) == 20 and count >= 40, (len(sequences), count)
             print(f"PASS: 20 real windows, {count} ordered PNG frames, first message lost; "
-                  "600ms first NACK delay gates messages 1..8 and ACKs resume progress", flush=True)
+                  "withheld NACK gates messages 1..8 and ACKs resume progress", flush=True)
         finally:
             if loss is not None:
                 loss.close()
@@ -314,6 +335,69 @@ def twenty_windows(wine, crypto, log):
                 stop(app)
             for _, output in app_logs:
                 output.close()
+
+class BlackholeProxy(LossProxy):
+    def should_drop(self, _plaintext, _message):
+        return True
+
+
+def window_deadline(wine, crypto, log, *, blackhole=False, codec="png"):
+    with server(1000, log, codec) as (runtime, environment, token, tcp_port, udp_port):
+        app = relay = loss = None
+        try:
+            with (runtime / "app.log").open("w") as app_log:
+                app = subprocess.Popen([str(BUILD / "test-app"), "two"], env=environment,
+                                       stdout=app_log, stderr=app_log)
+                wait(lambda: "CONFIGURE 2 " in (runtime / "app.log").read_text())
+                relay = DelayProxy(("127.0.0.1", tcp_port))
+                proxy = BlackholeProxy if blackhole else LossProxy
+                loss = proxy(("127.0.0.1", udp_port), relay, crypto)
+                output = runtime / "window-deadline.bin"
+                result = subprocess.run(
+                    ["wine", str(PROBE), str(relay.port), token, str(output), "2"],
+                    env={**wine, "WAYBRIDGE_UDP_TEST_WINDOWS": "1",
+                         "WAYBRIDGE_UDP_TEST_NO_REFRESH": "1",
+                         "WAYBRIDGE_UDP_HOST": "127.0.0.1", "WAYBRIDGE_UDP_PORT": str(loss.port)},
+                    capture_output=True, text=True, timeout=20)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert relay.offer["version"] == 2 and loss.dropped > 0
+            assert not relay.errors and not loss.errors, (relay.errors, loss.errors)
+            assert "UDP per-window media active" in result.stdout, result.stdout
+            assert loss.lost_window, loss.lost_window
+            data = output.read_bytes()
+            windows = []
+            while data:
+                size, = struct.unpack(">I", data[:4])
+                assert len(data) >= 4 + size and size >= 37
+                kind, body = data[4], data[5:4 + size]
+                windows.append(int.from_bytes(body[:4], "big"))
+                if codec == "h264-nvenc":
+                    assert kind == 2 and int.from_bytes(body[48:52], "big") == 1
+                    color_bytes = int.from_bytes(body[52:56], "big")
+                    decoded = subprocess.check_output(
+                        ["ffmpeg", "-v", "error", "-f", "h264", "-i", "pipe:0",
+                         "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+                        input=body[60:60 + color_bytes], timeout=10)
+                    width, height = struct.unpack(">II", body[40:48])
+                    assert len(decoded) == 3 * width * height
+                else:
+                    assert kind == 1
+                data = data[4 + size:]
+            if blackhole:
+                assert len(set(windows)) == len(windows) == 2, windows
+                print("PASS: TCP restored both windows while every UDP media packet was blackholed", flush=True)
+            else:
+                assert len(windows) == 2 and windows[0] != loss.lost_window
+                assert windows[1] == loss.lost_window, windows
+                print(f"PASS: {codec.upper()} first-frame loss leaves another window live "
+                      "and refreshes only the lost window at its deadline", flush=True)
+        finally:
+            if loss is not None:
+                loss.close()
+            if relay is not None:
+                relay.close()
+            if app is not None:
+                stop(app)
 
 
 def disconnect(crypto, log):
@@ -406,8 +490,10 @@ def main():
             wine = {**os.environ, "DISPLAY": display, "WINEPREFIX": str(prefix), "WINEDEBUG": "-all",
                     "WINEDLLOVERRIDES": "winemenubuilder.exe=d;mscoree,mshtml="}
             subprocess.run(["wineboot", "-u"], env=wine, stdout=log, stderr=log, check=True, timeout=60)
-            head_repair(wine)
+            receiver_repairs(wine)
             twenty_windows(wine, crypto, log)
+            window_deadline(wine, crypto, log)
+            window_deadline(wine, crypto, log, blackhole=True)
             disconnect(crypto, log)
         finally:
             if read_fd is not None:

@@ -35,7 +35,7 @@ Waybridge requires:
 ```bash
 sudo pacman -S --needed \
   base-devel pkgconf rustup \
-  mesa libdrm wayland libxkbcommon ffmpeg glib2 python \
+  mesa libdrm wayland libxkbcommon ffmpeg opus glib2 python \
   xorg-xwayland pipewire-pulse libpulse fuse3 librsvg \
   xdg-desktop-portal xdg-desktop-portal-gtk
 # Optional (NVIDIA CUDA GL interop / experimental HDR):
@@ -48,7 +48,7 @@ sudo pacman -S --needed \
 sudo dnf install \
   gcc gcc-c++ pkgconf-pkg-config \
   mesa-libEGL-devel mesa-libGLES-devel libdrm-devel wayland-devel libxkbcommon-devel \
-  ffmpeg-free-devel glib2 python3 \
+  ffmpeg-free-devel opus-devel glib2 python3 \
   xorg-x11-server-Xwayland pipewire-pulseaudio pulseaudio-utils fuse3 librsvg2-tools \
   xdg-desktop-portal xdg-desktop-portal-gtk
 # Note: For NVENC support on Fedora, use RPM Fusion's ffmpeg-devel / ffmpeg packages.
@@ -60,7 +60,7 @@ sudo dnf install \
 sudo apt update && sudo apt install -y \
   build-essential pkg-config \
   libegl-dev libgles2-dev libdrm-dev libwayland-dev libxkbcommon-dev \
-  libavcodec-dev libavutil-dev libglib2.0-0 python3 \
+  libavcodec-dev libavutil-dev libopus-dev libglib2.0-0 python3 \
   xwayland pipewire-pulse pulseaudio-utils fuse3 librsvg2-bin \
   xdg-desktop-portal xdg-desktop-portal-gtk
 ```

@@ -9,7 +9,22 @@
 #include <string.h>
 #include <stdio.h>
 
-struct wb_encoder { AVCodecContext *codec; AVBSFContext *filter; AVFrame *frame; AVPacket *packet; int width, height; int gpu; };
+struct wb_encoder {
+    AVCodecContext *codec;
+    AVBSFContext *filter;
+    AVFrame *frame;
+    AVPacket *packet;
+    int width, height;
+    int gpu;
+    uint64_t submitted;
+    int since_key;
+};
+
+static void wb_encoder_set_rate_fields(AVCodecContext *ctx, int bitrate) {
+    ctx->bit_rate = (int64_t)bitrate * 1000;
+    ctx->rc_max_rate = ctx->bit_rate;
+    ctx->rc_buffer_size = (int)(ctx->bit_rate / ctx->framerate.num);
+}
 
 void wb_encoder_free(struct wb_encoder *encoder) {
     if (!encoder) return;
@@ -48,8 +63,7 @@ static struct wb_encoder *wb_encoder_new_input(int kind, int width, int height, 
         encoder->gpu=1;
     }
     ctx->time_base=(AVRational){1,fps}; ctx->framerate=(AVRational){fps,1};
-    ctx->bit_rate=(int64_t)bitrate*1000; ctx->rc_max_rate=ctx->bit_rate;
-    ctx->rc_buffer_size=(int)(ctx->bit_rate/fps);
+    wb_encoder_set_rate_fields(ctx, bitrate);
     ctx->gop_size=fps*2; ctx->max_b_frames=0;
     ctx->flags|=AV_CODEC_FLAG_LOW_DELAY;
     ctx->color_range=AVCOL_RANGE_MPEG; ctx->colorspace=hdr?AVCOL_SPC_BT2020_NCL:AVCOL_SPC_BT709;
@@ -114,11 +128,25 @@ struct wb_encoder *wb_encoder_new(int width, int height, int fps, int bitrate, c
     return wb_encoder_new_codec(2,width,height,fps,bitrate,error,size);
 }
 
+int wb_encoder_stage_bitrate(struct wb_encoder *encoder, int bitrate) {
+    AVCodecContext *ctx = encoder->codec;
+    int gop = ctx->gop_size;
+    // FFmpeg requests an IDR after a successful NVENC bitrate update. Its
+    // return value covers the encode, so require an unscheduled key packet to
+    // confirm the update. First frames and possible GOP boundaries are ambiguous.
+    if (bitrate < 1000 || bitrate > 200000 || gop < 2 ||
+        encoder->submitted % gop == 0 || encoder->since_key >= gop - 1)
+        return 0;
+    wb_encoder_set_rate_fields(ctx, bitrate);
+    return 1;
+}
+
 static int wb_encoder_encode_frame(struct wb_encoder *encoder, AVFrame *frame, int64_t sequence,
                                    int force_idr, const uint8_t **output, int64_t *pts, int *key) {
     frame->pts=sequence;frame->pict_type=force_idr?AV_PICTURE_TYPE_I:AV_PICTURE_TYPE_NONE;
     int result=avcodec_send_frame(encoder->codec,frame);
     if (result<0) return result;
+    encoder->submitted++;
     av_packet_unref(encoder->packet);
     result=avcodec_receive_packet(encoder->codec,encoder->packet);
     if (result<0) return result;
@@ -127,6 +155,10 @@ static int wb_encoder_encode_frame(struct wb_encoder *encoder, AVFrame *frame, i
     result=av_bsf_receive_packet(encoder->filter,encoder->packet);
     if (result<0) return result;
     *output=encoder->packet->data;*pts=encoder->packet->pts;*key=!!(encoder->packet->flags&AV_PKT_FLAG_KEY);
+    if (*key)
+        encoder->since_key = 0;
+    else if (encoder->since_key < encoder->codec->gop_size)
+        encoder->since_key++;
     return encoder->packet->size;
 }
 

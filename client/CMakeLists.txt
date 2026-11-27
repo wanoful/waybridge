@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(waybridge_client VERSION 0.3.0 LANGUAGES C CXX RC)
 if(MSVC)
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  set(OPUS_STATIC_RUNTIME ON)
 endif()
 include(FetchContent)
 if(POLICY CMP0135)
@@ -26,6 +27,27 @@ FetchContent_Declare(sdl3
 FetchContent_MakeAvailable(sdl3)
 configure_file("${sdl3_SOURCE_DIR}/LICENSE.txt" "${CMAKE_BINARY_DIR}/SDL3-LICENSE.txt" COPYONLY)
 
+set(OPUS_BUILD_SHARED_LIBRARY OFF)
+if(WIN32 AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$" OR CMAKE_GENERATOR_PLATFORM MATCHES "^ARM64($|,)"))
+  # Opus 1.6.1's CMake ARM intrinsics path fails with LLVM-MinGW on Windows ARM64.
+  set(OPUS_DISABLE_INTRINSICS ON)
+endif()
+FetchContent_Declare(opus
+  URL https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz
+  URL_HASH SHA256=6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1)
+FetchContent_MakeAvailable(opus)
+configure_file("${opus_SOURCE_DIR}/COPYING" "${CMAKE_BINARY_DIR}/Opus-LICENSE.txt" COPYONLY)
+
+set(NANORS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../native/third_party/nanors")
+add_library(waybridge-udp-fec STATIC
+  ../native/udp_fec.c
+  "${NANORS_DIR}/rs.c"
+  "${NANORS_DIR}/deps/obl/oblas_common.c"
+  "${NANORS_DIR}/deps/obl/oblas_lite.c")
+target_include_directories(waybridge-udp-fec PRIVATE "${NANORS_DIR}" "${NANORS_DIR}/deps/obl")
+target_compile_features(waybridge-udp-fec PRIVATE c_std_11)
+configure_file("${NANORS_DIR}/LICENSE" "${CMAKE_BINARY_DIR}/nanors-LICENSE.txt" COPYONLY)
+
 add_executable(waybridge-client main.cpp branding.rc)
 add_executable(waybridge-readonly-probe EXCLUDE_FROM_ALL ../tests/windows_readonly_probe.cpp)
 target_compile_features(waybridge-readonly-probe PRIVATE cxx_std_17)
@@ -36,13 +58,15 @@ add_executable(waybridge-udp-probe EXCLUDE_FROM_ALL ../tests/windows_udp_probe.c
 target_compile_features(waybridge-udp-probe PRIVATE cxx_std_17)
 target_compile_definitions(waybridge-udp-probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX WINVER=0x0A00 _WIN32_WINNT=0x0A00)
 target_include_directories(waybridge-udp-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(waybridge-udp-probe PRIVATE ws2_32 crypt32 bcrypt)
+target_compile_definitions(waybridge-udp-probe PRIVATE WAYBRIDGE_RS_FEC)
+target_link_libraries(waybridge-udp-probe PRIVATE ws2_32 crypt32 bcrypt waybridge-udp-fec)
 target_compile_features(waybridge-client PRIVATE cxx_std_17)
 target_compile_definitions(waybridge-client PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_definitions(waybridge-client PRIVATE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
 target_compile_definitions(waybridge-client PRIVATE WAYBRIDGE_VERSION="${PROJECT_VERSION}")
 set(WAYBRIDGE_VIEWER_LIBRARIES SDL3::SDL3-static advapi32 secur32 bcrypt ws2_32 gdiplus ole32 crypt32 shell32 uuid d3d11 dxgi dcomp d3dcompiler mfuuid wmcodecdspuuid strmiids oleaut32 windowscodecs imm32 dwmapi)
-target_link_libraries(waybridge-client PRIVATE ${WAYBRIDGE_VIEWER_LIBRARIES})
+target_compile_definitions(waybridge-client PRIVATE WAYBRIDGE_RS_FEC)
+target_link_libraries(waybridge-client PRIVATE ${WAYBRIDGE_VIEWER_LIBRARIES} Opus::opus waybridge-udp-fec)
 add_executable(waybridge-gamepad-probe EXCLUDE_FROM_ALL ../tests/windows_gamepad_probe.cpp)
 target_include_directories(waybridge-gamepad-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(waybridge-gamepad-probe PRIVATE cxx_std_17)

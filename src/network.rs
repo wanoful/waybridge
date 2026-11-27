@@ -1,5 +1,5 @@
 //! One authenticated viewer; bounded input, priority control, latest-frame-only video.
-use crate::{file_transport::FileLane, protocol, transfer_worker::Ingress, udp};
+use crate::{audio, file_transport::FileLane, protocol, transfer_worker::Ingress, udp};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -49,6 +49,9 @@ struct QueuedFrame {
     queued: Instant,
 }
 
+const AUDIO_CREDITS: usize = 4;
+const AUDIO_BACKLOG: usize = 4;
+
 #[derive(Default)]
 struct Queue {
     audio: VecDeque<Vec<u8>>,
@@ -64,6 +67,7 @@ struct Queue {
     active_codec: BTreeMap<u32, waybridge_codec::Codec>,
     gpu_disabled: BTreeSet<u32>,
     capture_refresh: BTreeSet<u32>,
+    video_refresh: BTreeSet<u32>,
     hdr_windows: BTreeSet<u32>,
     in_flight: BTreeMap<u32, BTreeMap<u64, std::time::Instant>>,
     closed_windows: BTreeSet<u32>,
@@ -108,7 +112,7 @@ impl Queue {
 }
 
 pub struct Peer {
-    audio_enabled: bool,
+    audio_codec: Option<audio::Codec>,
     audio_attached: AtomicBool,
     microphone: Option<crate::microphone::Input>,
     udp: Option<Arc<udp::Transport>>,
@@ -153,28 +157,50 @@ impl Peer {
         self.notifications_v1 && self.notifications_initial
     }
     pub fn audio_frame(&self, frame: Vec<u8>) {
-        if !self.audio_enabled || !self.audio_attached.load(Ordering::Relaxed) {
+        if !self.audio_attached.load(Ordering::Relaxed) {
             return;
         }
         let mut q = self.queue.lock().unwrap();
         if q.closed {
             return;
         }
-        while q.audio.len() >= 4 {
+        while q.audio.len() >= AUDIO_BACKLOG {
             q.audio.pop_front();
+            crate::metrics::increment("audio_unsent_drops");
         }
         q.audio.push_back(frame);
+        crate::metrics::gauge("audio_queued_blocks", q.audio.len());
         self.wake.notify_all();
     }
-    fn write_audio(&self, mut socket: TcpStream, alive: &AtomicBool) -> io::Result<()> {
+    fn write_audio(
+        &self,
+        mut socket: TcpStream,
+        alive: &AtomicBool,
+        codec: audio::Codec,
+    ) -> io::Result<()> {
+        let (mut encoder, ready): (_, &[u8]) = match codec {
+            audio::Codec::Pcm => (None, br#"{"type":"audio_ready"}"#),
+            audio::Codec::Opus => (
+                Some(audio::Encoder::new()?),
+                br#"{"type":"audio_ready","codec":"opus"}"#,
+            ),
+        };
+        protocol::write_packet(&mut socket, protocol::JSON, ready)?;
         loop {
-            let frame = {
+            let mut frame = {
                 let mut q = self.queue.lock().unwrap();
-                while (q.audio.is_empty() || q.audio_unacked.len() >= 4)
+                let mut credit_wait = None;
+                while (q.audio.is_empty() || q.audio_unacked.len() >= AUDIO_CREDITS)
                     && !q.closed
                     && alive.load(Ordering::Relaxed)
                 {
+                    if !q.audio.is_empty() {
+                        credit_wait.get_or_insert_with(Instant::now);
+                    }
                     q = self.wake.wait(q).unwrap();
+                }
+                if let Some(started) = credit_wait {
+                    crate::metrics::record("audio_credit_wait", started.elapsed());
                 }
                 if q.closed || !alive.load(Ordering::Relaxed) {
                     return Ok(());
@@ -182,9 +208,14 @@ impl Peer {
                 let frame = q.audio.pop_front().unwrap();
                 q.audio_unacked
                     .insert(u64::from_be_bytes(frame[12..20].try_into().unwrap()));
+                crate::metrics::gauge("audio_queued_blocks", q.audio.len());
+                crate::metrics::gauge("audio_unacked_blocks", q.audio_unacked.len());
                 frame
             };
-            protocol::write_packet(&mut socket, 3, &frame)?;
+            if let Some(encoder) = &mut encoder {
+                encoder.encode(&mut frame)?;
+            }
+            protocol::write_packet(&mut socket, protocol::AUDIO, &frame)?;
         }
     }
     pub fn data_drag_enabled(&self) -> bool {
@@ -239,8 +270,11 @@ impl Peer {
     }
     pub fn configure_microphone(&self, request: u64, enabled: bool) {
         if let Some(microphone) = &self.microphone {
-            if let Some(allowed) = microphone.configure(request, || enabled && self.desktop_input()) {
-                self.control(json!({"type":"microphone_state","request_id":request,"allowed":allowed}));
+            if let Some(allowed) = microphone.configure(request, || enabled && self.desktop_input())
+            {
+                self.control(
+                    json!({"type":"microphone_state","request_id":request,"allowed":allowed}),
+                );
             }
         }
     }
@@ -291,7 +325,8 @@ impl Peer {
     }
     pub fn cancel_file_upload(&self, batch: u64) {
         if self.has_file_lane() {
-            self.file_upload_cancelled.fetch_max(batch, Ordering::Relaxed);
+            self.file_upload_cancelled
+                .fetch_max(batch, Ordering::Relaxed);
         }
     }
     pub fn file_upload_current(&self, batch: u64) -> bool {
@@ -310,8 +345,12 @@ impl Peer {
             .store(generation, Ordering::Relaxed);
     }
     pub fn file_export_current(&self, generation: u64) -> bool {
-        !self.is_closed() && self.file_export_generation.load(Ordering::Relaxed) == generation
-            && self.files.as_ref().is_none_or(|files| files.clipboard_current(generation))
+        !self.is_closed()
+            && self.file_export_generation.load(Ordering::Relaxed) == generation
+            && self
+                .files
+                .as_ref()
+                .is_none_or(|files| files.clipboard_current(generation))
     }
 
     pub fn begin_resize(&self, id: u32, width: u32, height: u32, started: Instant) {
@@ -340,6 +379,7 @@ impl Peer {
     pub fn frame(&self, id: u32, bytes: Vec<u8>) {
         let mut q = self.queue.lock().unwrap();
         if !q.closed && !q.closed_windows.contains(&id) {
+            q.video_refresh.remove(&id);
             if self.acknowledgements {
                 if let Some(previous) = q.frames.get(&id) {
                     let sequences: Vec<_> = previous
@@ -403,6 +443,9 @@ impl Peer {
     pub fn take_capture_refresh(&self, id: u32) -> bool {
         self.queue.lock().unwrap().capture_refresh.remove(&id)
     }
+    pub fn needs_video_refresh(&self, id: u32) -> bool {
+        self.queue.lock().unwrap().video_refresh.contains(&id)
+    }
     pub fn udp_video_rate(&self) -> Option<u64> {
         self.udp.as_ref()?.live_pacing_kbps()
     }
@@ -436,6 +479,14 @@ impl Peer {
     pub fn video_frame(&self, id: u32, codec: waybridge_codec::Codec, bytes: Vec<u8>) {
         let mut q = self.queue.lock().unwrap();
         if !q.closed && !q.closed_windows.contains(&id) && !q.png_only.contains(&id) {
+            if q.video_refresh.contains(&id) {
+                if !udp::independent(protocol::VIDEO, &bytes) {
+                    // An encode already running when its old stream expired
+                    // cannot become the first frame of the restored chain.
+                    return;
+                }
+                q.video_refresh.remove(&id);
+            }
             if self.acknowledgements {
                 q.in_flight.entry(id).or_default().insert(
                     u64::from_be_bytes(bytes[12..20].try_into().unwrap()),
@@ -477,10 +528,15 @@ impl Peer {
         q.active_codec.remove(&id);
         q.gpu_disabled.remove(&id);
         q.capture_refresh.remove(&id);
+        q.video_refresh.remove(&id);
         q.hdr_windows.remove(&id);
         q.in_flight.remove(&id);
         q.resizes.remove(&id);
         q.icons.remove(&id);
+        if let Some(udp) = &self.udp {
+            udp.forget_window(id);
+        }
+        self.wake.notify_all();
     }
     /// File workers may wait for network capacity; the compositor never does.
     pub fn bulk(&self, message: Value) -> bool {
@@ -513,11 +569,29 @@ impl Peer {
     }
     fn write_loop(&self, mut socket: TcpStream, media: bool) -> io::Result<()> {
         let mut udp_started = false;
+        let window_udp = self.udp.as_ref().filter(|udp| media && udp.per_window());
         loop {
             let (kind, bytes, resize) = {
                 let mut q = self.queue.lock().unwrap();
                 let frames_allowed = media || !self.split_media;
                 loop {
+                    let mut deadline = None;
+                    if let Some(udp) = window_udp {
+                        let (expired, next) = udp.expire_windows(Instant::now());
+                        deadline = next;
+                        for id in expired {
+                            if !q.closed_windows.contains(&id) {
+                                q.frames.remove(&id);
+                                q.in_flight.remove(&id);
+                                q.video_refresh.insert(id);
+                                q.capture_refresh.insert(id);
+                                crate::metrics::increment("udp_window_refresh");
+                            }
+                        }
+                        q.repairs.retain(|bytes| {
+                            udp.repair_pending(u64::from_be_bytes(bytes[..8].try_into().unwrap()))
+                        });
+                    }
                     let frame_ready = q.next_frame().is_some_and(|(_, size)| {
                         !media
                             || self
@@ -536,7 +610,14 @@ impl Peer {
                     if q.closed || ready {
                         break;
                     }
-                    q = self.wake.wait(q).unwrap();
+                    q = if let Some(deadline) = deadline {
+                        self.wake
+                            .wait_timeout(q, deadline.saturating_duration_since(Instant::now()))
+                            .unwrap()
+                            .0
+                    } else {
+                        self.wake.wait(q).unwrap()
+                    };
                 }
                 if q.closed {
                     return Ok(());
@@ -580,7 +661,16 @@ impl Peer {
                     )?;
                     udp_started = true;
                 }
-                self.udp.as_ref().unwrap().send(kind, &bytes, &mut socket)?;
+                let udp = self.udp.as_ref().unwrap();
+                udp.send(kind, &bytes, &mut socket)?;
+                if udp.per_window() {
+                    let id = u32::from_be_bytes(bytes[..4].try_into().unwrap());
+                    if self.window_closed(id) {
+                        // Window close can race with a frame already removed
+                        // from the queue by this writer.
+                        udp.forget_window(id);
+                    }
+                }
             } else {
                 protocol::write_packet(&mut socket, kind, &bytes)?;
             }
@@ -657,7 +747,9 @@ pub fn listen(
                 }
                 if hello["channel"] == "microphone" {
                     let peer = session.lock().unwrap().as_ref().and_then(|(key, peer)| {
-                        (hello["media_key"].as_str() == Some(key)).then(|| peer.upgrade()).flatten()
+                        (hello["media_key"].as_str() == Some(key))
+                            .then(|| peer.upgrade())
+                            .flatten()
                     });
                     if let (Some(peer), Some(request)) = (peer, hello["request_id"].as_u64()) {
                         if let Some(microphone) = &peer.microphone {
@@ -673,7 +765,10 @@ pub fn listen(
                             .flatten()
                     });
                     let Some(peer) = peer else { return };
-                    if !peer.audio_enabled || peer.audio_attached.swap(true, Ordering::SeqCst) {
+                    let Some(codec) = peer.audio_codec else {
+                        return;
+                    };
+                    if peer.audio_attached.swap(true, Ordering::SeqCst) {
                         return;
                     }
                     let Ok(mut ack_socket) = socket.try_clone() else {
@@ -710,6 +805,10 @@ pub fn listen(
                             let mut q = reader_peer.queue.lock().unwrap();
                             if q.audio_unacked.contains(&sequence) {
                                 q.audio_unacked.retain(|s| *s > sequence);
+                                crate::metrics::gauge(
+                                    "audio_unacked_blocks",
+                                    q.audio_unacked.len(),
+                                );
                                 reader_peer.wake.notify_all();
                             }
                         }
@@ -718,12 +817,9 @@ pub fn listen(
                         reader_alive.store(false, Ordering::Relaxed);
                         reader_peer.wake.notify_all();
                     });
-                    let _ = protocol::write_packet(
-                        &mut socket,
-                        protocol::JSON,
-                        b"{\"type\":\"audio_ready\"}",
-                    );
-                    let _ = peer.write_audio(socket, &alive);
+                    if let Err(error) = peer.write_audio(socket, &alive, codec) {
+                        tracing::debug!(%error, "audio connection stopped");
+                    }
                     if let Some(socket) = shutdown {
                         let _ = socket.shutdown(std::net::Shutdown::Both);
                     }
@@ -736,7 +832,9 @@ pub fn listen(
                 }
                 if hello["channel"] == "files" {
                     let peer = session.lock().unwrap().as_ref().and_then(|(key, peer)| {
-                        (hello["media_key"].as_str() == Some(key)).then(|| peer.upgrade()).flatten()
+                        (hello["media_key"].as_str() == Some(key))
+                            .then(|| peer.upgrade())
+                            .flatten()
                     });
                     if let Some(peer) = peer.filter(|peer| !peer.is_closed()) {
                         if let Some(files) = &peer.files {
@@ -771,12 +869,22 @@ pub fn listen(
                     && hello["split_media"] == true
                     && hello["frame_ack"] == true
                 {
-                    udp.and_then(|hub| hub.session().ok())
+                    udp.and_then(|hub| {
+                        hub.session(hello["udp_window_v2"] == true, hello["udp_rs_v1"] == true)
+                            .ok()
+                    })
+                } else {
+                    None
+                };
+                let audio_codec = if audio && hello["audio_opus_v1"] == true {
+                    Some(audio::Codec::Opus)
+                } else if audio && hello["audio_pcm"] == true {
+                    Some(audio::Codec::Pcm)
                 } else {
                     None
                 };
                 let peer = Arc::new(Peer {
-                    audio_enabled: audio && hello["audio_pcm"].as_bool().unwrap_or(false),
+                    audio_codec,
                     audio_attached: AtomicBool::new(false),
                     microphone: (hello["microphone_v1"] == true && microphone.strong_count() > 0)
                         .then(|| crate::microphone::Input::new(microphone)),
@@ -784,7 +892,8 @@ pub fn listen(
                     queue: Mutex::new(Queue::default()),
                     wake: Condvar::new(),
                     file_tree: hello["file_tree"].as_bool().unwrap_or(false),
-                    files: (hello["file_tree"] == true && hello["file_channel_v1"] == true).then(FileLane::new),
+                    files: (hello["file_tree"] == true && hello["file_channel_v1"] == true)
+                        .then(FileLane::new),
                     file_epoch: AtomicU64::new(0),
                     file_export_generation: AtomicU64::new(0),
                     file_upload_cancelled: AtomicU64::new(0),
@@ -880,7 +989,7 @@ pub fn listen(
                     "data_drag_result_v1",
                     "activation_v1",
                 ];
-                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media,"file_channel_v1":peer.has_file_lane(), "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1,"notifications_v1":peer.notifications_v1,"tray_v1":peer.tray_v1,"pen_v1":hello["pen_v1"] == true,"pen_settings_v1":hello["pen_v1"] == true,"pen_drag_v1":hello["pen_v1"] == true && hello["pen_drag_v1"] == true,"gamepad_v1":hello["gamepad_v1"] == true,"gamepad_settings_v1":hello["gamepad_v1"] == true,"gamepad_reconnect_v1":hello["gamepad_v1"] == true && hello["gamepad_reconnect_v1"] == true,"touch_v1":hello["touch_v1"] == true, "touch_settings_v1":hello["touch_v1"] == true,"touch_interaction_v1":hello["touch_v1"] == true && hello["touch_interaction_v1"] == true,"touchpad_v1":hello["touchpad_v1"] == true,"data_drag_v1":peer.data_drag_v1,"data_drag_result_v1":peer.data_drag_v1,"activation_v1":peer.activation_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_enabled, "microphone_v1":peer.microphone.is_some(), "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":features}));
+                peer.control(json!({"type":"hello", "version":protocol::VERSION, "codec":"mixed", "split_media":peer.split_media,"file_channel_v1":peer.has_file_lane(), "media_key":key,"udp_fec_v1":peer.udp.as_ref().map(|u|u.offer()), "cursor_v1":peer.cursor_v1,"window_icon_v1":peer.window_icon_v1,"window_semantics_v1":peer.window_semantics_v1,"notifications_v1":peer.notifications_v1,"tray_v1":peer.tray_v1,"pen_v1":hello["pen_v1"] == true,"pen_settings_v1":hello["pen_v1"] == true,"pen_drag_v1":hello["pen_v1"] == true && hello["pen_drag_v1"] == true,"gamepad_v1":hello["gamepad_v1"] == true,"gamepad_settings_v1":hello["gamepad_v1"] == true,"gamepad_reconnect_v1":hello["gamepad_v1"] == true && hello["gamepad_reconnect_v1"] == true,"touch_v1":hello["touch_v1"] == true, "touch_settings_v1":hello["touch_v1"] == true,"touch_interaction_v1":hello["touch_v1"] == true && hello["touch_interaction_v1"] == true,"touchpad_v1":hello["touchpad_v1"] == true,"data_drag_v1":peer.data_drag_v1,"data_drag_result_v1":peer.data_drag_v1,"activation_v1":peer.activation_v1, "hdr":hdr_enabled, "audio_pcm":peer.audio_codec == Some(audio::Codec::Pcm), "audio_opus_v1":peer.audio_codec == Some(audio::Codec::Opus), "microphone_v1":peer.microphone.is_some(), "color_spaces":if hdr_enabled {vec!["bt709_sdr","bt2020_pq"]}else{vec!["bt709_sdr"]}, "color_depths":if hdr_enabled {vec![8,10]}else{vec![8]}, "codecs":["png_rgba","h264_alpha","hevc_alpha","av1_alpha","hevc_main10_pq_alpha16","av1_main10_pq_alpha16"], "features":features}));
                 if tx.send(Event::Connected(peer.clone())).is_ok() {
                     let _ = tx.send(Event::Message(hello));
                     let _ = socket.set_read_timeout(None);

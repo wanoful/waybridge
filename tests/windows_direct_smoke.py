@@ -205,7 +205,13 @@ def main():
                 native.send(type="send_files", paths=["Z:" + str(source)])
                 native.until(lambda event: event.get("type") == "transfer" and event.get("event") == "tree_upload_ready" and event.get("stage") == "commit")
                 if audio_device:
+                    wait(lambda: "Audio stream codec: opus" in native.log.read_text())
                     wait(lambda: "WASAPI 48 kHz stereo audio playback active" in native.log.read_text())
+                    playback = native.until(lambda event: event.get("type") == "status" and
+                                            event.get("audio_playback", {}).get("device_active"))
+                    playback = playback["audio_playback"]
+                    assert playback["codec"] == "opus" and 0 <= playback["buffered_ms"] <= 100
+                    assert "sequence_gaps" in playback and "underruns" in playback
                     sink_path = temporary / "sink"
                     code = "import os,pathlib;pathlib.Path(" + repr(str(sink_path)) + ").write_text(os.environ['PULSE_SINK'])"
                     ok(dict(op="launch", session=session["name"], argv=["python3", "-I", "-c", code]))
@@ -255,7 +261,7 @@ def main():
                     contents = path.read_text(errors="replace")
                     assert not any(secret in contents for secret in secrets), "credential leaked into fixture logs"
                 print("PASS: actual rustls service + Schannel native control/media, pixels, input, live settings, Unicode upload, retained-session reconnect, pin/auth rejection and active-client revocation")
-                print("PASS: encrypted native audio via private WASAPI endpoint and null-sink loopback" if audio_device else
+                print("PASS: encrypted native Opus audio via private WASAPI endpoint and null-sink loopback" if audio_device else
                       "SKIP: physical/native audio endpoint unavailable; control and media passed")
             finally:
                 if session and cleanup_credentials:

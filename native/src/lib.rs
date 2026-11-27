@@ -43,6 +43,7 @@ unsafe extern "C" {
         key: *mut c_int,
     ) -> c_int;
     fn wb_encoder_free(encoder: *mut c_void);
+    fn wb_encoder_stage_bitrate(encoder: *mut c_void, bitrate: c_int) -> c_int;
     fn wb_encoder_encode(
         encoder: *mut c_void,
         rgba: *const u8,
@@ -184,6 +185,14 @@ impl Encoder {
                     .into_owned()
             })
     }
+    /// Stage a live rate update for the next encode. An unforced key packet
+    /// from that encode confirms it. Recreate the encoder if confirmation fails.
+    pub fn stage_bitrate(&mut self, bitrate: u32) -> bool {
+        if !(1000..=200000).contains(&bitrate) {
+            return false;
+        }
+        unsafe { wb_encoder_stage_bitrate(self.handle.as_ptr(), bitrate as c_int) != 0 }
+    }
     pub fn encode(
         &mut self,
         rgba: &[u8],
@@ -286,7 +295,7 @@ pub fn probe_10bit(codec: Codec) -> Result<(u32, u32, u32), String> {
 
 #[cfg(test)]
 mod codec_tests {
-    use super::Codec;
+    use super::{Codec, Encoder};
 
     #[test]
     fn video_kinds_round_trip_without_claiming_other_channels() {
@@ -295,6 +304,25 @@ mod codec_tests {
         }
         for kind in [0, 1, 3, 6, 9, 255] {
             assert_eq!(Codec::from_kind(kind), None);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU with H.264, HEVC and AV1 NVENC"]
+    fn live_bitrate_changes_return_independent_packets() {
+        let rgba = vec![128; 320 * 180 * 4];
+        for codec in [Codec::H264, Codec::Hevc, Codec::Av1] {
+            let mut encoder = Encoder::with_codec(codec, 320, 180, 60, 6000).unwrap();
+            assert!(!encoder.stage_bitrate(3000), "{codec:?} first frame");
+            assert!(encoder.encode(&rgba, 1, true).unwrap().1, "{codec:?}");
+            assert!(!encoder.encode(&rgba, 2, false).unwrap().1, "{codec:?}");
+            assert!(!encoder.stage_bitrate(999), "{codec:?} invalid rate");
+            assert!(encoder.stage_bitrate(1500), "{codec:?}");
+            assert!(encoder.encode(&rgba, 3, false).unwrap().1, "{codec:?}");
+            assert!(!encoder.encode(&rgba, 4, false).unwrap().1, "{codec:?}");
+            assert!(encoder.stage_bitrate(6000), "{codec:?}");
+            assert!(encoder.encode(&rgba, 5, false).unwrap().1, "{codec:?}");
+            assert!(!encoder.encode(&rgba, 6, false).unwrap().1, "{codec:?}");
         }
     }
 }

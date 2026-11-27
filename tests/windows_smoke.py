@@ -221,7 +221,7 @@ def main():
             if proxy:
                 assert proxy.received>0,"test must carry actual UDP shards"
                 log.flush()
-                assert "UDP ordered media active" in Path(log.name).read_text()
+                assert "UDP per-window media active" in Path(log.name).read_text()
 
 
 if __name__=="__main__":main()

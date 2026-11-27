@@ -66,8 +66,60 @@ static int headRepair(unsigned port) {
   return result;
 }
 
+static int windowRepair(unsigned port) {
+  WSADATA data{};
+  if (WSAStartup(MAKEWORD(2, 2), &data))
+    return 2;
+  SetEnvironmentVariableW(L"WAYBRIDGE_UDP_HOST", L"127.0.0.1");
+  SetEnvironmentVariableW(L"WAYBRIDGE_UDP_PORT", nullptr);
+  int result = 0;
+  {
+    UdpMedia udp;
+    std::vector<uint32_t> order;
+    try {
+      const std::string key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+      udp.start(
+          {{"version", 2}, {"session", "77"}, {"port", port},
+           {"chunk", 1024}, {"group", 8}, {"tx_key", key}, {"rx_key", key}},
+          [&](uint8_t, std::vector<uint8_t> body) { order.push_back(u32(body.data() + 16)); },
+          [](const Json &) {});
+      udp.activate();
+      auto repair = [&](uint8_t message, uint8_t window, uint8_t previous, bool independent) {
+        std::vector<uint8_t> packet(21 + 60);
+        packet[7] = message;
+        packet[8] = independent ? 0x82 : 2;
+        packet[12] = packet[21 + 3] = window;
+        packet[20] = previous;
+        packet[21 + 19] = message;
+        packet[21 + 51] = independent;
+        udp.repair(packet.data(), packet.size());
+      };
+      repair(1, 1, 0, true);
+      repair(3, 1, 2, false);
+      repair(4, 2, 0, true);
+      if (order != std::vector<uint32_t>{1, 4})
+        throw std::runtime_error("a missing reference blocked another window or released a predictive frame");
+      repair(5, 1, 3, true);
+      repair(2, 1, 1, false);
+      repair(6, 1, 5, false);
+      if (order != std::vector<uint32_t>{1, 4, 5, 6})
+        throw std::runtime_error("the refreshed chain accepted a stale frame");
+      std::cout << "PASS: independent windows, reference ordering and stale repair rejection\n";
+    } catch (const std::exception &error) {
+      std::cerr << error.what() << '\n';
+      result = 7;
+    }
+    running = false;
+    udp.stop();
+  }
+  WSACleanup();
+  return result;
+}
+
 int wmain(int argc, wchar_t **argv) {
   if (argc == 3 && std::wstring(argv[1]) == L"head")
     return headRepair(unsigned(std::stoul(argv[2])));
+  if (argc == 3 && std::wstring(argv[1]) == L"window")
+    return windowRepair(unsigned(std::stoul(argv[2])));
   return original_udp_probe_main(argc, argv);
 }

@@ -67,7 +67,7 @@ class FeedbackRelay(DelayProxy):
                 pass
 
 
-def run(wine, crypto, log, log_path, nvenc, two_windows):
+def run(wine, crypto, log, log_path, nvenc, two_windows, require_live_bitrate):
     with tempfile.TemporaryDirectory(prefix='waybridge-udp-adaptive-') as directory:
         runtime = Path(directory)
         env = {**os.environ, 'XDG_RUNTIME_DIR': directory, 'WAYLAND_DISPLAY': 'adaptive-0'}
@@ -144,30 +144,40 @@ def run(wine, crypto, log, log_path, nvenc, two_windows):
             report = dict(frames=count, dropped_shards=loss.dropped, delayed_acks=delayed,
                           pacing_kbps=rates, counters=counters)
             if nvenc:
-                encoder_rates = {
-                    int(epoch): int(rate) for rate, epoch in
-                    re.findall(r'bitrate_kbps=(\d+).*?epoch=(\d+)', trace)
-                }
+                encoder_rates = {}
+                for window, rate, pacing, active, epoch, sequence in re.findall(
+                    r'NVENC (?:ultra-low-latency encoder active|bitrate reconfigured in place)'
+                    r' id=(\d+).*?bitrate_kbps=(\d+)(?: udp_pacing_kbps=(\d+))?'
+                    r' active_windows=(\d+) epoch=(\d+)(?: sequence=(\d+))?', trace,
+                ):
+                    encoder_rates.setdefault(int(window), []).append(
+                        (int(epoch), int(rate), int(pacing or 0), int(active),
+                         int(sequence) if sequence else None)
+                    )
                 epoch_rates = {
-                    window: check_epochs(frames, encoder_rates, bitrate)
+                    window: check_epochs(frames, encoder_rates[window], bitrate, require_live_bitrate)
                     for window, frames in video.items()
                 }
-                targets = {window: [rate for _, rate in epochs] for window, epochs in epoch_rates.items()}
+                targets = {window: [rate for _, rate, _, _, _ in epochs] for window, epochs in epoch_rates.items()}
                 if two_windows:
                     shared_ceiling = ceiling * 3 // 8
-                    shares = {
-                        int(epoch): max(1000, int(pacing) * 3 // 8)
-                        for pacing, epoch in re.findall(r'udp_pacing_kbps=(\d+) active_windows=2 epoch=(\d+)', trace)
-                    }
                     for window, epochs in epoch_rates.items():
-                        assert any(epoch in shares and rate == shares[epoch] for epoch, rate in epochs), (epochs, shares)
+                        assert any(active == 2 and rate == max(1000, pacing * 3 // 8)
+                                   for _, rate, pacing, active, _ in epochs), epochs
                         assert min(targets[window]) < shared_ceiling == targets[window][-1], targets
                 else:
                     only_window = next(iter(targets.values()))
                     assert only_window[0] == bitrate and min(only_window) < bitrate, only_window
                     assert only_window[-1] == bitrate, only_window
-                report['encoder_epoch_kbps'] = epoch_rates
-                print(f'PASS: {count} ordered PE/CNG NVENC frames; targets by window {targets} kbps, independent decodable epochs through loss and recovery', flush=True)
+                report['encoder_epoch_kbps'] = {
+                    window: [(epoch, rate) for epoch, rate, _, _, _ in changes]
+                    for window, changes in epoch_rates.items()
+                }
+                live = sum(sequence is not None for changes in epoch_rates.values()
+                           for _, _, _, _, sequence in changes)
+                report['encoder_live_updates'] = live
+                print(f'PASS: {count} ordered PE/CNG NVENC frames; targets by window {targets} kbps, '
+                      f'{live} in-place changes, independent keyframes are decodable', flush=True)
             else:
                 print(f'PASS: real PE/CNG, {count} exact ordered PNG frames through UDP loss/TCP repair and 200ms feedback delay; pacing backs off then recovers within ceiling: {rates}', flush=True)
             log_path.with_name(log_path.stem + '-report.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -180,28 +190,45 @@ def run(wine, crypto, log, log_path, nvenc, two_windows):
             stop(host)
 
 
-def check_epochs(frames, encoder_rates, bitrate):
-    epoch_rates = {}
+def check_epochs(frames, encoder_rates, bitrate, require_live_bitrate):
+    observed = []
+    for epoch, rate, pacing, active, sequence in encoder_rates:
+        if any(frame['epoch'] == epoch for frame in frames) and (sequence is None or sequence <= frames[-1]['seq']):
+            assert 1_000 <= rate <= bitrate, (epoch, rate)
+            observed.append((epoch, rate, pacing, active, sequence))
+    assert observed
+    if require_live_bitrate:
+        assert any(sequence is not None for _, _, _, _, sequence in observed), observed
+    seen = set()
     for epoch, group in groupby(frames, key=lambda packet: packet['epoch']):
         batch = list(group)
-        assert batch[0]['key'] == 1 and epoch not in epoch_rates, epoch
-        rate = encoder_rates[epoch]
-        assert 1_000 <= rate <= bitrate, (epoch, rate)
-        epoch_rates[epoch] = rate
-        image = decoded(batch[:6])
-        w, h = image.size
-        assert image.getpixel((w // 2, h // 4))[0] > 225
-        assert image.getpixel((w // 2, 3 * h // 4))[2] > 225
+        assert batch[0]['key'] == 1 and epoch not in seen, epoch
+        seen.add(epoch)
+        by_sequence = {frame['seq']: i for i, frame in enumerate(batch)}
+        starts = [0]
+        for rate_epoch, _, _, _, sequence in observed:
+            if rate_epoch == epoch and sequence is not None:
+                pos = by_sequence[sequence]
+                assert pos > 0 and batch[pos]['key'] == 1, (epoch, sequence)
+                starts.append(pos)
+        for start in starts:
+            image = decoded(batch[start:start+6])
+            w, h = image.size
+            assert image.getpixel((w // 2, h // 4))[0] > 225
+            assert image.getpixel((w // 2, 3 * h // 4))[2] > 225
     assert any(not packet['key'] for packet in frames)
-    return list(epoch_rates.items())
+    return observed
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--nvenc', action='store_true', help='exercise decoder epochs across bitrate changes on an NVIDIA host')
     parser.add_argument('--two-windows', action='store_true', help='exercise the shared pacing budget across two NVENC windows')
+    parser.add_argument('--require-live-bitrate', action='store_true', help='require in-place rate updates on a supported GPU')
     options = parser.parse_args()
     nvenc = options.nvenc or options.two_windows
+    if options.require_live_bitrate and not nvenc:
+        parser.error('--require-live-bitrate requires --nvenc or --two-windows')
     BUILD.mkdir(parents=True, exist_ok=True)
     (ROOT / 'build/windows').mkdir(parents=True, exist_ok=True)
     subprocess.run(['cargo', 'build', '--locked'], cwd=ROOT, check=True)
@@ -230,7 +257,7 @@ def main():
             wine = {**os.environ, 'DISPLAY': display, 'WINEPREFIX': str(prefix), 'WINEDEBUG': '-all',
                     'WINEDLLOVERRIDES': 'winemenubuilder.exe=d;mscoree,mshtml='}
             subprocess.run(['wineboot', '-u'], env=wine, stdout=log, stderr=log, check=True, timeout=60)
-            run(wine, Crypto(), log, log_path, nvenc, options.two_windows)
+            run(wine, Crypto(), log, log_path, nvenc, options.two_windows, options.require_live_bitrate)
         finally:
             if read_fd is not None:
                 os.close(read_fd)

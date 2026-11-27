@@ -61,7 +61,7 @@ The client converges on a single TLS transport, retiring embedded SSH and raw tu
 ### Reusing Upstream Libraries from Sunshine and Moonlight
 
 - **SDL3 gamepad support** handles discovery, mapping, hotplug, and rumble in the Windows client. Discovery, input, rumble, and reconnect were verified with a physical Xbox Bluetooth controller. Waybridge manages focus leases, unfocus zeroing, slot assignment, and Linux session ownership. See [Gamepads](GAMEPADS.md).
-- **`libopus` audio** is the next library candidate on the network track, adding codec support and capability negotiation over existing capture/playback while keeping PCM fallback. Default policies will follow LAN/VPN measurements of bitrate, latency, dropouts, A/V sync, and CPU cost.
+- **`libopus` audio** is preferred for Linux-to-Windows playback at 128 kb/s with 10 ms stereo blocks. PCM remains available through codec negotiation. Verify latency, dropouts, A/V sync, and CPU cost across LAN and VPN links. See [Network Experience](NETWORK.md).
 - **`libvirtualhid`** will be evaluated when advanced controller features such as DualSense touchpads and gyroscopes are needed (assessing Linux `uhid` permissions, Rust FFI boundaries, game detection, and feedback); `uinput` continues serving standard Xbox controllers.
 - **Forward error correction** uses existing XOR parity + TCP repair as the baseline. Compare Reed–Solomon under equal transmit budgets for burst-loss frame age, repair success rate, and CPU overhead before introducing a separate implementation (`moonlight-common-c` serves as a GameStream design reference). See [Network Experience](NETWORK.md).
 

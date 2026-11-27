@@ -15,11 +15,13 @@
 // clang-format on
 
 #include "presentation.h"
+#include "presentation_cadence.h"
 #include "h264_decoder.h"
 #include "h264_decoder_cache.h"
 #include "image_decoder.h"
 #include "hdr_capabilities.h"
 #include "audio.h"
+#include <opus.h>
 #include "native_cursor.h"
 #include "native_icon.h"
 #include "application_identity.h"
@@ -52,6 +54,7 @@
 #include <set>
 #include <iostream>
 #include <map>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -116,6 +119,7 @@ NativePen nativePen([](const Json &message) { sendJson(message); });
 NativeGamepad nativeGamepads([](const Json &message) { sendJson(message); });
 constexpr size_t MaxPacket = 72 * 1024 * 1024;
 constexpr UINT NetworkReady = WM_APP + 1;
+constexpr UINT PresentReady = WM_APP + 4;
 SOCKET connection = INVALID_SOCKET;
 HWND controller = nullptr;
 std::atomic<bool> running{true};
@@ -149,6 +153,7 @@ std::string microphoneKey;
 std::string serverHost, serverPort, serverToken;
 std::set<uint8_t> supportedVideoKinds;
 using Clock = std::chrono::steady_clock;
+PresentationWake presentationWake;
 constexpr UINT_PTR MoveViewportTimer = 2;
 constexpr UINT MoveViewportIntervalMs = 33;
 constexpr UINT_PTR ResizePreviewTimer = 3;
@@ -233,6 +238,9 @@ struct RemoteWindow {
   int pixelWidth = 0, pixelHeight = 0;
   std::shared_ptr<DecodedFrame> frame;
   std::unique_ptr<Presentation> presentation;
+  PresentationCadence presentationCadence;
+  HMONITOR presentationMonitor = nullptr;
+  Clock::time_point lastPresentation;
   UINT dpi = 96;
   int originX = 0, originY = 0;
   bool touchInput = false, penInput = false;
@@ -260,6 +268,7 @@ struct RemoteWindow {
   int lastMonitorWidth = 0, lastMonitorHeight = 0;
 };
 std::map<uint32_t, std::unique_ptr<RemoteWindow>> windows;
+std::map<uint32_t, std::shared_ptr<DecodedFrame>> pendingPresentations;
 Json imeStatus;
 void updateIme();
 uint32_t grabbedRoot = 0;
@@ -504,13 +513,16 @@ void queueMedia(uint8_t kind, std::vector<uint8_t> bytes) {
   std::unique_lock<std::mutex> guard(inboxMutex);
   if (frames.size() >= 128 && !frames.count(id))
     throw std::runtime_error("too many media windows");
-  if (VideoDecoder::videoKind(kind))
+  // A new independent frame can replace work on a stale reference chain.
+  // This also releases any decoder queue wait for an expired UDP window.
+  bool independent = kind == 1 || u32(bytes.data() + 48) == 1;
+  if (!independent)
     frameWake.wait(guard,
                    [&] { return !running || !frames.count(id) || frames.at(id).size() < 4; });
   if (!running)
     return;
   auto &queue = frames[id];
-  if (kind == 1)
+  if (independent)
     queue.clear();
   queue.push_back({kind, std::move(bytes), Clock::now()});
   frameWake.notify_all();
@@ -554,6 +566,8 @@ void receiveLoop(SOCKET socket) {
         incoming = Json::parse(packet.begin() + 1, packet.end());
         if (FileTree::uploadResponse(incoming) || FileDrag::receive(incoming)) continue;
         auto type = incoming.value("type", "");
+        if (type == "window_closed")
+          udpMedia.forgetWindow(incoming.at("id").get<uint32_t>());
         if (type == "tree_begin" || type == "tree_chunk" || type == "tree_done" || type == "tree_error" ||
             type == "files_begin" || type == "file_chunk" || type == "files_done" || type == "files_error")
           incoming["_file_io_bytes"] = size; // receiver-derived; never trust a peer-supplied cost
@@ -675,9 +689,14 @@ void startMedia(const std::string &key) {
   });
 }
 
-void receiveAudio(SOCKET socket) {
+void receiveAudio(SOCKET socket, bool useOpus) {
+  constexpr int OpusFrames = 480, MaxOpusBytes = 1275;
+  const char *codec = useOpus ? "opus" : "pcm_s16le";
   bool ready = false;
   uint64_t lastSequence = 0;
+  Clock::time_point lastArrival;
+  std::unique_ptr<OpusDecoder, decltype(&opus_decoder_destroy)> decoder(nullptr, opus_decoder_destroy);
+  std::array<opus_int16, OpusFrames * 2> samples{};
   try {
     uint8_t header[4];
     while (running && readAll(socket, header, 4)) {
@@ -687,26 +706,51 @@ void receiveAudio(SOCKET socket) {
       std::vector<uint8_t> packet(size);
       if (!readAll(socket, packet.data(), size))
         break;
+      const auto arrival = Clock::now();
       if (!ready) {
-        if (packet[0] != 0 ||
-            Json::parse(packet.begin() + 1, packet.end()).value("type", "") != "audio_ready")
+        if (packet[0] != 0)
           break;
+        const auto message = Json::parse(packet.begin() + 1, packet.end());
+        if (message.value("type", "") != "audio_ready" || message.value("codec", "pcm_s16le") != codec)
+          break;
+        if (useOpus) {
+          int error = 0;
+          decoder.reset(opus_decoder_create(48000, 2, &error));
+          if (!decoder)
+            throw std::runtime_error(opus_strerror(error));
+        }
+        std::cout << "Audio stream codec: " << codec << '\n' << std::flush;
         ready = true;
-        audioPlayback.start();
+        audioPlayback.start(codec);
         continue;
       }
       if (packet[0] != 3 || size < 29)
         break;
       const uint8_t *p = packet.data() + 1;
       uint32_t frames = u32(p + 8);
-      if (u32(p) != 48000 || p[4] != 0 || p[5] != 2 || p[6] != 0 || p[7] != 16 || !frames ||
-          frames > 4800 || size != 29 + frames * 4)
+      uint32_t payloadBytes = size - 29;
+      if (u32(p) != 48000 || p[4] != 0 || p[5] != 2 || p[6] != 0 || p[7] != 16)
+        break;
+      if (useOpus ? (frames != OpusFrames || !payloadBytes || payloadBytes > MaxOpusBytes)
+                  : (!frames || frames > 4800 || payloadBytes != frames * 4))
         break;
       uint64_t sequence = (uint64_t(u32(p + 12)) << 32) | u32(p + 16);
       if (sequence <= lastSequence)
         continue;
+      const uint64_t skipped = lastSequence ? sequence - lastSequence - 1 : 0;
+      if (decoder) {
+        int decoded = opus_decode(decoder.get(), p + 28, static_cast<opus_int32>(payloadBytes),
+                                  samples.data(), OpusFrames, 0);
+        if (decoded != OpusFrames)
+          break;
+        audioPlayback.push(reinterpret_cast<const uint8_t *>(samples.data()), sizeof(samples), skipped);
+      } else {
+        audioPlayback.push(p + 28, payloadBytes, skipped);
+      }
+      if (lastSequence)
+        clientStats.record("audio_arrival", millis(arrival - lastArrival));
+      lastArrival = arrival;
       lastSequence = sequence;
-      audioPlayback.push(p + 28, size_t(frames) * 4);
       auto ack = Json({{"type", "audio_ack"}, {"sequence", sequence}}).dump();
       uint32_t length = htonl(uint32_t(ack.size() + 1));
       std::vector<uint8_t> wire(5 + ack.size());
@@ -726,10 +770,10 @@ void receiveAudio(SOCKET socket) {
   }
 }
 
-void startAudio(const std::string &key) {
+void startAudio(const std::string &key, bool useOpus) {
   if (audioReceiver.joinable())
     return;
-  audioReceiver = std::thread([key] {
+  audioReceiver = std::thread([key, useOpus] {
     addrinfo hints{};
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_family = AF_UNSPEC;
@@ -795,9 +839,10 @@ void startAudio(const std::string &key) {
         break;
       sent += n;
     }
-    if (sent == wire.size())
-      receiveAudio(socket);
-    else
+    if (sent == wire.size()) {
+      receiveAudio(socket, useOpus);
+      audioPlayback.stop();
+    } else
       std::cerr << "Audio channel unavailable; video continues\n";
     audioConnection = INVALID_SOCKET;
     NativeTransport::detach(socket);
@@ -2321,6 +2366,20 @@ void reconcileWindows() {
   if (modalFocus && IsWindowEnabled(modalFocus))
     SetForegroundWindow(modalFocus);
 }
+void updatePresentationCadence(RemoteWindow *w) {
+  HMONITOR monitor = MonitorFromWindow(w->hwnd, MONITOR_DEFAULTTONEAREST);
+  if (monitor == w->presentationMonitor)
+    return;
+  w->presentationMonitor = monitor;
+  MONITORINFOEXW info{};
+  info.cbSize = sizeof(info);
+  DEVMODEW mode{};
+  mode.dmSize = sizeof(mode);
+  const bool known = monitor && GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO *>(&info)) &&
+                     EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode);
+  w->presentationCadence.refreshRate(known ? mode.dmDisplayFrequency : 0);
+  w->lastPresentation = {};
+}
 void presentWindowFrame(RemoteWindow *w, const std::shared_ptr<DecodedFrame> &frame) {
   clientStats.record("ui_queue", millis(Clock::now() - frame->decoded));
   if (semanticsNegotiated &&
@@ -2392,6 +2451,16 @@ void presentWindowFrame(RemoteWindow *w, const std::shared_ptr<DecodedFrame> &fr
     w->resizePending = false;
   }
   clientStats.report();
+  auto submitted = Clock::now();
+  if (!w->popup) {
+    if (w->lastPresentation != Clock::time_point{} &&
+        submitted - w->lastPresentation < std::chrono::milliseconds(250))
+      clientStats.record(w->id == mediaBudget.focused() ? "foreground_present_interval"
+                                                      : "background_present_interval",
+                         millis(submitted - w->lastPresentation));
+    w->presentationCadence.submitted(submitted);
+    w->lastPresentation = submitted;
+  }
   w->frame = frame;
   presentedFrames.fetch_add(1, std::memory_order_relaxed);
   if (w->presentation)
@@ -2428,6 +2497,63 @@ void finishWindowSizing(RemoteWindow *w) {
   sendResize(w);
   if (w->resizePreview && !SetTimer(w->hwnd, ResizePreviewTimer, ResizePreviewSettleMs, nullptr))
     finishResizePreview(w);
+}
+
+void presentPendingWindows() {
+  auto deadline = Clock::time_point::max();
+  auto present = [&](uint32_t id) {
+    auto pending = pendingPresentations.find(id);
+    if (pending == pendingPresentations.end())
+      return;
+    auto found = windows.find(id);
+    if (found == windows.end()) {
+      pendingPresentations.erase(pending);
+      return;
+    }
+    auto *w = found->second.get();
+    const auto &candidate = pending->second;
+    if ((w->frame && candidate->sequence <= w->frame->sequence) ||
+        (w->deferredResizeFrame && candidate->sequence <= w->deferredResizeFrame->sequence)) {
+      pendingPresentations.erase(pending);
+      return;
+    }
+    if (!w->popup)
+      updatePresentationCadence(w);
+    // First content, remapping and size changes must become interactive immediately.
+    const bool steady = !w->popup && w->shown && w->state.mapped && w->frame &&
+                        !w->resizePreview && !w->sizing && IsWindowVisible(w->hwnd) &&
+                        !IsIconic(w->hwnd) && candidate->width == w->pixelWidth &&
+                        candidate->height == w->pixelHeight && candidate->logicalWidth == w->width &&
+                        candidate->logicalHeight == w->height && candidate->originX == w->originX &&
+                        candidate->originY == w->originY;
+    auto due = w->presentationCadence.deadline();
+    if (steady && presentationWake.available() && Clock::now() < due) {
+      deadline = std::min(deadline, due);
+      return;
+    }
+    auto frame = std::move(pending->second);
+    pendingPresentations.erase(pending);
+    if (w->resizePreview) {
+      if (!matchesClientSize(w, frame->logicalWidth, frame->logicalHeight)) {
+        w->deferredResizeFrame = frame;
+        acknowledge(w, frame->sequence);
+        return;
+      }
+      clearResizePreview(w);
+    }
+    presentWindowFrame(w, frame);
+  };
+  const auto foreground = mediaBudget.focused();
+  present(foreground);
+  std::vector<uint32_t> remaining;
+  remaining.reserve(pendingPresentations.size());
+  for (const auto &entry : pendingPresentations)
+    if (entry.first != foreground) remaining.push_back(entry.first);
+  for (uint32_t id : remaining) present(id);
+  if (deadline != Clock::time_point::max() && !presentationWake.arm(deadline)) {
+    presentationWake.stop();
+    presentPendingWindows();
+  }
 }
 
 bool acceptsInput(RemoteWindow *w, LPARAM lp) {
@@ -3292,6 +3418,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     return 0;
   case WM_DISPLAYCHANGE:
   case WM_SETTINGCHANGE:
+    if (message == WM_DISPLAYCHANGE) {
+      w->presentationMonitor = nullptr;
+      w->presentationCadence.refreshRate(0);
+      PostMessageW(controller, PresentReady, 0, 0);
+    }
     if (w->state.fullscreen && !IsIconic(hwnd)) {
       MONITORINFO monitor{};
       monitor.cbSize = sizeof(monitor);
@@ -3534,6 +3665,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
 }
 
 void destroyRemote(uint32_t id) {
+  pendingPresentations.erase(id);
   nativeActivation.closed(id);
   std::vector<uint32_t> children;
   for (auto &[child, w] : windows)
@@ -3631,8 +3763,9 @@ void dispatchNetwork() {
         PostQuitMessage(1);
         return;
       }
-      if (m.value("audio_pcm", false))
-        startAudio(m.at("media_key").get<std::string>());
+      const bool useOpus = m.value("audio_opus_v1", false);
+      if (useOpus || m.value("audio_pcm", false))
+        startAudio(m.at("media_key").get<std::string>(), useOpus);
       if (m.value("microphone_v1", false))
         microphoneKey = m.value("media_key", "");
       if (m.contains("udp_fec_v1"))
@@ -4043,31 +4176,16 @@ void dispatchNetwork() {
     if (visual.value("type", "") == "drag_visual_reset") dragVisual.reset();
     else dragVisual.receive(visual);
   }
-  auto present = [&](uint32_t id, const auto &frame) {
-    auto it = windows.find(id);
-    if (it == windows.end())
-      return;
-    auto *w = it->second.get();
-    if ((w->frame && frame->sequence <= w->frame->sequence) ||
-        (w->deferredResizeFrame && frame->sequence <= w->deferredResizeFrame->sequence))
-      return;
-    if (w->resizePreview) {
-      if (!matchesClientSize(w, frame->logicalWidth, frame->logicalHeight)) {
-        w->deferredResizeFrame = frame;
-        // Retain at most one decoded frame for apps that return a different size.
-        acknowledge(w, frame->sequence);
-        return;
-      }
-      clearResizePreview(w);
+  for (auto &[id, frame] : pendingFrames) {
+    auto &pendingFrame = pendingPresentations[id];
+    if (!pendingFrame || frame->sequence > pendingFrame->sequence) {
+      if (pendingFrame)
+        clientStats.record("presentation_coalesced_delay", millis(Clock::now() - pendingFrame->decoded));
+      pendingFrame = std::move(frame);
     }
-    presentWindowFrame(w, frame);
-  };
-  auto foreground = pendingFrames.find(mediaBudget.focused());
-  if (foreground != pendingFrames.end()) {
-    present(foreground->first, foreground->second);
-    pendingFrames.erase(foreground);
   }
-  for (auto &[id, frame] : pendingFrames) present(id, frame);
+  if (!pendingFrames.empty())
+    presentPendingWindows();
   syncDraggedWindowPosition();
   if (windowDrag.active && (!windowDrag.touch || promotedToplevelMove()) && !windowDrag.released && windowDrag.attached &&
       !windowDrag.moveAttempted && !windowDragMove.hwnd)
@@ -4252,6 +4370,13 @@ void publishHostedStatus() {
   }
   Json status=professionalInputStatus();
   addMicrophoneStatus(status);
+  const auto audio = audioPlayback.status();
+  if (audio.codec) {
+    status["audio_playback"] = {{"codec", audio.codec}, {"device_active", audio.playing},
+                                {"buffered_ms", audio.bufferedMs},
+                                {"sequence_gaps", audio.skippedPackets}, {"underruns", audio.underruns},
+                                {"discarded_ms", audio.discardedMs}};
+  }
   const auto budget = mediaBudget.snapshot();
   status["media_budget"] = {{"cpu_reserved_bytes", budget.used.cpu},
                             {"gpu_estimated_bytes", budget.used.gpu},
@@ -4379,6 +4504,10 @@ LRESULT CALLBACK controlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     if (message == NetworkReady) {
       dispatchNetwork();
       FileIo::drain();
+      return 0;
+    }
+    if (message == PresentReady) {
+      presentPendingWindows();
       return 0;
     }
     if (message == WM_CLIPBOARDUPDATE) {
@@ -4573,6 +4702,7 @@ int wmain(int argc, wchar_t **argv) {
   RegisterClassW(&wc);
   controller = CreateWindowExW(0, wc.lpszClassName, L"Waybridge", 0, 0, 0, 0, 0, HWND_MESSAGE,
                                nullptr, instance, nullptr);
+  presentationWake.start(controller, PresentReady);
   hostControl.start(controller, [](const Json &request) {
     // A shell IStream read may be blocking the native STA. Wake it before
     // dispatching the cancellation that finishes the drag on that same STA.
@@ -4674,8 +4804,11 @@ int wmain(int argc, wchar_t **argv) {
             {"color_scheme", appAppearance},
             {"split_media", true},
             {"audio_pcm", audioSupported},
+            {"audio_opus_v1", audioSupported},
             {"microphone_v1", true},
             {"udp_fec_v1", UdpMedia::requested()},
+            {"udp_window_v2", true},
+            {"udp_rs_v1", ReedSolomonAvailable},
             {"frame_ack", true},
             {"hdr", supportedVideoKinds.count(7) > 0 || supportedVideoKinds.count(8) > 0},
             {"color_spaces", Json::array({"bt709_sdr", "bt2020_pq"})},
@@ -4715,6 +4848,8 @@ int wmain(int argc, wchar_t **argv) {
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
+  presentationWake.stop();
+  pendingPresentations.clear();
   remoteTray.clear();
   windowDrag.cancelled = true;
   endWindowDrag();

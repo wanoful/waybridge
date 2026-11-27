@@ -104,6 +104,9 @@ int wmain(int argc, wchar_t **argv) {
   WSAStartup(MAKEWORD(2, 2), &data);
   auto port = utf8(argv[1]), token = utf8(argv[2]), path = utf8(argv[3]);
   bool hdr = getenv("WAYBRIDGE_UDP_TEST_HDR") != nullptr;
+  bool perWindow = getenv("WAYBRIDGE_UDP_TEST_WINDOWS") != nullptr;
+  bool reedSolomon = perWindow && ReedSolomonAvailable && getenv("WAYBRIDGE_UDP_TEST_RS");
+  bool refresh = getenv("WAYBRIDGE_UDP_TEST_NO_REFRESH") == nullptr;
   int target = std::stoi(argv[4]);
   control = connectTo(port.c_str());
   if (control == INVALID_SOCKET)
@@ -113,6 +116,8 @@ int wmain(int argc, wchar_t **argv) {
             {"token", token},
             {"split_media", true},
             {"udp_fec_v1", true},
+            {"udp_window_v2", perWindow},
+            {"udp_rs_v1", reedSolomon},
             {"frame_ack", true},
             {"hdr", hdr},
             {"color_spaces", Json::array({"bt2020_pq", "bt709_sdr"})},
@@ -133,11 +138,13 @@ int wmain(int argc, wchar_t **argv) {
     output.flush();
     uint64_t seq = (uint64_t(u32(body.data() + 12)) << 32) | u32(body.data() + 16);
     sendJson({{"type", "frame_ack"}, {"id", u32(body.data())}, {"sequence", seq}});
-    if (++count < target)
+    if (++count < target && refresh)
       sendJson({{"type", "refresh"}});
   };
   UdpMedia udp;
   udp.start(hello.at("udp_fec_v1"), frame, sendJson);
+  if (perWindow)
+    Sleep(50);
   SOCKET media = connectTo(port.c_str());
   sendPacket(media, 0,
              Json{{"type", "hello"},

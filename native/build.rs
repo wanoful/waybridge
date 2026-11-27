@@ -1,4 +1,15 @@
 fn main() {
+    println!("cargo:rerun-if-changed=udp_fec.c");
+    println!("cargo:rerun-if-changed=udp_fec.h");
+    println!("cargo:rerun-if-changed=third_party/nanors");
+    cc::Build::new()
+        .include("third_party/nanors")
+        .include("third_party/nanors/deps/obl")
+        .file("udp_fec.c")
+        .file("third_party/nanors/rs.c")
+        .file("third_party/nanors/deps/obl/oblas_common.c")
+        .file("third_party/nanors/deps/obl/oblas_lite.c")
+        .compile("waybridge_udp_fec");
     println!("cargo:rerun-if-changed=nvenc.c");
     println!("cargo:rerun-if-changed=hdr_probe.c");
     println!("cargo:rerun-if-changed=gpu_interop.c");

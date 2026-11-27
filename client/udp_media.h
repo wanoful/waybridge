@@ -1,24 +1,44 @@
 #pragma once
 // Datagram authentication is Windows CNG AES-GCM; reassembly never drops dependent access units.
 #include <bcrypt.h>
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <stdexcept>
+#include "udp_fec.h"
 
 class UdpMedia {
-  static constexpr size_t Chunk = 1024, Group = 8, Budget = 96 * 1024 * 1024;
+  static constexpr size_t Chunk = 1024, Group = 8, RsGroup = 16, Budget = 96 * 1024 * 1024;
   static bool videoKind(uint8_t kind) {
     return kind == 2 || kind == 4 || kind == 5 || kind == 7 || kind == 8;
   }
 
+  struct Route {
+    uint32_t window = 0;
+    uint64_t predecessor = 0;
+    bool independent = false;
+    bool operator==(const Route &other) const {
+      return window == other.window && predecessor == other.predecessor &&
+             independent == other.independent;
+    }
+  };
   struct Frame {
     uint8_t kind = 0;
     size_t total = 0, count = 0, have = 0, reserved = 0;
     std::vector<uint8_t> body, seen;
     std::map<size_t, std::array<uint8_t, Chunk>> parity;
+    Route route;
+    Clock::time_point firstSeen = Clock::now();
+    Clock::time_point lastProgress = firstSeen;
+  };
+  struct Window {
+    uint64_t delivered = 0, refresh = 0;
+    Clock::time_point lastRetry{};
   };
   std::mutex mutex;
   std::map<uint64_t, Frame> frames;
+  std::map<uint32_t, Window> windows;
+  std::set<uint32_t> retiredWindows;
   std::set<uint64_t> replay;
   size_t reserved = 0;
   uint64_t session = 0, next = 1, counter = 0, highest = 0;
@@ -28,6 +48,8 @@ class UdpMedia {
   std::thread worker;
   std::atomic<bool> live{false};
   bool active = false;
+  bool perWindow = false;
+  bool reedSolomon = false;
   bool logged = false, loggedFec = false, loggedRepair = false;
   std::function<void(uint8_t, std::vector<uint8_t>)> deliver;
   std::function<void(const Json &)> feedback;
@@ -85,7 +107,77 @@ class UdpMedia {
       ::send(socket, reinterpret_cast<const char *>(packet.data()), int(packet.size()), 0);
     }
   }
+  void eraseFrame(std::map<uint64_t, Frame>::iterator it) {
+    reserved -= it->second.reserved;
+    frames.erase(it);
+  }
+  bool acceptRoute(uint64_t message, const Route &route) {
+    if (!message || !route.window || route.predecessor >= message || retiredWindows.count(route.window))
+      return false;
+    if (windows.size() >= 128 && !windows.count(route.window))
+      return false;
+    auto &window = windows[route.window];
+    return message > window.delivered && message >= window.refresh;
+  }
+  void discardEarlier(uint32_t id, uint64_t message) {
+    for (auto it = frames.begin(); it != frames.end() && it->first < message;) {
+      if (it->second.route.window == id)
+        eraseFrame(it++);
+      else
+        ++it;
+    }
+  }
+  bool reserveFrame(size_t cost, uint64_t message, const Route &route) {
+    auto full = [&] { return frames.size() >= 16 || reserved + cost > Budget; };
+    if (perWindow && full()) {
+      const auto cutoff = Clock::now() - std::chrono::milliseconds(250);
+      for (auto it = frames.begin(); full() && it != frames.end();) {
+        if (it->second.lastProgress < cutoff)
+          eraseFrame(it++);
+        else
+          ++it;
+      }
+      if (full() && route.independent) {
+        windows.at(route.window).refresh = message;
+        discardEarlier(route.window, message);
+      }
+    }
+    return !full();
+  }
+  void drainWindow(uint32_t id, Window &window) {
+    while (active) {
+      auto it = std::find_if(frames.begin(), frames.end(), [&](const auto &entry) {
+        const auto &f = entry.second;
+        return f.route.window == id && f.have == f.count &&
+               (f.route.independent || f.route.predecessor == window.delivered);
+      });
+      if (it == frames.end())
+        return;
+      const auto message = it->first;
+      auto kind = it->second.kind;
+      auto body = std::move(it->second.body);
+      bool independent = kind == 1 || (body.size() >= 60 && u32(body.data() + 48) == 1);
+      const bool valid = body.size() >= (kind == 1 ? 36u : 60u) && u32(body.data()) == id &&
+                         independent == it->second.route.independent;
+      eraseFrame(it);
+      if (!valid)
+        return;
+      if (!logged) {
+        std::cout << "UDP per-window media active\n" << std::flush;
+        logged = true;
+      }
+      deliver(kind, std::move(body));
+      window.delivered = message;
+      discardEarlier(id, message);
+      feedback(Json{{"type", "udp_ack"}, {"message", message}});
+    }
+  }
   void drain() {
+    if (perWindow) {
+      for (auto &[id, window] : windows)
+        drainWindow(id, window);
+      return;
+    }
     while (active) {
       auto it = frames.find(next);
       if (it == frames.end() || it->second.have != it->second.count)
@@ -104,27 +196,37 @@ class UdpMedia {
     }
   }
   void fragment(const std::vector<uint8_t> &p) {
-    if (p.size() < 20 || (p[0] != 1 && p[0] != 2) || (p[1] != 1 && !videoKind(p[1])) || p[6] ||
-        p[7])
+    size_t header = perWindow ? 32 : 20;
+    if (p.size() < header || (p[0] != 1 && p[0] != 2) ||
+        (p[6] && !(reedSolomon && p[0] == 2 && p[6] == 1)) || p[7])
+      return;
+    uint8_t kind = perWindow ? p[1] & 0x7f : p[1];
+    if (kind != 1 && !videoKind(kind))
       return;
     size_t index = (size_t(p[2]) << 8) | p[3], count = (size_t(p[4]) << 8) | p[5],
            total = u32(p.data() + 8);
     uint64_t message = read64(p.data() + 12);
     if (!total || total > 8 * 1024 * 1024 || count != (total + Chunk - 1) / Chunk || index >= count)
       return;
-    if (p[0] == 2 ? index % Group || p.size() != 20 + Chunk
-                  : p.size() != 20 + std::min(Chunk, total - index * Chunk))
+    size_t group = reedSolomon ? RsGroup : Group;
+    if (p[0] == 2 ? index % group || p.size() != header + Chunk ||
+                       (p[6] && count - index <= Group)
+                  : p.size() != header + std::min(Chunk, total - index * Chunk))
       return;
+    Route route;
+    if (perWindow)
+      route = {u32(p.data() + 20), read64(p.data() + 24), (p[1] & 0x80) != 0};
     std::lock_guard<std::mutex> guard(mutex);
-    if (message < next || message - next >= 32)
+    if (perWindow ? !acceptRoute(message, route) : message < next || message - next >= 32)
       return;
     auto it = frames.find(message);
     if (it == frames.end()) {
       size_t cost = total + count + ((count + Group - 1) / Group) * Chunk;
-      if (frames.size() >= 16 || reserved + cost > Budget)
+      if (!reserveFrame(cost, message, route))
         return; // TCP repair supplies the missing ordered message.
       Frame f;
-      f.kind = p[1];
+      f.kind = kind;
+      f.route = route;
       f.total = total;
       f.count = count;
       f.body.resize(total);
@@ -134,40 +236,75 @@ class UdpMedia {
       it = frames.emplace(message, std::move(f)).first;
     }
     auto &f = it->second;
-    if (f.kind != p[1] || f.total != total || f.count != count)
+    if (f.kind != kind || f.total != total || f.count != count || !(f.route == route))
       return;
+    auto shard = index * 2 + p[6];
     if (p[0] == 1 && !f.seen[index]) {
-      memcpy(f.body.data() + index * Chunk, p.data() + 20, p.size() - 20);
+      memcpy(f.body.data() + index * Chunk, p.data() + header, p.size() - header);
       f.seen[index] = 1;
       ++f.have;
-    } else if (p[0] == 2 && !f.parity.count(index)) {
+      f.lastProgress = Clock::now();
+    } else if (p[0] == 2 && !f.parity.count(shard)) {
       std::array<uint8_t, Chunk> a{};
-      memcpy(a.data(), p.data() + 20, Chunk);
-      f.parity[index] = a;
+      memcpy(a.data(), p.data() + header, Chunk);
+      f.parity[shard] = a;
+      f.lastProgress = Clock::now();
     }
-    size_t first = index / Group * Group, missing = count, absent = 0;
-    for (size_t i = first; i < std::min(first + Group, count); ++i)
+    size_t first = index / group * group, missing = count, absent = 0;
+    for (size_t i = first; i < std::min(first + group, count); ++i)
       if (!f.seen[i]) {
         missing = i;
         ++absent;
       }
-    auto parity = f.parity.find(first);
-    if (absent == 1 && parity != f.parity.end()) {
+    auto parity = f.parity.find(first * 2);
+    size_t recovered = 0;
+    if (reedSolomon) {
+      auto second = f.parity.find(first * 2 + 1);
+      const uint8_t *p0 = parity == f.parity.end() ? nullptr : parity->second.data();
+      const uint8_t *p1 = second == f.parity.end() ? nullptr : second->second.data();
+      if (absent && absent <= size_t(p0 != nullptr) + size_t(p1 != nullptr))
+        recovered = recoverReedSolomon(f.body.data(), total, f.seen.data(), first, p0, p1);
+    } else if (absent == 1 && parity != f.parity.end()) {
       auto restored = parity->second;
-      for (size_t i = first; i < std::min(first + Group, count); ++i)
+      for (size_t i = first; i < std::min(first + group, count); ++i)
         if (i != missing)
           for (size_t j = 0; j < std::min(Chunk, total - i * Chunk); ++j)
             restored[j] ^= f.body[i * Chunk + j];
       memcpy(f.body.data() + missing * Chunk, restored.data(),
              std::min(Chunk, total - missing * Chunk));
       f.seen[missing] = 1;
-      ++f.have;
-      if (!loggedFec) {
-        std::cout << "UDP XOR shard recovered\n" << std::flush;
-        loggedFec = true;
-      }
+      recovered = 1;
     }
-    drain();
+    f.have += recovered;
+    if (recovered && !loggedFec) {
+      std::cout << (reedSolomon ? "UDP Reed–Solomon shards recovered\n" : "UDP XOR shard recovered\n")
+                << std::flush;
+      loggedFec = true;
+    }
+    if (perWindow)
+      drainWindow(route.window, windows.at(route.window));
+    else
+      drain();
+  }
+  void requestWindowRepairs(Clock::time_point now) {
+    unsigned requested = 0;
+    for (const auto &[message, frame] : frames) {
+      auto &window = windows.at(frame.route.window);
+      if (now - frame.firstSeen < std::chrono::milliseconds(55) ||
+          now - window.lastRetry < std::chrono::milliseconds(50))
+        continue;
+      uint64_t missing = 0;
+      if (!frame.route.independent && frame.route.predecessor > window.delivered)
+        missing = frame.route.predecessor;
+      else if (frame.have != frame.count)
+        missing = message;
+      if (!missing)
+        continue;
+      feedback(Json{{"type", "udp_retry"}, {"message", missing}});
+      window.lastRetry = now;
+      if (++requested == 4)
+        return;
+    }
   }
   void receive() {
     auto keep = Clock::now() - std::chrono::seconds(2), retry = Clock::now();
@@ -202,10 +339,14 @@ class UdpMedia {
         hello();
         keep = now;
       }
-      if (now - retry >= std::chrono::milliseconds(100)) {
+      if (now - retry >= std::chrono::milliseconds(perWindow ? 25 : 100)) {
         std::lock_guard<std::mutex> guard(mutex);
-        if (active)
-          feedback(Json{{"type", "udp_retry"}, {"message", next}});
+        if (active) {
+          if (perWindow)
+            requestWindowRepairs(now);
+          else
+            feedback(Json{{"type", "udp_retry"}, {"message", next}});
+        }
         retry = now;
       }
     }
@@ -220,7 +361,16 @@ public:
     if (worker.joinable() || !requested() || !offer.is_object())
       return;
     try {
-      require(offer.at("version") == 1 && offer.at("chunk") == Chunk && offer.at("group") == Group);
+      auto fec = offer.value("fec", "xor");
+      const bool rs = fec == "rs";
+      require((offer.at("version") == 1 || offer.at("version") == 2) && offer.at("chunk") == Chunk &&
+              (fec == "xor" || (rs && ReedSolomonAvailable && offer.at("version") == 2)) &&
+              offer.at("group") == (rs ? RsGroup : Group));
+      {
+        std::lock_guard<std::mutex> guard(mutex);
+        perWindow = offer.at("version") == 2;
+        reedSolomon = rs;
+      }
       session = std::stoull(offer.at("session").get<std::string>());
       auto tx = unbase64(offer.at("rx_key")), rx = unbase64(offer.at("tx_key"));
       require(tx.size() == 32 && rx.size() == 32);
@@ -274,13 +424,63 @@ public:
     active = true;
     drain();
   }
-  void repair(const uint8_t *p, size_t size) {
-    require(size >= 9);
-    uint64_t message = read64(p);
-    uint8_t kind = p[8];
-    size_t total = size - 9;
-    require((kind == 1 && total >= 36) || (videoKind(kind) && total >= 60));
+  void forgetWindow(uint32_t id) {
     std::lock_guard<std::mutex> guard(mutex);
+    if (!perWindow)
+      return;
+    windows.erase(id);
+    retiredWindows.insert(id);
+    if (retiredWindows.size() > 256)
+      retiredWindows.erase(retiredWindows.begin());
+    for (auto it = frames.begin(); it != frames.end();) {
+      if (it->second.route.window == id)
+        eraseFrame(it++);
+      else
+        ++it;
+    }
+  }
+  void repair(const uint8_t *p, size_t size) {
+    std::lock_guard<std::mutex> guard(mutex);
+    size_t header = perWindow ? 21 : 9;
+    require(size >= header);
+    uint64_t message = read64(p);
+    uint8_t kind = perWindow ? p[8] & 0x7f : p[8];
+    size_t total = size - header;
+    require((kind == 1 && total >= 36) || (videoKind(kind) && total >= 60));
+    if (perWindow) {
+      Route route{u32(p + 9), read64(p + 13), (p[8] & 0x80) != 0};
+      if (!acceptRoute(message, route))
+        return;
+      auto old = frames.find(message);
+      if (old != frames.end())
+        eraseFrame(old);
+      auto &window = windows.at(route.window);
+      if (!reserveFrame(total, message, route)) {
+        // A complete repair that can be consumed immediately needs no
+        // reassembly credit.
+        if (active && (route.independent || route.predecessor == window.delivered)) {
+          require(u32(p + header) == route.window &&
+                  route.independent == (kind == 1 || u32(p + header + 48) == 1));
+          deliver(kind, std::vector<uint8_t>(p + header, p + size));
+          window.delivered = message;
+          discardEarlier(route.window, message);
+          feedback(Json{{"type", "udp_ack"}, {"message", message}});
+          drainWindow(route.window, window);
+        }
+        return;
+      }
+      Frame f;
+      f.kind = kind;
+      f.total = total;
+      f.count = f.have = 1;
+      f.reserved = total;
+      f.route = route;
+      f.body.assign(p + header, p + size);
+      reserved += total;
+      frames.emplace(message, std::move(f));
+      drainWindow(route.window, window);
+      return;
+    }
     if (message < next)
       return;
     require(message - next < 32);

@@ -99,7 +99,13 @@ static void removed(void *data, struct wl_registry *registry, uint32_t id) {
 }
 static const struct wl_registry_listener registry_listener = {.global = global,
                                                               .global_remove = removed};
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc == 3) {
+    width = atoi(argv[1]);
+    height = atoi(argv[2]);
+    if (width < 16 || height < 16 || width > 4096 || height > 4096)
+      return 1;
+  }
   display = wl_display_connect(NULL);
   if (!display)
     return 1;

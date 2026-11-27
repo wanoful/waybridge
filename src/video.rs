@@ -43,6 +43,14 @@ impl Frame {
     fn input_key(&self) -> usize {
         self.gpu.as_ref().map_or(0, |frame| frame.device_key())
     }
+    fn same_capture_format(&self, newer: &Self) -> bool {
+        self.width == newer.width
+            && self.height == newer.height
+            && self.input_key() == newer.input_key()
+            && self.gpu.as_ref().is_some_and(|f| f.hdr())
+                == newer.gpu.as_ref().is_some_and(|f| f.hdr())
+            && Arc::ptr_eq(&self.peer, &newer.peer)
+    }
     fn download_gpu(&mut self) -> Result<(), String> {
         if let Some(gpu) = self.gpu.take() {
             let started = Instant::now();
@@ -80,8 +88,10 @@ struct Session {
     lease: Option<Lease>,
     touched: Instant,
     bitrate: u32,
+    configured_bitrate: u32,
     rate_since: Instant,
     recovery_since: Option<Instant>,
+    live_bitrate: bool,
     failed: bool,
     epoch: u32,
     force_idr: bool,
@@ -120,15 +130,15 @@ fn next_bitrate(current: u32, target: u32, held: Duration) -> u32 {
 }
 
 impl Session {
-    fn choose_bitrate(&mut self, target: u32, now: Instant) -> u32 {
+    fn choose_bitrate(&mut self, configured: u32, target: u32, now: Instant) -> u32 {
         if self.failed {
             return self.bitrate;
         }
-        if self.encoder.is_none() {
+        if self.encoder.is_none() || self.configured_bitrate != configured {
             return target;
         }
         // A brief transport recovery can be followed by another backoff.
-        // Wait for sustained headroom before spending another encoder restart.
+        // Wait for sustained headroom before increasing the encoder rate.
         let since = if target > self.bitrate {
             *self.recovery_since.get_or_insert(now)
         } else {
@@ -136,6 +146,92 @@ impl Session {
             self.rate_since
         };
         next_bitrate(self.bitrate, target, now.duration_since(since))
+    }
+
+    fn update_bitrate(&mut self, bitrate: u32, now: Instant) {
+        self.bitrate = bitrate;
+        self.rate_since = now;
+        self.recovery_since = None;
+    }
+
+    fn encode_frame(&mut self, frame: &mut Frame) -> Result<(Vec<u8>, bool), String> {
+        let encoder = self.encoder.as_mut().unwrap();
+        if let Some(gpu) = &mut frame.gpu {
+            encoder.encode_gpu(gpu, frame.sequence, self.force_idr)
+        } else {
+            encoder.encode(&frame.rgba, frame.sequence, self.force_idr)
+        }
+    }
+
+    fn ensure_encoder(
+        &mut self,
+        frame: &Frame,
+        fps: u32,
+        budget: &Budget,
+        idle: &mut VecDeque<(u32, Session)>,
+        pacing: Option<u64>,
+        active_windows: usize,
+    ) {
+        if self.failed || self.encoder.is_some() {
+            return;
+        }
+        let cost = media_budget::encoder(
+            frame.width,
+            frame.height,
+            self.codec.hdr(),
+            frame.gpu.is_some(),
+        );
+        let Some(lease) = budget.acquire(frame.id, cost).or_else(|| {
+            idle.clear();
+            budget.acquire(frame.id, cost)
+        }) else {
+            return;
+        };
+        let started = Instant::now();
+        let create = || match &frame.gpu {
+            Some(gpu) => nvenc::Encoder::with_gpu(
+                self.codec,
+                frame.width,
+                frame.height,
+                fps,
+                self.bitrate,
+                gpu,
+            ),
+            None => {
+                nvenc::Encoder::with_codec(self.codec, frame.width, frame.height, fps, self.bitrate)
+            }
+        };
+        let mut result = create();
+        if result.is_err() && !idle.is_empty() {
+            idle.clear();
+            result = create();
+        }
+        metrics::record("encoder_init", started.elapsed());
+        match result {
+            Ok(encoder) => {
+                self.encoder = Some(encoder);
+                self.lease = Some(lease);
+                tracing::info!(
+                    id = frame.id,
+                    width = frame.width,
+                    height = frame.height,
+                    codec = self.codec.name(),
+                    input = if frame.gpu.is_some() { "cuda" } else { "cpu" },
+                    bitrate_kbps = self.bitrate,
+                    udp_pacing_kbps = pacing,
+                    active_windows,
+                    epoch = self.epoch,
+                    "NVENC ultra-low-latency encoder active"
+                );
+            }
+            Err(error) => {
+                self.failed = true;
+                if frame.gpu.is_some() {
+                    frame.peer.disable_gpu(frame.id);
+                }
+                tracing::warn!(id=frame.id,%error,"NVENC unavailable; using lossless PNG");
+            }
+        }
     }
 }
 
@@ -209,10 +305,12 @@ impl Encoder {
                     let reclaim = q.reclaim.take();
                     (frame, reset, forget, config, reclaim)
                 };
-                if let Some(config) = config {
-                    (fps, bitrate) = config;
-                    sessions.clear();
-                    idle.clear();
+                if let Some((next_fps, next_bitrate)) = config {
+                    if next_fps != fps {
+                        sessions.clear();
+                        idle.clear();
+                    }
+                    (fps, bitrate) = (next_fps, next_bitrate);
                 }
                 if reset {
                     sessions.clear();
@@ -282,6 +380,7 @@ impl Encoder {
                     continue;
                 }
                 let mut queue_wait = frame.enqueued.elapsed();
+                let mut rate_selection = None;
                 if use_video {
                     let now = Instant::now();
                     let same_owner = |s: &Session| {
@@ -304,22 +403,20 @@ impl Encoder {
                         0
                     };
                     let target = target_bitrate(bitrate, pacing, active_windows);
-                    let (selected_bitrate, rate_changed) = sessions
+                    let selected_bitrate = sessions
                         .get_mut(&frame.id)
                         .filter(|s| same_owner(s))
-                        .map_or((target, false), |s| {
-                            let selected = s.choose_bitrate(target, now);
-                            (selected, s.bitrate != selected)
-                        });
+                        .map_or(target, |s| s.choose_bitrate(bitrate, target, now));
+                    rate_selection = Some((selected_bitrate, pacing, active_windows));
                     let recreate = sessions.get(&frame.id).is_none_or(|s| {
                         s.width != frame.width
                             || s.height != frame.height
                             || s.codec != selected_codec
                             || s.input_key != frame.input_key()
                             || !same_owner(s)
-                    }) || rate_changed;
+                    });
                     if recreate {
-                        epoch = epoch.wrapping_add(1);
+                        epoch = epoch.wrapping_add(1).max(1);
                         // Release obsolete bitrate variants before acquiring a lease.
                         idle.retain(|(id, s)| {
                             *id != frame.id || (same_owner(s) && s.bitrate == selected_bitrate)
@@ -361,8 +458,10 @@ impl Encoder {
                             lease: None,
                             touched: now,
                             bitrate: selected_bitrate,
+                            configured_bitrate: bitrate,
                             rate_since: now,
                             recovery_since: None,
+                            live_bitrate: true,
                             failed: false,
                             epoch,
                             force_idr: true,
@@ -371,88 +470,28 @@ impl Encoder {
                         next.force_idr = true;
                         next.rate_since = now;
                         next.recovery_since = None;
+                        next.configured_bitrate = bitrate;
                         sessions.insert(frame.id, next);
                     }
                     let session = sessions.get_mut(&frame.id).unwrap();
                     session.touched = Instant::now();
-                    if !session.failed && session.encoder.is_none() {
-                        let cost = media_budget::encoder(
-                            frame.width,
-                            frame.height,
-                            selected_codec.hdr(),
-                            frame.gpu.is_some(),
-                        );
-                        let lease = worker_budget.acquire(frame.id, cost).or_else(|| {
-                            idle.clear();
-                            worker_budget.acquire(frame.id, cost)
-                        });
-                        if let Some(lease) = lease {
-                            let started = Instant::now();
-                            let create = || {
-                                if let Some(gpu) = &frame.gpu {
-                                    nvenc::Encoder::with_gpu(
-                                        selected_codec,
-                                        frame.width,
-                                        frame.height,
-                                        fps,
-                                        session.bitrate,
-                                        gpu,
-                                    )
-                                } else {
-                                    nvenc::Encoder::with_codec(
-                                        selected_codec,
-                                        frame.width,
-                                        frame.height,
-                                        fps,
-                                        session.bitrate,
-                                    )
-                                }
-                            };
-                            let mut result = create();
-                            if result.is_err() && !idle.is_empty() {
-                                idle.clear();
-                                result = create();
-                            }
-                            metrics::record("encoder_init", started.elapsed());
-                            match result {
-                                Ok(encoder) => {
-                                    session.encoder = Some(encoder);
-                                    session.lease = Some(lease);
-                                    tracing::info!(
-                                        id = frame.id,
-                                        width = frame.width,
-                                        height = frame.height,
-                                        codec = selected_codec.name(),
-                                        input = if frame.gpu.is_some() { "cuda" } else { "cpu" },
-                                        bitrate_kbps = session.bitrate,
-                                        udp_pacing_kbps = pacing,
-                                        active_windows,
-                                        epoch = session.epoch,
-                                        "NVENC ultra-low-latency encoder active"
-                                    );
-                                }
-                                Err(error) => {
-                                    session.failed = true;
-                                    if frame.gpu.is_some() {
-                                        frame.peer.disable_gpu(frame.id);
-                                    }
-                                    tracing::warn!(id=frame.id,%error,"NVENC unavailable; using lossless PNG");
-                                }
-                            }
-                        }
+                    if session.encoder.is_none() {
+                        session.update_bitrate(selected_bitrate, now);
                     }
+                    session.ensure_encoder(
+                        &frame,
+                        fps,
+                        &worker_budget,
+                        &mut idle,
+                        pacing,
+                        active_windows,
+                    );
                     // A cold session can take >100 ms. Prefer the latest unencoded
                     // image, and never transmit an obsolete intermediate resize.
                     let (lock, _) = &*worker;
                     let mut q = lock.lock().unwrap();
                     if let Some(latest) = q.frames.get(&frame.id) {
-                        if latest.width != frame.width
-                            || latest.height != frame.height
-                            || latest.input_key() != frame.input_key()
-                            || latest.gpu.as_ref().is_some_and(|f| f.hdr())
-                                != frame.gpu.as_ref().is_some_and(|f| f.hdr())
-                            || !Arc::ptr_eq(&latest.peer, &frame.peer)
-                        {
+                        if !frame.same_capture_format(latest) {
                             continue;
                         }
                         let latest = q.frames.remove(&frame.id).unwrap();
@@ -492,15 +531,84 @@ impl Encoder {
                     frame.straight = true;
                 }
                 metrics::record("unpremultiply", conversion.elapsed());
-                if use_video {
+                if let Some((selected_bitrate, pacing, active_windows)) = rate_selection {
                     let session = sessions.get_mut(&frame.id).unwrap();
-                    if let Some(encoder) = session.encoder.as_mut() {
-                        let started = Instant::now();
-                        let result = if let Some(gpu) = &mut frame.gpu {
-                            encoder.encode_gpu(gpu, frame.sequence, session.force_idr)
-                        } else {
-                            encoder.encode(&frame.rgba, frame.sequence, session.force_idr)
-                        };
+                    let refresh = frame.peer.needs_video_refresh(frame.id);
+                    let mut started = Instant::now();
+                    let mut packet = None;
+                    if session.encoder.is_some() && selected_bitrate != session.bitrate {
+                        let staged = session.live_bitrate
+                            && !session.force_idr
+                            && !refresh
+                            && session
+                                .encoder
+                                .as_mut()
+                                .unwrap()
+                                .stage_bitrate(selected_bitrate);
+                        if staged {
+                            let result = session.encode_frame(&mut frame);
+                            if matches!(&result, Ok((_, true))) {
+                                session.update_bitrate(selected_bitrate, started);
+                                packet = Some(result);
+                                metrics::record("encoder_reconfigure", started.elapsed());
+                                tracing::info!(
+                                    id = frame.id,
+                                    bitrate_kbps = selected_bitrate,
+                                    udp_pacing_kbps = pacing,
+                                    active_windows,
+                                    epoch = session.epoch,
+                                    sequence = frame.sequence,
+                                    "NVENC bitrate reconfigured in place"
+                                );
+                            } else {
+                                session.live_bitrate = false;
+                                metrics::increment("encoder_reconfigure_failed");
+                                tracing::debug!(
+                                    id = frame.id,
+                                    bitrate_kbps = selected_bitrate,
+                                    "NVENC did not confirm live bitrate change"
+                                );
+                            }
+                        }
+                        if packet.is_none() {
+                            // The aborted encode was never published. Restart
+                            // at the same input with an independent reference chain.
+                            session.encoder = None;
+                            session.lease = None;
+                            epoch = epoch.wrapping_add(1).max(1);
+                            session.epoch = epoch;
+                            session.force_idr = true;
+                            session.update_bitrate(selected_bitrate, started);
+                            idle.retain(|(id, s)| *id != frame.id || s.bitrate == selected_bitrate);
+                            session.ensure_encoder(
+                                &frame,
+                                fps,
+                                &worker_budget,
+                                &mut idle,
+                                pacing,
+                                active_windows,
+                            );
+                            if worker
+                                .0
+                                .lock()
+                                .unwrap()
+                                .frames
+                                .get(&frame.id)
+                                .is_some_and(|latest| !frame.same_capture_format(latest))
+                            {
+                                continue;
+                            }
+                            started = Instant::now();
+                        }
+                    }
+                    session.configured_bitrate = bitrate;
+                    if session.encoder.is_some() {
+                        if refresh && !session.force_idr {
+                            epoch = epoch.wrapping_add(1).max(1);
+                            session.epoch = epoch;
+                            session.force_idr = true;
+                        }
+                        let result = packet.unwrap_or_else(|| session.encode_frame(&mut frame));
                         match result {
                             Ok((color, key)) => {
                                 session.force_idr = false;

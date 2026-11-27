@@ -10,6 +10,21 @@ use std::{
     time::Instant,
 };
 
+mod opus;
+pub(crate) use opus::Encoder;
+
+const SAMPLE_RATE: u32 = 48_000;
+const CHANNELS: u16 = 2;
+const BLOCK_FRAMES: u32 = 480;
+const PCM_BYTES: usize = BLOCK_FRAMES as usize * CHANNELS as usize * size_of::<i16>();
+const HEADER_BYTES: usize = 28;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Codec {
+    Pcm,
+    Opus,
+}
+
 struct Sink {
     name: String,
     module: u32,
@@ -124,7 +139,7 @@ impl Session {
         let worker = thread::spawn(move || {
             let start = Instant::now();
             let mut sequence = 0u64;
-            let mut pcm = [0u8; 480 * 2 * 2]; // 10 ms, stereo signed 16-bit little endian.
+            let mut pcm = [0u8; PCM_BYTES];
             while stdout.read_exact(&mut pcm).is_ok() {
                 if crate::shutdown::requested() {
                     break;
@@ -132,11 +147,11 @@ impl Session {
                 sequence = sequence.wrapping_add(1);
                 let current = subscriber.lock().unwrap().upgrade();
                 if let Some(peer) = current {
-                    let mut frame = Vec::with_capacity(28 + pcm.len());
-                    frame.extend(48000u32.to_be_bytes());
-                    frame.extend(2u16.to_be_bytes());
+                    let mut frame = Vec::with_capacity(HEADER_BYTES + pcm.len());
+                    frame.extend(SAMPLE_RATE.to_be_bytes());
+                    frame.extend(CHANNELS.to_be_bytes());
                     frame.extend(16u16.to_be_bytes());
-                    frame.extend(480u32.to_be_bytes());
+                    frame.extend(BLOCK_FRAMES.to_be_bytes());
                     frame.extend(sequence.to_be_bytes());
                     frame.extend((start.elapsed().as_micros() as u64).to_be_bytes());
                     frame.extend(pcm);
