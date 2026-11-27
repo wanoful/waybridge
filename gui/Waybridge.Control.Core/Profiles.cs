@@ -36,6 +36,7 @@ public sealed record ClientSettings
     public string BadgePng { get; set; } = "";
     public bool Notifications { get; set; } = true;
     public bool Tray { get; set; } = true;
+    public bool WindowsTerminalProfile { get; set; }
     public int Volume { get; set; } = 100;
     public string GpuInput { get; set; } = "cpu";
     public void Validate()
@@ -135,6 +136,22 @@ public sealed class ProfileStore(string directory)
             File.Move(temp, path, true);
         }
         finally { File.Delete(temp); }
+    }
+
+    public static ConnectionProfile FindConnection(IReadOnlyList<ConnectionProfile> profiles, string query)
+    {
+        string trimmed = (query ?? "").Trim();
+        if (trimmed.Length == 0) throw new ArgumentException(Tr("Specify a workstation name or connection ID with --connection."));
+        if (Guid.TryParse(trimmed, out var id))
+        {
+            var byId = profiles.FirstOrDefault(item => item.Id == id);
+            if (byId is not null) return byId;
+        }
+        var byName = profiles.Where(item => string.Equals(item.Name.Trim(), trimmed, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (byName.Count == 1) return byName[0];
+        if (byName.Count > 1)
+            throw new ArgumentException(Tr("Multiple connections are named “{0}”. Specify the connection ID instead.", trimmed));
+        throw new KeyNotFoundException(Tr("No saved Waybridge connection matches “{0}”.", trimmed));
     }
 }
 

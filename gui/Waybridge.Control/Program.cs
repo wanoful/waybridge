@@ -18,7 +18,12 @@ internal static class Program
         try
         {
             AppLaunchLink? launchLink = null;
-            if (args.Length > 0 && (args[0] != "--launch-link" || args.Length != 2 ||
+            bool startHidden = false;
+            if (args.Length == 1 && args[0] == "--background")
+            {
+                startHidden = true;
+            }
+            else if (args.Length > 0 && (args[0] != "--launch-link" || args.Length != 2 ||
                 !AppLaunchLink.TryParse(args[1], out launchLink)))
             {
                 TrayIcon.ShowLinkError(Tr("Invalid app link. Copy it again or create a new shortcut from Waybridge."));
@@ -29,6 +34,7 @@ internal static class Program
             instance = new Mutex(true, @"Local\Waybridge.ControlCenter", out bool first);
             if (!first)
             {
+                if (startHidden) return;
                 StartupDiagnostics.Write("another control center is running; forwarding activation");
                 if (launchLink is null) TrayIcon.ShowExisting();
                 else if (!TrayIcon.ForwardLaunchLink(launchLink))
@@ -43,13 +49,13 @@ internal static class Program
             {
                 StartupDiagnostics.Write("unable to register the Waybridge URI protocol: " + error.Message);
             }
-            StartGui(launchLink);
+            StartGui(launchLink, startHidden);
             StartupDiagnostics.Write("application loop exited normally");
         }
         catch (Exception error) { StartupDiagnostics.Fatal("Program.Main", error); Environment.ExitCode = 1; }
     }
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void StartGui(AppLaunchLink? launchLink)
+    private static void StartGui(AppLaunchLink? launchLink, bool startHidden)
     {
         StartupDiagnostics.Write("initializing WinRT COM wrappers");
         WinRT.ComWrappersSupport.InitializeComWrappers();
@@ -60,7 +66,7 @@ internal static class Program
             SynchronizationContext.SetSynchronizationContext(
                 new Microsoft.UI.Dispatching.DispatcherQueueSynchronizationContext(
                     Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread()));
-            new ControlApplication(null, launchLink);
+            new ControlApplication(null, launchLink, startHidden);
         });
     }
 }
@@ -71,17 +77,19 @@ public sealed class ControlApplication : Application, IXamlMetadataProvider
     private XamlControlsXamlMetaDataProvider? metadata;
     private readonly string? stateDirectory;
     private readonly AppLaunchLink? launchLink;
+    private readonly bool startHidden;
     private readonly HashSet<string> observedTypes = [];
     private XamlControlsXamlMetaDataProvider Metadata => metadata ??= new();
-    public ControlApplication(string? stateDirectory = null) : this(stateDirectory, null)
+    public ControlApplication(string? stateDirectory = null) : this(stateDirectory, null, false)
     {
         if (stateDirectory is not null) Localization.Initialize(LauncherPreferences.StartupLanguage(stateDirectory));
     }
 
-    internal ControlApplication(string? stateDirectory, AppLaunchLink? launchLink)
+    internal ControlApplication(string? stateDirectory, AppLaunchLink? launchLink, bool startHidden)
     {
         this.stateDirectory = stateDirectory;
         this.launchLink = launchLink;
+        this.startHidden = startHidden;
         StartupDiagnostics.Write("WinUI Application constructed");
         UnhandledException += (_, args) => StartupDiagnostics.Fatal("WinUI unhandled exception", args.Exception);
     }
@@ -101,6 +109,12 @@ public sealed class ControlApplication : Application, IXamlMetadataProvider
         if (launchLink is not null)
         {
             window.QueueLaunchLink(launchLink);
+            return;
+        }
+        if (startHidden)
+        {
+            StartupDiagnostics.Write("starting hidden in tray for background IPC");
+            window.StartBackgroundInitialization();
             return;
         }
         StartupDiagnostics.Write("activating MainWindow");

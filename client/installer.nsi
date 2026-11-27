@@ -167,6 +167,8 @@ Section "Uninstall"
   RMDir "$INSTDIR"
   Delete "$SMPROGRAMS\Waybridge\Waybridge.lnk"
   RMDir "$SMPROGRAMS\Waybridge"
+  Delete "$LOCALAPPDATA\Microsoft\Windows Terminal\Fragments\Waybridge\profiles.json"
+  RMDir "$LOCALAPPDATA\Microsoft\Windows Terminal\Fragments\Waybridge"
   ReadRegStr $0 HKCU "${PROTOCOL}\shell\open\command" ""
   StrCmp $0 '${HANDLER}' 0 +2
   DeleteRegKey HKCU "${PROTOCOL}"

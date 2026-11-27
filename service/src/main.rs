@@ -1,3 +1,4 @@
+mod shell;
 mod storage;
 mod tui;
 
@@ -93,6 +94,7 @@ struct Shared {
     compositor: String,
     python: String,
     config_path: Option<PathBuf>,
+    runtime_dir: PathBuf,
     configuration: Value,
     changed: watch::Sender<u64>,
     rpc_slots: Semaphore,
@@ -346,7 +348,7 @@ async fn remote(
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let op = request["op"].as_str().unwrap_or("");
     if op == "hello" {
-        return write_response(&mut connection, &id, Ok(json!({"version":1,"certificate_sha256":shared.certificate_sha256,"features":["pairing","sessions","launch","applications","app_icons","stream","revoke"]}))).await;
+        return write_response(&mut connection, &id, Ok(json!({"version":1,"certificate_sha256":shared.certificate_sha256,"features":["pairing","sessions","launch","applications","app_icons","stream","shell","revoke"]}))).await;
     }
     if op == "pair" {
         let result = (|| {
@@ -387,6 +389,20 @@ async fn remote(
             &mut connection,
             &id,
             result.map_err(|error| ("bad_request", error.to_string())),
+        )
+        .await;
+    }
+    if op == "shell" {
+        let changes = shared.changed.subscribe();
+        let shared_auth = shared.clone();
+        let auth_request = request.clone();
+        return shell::serve(
+            connection,
+            &id,
+            &request,
+            &shared.runtime_dir,
+            changes,
+            move || authenticated(&shared_auth, &auth_request),
         )
         .await;
     }
@@ -618,6 +634,7 @@ async fn serve(
         compositor,
         python,
         config_path,
+        runtime_dir: runtime.clone(),
         configuration,
         changed,
         rpc_slots: Semaphore::new(4),

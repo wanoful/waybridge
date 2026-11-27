@@ -29,7 +29,7 @@ internal sealed partial class MainWindow : Window
     private readonly InfoBar notice = new() { IsOpen = false, IsClosable = true };
     private bool notificationServiceWarning;
     private readonly ProfileStore store;
-    private readonly CredentialStore secrets = new();
+    private readonly WindowsCredentialStore secrets = new();
     private readonly SessionController controller;
     private readonly DesktopNotifications desktopNotifications;
     private readonly TrayIcon tray;
@@ -121,18 +121,22 @@ internal sealed partial class MainWindow : Window
         controller = new(Path.Combine(AppContext.BaseDirectory, "waybridge-client.exe"));
         desktopNotifications = new(request => controller.SendEngineAsync(request), message => UI(() => Inform(message)));
         controller.Status += _ => UI(() => status.Text = controller.CurrentStatus);
-        controller.ConnectionChanged += connected => UI(() =>
+        controller.ConnectionChanged += connected =>
         {
-            desktopNotifications.ConnectionChanged(connected);
-            TouchConnectionChanged(connected);
-            if (!connected)
+            if (!connected) NotifyTerminalsDisconnected(Tr("Disconnected from the remote workstation."));
+            UI(() =>
             {
-                ResetConnectionView();
-                if (!controller.IsRunning) liveSettings = null;
-            }
-            tray?.Update(connected);
-            UpdateMode();
-        });
+                desktopNotifications.ConnectionChanged(connected);
+                TouchConnectionChanged(connected);
+                if (!connected)
+                {
+                    ResetConnectionView();
+                    if (!controller.IsRunning) liveSettings = null;
+                }
+                tray?.Update(connected);
+                UpdateMode();
+            });
+        };
         controller.Log += _ => UI(() => logs.Text = string.Join(Environment.NewLine, controller.Logs));
         controller.Message += message =>
         {
@@ -146,6 +150,7 @@ internal sealed partial class MainWindow : Window
             });
         };
         tray = new(action => UI(() => TrayAction(action)), QueueLaunchLink);
+        InitializeControlIpc(directory);
         root.RowDefinitions.Add(new() { Height = GridLength.Auto });
         root.RowDefinitions.Add(new() { Height = GridLength.Auto });
         root.RowDefinitions.Add(new() { Height = new GridLength(1, GridUnitType.Star) });
@@ -478,6 +483,7 @@ internal sealed partial class MainWindow : Window
         initialized = true;
         Load(initial ?? NewProfile());
         SetDirectoryLayout();
+        SyncWindowsTerminalProfiles();
         if (refreshCatalog && initial is not null) await RefreshApplicationsAsync();
     }
     private void UpdateMode()
@@ -540,6 +546,7 @@ internal sealed partial class MainWindow : Window
         gpu.SelectedIndex = settings.GpuInput == "cuda" ? 1 : 0;
         clipboard.SelectedIndex = Array.IndexOf(new[] { "both", "send", "receive", "off" }, settings.Clipboard);
         remoteTray.IsOn = settings.Tray;
+        windowsTerminalProfile.IsOn = settings.WindowsTerminalProfile;
         images.IsOn = settings.ClipboardImages; files.IsOn = settings.Files; dragText.IsOn = settings.DragText; readOnly.IsOn = settings.ReadOnly; ime.IsOn = settings.Ime; touch.IsOn = settings.Touch;
         fileRate.Value = settings.FileRateKib;
         pen.IsOn = settings.Pen; penPressureGamma.Value = settings.PenPressureGamma;
@@ -565,7 +572,9 @@ internal sealed partial class MainWindow : Window
             FileRateKib = checked((int)fileRate.Value),
             Pen = pen.IsOn, PenPressureGamma = penPressureGamma.Value,
             Gamepads = gamepads.IsOn, GamepadRumble = gamepadRumble.IsOn, GamepadDeadzone = checked((int)gamepadDeadzone.Value),
-            Notifications = notifications.IsOn, Tray = remoteTray.IsOn, TouchModes = new(touchModes, StringComparer.Ordinal)
+            Notifications = notifications.IsOn, Tray = remoteTray.IsOn,
+            WindowsTerminalProfile = windowsTerminalProfile.IsOn,
+            TouchModes = new(touchModes, StringComparer.Ordinal)
         };
         var result = selected with
         {
@@ -597,6 +606,7 @@ internal sealed partial class MainWindow : Window
             _ = GuardAsync(RefreshApplicationsAsync);
         }
         UpdateMode(); UpdateTouchStatus(); UpdateInputDeviceStatus();
+        SyncWindowsTerminalProfiles();
     }
     private async Task ConnectOrDisconnectAsync()
     {
@@ -1033,7 +1043,9 @@ internal sealed partial class MainWindow : Window
             if (action == "mute") await QuickSettingAsync(audioSetting: true);
             if (action == "quit")
             {
-                quitting = true; activeDialog?.Hide(); InvalidateCatalog(); await desktopNotifications.DisposeAsync(); await controller.DisposeAsync(); tray.Dispose();
+                quitting = true; activeDialog?.Hide(); InvalidateCatalog();
+                if (controlIpc is not null) await controlIpc.DisposeAsync();
+                await desktopNotifications.DisposeAsync(); await controller.DisposeAsync(); tray.Dispose();
                 Close(); Application.Current.Exit();
             }
         });

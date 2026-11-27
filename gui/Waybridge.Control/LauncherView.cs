@@ -171,10 +171,11 @@ internal sealed partial class MainWindow
         var transfer = IconButton(L("File transfers"), "\uE8B7");
         transfer.Click += (_, _) => { transferDrawer.IsPaneOpen = !transferDrawer.IsPaneOpen; MarkTransferSeen(); };
         var transferAction = new Grid { Children = { transfer, transferBadge } };
+        openTerminal.Click += async (_, _) => await GuardAsync(OpenRemoteTerminalAsync);
         var settings = IconButton(L("Settings"), "\uE713");
         settings.Click += (_, _) => ShowPage("display");
         var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, VerticalAlignment = VerticalAlignment.Center,
-            Children = { readOnlyQuick, audioButton, linkButton, transferAction, settings } };
+            Children = { openTerminal, readOnlyQuick, audioButton, linkButton, transferAction, settings } };
 
         L("Search remote apps, windows, or commands").Name(applicationSearch);
         applicationSearch.TextChanged += (_, _) =>
@@ -183,7 +184,7 @@ internal sealed partial class MainWindow
             RefreshLauncherSearch();
         };
         applicationSearch.KeyDown += SearchKeyDown;
-        foreach (var control in new Microsoft.UI.Xaml.Controls.Control[] { profilePicker, connect, more, applicationSearch, readOnlyQuick, audioButton, linkButton, transfer, settings })
+        foreach (var control in new Microsoft.UI.Xaml.Controls.Control[] { profilePicker, connect, more, applicationSearch, openTerminal, readOnlyQuick, audioButton, linkButton, transfer, settings })
         {
             control.Height = control.MinHeight = height;
             control.VerticalAlignment = VerticalAlignment.Center;
@@ -546,6 +547,7 @@ internal sealed partial class MainWindow
         catalogScroll.Visibility = hasProfile ? Visibility.Visible : Visibility.Collapsed;
         emptyAdd.IsEnabled = canPair;
         refreshApps.IsEnabled = hasProfile && paired && !busy;
+        openTerminal.IsEnabled = initialized && hasProfile && paired && !busy;
         applicationSearch.IsEnabled = hasProfile && paired;
         muteQuick.IsEnabled = readOnlyQuick.IsEnabled = endSessionQuick.IsEnabled = live && !busy;
         var requested = liveSettings ?? selected.Settings;

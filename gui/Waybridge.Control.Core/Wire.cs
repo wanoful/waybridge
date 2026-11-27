@@ -19,6 +19,14 @@ public sealed class JsonLines(Stream stream, int limit = 1024 * 1024)
 {
     private readonly byte[] buffer = new byte[limit];
     private int used;
+    public byte[] TakeBufferedBytes()
+    {
+        if (used == 0) return [];
+        byte[] remaining = new byte[used];
+        Buffer.BlockCopy(buffer, 0, remaining, 0, used);
+        used = 0;
+        return remaining;
+    }
     public async Task<JsonElement?> ReadAsync(CancellationToken cancellationToken)
     {
         while (true)

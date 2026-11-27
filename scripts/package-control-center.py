@@ -13,7 +13,7 @@ arch = sys.argv[1]
 assert arch in ("arm64", "x64")
 directory = root / "build" / ("control-center-" + arch)
 expected = 0xaa64 if arch == "arm64" else 0x8664
-for name in ("Waybridge.Control.exe", "waybridge-client.exe", "coreclr.dll", "Microsoft.UI.Xaml.dll", "Microsoft.WindowsAppRuntime.dll", "Microsoft.WindowsAppRuntime.Insights.Resource.dll"):
+for name in ("Waybridge.Control.exe", "waybridge.exe", "waybridge-client.exe", "coreclr.dll", "Microsoft.UI.Xaml.dll", "Microsoft.WindowsAppRuntime.dll", "Microsoft.WindowsAppRuntime.Insights.Resource.dll"):
     path = next(p for p in directory.iterdir() if p.name.lower() == name.lower())
     data = path.read_bytes()
     offset, = struct.unpack_from("<I", data, 0x3c)
@@ -29,6 +29,9 @@ manifest = ET.fromstring(manifest_exe[start:end])
 assert list(manifest)[0].tag.endswith("assemblyIdentity"), "assembly identity must lead the manifest"
 assert len(manifest.findall(".//{urn:schemas-microsoft-com:winrt.v1}activatableClass")) > 100
 assert config["runtimeOptions"]["includedFrameworks"] and "frameworks" not in config["runtimeOptions"]
+cli_config = json.loads((directory / "waybridge.runtimeconfig.json").read_text())
+assert cli_config["runtimeOptions"]["includedFrameworks"] == config["runtimeOptions"]["includedFrameworks"]
+assert (directory / "waybridge.dll").is_file() and (directory / "waybridge.deps.json").is_file()
 for name in ("waybridge.ico", "waybridge.png", "waybridge-badge.png"):
     assert (directory / "Assets" / name).is_file(), "missing GUI branding resource: " + name
 assert (directory / "Microsoft.UI.Xaml.Controls.pri").is_file()

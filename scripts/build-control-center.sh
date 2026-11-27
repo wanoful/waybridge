@@ -34,6 +34,13 @@ for arch in "${architectures[@]}"; do
     -p:WindowsAppSDKSelfContained=true -p:MicrosoftWindowsAppSDKPackageDir= \
     "-p:PathMap=$PWD=/_/waybridge" \
     "-p:ManifestTool=$PWD/scripts/merge-windows-manifest.py" -o "$output"
+  cli_stage="build/cli-$arch"
+  rm -rf -- "$cli_stage"
+  dotnet publish gui/Waybridge.Cli/Waybridge.Cli.csproj -c Release \
+    -r "win-$arch" --self-contained true \
+    "-p:PathMap=$PWD=/_/waybridge" -o "$cli_stage"
+  cp "$cli_stage/waybridge.exe" "$cli_stage/waybridge.dll" \
+    "$cli_stage/waybridge.deps.json" "$cli_stage/waybridge.runtimeconfig.json" "$output/"
   cp "$native/waybridge-client.exe" "$output/"
   cp README.md "$output/README.md"
   mkdir -p "$output/docs"
@@ -42,6 +49,8 @@ for arch in "${architectures[@]}"; do
   cp LICENSE "$output/LICENSE-Waybridge.txt"
   mkdir -p "$output/licenses"
   cp "$native/SDL3-LICENSE.txt" "$output/licenses/"
+  cp "$native/Opus-LICENSE.txt" "$output/licenses/"
+  cp "$native/nanors-LICENSE.txt" "$output/licenses/"
   cp client/third_party/json.LICENSE.MIT "$output/licenses/nlohmann-json-LICENSE.txt"
   dotnet_version=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["runtimeOptions"]["includedFrameworks"][0]["version"])' "$output/Waybridge.Control.runtimeconfig.json")
   packages="${NUGET_PACKAGES:-$HOME/.nuget/packages}"

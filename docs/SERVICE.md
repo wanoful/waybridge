@@ -162,6 +162,40 @@ operation. The provided user-unit template uses `KillMode=process` to preserve
 that distinction. Host logout/user-service shutdown policy remains a deployment
 setting and must be configured for the desired persistence.
 
+## Interactive Shell (`op: "shell"`)
+
+Authenticated clients can also open an interactive Linux PTY over a pinned TLS
+connection bound to an active graphical session:
+
+```json
+{"id":5,"op":"shell","client_id":"ID","client_token":"TOKEN","session":"waybridge-0","cols":120,"rows":30,"term":"xterm-256color"}
+```
+
+After verifying client trust and the live session descriptor/compositor PID, the
+service allocates a PTY, spawns the user's shell, and replies:
+
+```json
+{"id":5,"ok":true,"result":{"shell_ready":true,"version":1}}
+```
+
+Following that LF, the stream switches to 5-byte big-endian frames
+(`[u8 kind][u32 length][payload]`): `1` (`DATA`, bidirectional PTY bytes),
+`2` (`RESIZE`, `[u16 cols][u16 rows]` → `TIOCSWINSZ`), `3` (`EXIT`,
+`[i32 code][u8 reason]`, where reason `0` = normal exit, `1` = remote session
+ended, `2` = client revoked), and `4`/`5` (`PING`/`PONG`).
+
+For `bash`, `zsh`, and `fish`, the service generates a private `0700`/`0600`
+wrapper RC under its runtime directory that sources the user's normal shell
+startup files first, then exports the active Waybridge graphical and audio
+session environment (`WAYLAND_DISPLAY`, `DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`,
+`PULSE_SINK`, `PIPEWIRE_NODE`, `PULSE_SOURCE`, `WAYBRIDGE_SHELL=1`,
+`WAYBRIDGE_SESSION`), unsets host IM overrides (`GTK_IM_MODULE`, `QT_IM_MODULE`,
+`XMODIFIERS`, etc.), and finally sources an optional user hook at
+`$XDG_CONFIG_HOME/waybridge/shellrc` (or `shellrc.fish` for `fish`). Temporary
+wrapper files are deleted on exit. If the session compositor exits or the client
+is revoked, the service sends `EXIT` and terminates the shell process group
+immediately.
+
 ## Install and verify
 
 ```sh

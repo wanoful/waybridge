@@ -426,5 +426,104 @@ try
     }
     Console.WriteLine("PASS: cancellation of a silent connected worker is bounded and terminates it without waiting for live stderr EOF");
 
+    // Connection lookup, Windows Terminal fragments, shell framing, and Control IPC tests.
+    Check(!new ClientSettings().WindowsTerminalProfile, "Windows Terminal profile sync must default to off");
+    var wtFirst = directProfile with { Id = Guid.Parse("11111111-2222-3333-4444-555555555555"), Name = "Studio Linux",
+        Settings = new ClientSettings { WindowsTerminalProfile = true } };
+    var wtSecond = directProfile with { Id = Guid.Parse("66666666-7777-8888-9999-aaaaaaaaaaaa"), Name = "Gaming Box",
+        Settings = new ClientSettings { WindowsTerminalProfile = false } };
+    var wtUnpaired = wtFirst with { Id = Guid.Parse("bbbbbbbb-cccc-dddd-eeee-ffffffffffff"), Name = "Unpaired", ClientId = "" };
+    Check(ProfileStore.FindConnection([wtFirst, wtSecond], wtFirst.Id.ToString("D")).Id == wtFirst.Id, "FindConnection by GUID failed");
+    Check(ProfileStore.FindConnection([wtFirst, wtSecond], "studio linux").Id == wtFirst.Id, "FindConnection by case-insensitive name failed");
+    await Reject<KeyNotFoundException>(() => { _ = ProfileStore.FindConnection([wtFirst], "missing"); return Task.CompletedTask; });
+    await Reject<ArgumentException>(() => { _ = ProfileStore.FindConnection([wtFirst, wtSecond with { Name = "Studio Linux" }], "Studio Linux"); return Task.CompletedTask; });
+
+    Guid fragGuidA = WindowsTerminalFragments.GenerateProfileGuid(wtFirst.Id);
+    Guid fragGuidB = WindowsTerminalFragments.GenerateProfileGuid(wtFirst.Id);
+    Check(fragGuidA == fragGuidB && fragGuidA != wtFirst.Id, "fragment profile GUID must be deterministic UUIDv5");
+    Check(((fragGuidA.ToByteArray()[7] >> 4) & 0x0F) == 5, "fragment profile GUID must carry UUID version 5");
+
+    string fragDir = Path.Combine(directory, "wt-fragments", "Waybridge");
+    WindowsTerminalFragments.Sync([wtFirst, wtSecond, wtUnpaired], @"C:\Apps\Waybridge\waybridge.exe", @"C:\Apps\Waybridge\Assets\waybridge.png", fragDir);
+    string fragPath = Path.Combine(fragDir, "profiles.json");
+    Check(File.Exists(fragPath), "Windows Terminal fragment file was not created");
+    byte[] fragBytes = await File.ReadAllBytesAsync(fragPath);
+    Check(!(fragBytes.Length >= 3 && fragBytes[0] == 0xEF && fragBytes[1] == 0xBB && fragBytes[2] == 0xBF), "Windows Terminal fragment must be UTF-8 without BOM");
+    using (var fragDoc = JsonDocument.Parse(fragBytes))
+    {
+        var list = fragDoc.RootElement.GetProperty("profiles");
+        Check(list.ValueKind == JsonValueKind.Array && list.GetArrayLength() == 1, "fragment must only include paired profiles with sync enabled");
+        var entry = list[0];
+        Check(entry.GetProperty("guid").GetString() == "{" + fragGuidA.ToString("D") + "}", "fragment guid mismatch");
+        Check(entry.GetProperty("name").GetString() == "Waybridge · Studio Linux", "fragment name mismatch");
+        Check(entry.GetProperty("commandline").GetString() == $"\"C:\\Apps\\Waybridge\\waybridge.exe\" shell --connection {wtFirst.Id:D}", "fragment commandline mismatch");
+        Check(entry.GetProperty("icon").GetString() == @"C:\Apps\Waybridge\Assets\waybridge.png", "fragment icon mismatch");
+    }
+    WindowsTerminalFragments.Sync([wtFirst with { Settings = wtFirst.Settings with { WindowsTerminalProfile = false } }],
+        @"C:\Apps\Waybridge\waybridge.exe", null, fragDir);
+    Check(!File.Exists(fragPath) && !Directory.Exists(fragDir), "disabling all fragment toggles must clean up profiles.json");
+    Console.WriteLine("PASS: connection lookup and Windows Terminal JSON fragment generation/cleanup");
+
+    using (var frameStream = new MemoryStream())
+    {
+        await ShellProtocol.WriteFrameAsync(frameStream, ShellProtocol.KindData, Encoding.UTF8.GetBytes("hello-pty"), CancellationToken.None);
+        await ShellProtocol.WriteResizeAsync(frameStream, 140, 42, CancellationToken.None);
+        await ShellProtocol.WriteFrameAsync(frameStream, ShellProtocol.KindPing, ReadOnlyMemory<byte>.Empty, CancellationToken.None);
+        await ShellProtocol.WriteFrameAsync(frameStream, ShellProtocol.KindExit, new byte[] { 0, 0, 0, 9, ShellProtocol.ReasonSessionEnded }, CancellationToken.None);
+        frameStream.Position = 0;
+        var f1 = await ShellProtocol.ReadFrameAsync(frameStream, CancellationToken.None);
+        var f2 = await ShellProtocol.ReadFrameAsync(frameStream, CancellationToken.None);
+        var f3 = await ShellProtocol.ReadFrameAsync(frameStream, CancellationToken.None);
+        var f4 = await ShellProtocol.ReadFrameAsync(frameStream, CancellationToken.None);
+        var f5 = await ShellProtocol.ReadFrameAsync(frameStream, CancellationToken.None);
+        Check(f1?.Kind == ShellProtocol.KindData && Encoding.UTF8.GetString(f1.Value.Payload) == "hello-pty", "DATA frame round-trip failed");
+        Check(f2?.Kind == ShellProtocol.KindResize && f2.Value.Payload.SequenceEqual(new byte[] { 0, 140, 0, 42 }), "RESIZE frame round-trip failed");
+        Check(f3?.Kind == ShellProtocol.KindPing && f3.Value.Payload.Length == 0, "PING frame round-trip failed");
+        Check(f4?.Kind == ShellProtocol.KindExit && ShellProtocol.ParseExit(f4.Value.Payload) == (9, ShellProtocol.ReasonSessionEnded), "EXIT frame round-trip failed");
+        Check(f5 is null, "expected EOF after final frame");
+    }
+    using (var combined = new MemoryStream())
+    {
+        await combined.WriteAsync(Encoding.UTF8.GetBytes("{\"id\":1,\"ok\":true}\n"));
+        await ShellProtocol.WriteFrameAsync(combined, ShellProtocol.KindData, Encoding.UTF8.GetBytes("pipelined"), CancellationToken.None);
+        combined.Position = 0;
+        var lineReader = new JsonLines(combined, 4096);
+        var header = await lineReader.ReadAsync(CancellationToken.None);
+        Check(header?.GetProperty("ok").GetBoolean() == true, "JSON line handshake failed");
+        byte[] leftover = lineReader.TakeBufferedBytes();
+        Check(leftover.Length > 0, "JsonLines did not preserve pipelined binary prefix");
+        using var tail = new MemoryStream(leftover);
+        var pipelined = await ShellProtocol.ReadFrameAsync(tail, CancellationToken.None);
+        Check(pipelined?.Kind == ShellProtocol.KindData && Encoding.UTF8.GetString(pipelined.Value.Payload) == "pipelined", "pipelined frame lost");
+    }
+    Console.WriteLine("PASS: shell binary framing and pipelined handshake buffer handoff");
+
+    string ipcPipe = ControlIpc.PipeName(Path.Combine(directory, "ipc-state"));
+    Check(ipcPipe == ControlIpc.PipeName(Path.Combine(directory, "ipc-state") + Path.DirectorySeparatorChar), "IPC pipe name must normalize trailing separators");
+    using (var ipcCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+    {
+        var serverTask = Task.Run(async () =>
+        {
+            await using var server = new NamedPipeServerStream(ipcPipe, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            await server.WaitForConnectionAsync(ipcCts.Token);
+            var req = await new JsonLines(server, 4096).ReadAsync(ipcCts.Token);
+            Check(req?.GetProperty("op").GetString() == "ensure_connected" &&
+                req?.GetProperty("profile_id").GetString() == wtFirst.Id.ToString("D"), "IPC request mismatch");
+            await server.WriteAsync(Wire.Encode(new { ok = true, session = "waybridge-7" }), ipcCts.Token);
+            await server.FlushAsync(ipcCts.Token);
+            await Task.Delay(30, ipcCts.Token);
+            await server.WriteAsync(Wire.Encode(new { @event = "disconnected", reason = "Disconnected by user" }), ipcCts.Token);
+            await server.FlushAsync(ipcCts.Token);
+        }, ipcCts.Token);
+        await using var ipcClient = await ControlIpcClient.ConnectAndEnsureAsync(ipcPipe, wtFirst.Id, TimeSpan.FromSeconds(3), ipcCts.Token);
+        Check(ipcClient.Session == "waybridge-7", "IPC session mismatch");
+        string disconnectReason = await ipcClient.WaitForDisconnectAsync(ipcCts.Token);
+        Check(disconnectReason == "Disconnected by user", "IPC disconnect notification mismatch: " + disconnectReason);
+        await serverTask;
+    }
+    Console.WriteLine("PASS: Control Center local IPC ensure_connected and disconnect broadcast");
+
+
 }
 finally { Directory.Delete(directory, true); }

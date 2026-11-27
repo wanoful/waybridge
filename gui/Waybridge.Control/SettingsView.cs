@@ -72,6 +72,7 @@ internal sealed partial class MainWindow
     private UIElement DesktopPage() => SettingsPage(L("Desktop integration"),
         Row(L("Desktop notifications"), L("Applies immediately. Linux app notifications follow Windows notification settings."), notifications),
         Row(L("Remote app tray icons"), L("Applies immediately. Shows remote app tray icons in the Windows notification area."), remoteTray),
+        Row(L("Sync profile to Windows Terminal"), L("Adds this workstation to Windows Terminal via a JSON fragment. Save settings to apply."), windowsTerminalProfile),
         BadgeEditor(), SettingsActions(includeApply: true));
 
     private UIElement SettingsPage(UiText title, params UIElement[] children)
@@ -215,6 +216,7 @@ internal sealed partial class MainWindow
         launcherPreferences.SelectedProfile = remaining?.Id;
         Load(remaining ?? NewProfile());
         secrets.Delete(profile.Id);
+        SyncWindowsTerminalProfiles();
         await SaveLauncherPreferencesAsync();
         if (remaining is not null) await RefreshApplicationsAsync();
     });
