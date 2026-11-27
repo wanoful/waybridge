@@ -33,6 +33,7 @@ mod readonly_export;
 mod relative_input;
 mod session_guard;
 mod session_services;
+mod session_state;
 mod shutdown;
 mod stream_config;
 mod toplevel_drag;
@@ -349,6 +350,7 @@ struct App {
     _toplevel_icons: smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager,
     tray: Option<desktop_tray::Tray>,
     media: Option<desktop_media::Media>,
+    session_state: Option<Arc<session_state::Publisher>>,
     relative: relative_input::RelativeInput,
     touch: touch::Touch,
     touchpad: touchpad::Touchpad,
@@ -1029,6 +1031,49 @@ impl App {
             );
         }
     }
+    fn sync_session_state(&self) {
+        let Some(publisher) = &self.session_state else {
+            return;
+        };
+        let mut summaries = Vec::with_capacity(self.windows.len());
+        for remote in &self.windows {
+            if !remote.mapped || !remote.window.alive() {
+                continue;
+            }
+            if let Some(x) = remote.window.x11_surface() {
+                if x.is_override_redirect() {
+                    continue;
+                }
+                summaries.push(session_state::WindowSummary {
+                    id: remote.id,
+                    title: session_state::sanitize(&x.title(), 256),
+                    app_id: session_state::sanitize(&x.class(), 255),
+                    x11: true,
+                });
+            } else if let Some(top) = remote.window.toplevel() {
+                let (title, app_id) = with_states(top.wl_surface(), |states| {
+                    let data = states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .unwrap()
+                        .lock()
+                        .unwrap();
+                    (
+                        session_state::sanitize(data.title.as_deref().unwrap_or_default(), 256),
+                        session_state::sanitize(data.app_id.as_deref().unwrap_or_default(), 255),
+                    )
+                });
+                summaries.push(session_state::WindowSummary {
+                    id: remote.id,
+                    title,
+                    app_id,
+                    x11: false,
+                });
+            }
+        }
+        publisher.set_windows(summaries);
+    }
+
     fn sync_gamepads(&mut self) {
         let focused = self.focused_window.filter(|id| self.input_allowed(*id));
         let allowed =
@@ -2048,6 +2093,7 @@ impl App {
             );
         }
         self.refresh_x11_grab();
+        self.sync_session_state();
         for popup in &mut self.remote_popups {
             let Some(root) = self.windows.iter().find(|w| w.id == popup.root) else {
                 continue;
@@ -2971,6 +3017,7 @@ fn main() -> Result<()> {
         },
         tray: None,
         media: None,
+        session_state: None,
         _dialogs: smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<App>(&dh),
         relative: relative_input::RelativeInput::default(),
         touch: touch::Touch::default(),
@@ -3074,9 +3121,18 @@ fn main() -> Result<()> {
         application_session.service_runtime(),
         application_session.service_bus_address(),
     )?;
+    app.session_state = match session_state::Publisher::start(application_session.service_runtime())
+    {
+        Ok(publisher) => Some(publisher),
+        Err(error) => {
+            tracing::warn!(%error, "Waybridge session state publisher unavailable");
+            None
+        }
+    };
     app.tray = Some(desktop_tray::Tray::new(
         application_session.bus_address().to_owned(),
         app.events.clone(),
+        app.session_state.clone(),
     ));
     app.media = Some(desktop_media::Media::new(
         application_session.bus_address().to_owned(),
@@ -3137,6 +3193,9 @@ fn main() -> Result<()> {
                         notifications.connection(peer.notifications_initial());
                         if peer.notifications_enabled() {
                             peer.control(notifications.status());
+                        }
+                        if let Some(session_state) = &app.session_state {
+                            session_state.set_viewer_connected(true);
                         }
                         if let Some(tray) = &app.tray {
                             tray.set_peer(Some(peer.clone()));
@@ -3307,6 +3366,9 @@ fn main() -> Result<()> {
                         app.drag_visual.enabled = false;
                         app.activation.connection();
                         notifications.connection(false);
+                        if let Some(session_state) = &app.session_state {
+                            session_state.set_viewer_connected(false);
+                        }
                         if let Some(tray) = &app.tray {
                             tray.set_peer(None);
                         }
@@ -3403,6 +3465,9 @@ fn main() -> Result<()> {
     })();
     app.release_input();
     app.gamepads.disconnect();
+    if let Some(session_state) = &app.session_state {
+        session_state.stop();
+    }
     let mut xloop_error_reported = false;
     let shutdown_result = application_session.stop_services(|| {
         // A failed Xwayland event source must not prevent native clients from

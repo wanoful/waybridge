@@ -226,7 +226,8 @@ internal sealed partial class MainWindow
             InvalidateIcons();
             await RefreshApplicationsAsync();
             FilterApplications();
-            RenderWindows();
+            if (controller.Connected && controller.ActiveProfileId == selected.Id) RenderWindows();
+            else UpdateRemoteSessionView();
         });
         emptyAdd.Click += async (_, _) => await GuardAsync(PairDeviceAsync);
 
@@ -324,6 +325,7 @@ internal sealed partial class MainWindow
     {
         L("Running windows").Name(windowList);
         L("Remote background apps").Name(backgroundList);
+        var sessionCard = BuildRemoteSessionCard();
         windowSection.Children.Add(Heading(L("Remote windows"), 17)); windowSection.Children.Add(windowList);
         backgroundSection.Children.Add(Heading(L("Background apps"), 17)); backgroundSection.Children.Add(backgroundList);
         dock.ColumnDefinitions.Add(new() { Width = new GridLength(1, GridUnitType.Star) });
@@ -335,7 +337,7 @@ internal sealed partial class MainWindow
         dock.SizeChanged += (_, args) => LayoutDock(args.NewSize.Width);
         windowSection.Visibility = backgroundSection.Visibility = Visibility.Collapsed;
         UpdateDockVisibility();
-        return Column(Heading(L("Running"), 22), runningEmpty, dock);
+        return Column(Heading(L("Running"), 22), sessionCard, runningEmpty, dock, processSection);
     }
 
     private bool Matches(params string[] values)
@@ -440,10 +442,23 @@ internal sealed partial class MainWindow
     private void UpdateDockVisibility()
     {
         LayoutDock(dock.ActualWidth);
-        bool hasRunning = windowList.Items.Count > 0 || backgroundList.Items.Count > 0;
-        dock.Visibility = hasRunning ? Visibility.Visible : Visibility.Collapsed;
+        bool hasDock = windowList.Items.Count > 0 || backgroundList.Items.Count > 0;
+        bool hasProcesses = processList.Items.Count > 0;
+        bool hasRunning = hasDock || hasProcesses;
+        dock.Visibility = hasDock ? Visibility.Visible : Visibility.Collapsed;
         runningEmpty.Visibility = hasRunning ? Visibility.Collapsed : Visibility.Visible;
-        runningEmpty.Text = controller.Connected ? Tr("No matching remote windows or background apps.") : Tr("Connect to a workstation to see remote windows and background apps.");
+        bool live = controller.Connected && controller.ActiveProfileId == selected.Id;
+        if (live)
+            runningEmpty.Text = Tr("No matching remote windows or background apps.");
+        else if (PrimaryRemoteSession is { } session)
+            runningEmpty.Text = applicationSearch.Text.Trim().Length > 0
+                ? Tr("No matching remote windows, background apps, or processes.")
+                : session.DetailsAvailable
+                    ? Tr("No open windows or background apps detected in session “{0}”.", session.Name)
+                    : Tr("Update the Linux server to inspect open windows and background apps before connecting.");
+        else
+            runningEmpty.Text = "";
+        if (runningEmpty.Text.Length == 0) runningEmpty.Visibility = Visibility.Collapsed;
     }
 
     private void FilterApplications(bool keepDirectoryAtTop = false)
@@ -549,7 +564,8 @@ internal sealed partial class MainWindow
         refreshApps.IsEnabled = hasProfile && paired && !busy;
         openTerminal.IsEnabled = initialized && hasProfile && paired && !busy;
         applicationSearch.IsEnabled = hasProfile && paired;
-        muteQuick.IsEnabled = readOnlyQuick.IsEnabled = endSessionQuick.IsEnabled = live && !busy;
+        muteQuick.IsEnabled = readOnlyQuick.IsEnabled = live && !busy;
+        endSessionQuick.IsEnabled = CanEndRemoteSession;
         var requested = liveSettings ?? selected.Settings;
         string muteLabel = requested.Audio ? Tr("Mute") : Tr("Unmute");
         muteQuick.Content = muteLabel;
@@ -561,8 +577,12 @@ internal sealed partial class MainWindow
         AutomationProperties.SetName(connectionDot, live ? Tr("Connected") : controller.IsRunning ? Tr("Connecting") : Tr("Disconnected"));
         connectionDot.Fill = new SolidColorBrush(live ? ColorHelper.FromArgb(255, 22, 160, 93)
             : controller.IsRunning ? ColorHelper.FromArgb(255, 231, 173, 40) : ColorHelper.FromArgb(255, 126, 137, 153));
-        sessionStatus.Text = live && controller.CurrentSession is { } current ? current : controller.IsRunning ? Tr("Connecting") : Tr("Disconnected");
-        UpdateDockVisibility();
+        sessionStatus.Text = live && controller.CurrentSession is { } current ? current
+            : controller.IsRunning ? Tr("Connecting")
+            : PrimaryRemoteSession is { } remote ? Tr("Remote session running · {0}", remote.Name)
+            : remoteSessionsChecked && remoteSessionsError.Length == 0 && paired ? Tr("No remote session")
+            : Tr("Disconnected");
+        UpdateRemoteSessionView();
         UpdateCommandControls();
         if (!hasProfile) status.Text = Tr("Unpaired");
     }
@@ -572,7 +592,11 @@ internal sealed partial class MainWindow
         Load(profile);
         launcherPreferences.SelectedProfile = profile.Id;
         await SaveLauncherPreferencesAsync();
-        if (profile.Id == selected.Id) await RefreshApplicationsAsync();
+        if (profile.Id == selected.Id)
+        {
+            _ = GuardAsync(() => RefreshRemoteSessionsAsync(quiet: true));
+            await RefreshApplicationsAsync();
+        }
     }
 
     private async Task SaveLauncherPreferencesAsync()
@@ -605,7 +629,8 @@ internal sealed partial class MainWindow
             {
                 applications = available;
                 FilterApplications();
-                RenderWindows();
+                if (controller.Connected && controller.ActiveProfileId == selected.Id) RenderWindows();
+                else UpdateRemoteSessionView();
                 _ = GuardAsync(ApplyLauncherPoliciesAsync);
             }
         }

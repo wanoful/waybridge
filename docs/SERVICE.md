@@ -101,7 +101,14 @@ Authenticated management requests carry both credential fields:
 ```
 
 `list`, `ensure`, `info`, `applications`, `launch-plan`, `launch`, and `end` use the same request
-fields/results as `scripts/session-control.py`. The configured compositor binary
+fields/results as `scripts/session-control.py`. Passing `details:true` to `list` or `info`
+enriches each session object with out-of-band inspection metadata—`uptime_seconds`,
+`state_available`, `viewer_connected`, open `windows` (`id`, `title`, `app_id`, `x11`),
+SNI `background_apps` (`id`, `app_id`, `title`, `status`), and collapsed same-user
+session `processes` (`pid`, `name`, `app_id`, `count`, never raw command-line arguments
+or environment values)—read from the compositor's private `session-state.json` snapshot
+and `/proc` without attaching a streaming viewer. `end` accepts optional `expected_pid`
+and `expected_started` fields so remote callers can pin the exact session instance. The configured compositor binary
 overrides any network `binary` field. The helper runs locally with isolated Python
 imports, controlled stdio, bounded responses and PID/ownership checks. `ensure`
 returns the session's v3 `token` only after client authentication; `info` and

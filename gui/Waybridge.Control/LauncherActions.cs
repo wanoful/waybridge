@@ -303,7 +303,8 @@ internal sealed partial class MainWindow
         directoryHeader.Visibility = CommandMode ? Visibility.Collapsed : Visibility.Visible;
         if (!CommandMode) FilterApplications();
         else favoritesSection.Visibility = applicationList.Visibility = Visibility.Collapsed;
-        RenderWindows();
+        if (controller.Connected && controller.ActiveProfileId == selected.Id) RenderWindows();
+        else UpdateRemoteSessionView();
         UpdateCommandControls();
         if (CommandMode) RefreshCommandHistory();
         if (ActivePage == "apps") ScrollCatalogTo(0);

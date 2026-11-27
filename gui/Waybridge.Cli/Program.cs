@@ -25,6 +25,8 @@ internal static class Program
             {
                 "shell" => await RunShellAsync(args[1..], defaultState),
                 "list" => await RunListAsync(args[1..], defaultState),
+                "status" => await RunStatusAsync(args[1..], defaultState),
+                "end" => await RunEndAsync(args[1..], defaultState),
                 _ => UnknownCommand(args[0])
             };
         }
@@ -50,6 +52,8 @@ internal static class Program
     {
         Console.WriteLine("Usage:");
         Console.WriteLine("  waybridge shell --connection <name-or-id> [--cwd <linux-dir>]");
+        Console.WriteLine("  waybridge status --connection <name-or-id> [--json]");
+        Console.WriteLine("  waybridge end --connection <name-or-id> [--session <name>]");
         Console.WriteLine("  waybridge list");
     }
 
@@ -90,6 +94,131 @@ internal static class Program
             string paired = profile.ClientId.Length > 0 && profile.CertificateSha256.Length == 64 ? "paired" : "unpaired";
             Console.WriteLine($"{profile.Name}\t{profile.Id:D}\t{profile.Host}:{profile.Port}\t{paired}");
         }
+        return 0;
+    }
+
+    private static async Task<(ConnectionProfile Profile, string Token)> LoadAuthorizedProfileAsync(string stateDir, string? connectionQuery)
+    {
+        if (string.IsNullOrWhiteSpace(connectionQuery))
+            throw new ArgumentException(Tr("Specify a workstation name or connection ID with --connection."));
+        var profiles = await new ProfileStore(stateDir).LoadAsync();
+        var profile = ProfileStore.FindConnection(profiles, connectionQuery);
+        if (profile.ClientId.Length == 0 || profile.CertificateSha256.Length != 64)
+            throw new InvalidOperationException(Tr("Pair with “{0}” in Waybridge Control Center first.", profile.Name));
+        string? token = Environment.GetEnvironmentVariable("WAYBRIDGE_CLIENT_TOKEN") ?? ReadWindowsSecret(profile.Id);
+        if (string.IsNullOrWhiteSpace(token))
+            throw new InvalidOperationException(Tr("Saved credentials for “{0}” were not found. Pair again in Waybridge Control Center.", profile.Name));
+        return (profile, token);
+    }
+
+    private static async Task<int> RunStatusAsync(string[] args, string defaultState)
+    {
+        string? connectionQuery = null;
+        string stateDir = defaultState;
+        bool jsonOutput = false;
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--connection" or "-c":
+                    if (i + 1 >= args.Length) throw new ArgumentException(Tr("Missing value for --connection."));
+                    connectionQuery = args[++i];
+                    break;
+                case "--state-dir":
+                    if (i + 1 >= args.Length) throw new ArgumentException(Tr("Missing value for --state-dir."));
+                    stateDir = args[++i];
+                    break;
+                case "--json":
+                    jsonOutput = true;
+                    break;
+                case "-h" or "--help":
+                    PrintUsage();
+                    return 0;
+                default:
+                    throw new ArgumentException(Tr("Unexpected argument: {0}", args[i]));
+            }
+        }
+        var (profile, token) = await LoadAuthorizedProfileAsync(stateDir, connectionQuery);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var payload = await new DirectAgent(profile, token).CallAsync(new { op = "list", details = true }, timeout.Token);
+        if (jsonOutput)
+        {
+            Console.WriteLine(JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+            return 0;
+        }
+        var sessions = RemoteSessionModel.ParseList(payload);
+        if (sessions.Count == 0)
+        {
+            Console.WriteLine(Tr("No remote session is running on “{0}”.", profile.Name));
+            return 0;
+        }
+        foreach (var session in sessions)
+        {
+            string viewer = session.ViewerConnected switch
+            {
+                true => Tr("Viewer attached"),
+                false => Tr("Running in background (no viewer attached)"),
+                _ => ""
+            };
+            string uptime = session.UptimeSeconds is { } sec ? RemoteSessionModel.FormatUptime(sec) : "";
+            var summary = new[] { $"PID {session.Pid}", uptime, viewer }.Where(s => s.Length > 0);
+            Console.WriteLine($"{session.Name}\t{string.Join(" · ", summary)}");
+            foreach (var win in session.Windows)
+                Console.WriteLine($"  [window] {(win.Title.Length > 0 ? win.Title : win.AppId)} ({(win.X11 ? "X11" : "Wayland")})");
+            foreach (var bg in session.BackgroundApps)
+                Console.WriteLine($"  [background] {(bg.Title.Length > 0 ? bg.Title : bg.AppId)} ({bg.Status})");
+            foreach (var proc in session.Processes)
+                Console.WriteLine(proc.Count > 1
+                    ? $"  [process] {proc.Name} (PID {proc.Pid}, x{proc.Count})"
+                    : $"  [process] {proc.Name} (PID {proc.Pid})");
+        }
+        return 0;
+    }
+
+    private static async Task<int> RunEndAsync(string[] args, string defaultState)
+    {
+        string? connectionQuery = null;
+        string? sessionName = null;
+        string stateDir = defaultState;
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--connection" or "-c":
+                    if (i + 1 >= args.Length) throw new ArgumentException(Tr("Missing value for --connection."));
+                    connectionQuery = args[++i];
+                    break;
+                case "--session":
+                    if (i + 1 >= args.Length) throw new ArgumentException(Tr("Missing value for --session."));
+                    sessionName = args[++i];
+                    break;
+                case "--state-dir":
+                    if (i + 1 >= args.Length) throw new ArgumentException(Tr("Missing value for --state-dir."));
+                    stateDir = args[++i];
+                    break;
+                case "-h" or "--help":
+                    PrintUsage();
+                    return 0;
+                default:
+                    throw new ArgumentException(Tr("Unexpected argument: {0}", args[i]));
+            }
+        }
+        var (profile, token) = await LoadAuthorizedProfileAsync(stateDir, connectionQuery);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var agent = new DirectAgent(profile, token);
+        var sessions = RemoteSessionModel.ParseList(await agent.CallAsync(new { op = "list" }, timeout.Token));
+        if (sessions.Count == 0)
+        {
+            Console.WriteLine(Tr("No remote session is running on “{0}”.", profile.Name));
+            return 0;
+        }
+        RemoteSessionOverview? target = !string.IsNullOrWhiteSpace(sessionName)
+            ? sessions.FirstOrDefault(s => string.Equals(s.Name, sessionName, StringComparison.Ordinal))
+            : sessions.FirstOrDefault(s => string.Equals(s.Name, profile.Session, StringComparison.Ordinal)) ?? sessions[0];
+        if (target is null)
+            throw new KeyNotFoundException(Tr("Remote session “{0}” was not found on “{1}”.", sessionName!, profile.Name));
+        await agent.CallAsync(new { op = "end", session = target.Name, expected_pid = target.Pid, expected_started = target.Started }, timeout.Token);
+        Console.WriteLine(Tr("Remote session “{0}” ended.", target.Name));
         return 0;
     }
 

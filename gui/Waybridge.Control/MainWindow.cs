@@ -139,6 +139,7 @@ internal sealed partial class MainWindow : Window
                 }
                 tray?.Update(connected);
                 UpdateMode();
+                if (!quitting) _ = GuardAsync(() => RefreshRemoteSessionsAsync(quiet: true));
             });
         };
         controller.Log += _ => UI(() => logs.Text = string.Join(Environment.NewLine, controller.Logs));
@@ -184,10 +185,14 @@ internal sealed partial class MainWindow : Window
         AddPage("connection", L("Connect"), "\uE77B", ConnectionPage());
         AddPage("desktop", L("Desktop integration"), "\uE737", DesktopPage());
         AddPage("general", L("General"), "\uE713", GeneralPage());
-        navigation.SelectionChanged += (_, args) =>
+        navigation.SelectionChanged += (sender, args) =>
         {
             if (args.SelectedItem is NavigationViewItem item && item.Tag is string id)
+            {
                 navigation.Content = pages[id];
+                if (id is "running" or "connection" && initialized && paired)
+                    _ = GuardAsync(() => RefreshRemoteSessionsAsync(quiet: true));
+            }
         };
         navigation.SelectedItem = navigation.MenuItems[0];
         var searchShortcut = new KeyboardAccelerator { Key = VirtualKey.K, Modifiers = VirtualKeyModifiers.Control };
@@ -489,7 +494,12 @@ internal sealed partial class MainWindow : Window
         Load(initial ?? NewProfile());
         SetDirectoryLayout();
         SyncWindowsTerminalProfiles();
-        if (refreshCatalog && initial is not null) await RefreshApplicationsAsync();
+        InitializeRemoteSessionTimer();
+        if (refreshCatalog && initial is not null)
+        {
+            _ = GuardAsync(() => RefreshRemoteSessionsAsync(quiet: true));
+            await RefreshApplicationsAsync();
+        }
     }
     private void UpdateMode()
     {
@@ -502,7 +512,7 @@ internal sealed partial class MainWindow : Window
         name.IsEnabled = host.IsEnabled = remotePort.IsEnabled = hasProfile && editable;
         reconnect.IsEnabled = session.IsEnabled = sessionMode.IsEnabled = hasProfile && !busy;
         revoke.IsEnabled = paired && editable;
-        end.IsEnabled = !busy && live;
+        end.IsEnabled = CanEndRemoteSession;
         connect.IsEnabled = initialized && (!busy || (connecting && controller.IsRunning && !live));
         string connectLabel = live ? Tr("Disconnect") : controller.IsRunning ? Tr("Cancel connection") : paired ? Tr("Connect") : Tr("Pair");
         connect.Content = connectLabel;
@@ -522,6 +532,7 @@ internal sealed partial class MainWindow : Window
         {
             ResetTouchStatus(); ResetInputDeviceStatus(); touchApplicationNames.Clear();
             InvalidateCatalog();
+            InvalidateRemoteSessions();
             ResetConnectionView();
             transfers.Items.Clear(); receiveDirectory = "";
             MarkTransferSeen();
@@ -699,7 +710,7 @@ internal sealed partial class MainWindow : Window
                 state == "NeedsAttention" ? Muted(L("App needs attention")) : Muted(L("Running in background")), Actions(restore, menu)), new Thickness(12)));
         }
         backgroundSection.Visibility = backgroundList.Items.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
-        UpdateDockVisibility();
+        UpdateRemoteSessionView();
     }
     private void RefreshTouchApplications()
     {
@@ -999,6 +1010,7 @@ internal sealed partial class MainWindow : Window
             {
                 remoteWindows = windows.ToArray();
                 RenderWindows();
+                UpdateRemoteSessionView();
                 _ = GuardAsync(ApplyLauncherPoliciesAsync);
             }
             actual.Text = diagnosticMediaPath.Text = windows.Count > 0
@@ -1053,7 +1065,8 @@ internal sealed partial class MainWindow : Window
             if (action == "mute") await QuickSettingAsync(audioSetting: true);
             if (action == "quit")
             {
-                quitting = true; activeDialog?.Hide(); InvalidateCatalog();
+                quitting = true; activeDialog?.Hide(); InvalidateCatalog(); InvalidateRemoteSessions();
+                remoteSessionRefreshTimer?.Stop();
                 if (controlIpc is not null) await controlIpc.DisposeAsync();
                 await desktopMediaControls.DisposeAsync();
                 await desktopNotifications.DisposeAsync(); await controller.DisposeAsync(); tray.Dispose();

@@ -3,6 +3,7 @@
 use crate::{
     network::{Event, Peer},
     session_services::connect_bus,
+    session_state::{self, BackgroundAppSummary},
 };
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -133,12 +134,22 @@ pub struct Tray {
     desired: DesiredPeer,
 }
 impl Tray {
-    pub fn new(address: String, events: SyncSender<Event>) -> Self {
+    pub fn new(
+        address: String,
+        events: SyncSender<Event>,
+        session_state: Option<Arc<session_state::Publisher>>,
+    ) -> Self {
         let (sender, receiver) = sync_channel(64);
         let desired = DesiredPeer::default();
         let state = desired.clone();
         thread::spawn(move || {
-            if let Err(error) = run(&address, &receiver, &state, &events) {
+            if let Err(error) = run(
+                &address,
+                &receiver,
+                &state,
+                &events,
+                session_state.as_deref(),
+            ) {
                 tracing::warn!(%error, "tray adapter unavailable");
                 let mut revision = 0;
                 loop {
@@ -598,6 +609,7 @@ fn run(
     receiver: &Receiver<Command>,
     desired: &DesiredPeer,
     events: &SyncSender<Event>,
+    session_state: Option<&session_state::Publisher>,
 ) -> Result<()> {
     let bus = connect_bus(address, Duration::from_millis(500))?;
     let registry = Watcher::default();
@@ -778,6 +790,24 @@ fn run(
                     &(key,),
                 );
             }
+        }
+        if let Some(publisher) = session_state {
+            let summaries: Vec<BackgroundAppSummary> = items
+                .values()
+                .map(|v| BackgroundAppSummary {
+                    id: session_state::sanitize(&v.key, 256),
+                    app_id: session_state::sanitize(&v.app_id, 255),
+                    title: session_state::sanitize(
+                        v.info["title"].as_str().unwrap_or_default(),
+                        256,
+                    ),
+                    status: session_state::sanitize(
+                        v.info["status"].as_str().unwrap_or_default(),
+                        32,
+                    ),
+                })
+                .collect();
+            publisher.set_background_apps(summaries);
         }
         let snapshot = json!({"type":"tray_snapshot","epoch":epoch,"items":items.values().map(|v|&v.info).collect::<Vec<_>>()});
         if snapshot != previous {

@@ -64,7 +64,195 @@ def descriptor(session):
     return saved
 
 
-def info(session, auth=False):
+def _clean_text(value, limit):
+    if not isinstance(value, str):
+        return ""
+    clean = "".join(ch for ch in value if ch.isprintable() and not (0x7F <= ord(ch) <= 0x9F)).strip()
+    return clean.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+
+
+def _session_uptime_seconds(started_ticks):
+    try:
+        boot_seconds = float(Path("/proc/uptime").read_text().split()[0])
+        ticks = os.sysconf("SC_CLK_TCK")
+        if ticks <= 0:
+            return None
+        return max(0, int(boot_seconds - int(started_ticks) / ticks))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _session_state_snapshot(saved):
+    owned_runtime = saved.get("environment", {}).get("WAYBRIDGE_SESSION_RUNTIME")
+    if not owned_runtime or not isinstance(owned_runtime, str) or not Path(owned_runtime).is_absolute():
+        return None
+    try:
+        runtime_dir = Path(owned_runtime)
+        meta = runtime_dir.lstat()
+        if not stat.S_ISDIR(meta.st_mode) or meta.st_uid != os.getuid() or meta.st_mode & 0o077:
+            return None
+        state = json.loads(secure_read(runtime_dir / "session-state.json", 131072))
+        if (
+            not isinstance(state, dict)
+            or state.get("version") != 1
+            or state.get("pid") != saved["pid"]
+            or str(state.get("started")) != str(saved["started"])
+        ):
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+    windows = []
+    for item in (state.get("windows") or [])[:128]:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), int):
+            continue
+        windows.append(dict(
+            id=item["id"],
+            title=_clean_text(item.get("title", ""), 256),
+            app_id=_clean_text(item.get("app_id", ""), 255),
+            x11=bool(item.get("x11", False)),
+        ))
+    background_apps = []
+    for item in (state.get("background_apps") or [])[:64]:
+        if not isinstance(item, dict):
+            continue
+        background_apps.append(dict(
+            id=_clean_text(item.get("id", ""), 256),
+            app_id=_clean_text(item.get("app_id", ""), 255),
+            title=_clean_text(item.get("title", ""), 256),
+            status=_clean_text(item.get("status", ""), 32),
+        ))
+    viewer_connected = state.get("viewer_connected")
+    return dict(
+        state_available=True,
+        viewer_connected=viewer_connected if isinstance(viewer_connected, bool) else None,
+        windows=windows,
+        background_apps=background_apps,
+    )
+
+
+_INTERNAL_SESSION_COMMS = frozenset({
+    "waybridge",
+    "waybridge-servi",
+    "waybridge-notif",
+    "Xwayland",
+    "chrome_crashpad",
+    "crashpad_handle",
+    "dbus-daemon",
+    "dbus-broker",
+    "dbus-broker-lau",
+    "xdg-desktop-por",
+    "xdg-document-po",
+    "xdg-permission-",
+    "at-spi-bus-laun",
+    "at-spi2-registr",
+    "pipewire",
+    "pipewire-pulse",
+    "wireplumber",
+    "gvfsd",
+    "gvfsd-fuse",
+    "gvfs-udisks2-vo",
+    "dconf-service",
+    "kwalletd6",
+    "kwalletd5",
+    "gnome-keyring-d",
+})
+
+
+def _session_processes(session_name, saved):
+    uid = os.getuid()
+    skip_pids = {saved["pid"], os.getpid(), os.getppid()}
+    runtime_marker = saved.get("environment", {}).get("WAYBRIDGE_SESSION_RUNTIME") or ""
+    runtime_env = f"WAYBRIDGE_SESSION_RUNTIME={runtime_marker}".encode() if runtime_marker else None
+    id_env = f"WAYBRIDGE_SESSION_ID={runtime_marker}".encode() if runtime_marker else None
+    wayland_env = f"WAYLAND_DISPLAY={session_name}".encode()
+    desktop_env = b"XDG_CURRENT_DESKTOP=Waybridge"
+
+    matched = {}
+    try:
+        entries = list(os.scandir("/proc"))
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in skip_pids:
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+            if st.st_uid != uid:
+                continue
+            fd = os.open(f"/proc/{pid}/environ", os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                raw_env = os.read(fd, 65536)
+            finally:
+                os.close(fd)
+            env_parts = raw_env.split(b"\0")
+            belongs = (
+                (runtime_env is not None and runtime_env in env_parts)
+                or (id_env is not None and id_env in env_parts)
+                or (wayland_env in env_parts and desktop_env in env_parts)
+            )
+            if not belongs:
+                continue
+            stat_text = Path(f"/proc/{pid}/stat").read_text()
+            left = stat_text.find("(")
+            right = stat_text.rfind(")")
+            if left < 0 or right <= left:
+                continue
+            comm = _clean_text(stat_text[left + 1:right], 64)
+            tail = stat_text[right + 2:].split()
+            if len(tail) < 2 or tail[0] == "Z":
+                continue
+            ppid = int(tail[1])
+            if not comm or comm in _INTERNAL_SESSION_COMMS:
+                continue
+            app_id = ""
+            for part in env_parts:
+                if part.startswith(b"GIO_LAUNCHED_DESKTOP_FILE="):
+                    candidate = Path(part[len(b"GIO_LAUNCHED_DESKTOP_FILE="):].decode("utf-8", errors="ignore")).name
+                    if candidate.endswith(".desktop") and "/" not in candidate and "\\" not in candidate:
+                        app_id = _clean_text(candidate, 255)
+                    break
+            try:
+                exe = os.readlink(f"/proc/{pid}/exe")
+            except OSError:
+                exe = ""
+            matched[pid] = dict(pid=pid, ppid=ppid, name=comm, app_id=app_id, exe=exe, count=1)
+        except (OSError, ValueError):
+            continue
+
+    # Collapse worker/helper child trees sharing the same binary, comm, or desktop app_id.
+    roots = {}
+    for pid, proc in matched.items():
+        ancestor = pid
+        seen = {pid}
+        current = proc["ppid"]
+        while current in matched and current not in seen:
+            seen.add(current)
+            parent = matched[current]
+            same_app = (
+                (proc["exe"] and parent["exe"] == proc["exe"])
+                or (proc["app_id"] and parent["app_id"] == proc["app_id"])
+                or parent["name"] == proc["name"]
+            )
+            if same_app:
+                ancestor = current
+            current = parent["ppid"]
+        if ancestor == pid:
+            roots.setdefault(pid, dict(pid=pid, name=proc["name"], app_id=proc["app_id"], count=0))
+            roots[pid]["count"] += 1
+        else:
+            parent_proc = matched[ancestor]
+            roots.setdefault(ancestor, dict(pid=ancestor, name=parent_proc["name"], app_id=parent_proc["app_id"], count=0))
+            roots[ancestor]["count"] += 1
+
+    ordered = sorted(roots.values(), key=lambda item: (item["app_id"] == "", item["name"].casefold(), item["pid"]))
+    return ordered[:64]
+
+
+def info(session, auth=False, details=False):
     saved = descriptor(session)
     result = dict(name=session, pid=saved["pid"], started=str(saved["started"]),
                   port=int(saved["connection"]["listen"].rsplit(":", 1)[1]))
@@ -73,6 +261,16 @@ def info(session, auth=False):
         if not 16 <= len(token) <= 4096 or any(c.isspace() for c in token):
             raise ValueError("Invalid authentication token")
         result["token"] = token
+    if details:
+        uptime = _session_uptime_seconds(saved["started"])
+        if uptime is not None:
+            result["uptime_seconds"] = uptime
+        snapshot = _session_state_snapshot(saved)
+        if snapshot is not None:
+            result.update(snapshot)
+        else:
+            result.update(state_available=False, viewer_connected=None, windows=[], background_apps=[])
+        result["processes"] = _session_processes(session, saved)
     return result
 
 
@@ -86,12 +284,12 @@ def resolve_program(value):
     return found
 
 
-def list_sessions():
+def list_sessions(details=False):
     result = []
     for path in RUNTIME.glob("*.session.json"):
         session = path.name[:-len(".session.json")]
         try:
-            result.append(info(session))
+            result.append(info(session, details=details))
         except (ValueError, OSError, KeyError, TypeError):
             continue
     return sorted(result, key=lambda v: v["name"])
@@ -949,7 +1147,7 @@ def dispatch(request):
     if operation == "hello":
         return dict(version=1, platform="linux", features=["sessions", "launch", "applications", "launch-plan", "desktop-overrides"])
     if operation == "list":
-        return list_sessions()
+        return list_sessions(details=request.get("details") is True)
     if operation == "ensure":
         return ensure(request)
     if operation == "app_icons":
@@ -992,7 +1190,7 @@ def dispatch(request):
     session = name(request.get("session", "waybridge-0"))
     saved = descriptor(session)
     if operation == "info":
-        return info(session)
+        return info(session, details=request.get("details") is True)
     if operation in ("launch", "launch-plan"):
         return launch_application(request, saved, session, diagnostic=operation == "launch-plan")
     if operation == "end":

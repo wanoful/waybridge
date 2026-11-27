@@ -348,7 +348,7 @@ async fn remote(
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let op = request["op"].as_str().unwrap_or("");
     if op == "hello" {
-        return write_response(&mut connection, &id, Ok(json!({"version":1,"certificate_sha256":shared.certificate_sha256,"features":["pairing","sessions","launch","applications","app_icons","stream","shell","revoke"]}))).await;
+        return write_response(&mut connection, &id, Ok(json!({"version":1,"certificate_sha256":shared.certificate_sha256,"features":["pairing","sessions","session_details","launch","applications","app_icons","stream","shell","revoke"]}))).await;
     }
     if op == "pair" {
         let result = (|| {

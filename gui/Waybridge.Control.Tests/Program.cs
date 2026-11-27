@@ -597,6 +597,53 @@ try
     }
     Console.WriteLine("PASS: remote media controls model, settings, artwork validation, and read-only gating");
 
+    using (var sessionsDoc = JsonDocument.Parse("""
+        [
+          {
+            "name": "waybridge-0",
+            "pid": 4321,
+            "started": "998877",
+            "port": 41234,
+            "uptime_seconds": 3725,
+            "state_available": true,
+            "viewer_connected": false,
+            "windows": [
+              { "id": 1, "title": "Firefox", "app_id": "firefox", "x11": false }
+            ],
+            "background_apps": [
+              { "id": "org.telegram.desktop/StatusNotifierItem", "app_id": "org.telegram.desktop", "title": "Telegram", "status": "Active" }
+            ],
+            "processes": [
+              { "pid": 5500, "name": "chrome", "app_id": "google-chrome.desktop", "count": 12 }
+            ]
+          },
+          {
+            "name": "waybridge-legacy",
+            "pid": 9999,
+            "started": "112233",
+            "port": 41235
+          }
+        ]
+        """))
+    {
+        var parsedSessions = RemoteSessionModel.ParseList(sessionsDoc.RootElement);
+        Check(parsedSessions.Count == 2, "expected two parsed sessions");
+        var detailed = parsedSessions[0];
+        Check(detailed.Name == "waybridge-0" && detailed.Pid == 4321 && detailed.Started == "998877" &&
+            detailed.DetailsAvailable && detailed.ViewerConnected == false && detailed.UptimeSeconds == 3725, "detailed session fields mismatch");
+        Check(detailed.Windows.Count == 1 && detailed.Windows[0].Title == "Firefox" && !detailed.Windows[0].X11, "session window parse failed");
+        Check(detailed.BackgroundApps.Count == 1 && detailed.BackgroundApps[0].Title == "Telegram", "session background app parse failed");
+        Check(detailed.Processes.Count == 1 && detailed.Processes[0].Name == "chrome" && detailed.Processes[0].Count == 12, "session process parse failed");
+        var legacy = parsedSessions[1];
+        Check(legacy.Name == "waybridge-legacy" && !legacy.DetailsAvailable && legacy.ViewerConnected is null && legacy.Windows.Count == 0, "legacy session parse failed");
+        Localization.Initialize("en");
+        Check(RemoteSessionModel.FormatUptime(30) == "less than 1 min" &&
+            RemoteSessionModel.FormatUptime(600) == "10 min" &&
+            RemoteSessionModel.FormatUptime(3725) == "1 h 2 min" &&
+            RemoteSessionModel.FormatUptime(90000) == "1 d 1 h", "uptime formatting failed");
+        Localization.Initialize("system");
+    }
+    Console.WriteLine("PASS: remote session overview parsing, legacy fallback, and uptime formatting");
 
 }
 finally { Directory.Delete(directory, true); }

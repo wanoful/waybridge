@@ -34,7 +34,7 @@ internal sealed partial class MainWindow
             Field(L("Device name"), name), Field(L("Address"), host),
             Row(L("Service port"), L("Defaults to 49092. Reconnect to apply."), remotePort),
             advanced, SettingsActions(),
-            Card(Column(Heading(L("Remote session"), 17), Muted(L("Disconnecting keeps Linux apps running.")), end), new Thickness(15)));
+            Card(Column(Heading(L("Remote session"), 17), connectionSessionSummary, Actions(refreshRemoteSessionConnectionButton, end)), new Thickness(15)));
     }
 
     private UIElement DisplayPage() => SettingsPage(L("Video"),
@@ -235,11 +235,28 @@ internal sealed partial class MainWindow
         Inform(Tr("Unpaired. Add the device again to pair it."));
     });
 
-    private Task ConfirmEndAsync() => RunOperationAsync(async () =>
+    private async Task ConfirmEndAsync()
     {
-        var profileId = selected.Id;
-        if (!controller.Connected || controller.ActiveProfileId != profileId) return;
-        if (await ConfirmAsync(Tr("End the remote session?"), Tr("This closes Linux apps in the session. Disconnect to leave them running."), Tr("End session")))
-            await controller.EndSessionAsync(expectedProfileId: profileId);
-    });
+        var profile = selected;
+        if (controller.Connected && controller.ActiveProfileId == profile.Id)
+        {
+            await RunOperationAsync(async () =>
+            {
+                if (!controller.Connected || controller.ActiveProfileId != profile.Id) return;
+                if (await ConfirmAsync(Tr("End the remote session?"), Tr("This closes Linux apps in the session. Disconnect to leave them running."), Tr("End session")))
+                {
+                    await controller.EndSessionAsync(expectedProfileId: profile.Id);
+                    await RefreshRemoteSessionsAsync(quiet: true);
+                }
+            });
+            return;
+        }
+        if (busy || !paired || controller.IsRunning) return;
+        var target = PrimaryRemoteSession;
+        if (target is null) return;
+        string summary = FormatRemoteSessionSummary(target);
+        string message = Tr("This closes all Linux apps running in session “{0}”.\n\n{1}", target.Name, summary);
+        if (!await ConfirmAsync(Tr("End remote session “{0}”?", target.Name), message, Tr("End session"))) return;
+        await EndDisconnectedSessionAsync(profile, target);
+    }
 }
